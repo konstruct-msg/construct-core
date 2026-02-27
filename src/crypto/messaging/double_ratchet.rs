@@ -766,10 +766,14 @@ pub struct SerializableSession {
     #[serde(default)]
     local_user_id: String,
 }
+
+#[cfg(test)]
 mod tests {
-    
-    
-    
+    use super::{DoubleRatchetSession, SuiteID};
+    use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
+    use crate::crypto::messaging::SecureMessaging;
+    use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::classic::ClassicSuiteProvider;
 
     #[test]
     fn test_alice_bob_full_exchange() {
