@@ -107,6 +107,8 @@ interface ClassicCryptoCore {
     string decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, string content);
 
     boolean remove_session(string contact_id);
+
+    void set_local_user_id(string user_id);
 };
 
 // ============================================================================

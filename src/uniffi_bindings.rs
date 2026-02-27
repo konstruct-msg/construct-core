@@ -675,6 +675,16 @@ impl ClassicCryptoCore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         client.remove_session(&contact_id)
     }
+
+    /// Set the local user ID — must be called after login/registration so AAD binds
+    /// the correct sender identity to every encrypted message.
+    pub fn set_local_user_id(&self, user_id: String) {
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.set_local_user_id(user_id);
+    }
 }
 
 /// Create a new CryptoCore instance (exported via UDL)

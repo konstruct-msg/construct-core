@@ -770,7 +770,7 @@ pub struct SerializableSession {
 #[cfg(test)]
 mod tests {
     use super::{DoubleRatchetSession, SuiteID};
-    use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
+    use crate::crypto::handshake::{x3dh::X3DHProtocol, KeyAgreement};
     use crate::crypto::messaging::SecureMessaging;
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
