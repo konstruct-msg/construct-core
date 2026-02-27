@@ -133,6 +133,7 @@ where
         remote_bundle: &H::PublicKeyBundle,
         remote_identity: &P::KemPublicKey,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<Self, String> {
         use tracing::{error, info};
 
@@ -165,6 +166,7 @@ where
             initiator_state,
             remote_identity,
             contact_id.clone(),
+            local_user_id,
         )
         .map_err(|e| {
             error!(
@@ -243,6 +245,7 @@ where
         remote_ephemeral: &P::KemPublicKey,
         first_message: &M::EncryptedMessage,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<(Self, Vec<u8>), String> {
         use tracing::info;
 
@@ -273,6 +276,7 @@ where
             local_identity,
             first_message,
             contact_id.clone(),
+            local_user_id,
         )?;
 
         info!(
@@ -417,6 +421,7 @@ mod tests {
             &bob_bundle,
             &bob_identity_pub,
             "bob".to_string(),
+            "alice".to_string(),
         )
         .unwrap();
 
@@ -457,6 +462,7 @@ mod tests {
             &bob_bundle,
             &bob_identity_pub,
             "bob".to_string(),
+            "alice".to_string(),
         )
         .unwrap();
 
@@ -477,6 +483,7 @@ mod tests {
             &alice_ephemeral_pub,
             &encrypted1,
             "alice".to_string(),
+            "bob".to_string(),
         )
         .unwrap();
 
@@ -533,6 +540,7 @@ mod tests {
             &bob_bundle,
             &bob_identity_pub,
             "bob".to_string(),
+            "alice".to_string(),
         )
         .unwrap();
 

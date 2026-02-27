@@ -73,6 +73,9 @@ pub struct Client<P: CryptoProvider, H: KeyAgreement<P>, M: SecureMessaging<P>> 
     /// Активные сессии с контактами
     sessions: HashMap<String, Session<P, H, M>>,
 
+    /// Идентификатор локального пользователя (UUID от сервера)
+    local_user_id: String,
+
     /// PhantomData для generic types
     _phantom: PhantomData<(P, H, M)>,
 }
@@ -113,6 +116,7 @@ where
         Ok(Self {
             key_manager,
             sessions: HashMap::new(),
+            local_user_id: String::new(),
             _phantom: PhantomData,
         })
     }
@@ -137,6 +141,7 @@ where
         Ok(Self {
             key_manager,
             sessions: HashMap::new(),
+            local_user_id: String::new(),
             _phantom: PhantomData,
         })
     }
@@ -241,6 +246,7 @@ where
             remote_bundle,
             remote_identity,
             contact_id.to_string(),
+            self.local_user_id.clone(),
         )?;
 
         let session_id = session.session_id().to_string();
@@ -453,6 +459,7 @@ where
             remote_ephemeral,
             first_message,
             contact_id.to_string(),
+            self.local_user_id.clone(),
         )?;
 
         let session_id = session.session_id().to_string();
@@ -608,6 +615,16 @@ where
         &mut self.key_manager
     }
 
+    /// Установить идентификатор локального пользователя (вызывается после регистрации/логина)
+    pub fn set_local_user_id(&mut self, user_id: String) {
+        self.local_user_id = user_id;
+    }
+
+    /// Получить идентификатор локального пользователя
+    pub fn local_user_id(&self) -> &str {
+        &self.local_user_id
+    }
+
     /// Получить неизменяемую ссылку на KeyManager
     ///
     /// Для advanced использования
@@ -660,6 +677,8 @@ mod tests {
         // Alice and Bob create their clients
         let mut alice = TestClient::new().unwrap();
         let mut bob = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
+        bob.set_local_user_id("bob".to_string());
 
         // Bob's registration bundle
         let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
@@ -858,6 +877,7 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        alice.set_local_user_id("alice-device".to_string());
 
         let mut bob = Client::<
             ClassicSuiteProvider,
@@ -865,11 +885,18 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        bob.set_local_user_id("bob-device".to_string());
 
         // Alice получает bundle Bob-а для инициации сессии
         let bob_bundle = bob.get_registration_bundle().unwrap();
         let bob_identity = bob.key_manager.identity_public_key().unwrap().clone();
         let bob_device_id = derive_device_id(bob_bundle.identity_public.as_ref());
+
+        // Set actual device IDs as local_user_ids so AAD matches during encrypt/decrypt
+        let alice_bundle_pre = alice.get_registration_bundle().unwrap();
+        let alice_device_id_pre = derive_device_id(alice_bundle_pre.identity_public.as_ref());
+        alice.set_local_user_id(alice_device_id_pre);
+        bob.set_local_user_id(bob_device_id.clone());
 
         // Alice инициирует сессию с Bob
         let bob_bundle_for_init = crate::crypto::handshake::x3dh::X3DHPublicKeyBundle {

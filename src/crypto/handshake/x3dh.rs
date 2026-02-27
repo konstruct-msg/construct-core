@@ -357,7 +357,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         let root_key = P::hkdf_derive_key(
             &salt,
             &combined_dh,
-            b"X3DH Root Key",
+            b"Construct-X3DH-RootKey-v1",
             32, // 32 bytes root key
         )
         .map_err(|e| format!("HKDF derivation failed: {}", e))?;
@@ -423,7 +423,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         debug!(target: "crypto::x3dh", "Deriving root key with HKDF");
         // ✅ SECURITY: Use 0xFF salt per Signal X3DH specification (section 2.2)
         let salt = [0xFF_u8; 32];
-        let root_key = P::hkdf_derive_key(&salt, &combined_dh, b"X3DH Root Key", 32)
+        let root_key = P::hkdf_derive_key(&salt, &combined_dh, b"Construct-X3DH-RootKey-v1", 32)
             .map_err(|e| format!("HKDF derivation failed: {}", e))?;
 
         debug!(

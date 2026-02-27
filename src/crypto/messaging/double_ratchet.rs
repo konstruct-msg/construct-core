@@ -95,6 +95,7 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
 
     session_id: String,
     contact_id: String,
+    local_user_id: String,
 }
 
 /// Encrypted message in wire format
@@ -135,6 +136,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         initiator_state: InitiatorState<P>,
         remote_identity: &P::KemPublicKey,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<Self, String> {
         use tracing::debug;
 
@@ -184,6 +186,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_key_timestamps: HashMap::new(),
             session_id: uuid::Uuid::new_v4().to_string(),
             contact_id,
+            local_user_id,
         })
     }
 
@@ -203,6 +206,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         local_identity: &P::KemPrivateKey,
         first_message: &Self::EncryptedMessage,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<(Self, Vec<u8>), String> {
         use tracing::debug;
 
@@ -269,6 +273,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_key_timestamps: HashMap::new(),
             session_id: uuid::Uuid::new_v4().to_string(),
             contact_id: contact_id.clone(),
+            local_user_id,
         };
 
         // КРИТИЧЕСКИ ВАЖНО: Расшифровываем первое сообщение!
@@ -343,7 +348,11 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .map_err(|_| "Invalid public key length")?;
 
         // Associated Data: dh_public_key || message_number (per Signal/Noise protocol)
-        let mut associated_data = Vec::with_capacity(32 + 4);
+        // Associated Data: local_user_id || contact_id || dh_public_key || message_number
+        let mut associated_data =
+            Vec::with_capacity(self.local_user_id.len() + self.contact_id.len() + 32 + 4);
+        associated_data.extend_from_slice(self.local_user_id.as_bytes());
+        associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(&dh_public_key);
         associated_data.extend_from_slice(&message_number.to_be_bytes());
 
@@ -586,8 +595,11 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             "Decrypting with message key"
         );
 
-        // Reconstruct Associated Data: dh_public_key || message_number
-        let mut associated_data = Vec::with_capacity(32 + 4);
+        // Reconstruct Associated Data: contact_id (sender) || local_user_id (recipient) || dh_public_key || message_number
+        let mut associated_data =
+            Vec::with_capacity(self.contact_id.len() + self.local_user_id.len() + 32 + 4);
+        associated_data.extend_from_slice(self.contact_id.as_bytes());
+        associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
 
@@ -647,6 +659,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
             session_id: self.session_id.clone(),
             contact_id: self.contact_id.clone(),
+            local_user_id: self.local_user_id.clone(),
         }
     }
 
@@ -689,6 +702,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             skipped_key_timestamps: data.skipped_key_timestamps,
             session_id: data.session_id,
             contact_id: data.contact_id,
+            local_user_id: data.local_user_id,
         })
     }
 }
@@ -749,9 +763,9 @@ pub struct SerializableSession {
     skipped_key_timestamps: HashMap<u32, u64>,
     session_id: String,
     contact_id: String,
+    #[serde(default)]
+    local_user_id: String,
 }
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::handshake::{KeyAgreement, X3DHProtocol};
@@ -799,6 +813,7 @@ mod tests {
                 initiator_state,
                 &bob_identity_pub,
                 "bob".to_string(),
+                "alice".to_string(),
             )
             .unwrap();
 
@@ -827,6 +842,7 @@ mod tests {
                 &bob_identity_priv,
                 &encrypted1,
                 "alice".to_string(),
+                "bob".to_string(),
             )
             .unwrap();
 
@@ -880,6 +896,7 @@ mod tests {
             initiator_state,
             &bob_identity_pub,
             "bob".to_string(),
+            "alice".to_string(),
         )
         .unwrap();
 
@@ -906,6 +923,7 @@ mod tests {
             &bob_identity_priv,
             &msg1,
             "alice".to_string(),
+            "bob".to_string(),
         )
         .unwrap();
 

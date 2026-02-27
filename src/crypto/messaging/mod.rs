@@ -124,6 +124,7 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
         initiator_state: InitiatorState<P>,
         remote_identity: &P::KemPublicKey,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<Self, String>;
 
     /// Создать сессию как получатель (Bob)
@@ -159,6 +160,7 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
         local_identity: &P::KemPrivateKey,
         first_message: &Self::EncryptedMessage,
         contact_id: String,
+        local_user_id: String,
     ) -> Result<(Self, Vec<u8>), String>;
 
     /// Зашифровать сообщение

@@ -1,13 +1,13 @@
 // Шифрование приватных ключей мастер-паролем
-// PBKDF2 для деривации ключа + AES-256-GCM для шифрования
+// PBKDF2 для деривации ключа + ChaCha20-Poly1305 для шифрования
 
 use crate::config::Config;
 use crate::storage::models::StoredPrivateKeys;
 use crate::utils::error::{ConstructError, Result};
 use crate::utils::time::current_timestamp;
-use aes_gcm::{
+use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use ed25519_dalek::SigningKey;
 use pbkdf2::pbkdf2_hmac;
@@ -115,7 +115,7 @@ pub fn encrypt_private_keys(
     user_id: String,
     prekey_signature: Vec<u8>,
 ) -> Result<StoredPrivateKeys> {
-    let cipher = Aes256Gcm::new(master_key.into());
+    let cipher = ChaCha20Poly1305::new(master_key.into());
 
     // Шифруем каждый ключ отдельно с разными nonce
     let encrypted_identity = encrypt_data(&cipher, &keys.identity_secret)?;
@@ -145,7 +145,7 @@ pub fn decrypt_private_keys(
     stored: &StoredPrivateKeys,
     master_key: &[u8; KEY_LENGTH],
 ) -> Result<PrivateKeys> {
-    let cipher = Aes256Gcm::new(master_key.into());
+    let cipher = ChaCha20Poly1305::new(master_key.into());
 
     // Расшифровываем каждый ключ
     let identity_bytes = decrypt_data(&cipher, &stored.encrypted_identity_private)?;
@@ -165,7 +165,7 @@ pub fn decrypt_private_keys(
 }
 
 /// Зашифровать данные с использованием AES-256-GCM
-fn encrypt_data(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
+fn encrypt_data(cipher: &ChaCha20Poly1305, data: &[u8]) -> Result<Vec<u8>> {
     let nonce_length = Config::global().nonce_length;
 
     // Генерируем случайный nonce
@@ -189,7 +189,7 @@ fn encrypt_data(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Расшифровать данные с использованием AES-256-GCM
-fn decrypt_data(cipher: &Aes256Gcm, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn decrypt_data(cipher: &ChaCha20Poly1305, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let nonce_length = Config::global().nonce_length;
 
     if data.len() < nonce_length {
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn test_encrypt_data_includes_nonce() {
         let master_key = [0u8; KEY_LENGTH];
-        let cipher = Aes256Gcm::new(&master_key.into());
+        let cipher = ChaCha20Poly1305::new(&master_key.into());
         let data = b"test data";
 
         let encrypted = encrypt_data(&cipher, data).unwrap();
