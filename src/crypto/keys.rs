@@ -387,6 +387,25 @@ impl<P: CryptoProvider> KeyManager<P> {
         self.old_prekeys.len()
     }
 
+    /// Iterate over all prekey private keys: current first, then old ones.
+    ///
+    /// Used by `init_receiving_session_with_ephemeral` to try all available
+    /// prekeys when the current one fails (e.g. sender used a prekey from
+    /// before a rotation).
+    pub fn all_prekey_private_keys(&self) -> Vec<P::KemPrivateKey> {
+        let mut keys = Vec::with_capacity(1 + self.old_prekeys.len());
+        if let Some(current) = &self.current_signed_prekey {
+            keys.push(current.key_pair.0.clone());
+        }
+        // Sort old prekeys newest-first (highest key_id = most recent rotation)
+        let mut old: Vec<_> = self.old_prekeys.values().collect();
+        old.sort_by(|a, b| b.key_id.cmp(&a.key_id));
+        for prekey in old {
+            keys.push(prekey.key_pair.0.clone());
+        }
+        keys
+    }
+
     /// Получить signing key для экспорта
     pub fn signing_secret_key(&self) -> Result<&P::SignaturePrivateKey> {
         self.signing_key.as_ref().map(|k| &k.0).ok_or_else(|| {

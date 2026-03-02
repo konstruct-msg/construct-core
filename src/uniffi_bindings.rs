@@ -676,6 +676,21 @@ impl ClassicCryptoCore {
         client.remove_session(&contact_id)
     }
 
+    /// Returns the total number of available prekeys (current + archived).
+    ///
+    /// The Swift layer should call `uploadPreKeys` when this drops below a
+    /// threshold (e.g. < 5) to ensure incoming sessions can always be
+    /// established.
+    pub fn prekeys_available_count(&self) -> u32 {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old = client.key_manager().old_prekeys_count();
+        // +1 for the current prekey (always present after initialization)
+        (old + 1) as u32
+    }
+
     /// Set the local user ID — must be called after login/registration so AAD binds
     /// the correct sender identity to every encrypted message.
     pub fn set_local_user_id(&self, user_id: String) {

@@ -422,14 +422,17 @@ where
         remote_ephemeral: &P::KemPublicKey,
         first_message: &M::EncryptedMessage,
     ) -> Result<(String, Vec<u8>), String> {
-        use tracing::info;
+        use tracing::{info, warn};
 
-        // Check if session already exists
+        // If a session already exists it was created by the INITIATOR path (we sent
+        // first).  Remove it so we can establish the canonical RESPONDER session.
         if self.sessions.contains_key(contact_id) {
-            return Err(format!(
-                "Session already exists with contact: {}",
-                contact_id
-            ));
+            warn!(
+                target: "crypto::client",
+                contact_id = %contact_id,
+                "Removing existing session before RESPONDER init"
+            );
+            self.sessions.remove(contact_id);
         }
 
         info!(
@@ -442,40 +445,68 @@ where
             .key_manager
             .identity_secret_key()
             .map_err(|e| format!("Failed to get identity key: {:?}", e))?;
-        let local_signed_prekey = self
-            .key_manager
-            .current_signed_prekey()
-            .map_err(|e| format!("Failed to get signed prekey: {:?}", e))?
-            .key_pair
-            .0
-            .clone();
 
-        // Create session and decrypt first message
-        // ⚠️ ВАЖНО: init_as_responder теперь возвращает (session, plaintext)
-        let (session, plaintext) = Session::<P, H, M>::init_as_responder(
-            local_identity,
-            &local_signed_prekey,
-            remote_identity,
-            remote_ephemeral,
-            first_message,
-            contact_id.to_string(),
-            self.local_user_id.clone(),
-        )?;
+        // Try current prekey first, then fall back to older prekeys (in case the
+        // sender encrypted using a prekey that predates our last rotation).
+        let candidate_prekeys = self.key_manager.all_prekey_private_keys();
+        if candidate_prekeys.is_empty() {
+            return Err("No signed prekeys available".to_string());
+        }
 
-        let session_id = session.session_id().to_string();
+        let mut last_err = String::from("No prekeys tried");
+        for (idx, prekey) in candidate_prekeys.iter().enumerate() {
+            match Session::<P, H, M>::init_as_responder(
+                local_identity,
+                prekey,
+                remote_identity,
+                remote_ephemeral,
+                first_message,
+                contact_id.to_string(),
+                self.local_user_id.clone(),
+            ) {
+                Ok((session, plaintext)) => {
+                    let session_id = session.session_id().to_string();
+                    self.sessions.insert(contact_id.to_string(), session);
 
-        // Store session
-        self.sessions.insert(contact_id.to_string(), session);
+                    if idx > 0 {
+                        info!(
+                            target: "crypto::client",
+                            contact_id = %contact_id,
+                            prekey_index = idx,
+                            "Receiving session initialized with old prekey (index {})",
+                            idx
+                        );
+                    }
 
-        info!(
-            target: "crypto::client",
-            contact_id = %contact_id,
-            session_id = %session_id,
-            plaintext_len = %plaintext.len(),
-            "Receiving session initialized and first message decrypted"
-        );
+                    info!(
+                        target: "crypto::client",
+                        contact_id = %contact_id,
+                        session_id = %session_id,
+                        plaintext_len = %plaintext.len(),
+                        "Receiving session initialized and first message decrypted"
+                    );
 
-        Ok((session_id, plaintext))
+                    return Ok((session_id, plaintext));
+                }
+                Err(e) => {
+                    warn!(
+                        target: "crypto::client",
+                        contact_id = %contact_id,
+                        prekey_index = idx,
+                        error = %e,
+                        "Prekey {} failed, trying next",
+                        idx
+                    );
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(format!(
+            "All {} prekey(s) failed. Last error: {}",
+            candidate_prekeys.len(),
+            last_err
+        ))
     }
 
     /// Зашифровать сообщение для контакта

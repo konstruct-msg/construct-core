@@ -108,6 +108,8 @@ interface ClassicCryptoCore {
 
     boolean remove_session(string contact_id);
 
+    u32 prekeys_available_count();
+
     void set_local_user_id(string user_id);
 };
 
