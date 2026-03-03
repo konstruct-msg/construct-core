@@ -73,6 +73,10 @@ pub struct Client<P: CryptoProvider, H: KeyAgreement<P>, M: SecureMessaging<P>> 
     /// Активные сессии с контактами
     sessions: HashMap<String, Session<P, H, M>>,
 
+    /// Pending one-time prekey IDs for outbound sessions:
+    /// stored at init_session time, consumed on first encrypt (message_number==0)
+    pending_otpk_ids: HashMap<String, u32>,
+
     /// Идентификатор локального пользователя (UUID от сервера)
     local_user_id: String,
 
@@ -116,6 +120,7 @@ where
         Ok(Self {
             key_manager,
             sessions: HashMap::new(),
+            pending_otpk_ids: HashMap::new(),
             local_user_id: String::new(),
             _phantom: PhantomData,
         })
@@ -141,6 +146,7 @@ where
         Ok(Self {
             key_manager,
             sessions: HashMap::new(),
+            pending_otpk_ids: HashMap::new(),
             local_user_id: String::new(),
             _phantom: PhantomData,
         })
@@ -217,6 +223,7 @@ where
         contact_id: &str,
         remote_bundle: &H::PublicKeyBundle,
         remote_identity: &P::KemPublicKey,
+        one_time_prekey_id: u32,
     ) -> Result<String, String> {
         use tracing::info;
 
@@ -253,6 +260,11 @@ where
 
         // Store session
         self.sessions.insert(contact_id.to_string(), session);
+
+        // Store pending OTPK id for first encrypt (burn-on-use after message_number==0 send)
+        if one_time_prekey_id != 0 {
+            self.pending_otpk_ids.insert(contact_id.to_string(), one_time_prekey_id);
+        }
 
         info!(
             target: "crypto::client",
@@ -398,6 +410,7 @@ where
             &remote_identity,
             &remote_ephemeral,
             first_message,
+            0, // OTPK consumed upstream when called via init_receiving_session (test path)
         )
     }
 
@@ -421,6 +434,7 @@ where
         remote_identity: &P::KemPublicKey,
         remote_ephemeral: &P::KemPublicKey,
         first_message: &M::EncryptedMessage,
+        one_time_prekey_id: u32,
     ) -> Result<(String, Vec<u8>), String> {
         use tracing::{info, warn};
 
@@ -438,8 +452,25 @@ where
         info!(
             target: "crypto::client",
             contact_id = %contact_id,
+            has_otpk = (one_time_prekey_id != 0),
             "Initializing session as responder (with ephemeral)"
         );
+
+        // Consume the OTPK (burn-on-use) BEFORE borrowing identity key
+        let consumed_otpk = if one_time_prekey_id != 0 {
+            let key = self.key_manager.consume_one_time_prekey(one_time_prekey_id);
+            if key.is_none() {
+                warn!(
+                    target: "crypto::client",
+                    contact_id = %contact_id,
+                    key_id = one_time_prekey_id,
+                    "OTPK key_id not found locally — falling back to 3-DH"
+                );
+            }
+            key
+        } else {
+            None
+        };
 
         let local_identity = self
             .key_manager
@@ -463,6 +494,7 @@ where
                 first_message,
                 contact_id.to_string(),
                 self.local_user_id.clone(),
+                consumed_otpk.as_ref(),
             ) {
                 Ok((session, plaintext)) => {
                     let session_id = session.session_id().to_string();
@@ -675,6 +707,24 @@ where
     /// Для advanced использования
     pub fn get_session(&self, contact_id: &str) -> Option<&Session<P, H, M>> {
         self.sessions.get(contact_id)
+    }
+
+    /// Pop the pending one-time prekey id for a contact (used by first encrypt, message_number==0).
+    /// Returns 0 if no pending OTPK (fallback 3-DH mode).
+    pub fn take_pending_otpk_id(&mut self, contact_id: &str) -> u32 {
+        self.pending_otpk_ids.remove(contact_id).unwrap_or(0)
+    }
+
+    /// Generate new one-time prekeys and return (key_id, public_key_bytes) pairs for upload.
+    pub fn generate_one_time_prekeys(&mut self, count: u32) -> Result<Vec<(u32, Vec<u8>)>, String> {
+        self.key_manager
+            .generate_one_time_prekeys(count)
+            .map_err(|e| format!("Failed to generate OTPKs: {:?}", e))
+    }
+
+    /// How many one-time prekeys are stored locally (not yet consumed by incoming sessions).
+    pub fn one_time_prekey_count(&self) -> usize {
+        self.key_manager.one_time_prekey_count()
     }
 }
 

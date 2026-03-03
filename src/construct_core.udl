@@ -48,6 +48,7 @@ dictionary EncryptedMessageComponents {
     sequence<u8> ephemeral_public_key;
     u32 message_number;
     string content;
+    u32 one_time_prekey_id;
 };
 
 dictionary SessionInitResult {
@@ -74,6 +75,11 @@ enum CryptoError {
     "InvalidCiphertext",
     "SerializationFailed",
     "MessagePackDeserializationFailed",
+};
+
+dictionary OtpkPair {
+    u32 key_id;
+    sequence<u8> public_key;
 };
 
 interface ClassicCryptoCore {
@@ -109,6 +115,11 @@ interface ClassicCryptoCore {
     boolean remove_session(string contact_id);
 
     u32 prekeys_available_count();
+
+    [Throws=CryptoError]
+    sequence<OtpkPair> generate_one_time_prekeys(u32 count);
+
+    u32 one_time_prekey_count();
 
     void set_local_user_id(string user_id);
 };

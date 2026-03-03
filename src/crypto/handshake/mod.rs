@@ -170,6 +170,7 @@ pub trait KeyAgreement<P: CryptoProvider> {
         local_signed_prekey: &P::KemPrivateKey,
         remote_identity: &P::KemPublicKey,
         remote_ephemeral: &P::KemPublicKey,
+        local_one_time_prekey: Option<&P::KemPrivateKey>,
     ) -> Result<Self::SharedSecret, String>;
 }
 

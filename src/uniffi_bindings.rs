@@ -81,6 +81,7 @@ pub struct EncryptedMessageComponents {
     pub ephemeral_public_key: Vec<u8>, // 32 bytes
     pub message_number: u32,
     pub content: String, // Base64(nonce || ciphertext_with_tag)
+    pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
 }
 
 // Session initialization result with decrypted first message
@@ -91,6 +92,13 @@ pub struct SessionInitResult {
     pub decrypted_message: String, // UTF-8 decoded plaintext
 }
 
+/// One-time prekey pair for upload to server
+#[derive(Debug, Clone)]
+pub struct OtpkPair {
+    pub key_id: u32,
+    pub public_key: Vec<u8>,
+}
+
 // Key bundle for session initialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeyBundle {
@@ -99,6 +107,10 @@ struct KeyBundle {
     signature: Vec<u8>,
     verifying_key: Vec<u8>,
     suite_id: u16,
+    #[serde(default)]
+    one_time_prekey_public: Option<Vec<u8>>,
+    #[serde(default)]
+    one_time_prekey_id: Option<u32>,
 }
 
 // Private keys for persistence (exported via UDL)
@@ -349,11 +361,15 @@ impl ClassicCryptoCore {
             signature: key_bundle.signature.clone(),
             verifying_key: key_bundle.verifying_key.clone(),
             suite_id: SuiteID::new(key_bundle.suite_id).map_err(|_| CryptoError::InvalidKeyData)?,
+            one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
+            one_time_prekey_id: key_bundle.one_time_prekey_id,
         };
 
         // Extract remote identity public key
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
+
+        let one_time_prekey_id = key_bundle.one_time_prekey_id.unwrap_or(0);
 
         tracing::debug!(
             target: "crypto::uniffi",
@@ -387,7 +403,7 @@ impl ClassicCryptoCore {
 
         // Initialize the session (returns internal session_id which we ignore)
         client
-            .init_session(&contact_id, &public_bundle, &remote_identity)
+            .init_session(&contact_id, &public_bundle, &remote_identity, one_time_prekey_id)
             .map_err(|e| {
                 tracing::error!(
                     target: "crypto::uniffi",
@@ -434,6 +450,8 @@ impl ClassicCryptoCore {
             ephemeral_public_key: Vec<u8>,
             message_number: u32,
             content: String, // Base64
+            #[serde(default)]
+            one_time_prekey_id: u32,
         }
 
         let first_msg: FirstMessage =
@@ -520,6 +538,7 @@ impl ClassicCryptoCore {
                 &remote_identity,
                 &remote_ephemeral,
                 &encrypted_first_message,
+                first_msg.one_time_prekey_id,
             )
             .map_err(|e| {
                 tracing::error!(
@@ -598,10 +617,18 @@ impl ClassicCryptoCore {
         sealed_box.extend_from_slice(&encrypted_message.nonce);
         sealed_box.extend_from_slice(&encrypted_message.ciphertext);
 
+        // Pop OTPK id for first message (message_number == 0), else 0
+        let one_time_prekey_id = if encrypted_message.message_number == 0 {
+            client.take_pending_otpk_id(contact_id)
+        } else {
+            0
+        };
+
         Ok(EncryptedMessageComponents {
             ephemeral_public_key: encrypted_message.dh_public_key.to_vec(),
             message_number: encrypted_message.message_number,
             content: base64::engine::general_purpose::STANDARD.encode(&sealed_box),
+            one_time_prekey_id,
         })
     }
 
@@ -689,6 +716,32 @@ impl ClassicCryptoCore {
         let old = client.key_manager().old_prekeys_count();
         // +1 for the current prekey (always present after initialization)
         (old + 1) as u32
+    }
+
+    /// Generate `count` fresh one-time prekeys and return (key_id, public_key_bytes) pairs.
+    /// Caller MUST upload these to the server via KeyService.uploadPreKeys.
+    pub fn generate_one_time_prekeys(&self, count: u32) -> Result<Vec<OtpkPair>, CryptoError> {
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pairs = client.generate_one_time_prekeys(count).map_err(|e| {
+            tracing::error!(target: "crypto::uniffi", error = %e, "generate_one_time_prekeys failed");
+            CryptoError::InitializationFailed
+        })?;
+        Ok(pairs
+            .into_iter()
+            .map(|(key_id, public_key)| OtpkPair { key_id, public_key })
+            .collect())
+    }
+
+    /// How many one-time prekeys are stored locally (not yet consumed).
+    pub fn one_time_prekey_count(&self) -> u32 {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.one_time_prekey_count() as u32
     }
 
     /// Set the local user ID — must be called after login/registration so AAD binds

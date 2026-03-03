@@ -95,6 +95,14 @@ pub struct X3DHPublicKeyBundle {
 
     /// Crypto suite ID
     pub suite_id: SuiteID,
+
+    /// Bob's One-Time Prekey Public Key (OPK_B_pub) — optional, absent when depleted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub one_time_prekey_public: Option<Vec<u8>>,
+
+    /// Key ID for one_time_prekey_public — must be sent in wire payload so Bob can consume it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub one_time_prekey_id: Option<u32>,
 }
 
 /// Регистрационные данные для отправки на сервер
@@ -335,19 +343,41 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         let dh3 = P::kem_decapsulate(&ephemeral_private, remote_signed_prekey_public.as_ref())
             .map_err(|e| format!("DH3 failed: {}", e))?;
 
+        // DH4 = DH(EK_A, OPK_B) — optional, only when server provided a one-time prekey
+        let dh4_opt: Option<Vec<u8>> = if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
+            if otpk_bytes.len() != 32 {
+                return Err(format!(
+                    "Invalid one_time_prekey_public size: expected 32 bytes, got {} bytes",
+                    otpk_bytes.len()
+                ));
+            }
+            let remote_otpk = P::kem_public_key_from_bytes(otpk_bytes.clone());
+            trace!(target: "crypto::x3dh", "Computing DH4 = DH(EK_A, OPK_B)");
+            Some(P::kem_decapsulate(&ephemeral_private, remote_otpk.as_ref())
+                .map_err(|e| format!("DH4 failed: {}", e))?)
+        } else {
+            trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK in bundle — fallback mode)");
+            None
+        };
+
         debug!(
             target: "crypto::x3dh",
             dh1_len = %dh1.len(),
             dh2_len = %dh2.len(),
             dh3_len = %dh3.len(),
+            has_dh4 = dh4_opt.is_some(),
             "DH operations completed"
         );
 
-        // 3. Combine DH outputs: DH1 || DH2 || DH3
-        let mut combined_dh = Vec::with_capacity(dh1.len() + dh2.len() + dh3.len());
+        // 3. Combine DH outputs: DH1 || DH2 || DH3 [|| DH4]
+        let capacity = dh1.len() + dh2.len() + dh3.len() + dh4_opt.as_ref().map_or(0, |d| d.len());
+        let mut combined_dh = Vec::with_capacity(capacity);
         combined_dh.extend_from_slice(&dh1);
         combined_dh.extend_from_slice(&dh2);
         combined_dh.extend_from_slice(&dh3);
+        if let Some(dh4) = &dh4_opt {
+            combined_dh.extend_from_slice(dh4);
+        }
 
         // 4. Derive root key using HKDF
         debug!(target: "crypto::x3dh", "Step 3: Deriving root key with HKDF");
@@ -382,6 +412,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         local_signed_prekey: &P::KemPrivateKey,
         remote_identity: &P::KemPublicKey,
         remote_ephemeral: &P::KemPublicKey,
+        local_one_time_prekey: Option<&P::KemPrivateKey>,
     ) -> Result<Self::SharedSecret, String> {
         use tracing::{debug, trace};
 
@@ -405,19 +436,34 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         let dh3 = P::kem_decapsulate(local_signed_prekey, remote_ephemeral.as_ref())
             .map_err(|e| format!("DH3 failed: {}", e))?;
 
+        // DH4 = DH(OPK_B, EK_A) — optional, mirrors Alice's DH4
+        let dh4_opt: Option<Vec<u8>> = if let Some(otpk_priv) = local_one_time_prekey {
+            trace!(target: "crypto::x3dh", "Computing DH4 = DH(OPK_B, EK_A)");
+            Some(P::kem_decapsulate(otpk_priv, remote_ephemeral.as_ref())
+                .map_err(|e| format!("DH4 failed: {}", e))?)
+        } else {
+            trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK consumed — fallback mode)");
+            None
+        };
+
         debug!(
             target: "crypto::x3dh",
             dh1_len = %dh1.len(),
             dh2_len = %dh2.len(),
             dh3_len = %dh3.len(),
+            has_dh4 = dh4_opt.is_some(),
             "DH operations completed (responder)"
         );
 
-        // Combine DH outputs: DH1 || DH2 || DH3
-        let mut combined_dh = Vec::with_capacity(dh1.len() + dh2.len() + dh3.len());
+        // Combine DH outputs: DH1 || DH2 || DH3 [|| DH4]
+        let capacity = dh1.len() + dh2.len() + dh3.len() + dh4_opt.as_ref().map_or(0, |d| d.len());
+        let mut combined_dh = Vec::with_capacity(capacity);
         combined_dh.extend_from_slice(&dh1);
         combined_dh.extend_from_slice(&dh2);
         combined_dh.extend_from_slice(&dh3);
+        if let Some(dh4) = &dh4_opt {
+            combined_dh.extend_from_slice(dh4);
+        }
 
         // Derive root key using HKDF
         debug!(target: "crypto::x3dh", "Deriving root key with HKDF");

@@ -113,8 +113,14 @@ pub struct KeyManager<P: CryptoProvider> {
     /// История старых prekey для обратной совместимости
     old_prekeys: HashMap<u32, PrekeyStore<P>>,
 
-    /// Счетчик для key_id
+    /// One-time prekeys (OTPKs) — burn-on-use, stored until consumed by incoming X3DH
+    one_time_prekeys: HashMap<u32, (P::KemPrivateKey, P::KemPublicKey)>,
+
+    /// Счетчик для key_id signed prekeys
     next_prekey_id: u32,
+
+    /// Счетчик для OTPK key_id (separate range: starts at 1_000_000 to avoid collisions)
+    next_otpk_id: u32,
 
     _phantom: PhantomData<P>,
 }
@@ -127,7 +133,9 @@ impl<P: CryptoProvider> KeyManager<P> {
             signing_key: None,
             current_signed_prekey: None,
             old_prekeys: HashMap::new(),
+            one_time_prekeys: HashMap::new(),
             next_prekey_id: 1,
+            next_otpk_id: 1_000_000,
             _phantom: PhantomData,
         }
     }
@@ -324,6 +332,8 @@ impl<P: CryptoProvider> KeyManager<P> {
             signature: prekey.signature.clone(),
             verifying_key,
             suite_id: SuiteID::from_u16_unchecked(P::suite_id()), // Provider гарантирует валидный suite_id
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         })
     }
 
@@ -341,6 +351,8 @@ impl<P: CryptoProvider> KeyManager<P> {
             signature: prekey.signature.clone(),
             verifying_key,
             suite_id: SuiteID::from_u16_unchecked(P::suite_id()), // Provider гарантирует валидный suite_id
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         })
     }
 
@@ -385,6 +397,37 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Количество сохраненных старых prekeys
     pub fn old_prekeys_count(&self) -> usize {
         self.old_prekeys.len()
+    }
+
+    // ============================================================================
+    // One-Time Prekeys (OTPKs)
+    // ============================================================================
+
+    /// Generate `count` new one-time prekeys, store private keys, return (key_id, public_key_bytes) pairs.
+    /// Caller uploads the public keys to the server via UploadPreKeys.
+    pub fn generate_one_time_prekeys(&mut self, count: u32) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut result = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let (private_key, public_key) =
+                P::generate_kem_keys().map_err(ConstructError::Crypto)?;
+            let key_id = self.next_otpk_id;
+            self.next_otpk_id = self.next_otpk_id.wrapping_add(1);
+            let public_bytes = public_key.as_ref().to_vec();
+            self.one_time_prekeys.insert(key_id, (private_key, public_key));
+            result.push((key_id, public_bytes));
+        }
+        Ok(result)
+    }
+
+    /// Consume (burn) a one-time prekey by key_id. Returns the private key if found.
+    /// The key is removed from storage — it cannot be reused.
+    pub fn consume_one_time_prekey(&mut self, key_id: u32) -> Option<P::KemPrivateKey> {
+        self.one_time_prekeys.remove(&key_id).map(|(private, _)| private)
+    }
+
+    /// How many OTPKs are currently stored locally (not yet consumed).
+    pub fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.len()
     }
 
     /// Iterate over all prekey private keys: current first, then old ones.

@@ -48,6 +48,8 @@ impl From<KeyBundle> for X3DHPublicKeyBundle {
             signature: bundle.signature,
             verifying_key: bundle.verifying_key,
             suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         }
     }
 }
@@ -146,6 +148,8 @@ where
             verifying_key: remote_bundle.verifying_key.clone(),
             suite_id: SuiteID::new(remote_bundle.suite_id)
                 .map_err(|e| ConstructError::ValidationError(format!("Invalid suite_id: {}", e)))?,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Extract remote identity from bundle
@@ -155,7 +159,7 @@ where
         let public_bundle = &bundle_data as &<X3DHProtocol<P> as KeyAgreement<P>>::PublicKeyBundle;
 
         self.client
-            .init_session(contact_id, public_bundle, &remote_identity)
+            .init_session(contact_id, public_bundle, &remote_identity, 0)
             .map_err(|e| ConstructError::Crypto(crate::error::CryptoError::Other(e)))
     }
 

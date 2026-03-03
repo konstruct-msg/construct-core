@@ -246,12 +246,14 @@ where
         first_message: &M::EncryptedMessage,
         contact_id: String,
         local_user_id: String,
+        local_one_time_prekey: Option<&P::KemPrivateKey>,
     ) -> Result<(Self, Vec<u8>), String> {
         use tracing::info;
 
         info!(
             target: "crypto::session",
             contact_id = %contact_id,
+            has_otpk = local_one_time_prekey.is_some(),
             "Initializing session as responder (Bob)"
         );
 
@@ -261,6 +263,7 @@ where
             local_signed_prekey,
             remote_identity,
             remote_ephemeral,
+            local_one_time_prekey,
         )?;
 
         info!(
