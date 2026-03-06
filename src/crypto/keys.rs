@@ -430,6 +430,30 @@ impl<P: CryptoProvider> KeyManager<P> {
         self.one_time_prekeys.len()
     }
 
+    /// Export all stored OTPK (key_id, private_bytes, public_bytes) for persistence.
+    pub fn export_one_time_prekeys(&self) -> Vec<(u32, Vec<u8>, Vec<u8>)> {
+        self.one_time_prekeys
+            .iter()
+            .map(|(&id, (priv_key, pub_key))| {
+                (id, priv_key.as_ref().to_vec(), pub_key.as_ref().to_vec())
+            })
+            .collect()
+    }
+
+    /// Import previously exported OTPKs back into the store (used after core restore).
+    /// Also restores next_otpk_id to avoid collisions with persisted keys.
+    pub fn import_one_time_prekeys(&mut self, keys: Vec<(u32, Vec<u8>, Vec<u8>)>) {
+        for (key_id, priv_bytes, pub_bytes) in keys {
+            let private_key = P::kem_private_key_from_bytes(priv_bytes);
+            let public_key = P::kem_public_key_from_bytes(pub_bytes);
+            self.one_time_prekeys.insert(key_id, (private_key, public_key));
+            // Keep next_otpk_id above all imported IDs to avoid collisions
+            if key_id >= self.next_otpk_id {
+                self.next_otpk_id = key_id.wrapping_add(1);
+            }
+        }
+    }
+
     /// Iterate over all prekey private keys: current first, then old ones.
     ///
     /// Used by `init_receiving_session_with_ephemeral` to try all available

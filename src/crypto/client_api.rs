@@ -726,6 +726,16 @@ where
     pub fn one_time_prekey_count(&self) -> usize {
         self.key_manager.one_time_prekey_count()
     }
+
+    /// Export all stored OTPK private/public bytes for Keychain persistence.
+    pub fn export_one_time_prekeys(&self) -> Vec<(u32, Vec<u8>, Vec<u8>)> {
+        self.key_manager.export_one_time_prekeys()
+    }
+
+    /// Import previously persisted OTPKs back into the core after a Keychain restore.
+    pub fn import_one_time_prekeys(&mut self, keys: Vec<(u32, Vec<u8>, Vec<u8>)>) {
+        self.key_manager.import_one_time_prekeys(keys);
+    }
 }
 
 /// Convenience type alias для X3DH + Double Ratchet с Classic Suite

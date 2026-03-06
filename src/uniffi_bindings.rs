@@ -99,6 +99,14 @@ pub struct OtpkPair {
     pub public_key: Vec<u8>,
 }
 
+/// Full OTPK record for persistence (includes private key for Keychain storage)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtpkRecord {
+    pub key_id: u32,
+    pub private_key: Vec<u8>, // Base64-encoded private key bytes
+    pub public_key: Vec<u8>,  // Base64-encoded public key bytes
+}
+
 // Key bundle for session initialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeyBundle {
@@ -744,6 +752,38 @@ impl ClassicCryptoCore {
         client.one_time_prekey_count() as u32
     }
 
+    /// Export all locally stored OTPKs as a JSON string for Keychain persistence.
+    /// Call this after generating and uploading OTPKs to keep Keychain in sync.
+    pub fn export_one_time_prekeys_json(&self) -> Result<String, CryptoError> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records: Vec<OtpkRecord> = client
+            .export_one_time_prekeys()
+            .into_iter()
+            .map(|(key_id, private_key, public_key)| OtpkRecord { key_id, private_key, public_key })
+            .collect();
+        serde_json::to_string(&records).map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    /// Import previously persisted OTPKs from a JSON string back into the core.
+    /// Call this after restoring the core from Keychain to ensure OTPK continuity.
+    pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
+        let records: Vec<OtpkRecord> =
+            serde_json::from_str(&json).map_err(|_| CryptoError::SerializationFailed)?;
+        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = records
+            .into_iter()
+            .map(|r| (r.key_id, r.private_key, r.public_key))
+            .collect();
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.import_one_time_prekeys(keys);
+        Ok(())
+    }
+
     /// Set the local user ID — must be called after login/registration so AAD binds
     /// the correct sender identity to every encrypted message.
     pub fn set_local_user_id(&self, user_id: String) {
@@ -862,6 +902,76 @@ pub fn derive_verifying_key_from_secret(
     Ok(invite_crypto::derive_verifying_key_from_secret(
         &identity_secret_key,
     )?)
+}
+
+// ============================================================================
+// Account Recovery Bindings (BIP39 + SLIP-0010 Ed25519)
+// ============================================================================
+
+use crate::crypto::recovery;
+
+/// Ed25519 keypair derived from a recovery seed (output of mnemonic_to_seed).
+pub struct RecoveryKeypair {
+    /// 32-byte Ed25519 private key — keep in memory only, never persist.
+    pub private_key: Vec<u8>,
+    /// 32-byte Ed25519 public key — sent to server during SetRecoveryKey.
+    pub public_key: Vec<u8>,
+}
+
+/// Generate a BIP39 mnemonic with the given word count (12 or 24).
+pub fn generate_mnemonic(word_count: u8) -> Result<String, CryptoError> {
+    recovery::generate_mnemonic(word_count).map_err(|_| CryptoError::InitializationFailed)
+}
+
+/// Validate BIP39 checksum and word membership.
+pub fn validate_mnemonic(mnemonic: String) -> bool {
+    recovery::validate_mnemonic(&mnemonic)
+}
+
+/// Convert a BIP39 mnemonic to a 64-byte seed via PBKDF2-HMAC-SHA512 (no passphrase).
+pub fn mnemonic_to_seed(mnemonic: String) -> Result<Vec<u8>, CryptoError> {
+    let seed = recovery::mnemonic_to_seed(&mnemonic).map_err(|_| CryptoError::InvalidKeyData)?;
+    Ok(seed.to_vec())
+}
+
+/// Derive an Ed25519 recovery keypair from a 64-byte BIP39 seed.
+/// Path: m/44'/0'/0'/0'/0' (SLIP-0010, all hardened — required for Ed25519).
+pub fn derive_recovery_keypair(seed: Vec<u8>) -> Result<RecoveryKeypair, CryptoError> {
+    let kp =
+        recovery::derive_recovery_keypair(&seed).map_err(|_| CryptoError::InvalidKeyData)?;
+    Ok(RecoveryKeypair {
+        private_key: kp.private_key.to_vec(),
+        public_key: kp.public_key.to_vec(),
+    })
+}
+
+/// Sign a message string with a 32-byte Ed25519 private key. Returns 64 bytes.
+/// Used for SetRecoveryKey.setup_signature and RecoverAccount.recovery_signature.
+pub fn sign_recovery_challenge(
+    private_key: Vec<u8>,
+    message: String,
+) -> Result<Vec<u8>, CryptoError> {
+    let key: [u8; 32] = private_key
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    let sig = recovery::sign_recovery_challenge(&key, &message)
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    Ok(sig.to_vec())
+}
+
+/// Verify a 64-byte Ed25519 signature over a message using a 32-byte public key.
+pub fn verify_recovery_signature(
+    public_key: Vec<u8>,
+    message: String,
+    signature: Vec<u8>,
+) -> bool {
+    let Ok(pk): Result<[u8; 32], _> = public_key.try_into() else {
+        return false;
+    };
+    let Ok(sig): Result<[u8; 64], _> = signature.try_into() else {
+        return false;
+    };
+    recovery::verify_recovery_signature(&pk, &message, &sig)
 }
 
 // ============================================================================

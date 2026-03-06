@@ -103,6 +103,9 @@ pub mod master_key;
 /// Invite crypto - dynamic contact invites with ephemeral keys
 pub mod invite_crypto;
 
+/// Account recovery via BIP39 mnemonic + SLIP-0010 Ed25519 HD derivation
+pub mod recovery;
+
 // ============================================================================
 // Post-Quantum (conditionally compiled)
 // ============================================================================

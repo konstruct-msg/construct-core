@@ -82,6 +82,12 @@ dictionary OtpkPair {
     sequence<u8> public_key;
 };
 
+dictionary OtpkRecord {
+    u32 key_id;
+    sequence<u8> private_key;
+    sequence<u8> public_key;
+};
+
 interface ClassicCryptoCore {
     [Throws=CryptoError]
     string export_registration_bundle_json();
@@ -121,6 +127,12 @@ interface ClassicCryptoCore {
 
     u32 one_time_prekey_count();
 
+    [Throws=CryptoError]
+    string export_one_time_prekeys_json();
+
+    [Throws=CryptoError]
+    void import_one_time_prekeys_json(string json);
+
     void set_local_user_id(string user_id);
 };
 
@@ -135,6 +147,15 @@ dictionary EphemeralKeyPair {
 
 dictionary InviteSignature {
     sequence<u8> signature;
+};
+
+// ============================================================================
+// Account Recovery (BIP39 + SLIP-0010 Ed25519)
+// ============================================================================
+
+dictionary RecoveryKeypair {
+    sequence<u8> private_key;
+    sequence<u8> public_key;
 };
 
 // ============================================================================
@@ -197,6 +218,24 @@ namespace construct_core {
     
     [Throws=CryptoError]
     sequence<u8> derive_verifying_key_from_secret(sequence<u8> identity_secret_key);
+
+    // ── Account Recovery (BIP39 + SLIP-0010 Ed25519) ─────────────────────────
+
+    [Throws=CryptoError]
+    string generate_mnemonic(u8 word_count);
+
+    boolean validate_mnemonic(string mnemonic);
+
+    [Throws=CryptoError]
+    sequence<u8> mnemonic_to_seed(string mnemonic);
+
+    [Throws=CryptoError]
+    RecoveryKeypair derive_recovery_keypair(sequence<u8> seed);
+
+    [Throws=CryptoError]
+    sequence<u8> sign_recovery_challenge(sequence<u8> private_key, string message);
+
+    boolean verify_recovery_signature(sequence<u8> public_key, string message, sequence<u8> signature);
 
     // Traffic Protection Functions
     sequence<u8> generate_dummy_message(u64 size);
