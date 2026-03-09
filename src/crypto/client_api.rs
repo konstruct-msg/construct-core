@@ -263,7 +263,8 @@ where
 
         // Store pending OTPK id for first encrypt (burn-on-use after message_number==0 send)
         if one_time_prekey_id != 0 {
-            self.pending_otpk_ids.insert(contact_id.to_string(), one_time_prekey_id);
+            self.pending_otpk_ids
+                .insert(contact_id.to_string(), one_time_prekey_id);
         }
 
         info!(
@@ -639,7 +640,9 @@ where
             .sessions
             .get_mut(contact_id)
             .ok_or_else(|| format!("Session not found: {}", contact_id))?;
-        session.messaging_session_mut().apply_pq_contribution(kem_shared_secret)
+        session
+            .messaging_session_mut()
+            .apply_pq_contribution(kem_shared_secret)
     }
 
     ///

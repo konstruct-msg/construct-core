@@ -28,8 +28,7 @@ fn setup_sessions() -> (
 
     // Bob generates signed prekey
     let (bob_signed_prekey_priv, bob_signed_prekey_pub) = Provider::generate_kem_keys().unwrap();
-    let (bob_signing_key, bob_verifying_key) =
-        Provider::generate_signature_keys().unwrap();
+    let (bob_signing_key, bob_verifying_key) = Provider::generate_signature_keys().unwrap();
 
     // Sign with prologue (required by X3DH verifier)
     let bob_signature = {
@@ -66,8 +65,7 @@ fn setup_sessions() -> (
     let init_msg = alice_session.encrypt(b"__init__").unwrap();
 
     // Bob performs X3DH as responder
-    let alice_ephemeral_pub =
-        Provider::kem_public_key_from_bytes(init_msg.dh_public_key.to_vec());
+    let alice_ephemeral_pub = Provider::kem_public_key_from_bytes(init_msg.dh_public_key.to_vec());
     let root_key_bob = X3DHProtocol::<Provider>::perform_as_responder(
         &bob_identity_priv,
         &bob_signed_prekey_priv,

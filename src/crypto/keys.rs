@@ -413,7 +413,8 @@ impl<P: CryptoProvider> KeyManager<P> {
             let key_id = self.next_otpk_id;
             self.next_otpk_id = self.next_otpk_id.wrapping_add(1);
             let public_bytes = public_key.as_ref().to_vec();
-            self.one_time_prekeys.insert(key_id, (private_key, public_key));
+            self.one_time_prekeys
+                .insert(key_id, (private_key, public_key));
             result.push((key_id, public_bytes));
         }
         Ok(result)
@@ -422,7 +423,9 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Consume (burn) a one-time prekey by key_id. Returns the private key if found.
     /// The key is removed from storage — it cannot be reused.
     pub fn consume_one_time_prekey(&mut self, key_id: u32) -> Option<P::KemPrivateKey> {
-        self.one_time_prekeys.remove(&key_id).map(|(private, _)| private)
+        self.one_time_prekeys
+            .remove(&key_id)
+            .map(|(private, _)| private)
     }
 
     /// How many OTPKs are currently stored locally (not yet consumed).
@@ -446,7 +449,8 @@ impl<P: CryptoProvider> KeyManager<P> {
         for (key_id, priv_bytes, pub_bytes) in keys {
             let private_key = P::kem_private_key_from_bytes(priv_bytes);
             let public_key = P::kem_public_key_from_bytes(pub_bytes);
-            self.one_time_prekeys.insert(key_id, (private_key, public_key));
+            self.one_time_prekeys
+                .insert(key_id, (private_key, public_key));
             // Keep next_otpk_id above all imported IDs to avoid collisions
             if key_id >= self.next_otpk_id {
                 self.next_otpk_id = key_id.wrapping_add(1);

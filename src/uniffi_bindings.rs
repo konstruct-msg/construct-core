@@ -80,7 +80,7 @@ pub struct RegistrationBundleJson {
 pub struct EncryptedMessageComponents {
     pub ephemeral_public_key: Vec<u8>, // 32 bytes
     pub message_number: u32,
-    pub content: String, // Base64(nonce || ciphertext_with_tag)
+    pub content: String,         // Base64(nonce || ciphertext_with_tag)
     pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
 }
 
@@ -424,7 +424,12 @@ impl ClassicCryptoCore {
 
         // Initialize the session (returns internal session_id which we ignore)
         client
-            .init_session(&contact_id, &public_bundle, &remote_identity, one_time_prekey_id)
+            .init_session(
+                &contact_id,
+                &public_bundle,
+                &remote_identity,
+                one_time_prekey_id,
+            )
             .map_err(|e| {
                 tracing::error!(
                     target: "crypto::uniffi",
@@ -775,7 +780,11 @@ impl ClassicCryptoCore {
         let records: Vec<OtpkRecord> = client
             .export_one_time_prekeys()
             .into_iter()
-            .map(|(key_id, private_key, public_key)| OtpkRecord { key_id, private_key, public_key })
+            .map(|(key_id, private_key, public_key)| OtpkRecord {
+                key_id,
+                private_key,
+                public_key,
+            })
             .collect();
         serde_json::to_string(&records).map_err(|_| CryptoError::SerializationFailed)
     }
@@ -968,8 +977,7 @@ pub fn mnemonic_to_seed(mnemonic: String) -> Result<Vec<u8>, CryptoError> {
 /// Derive an Ed25519 recovery keypair from a 64-byte BIP39 seed.
 /// Path: m/44'/0'/0'/0'/0' (SLIP-0010, all hardened — required for Ed25519).
 pub fn derive_recovery_keypair(seed: Vec<u8>) -> Result<RecoveryKeypair, CryptoError> {
-    let kp =
-        recovery::derive_recovery_keypair(&seed).map_err(|_| CryptoError::InvalidKeyData)?;
+    let kp = recovery::derive_recovery_keypair(&seed).map_err(|_| CryptoError::InvalidKeyData)?;
     Ok(RecoveryKeypair {
         private_key: kp.private_key.to_vec(),
         public_key: kp.public_key.to_vec(),
@@ -991,11 +999,7 @@ pub fn sign_recovery_challenge(
 }
 
 /// Verify a 64-byte Ed25519 signature over a message using a 32-byte public key.
-pub fn verify_recovery_signature(
-    public_key: Vec<u8>,
-    message: String,
-    signature: Vec<u8>,
-) -> bool {
+pub fn verify_recovery_signature(public_key: Vec<u8>, message: String, signature: Vec<u8>) -> bool {
     let Ok(pk): Result<[u8; 32], _> = public_key.try_into() else {
         return false;
     };
@@ -1660,7 +1664,6 @@ pub fn derive_device_id(identity_public_key: Vec<u8>) -> String {
 pub fn format_federated_id(device_id: String, server_hostname: String) -> String {
     crate::device_id::format_federated_id(&device_id, &server_hostname)
 }
-
 
 // ── Post-Quantum KEM Namespace Functions ─────────────────────────────────────
 

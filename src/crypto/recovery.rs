@@ -209,10 +209,7 @@ mod tests {
     #[test]
     fn test_different_mnemonics_different_keys() {
         let s1 = mnemonic_to_seed(TEST_PHRASE).unwrap();
-        let s2 = mnemonic_to_seed(
-            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        )
-        .unwrap();
+        let s2 = mnemonic_to_seed("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
         let kp1 = derive_recovery_keypair(&s1).unwrap();
         let kp2 = derive_recovery_keypair(&s2).unwrap();
         assert_ne!(kp1.public_key, kp2.public_key);
@@ -227,7 +224,11 @@ mod tests {
         assert_eq!(sig.len(), 64);
         assert!(verify_recovery_signature(&kp.public_key, challenge, &sig));
         // Wrong message → invalid
-        assert!(!verify_recovery_signature(&kp.public_key, "wrong_message", &sig));
+        assert!(!verify_recovery_signature(
+            &kp.public_key,
+            "wrong_message",
+            &sig
+        ));
     }
 
     #[test]

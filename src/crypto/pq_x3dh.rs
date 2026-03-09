@@ -37,10 +37,12 @@ pub struct MLKEMEncapsulation {
 /// Returns `(public_key, secret_key)` as raw bytes.
 #[cfg(feature = "post-quantum")]
 pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
-    #[allow(deprecated)]
-    use ml_kem::{DecapsulationKey, EncapsulationKey, ExpandedKeyEncoding, Generate, KeyExport, MlKem768};
-    use getrandom_pq::SysRng;
     use getrandom_pq::rand_core::UnwrapErr;
+    use getrandom_pq::SysRng;
+    #[allow(deprecated)]
+    use ml_kem::{
+        DecapsulationKey, EncapsulationKey, ExpandedKeyEncoding, Generate, KeyExport, MlKem768,
+    };
     let mut rng = UnwrapErr(SysRng);
     let dk = DecapsulationKey::<MlKem768>::generate_from_rng(&mut rng);
     let ek: &EncapsulationKey<MlKem768> = dk.encapsulation_key();
@@ -64,7 +66,7 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
 /// the shared secret is mixed into the session root key.
 #[cfg(feature = "post-quantum")]
 pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
-    use ml_kem::{EncapsulationKey, Encapsulate, MlKem768};
+    use ml_kem::{Encapsulate, EncapsulationKey, MlKem768};
     if pk_bytes.len() != MLKEM768_PK_SIZE {
         return Err(format!(
             "Invalid ML-KEM-768 public key size: expected {}, got {}",
@@ -77,14 +79,15 @@ pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Strin
         .map_err(|_| "Failed to convert pk slice".to_string())?;
     let ek = EncapsulationKey::<MlKem768>::new(pk_arr)
         .map_err(|_| "Invalid ML-KEM-768 public key".to_string())?;
-    use getrandom_pq::SysRng;
     use getrandom_pq::rand_core::UnwrapErr;
+    use getrandom_pq::SysRng;
     let mut rng = UnwrapErr(SysRng);
     let (ct, ss) = ek.encapsulate_with_rng(&mut rng);
     Ok(MLKEMEncapsulation {
         ciphertext: ct.to_vec(),
         shared_secret: ss.to_vec(),
-    })}
+    })
+}
 
 #[cfg(not(feature = "post-quantum"))]
 pub fn mlkem768_encapsulate(_pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
@@ -117,7 +120,8 @@ pub fn mlkem768_decapsulate(sk_bytes: &[u8], ct_bytes: &[u8]) -> Result<Vec<u8>,
         .map_err(|_| "Failed to convert sk slice".to_string())?;
     let dk = DecapsulationKey::<MlKem768>::from_expanded_bytes(sk_arr)
         .map_err(|_| "Invalid ML-KEM-768 secret key".to_string())?;
-    let ss = dk.decapsulate_slice(ct_bytes)
+    let ss = dk
+        .decapsulate_slice(ct_bytes)
         .map_err(|_| "ML-KEM-768 decapsulation failed (bad ciphertext size)".to_string())?;
     Ok(ss.to_vec())
 }

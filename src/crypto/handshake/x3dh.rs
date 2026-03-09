@@ -290,21 +290,24 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             .map_err(|e| format!("DH3 failed: {}", e))?;
 
         // DH4 = DH(EK_A, OPK_B) — optional, only when server provided a one-time prekey
-        let dh4_opt: Option<Vec<u8>> = if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
-            if otpk_bytes.len() != 32 {
-                return Err(format!(
-                    "Invalid one_time_prekey_public size: expected 32 bytes, got {} bytes",
-                    otpk_bytes.len()
-                ));
-            }
-            let remote_otpk = P::kem_public_key_from_bytes(otpk_bytes.clone());
-            trace!(target: "crypto::x3dh", "Computing DH4 = DH(EK_A, OPK_B)");
-            Some(P::kem_decapsulate(&ephemeral_private, remote_otpk.as_ref())
-                .map_err(|e| format!("DH4 failed: {}", e))?)
-        } else {
-            trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK in bundle — fallback mode)");
-            None
-        };
+        let dh4_opt: Option<Vec<u8>> =
+            if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
+                if otpk_bytes.len() != 32 {
+                    return Err(format!(
+                        "Invalid one_time_prekey_public size: expected 32 bytes, got {} bytes",
+                        otpk_bytes.len()
+                    ));
+                }
+                let remote_otpk = P::kem_public_key_from_bytes(otpk_bytes.clone());
+                trace!(target: "crypto::x3dh", "Computing DH4 = DH(EK_A, OPK_B)");
+                Some(
+                    P::kem_decapsulate(&ephemeral_private, remote_otpk.as_ref())
+                        .map_err(|e| format!("DH4 failed: {}", e))?,
+                )
+            } else {
+                trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK in bundle — fallback mode)");
+                None
+            };
 
         debug!(
             target: "crypto::x3dh",
@@ -385,8 +388,10 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         // DH4 = DH(OPK_B, EK_A) — optional, mirrors Alice's DH4
         let dh4_opt: Option<Vec<u8>> = if let Some(otpk_priv) = local_one_time_prekey {
             trace!(target: "crypto::x3dh", "Computing DH4 = DH(OPK_B, EK_A)");
-            Some(P::kem_decapsulate(otpk_priv, remote_ephemeral.as_ref())
-                .map_err(|e| format!("DH4 failed: {}", e))?)
+            Some(
+                P::kem_decapsulate(otpk_priv, remote_ephemeral.as_ref())
+                    .map_err(|e| format!("DH4 failed: {}", e))?,
+            )
         } else {
             trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK consumed — fallback mode)");
             None
