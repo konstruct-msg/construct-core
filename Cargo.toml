@@ -1,6 +1,6 @@
 [package]
 name = "construct-core"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["Konstruct Team"]
 edition = "2021"
 rust-version = "1.80"
@@ -21,11 +21,12 @@ unsafe_attr_outside_unsafe = "allow"
 [features]
 default = []
 # Платформенные features (взаимоисключающие)
-ios = ["uniffi"]
+ios = ["uniffi", "dep:construct-ice"]
 wasm = []
 # Опциональные возможности
 post-quantum = [
-    "dep:pqcrypto-mlkem",
+    "dep:ml-kem",
+    "dep:getrandom_pq",
     "dep:pqcrypto-mldsa",
     "dep:pqcrypto-traits",
 ]
@@ -67,12 +68,16 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1.0", features = ["zeroize_derive"] }
 
 # Post-Quantum (optional) - ML-KEM and ML-DSA (NIST standardized names)
-pqcrypto-mlkem = { version = "0.1", optional = true }
+ml-kem = { version = "0.3.0-rc.0", optional = true }
+getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"], optional = true }
 pqcrypto-mldsa = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
 
 # iOS bindings (optional)
 uniffi = { version = "0.30", features = ["build"], optional = true }
+
+# Traffic obfuscation — ICE (obfs4 pluggable transport)
+construct-ice = { path = "../construct-ice", features = ["ffi"], optional = true }
 
 # WASM bindings (optional)
 [target.'cfg(target_arch = "wasm32")'.dependencies]

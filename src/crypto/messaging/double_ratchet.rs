@@ -90,8 +90,8 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     remote_dh_public: Option<P::KemPublicKey>,
 
     previous_sending_length: u32,
-    skipped_message_keys: HashMap<u32, P::AeadKey>,
-    skipped_key_timestamps: HashMap<u32, u64>,
+    skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
+    skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
 
     session_id: String,
     contact_id: String,
@@ -426,12 +426,42 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         };
 
         if needs_ratchet {
+            // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
+            // current receiving chain so out-of-order messages from the old DH epoch
+            // can still be decrypted after the ratchet overwrites the chain.
+            if let Some(old_remote_dh) = &self.remote_dh_public {
+                let old_chain_key_bytes = old_remote_dh.as_ref().to_vec();
+                let pn = encrypted.previous_chain_length;
+                while self.receiving_chain_length < pn {
+                    if self.skipped_message_keys.len()
+                        >= crate::config::Config::global().max_skipped_messages as usize
+                    {
+                        return Err("Too many skipped messages".to_string());
+                    }
+                    let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key)
+                        .map_err(|e| format!("KDF_CK failed: {}", e))?;
+                    let timestamp = crate::utils::time::now();
+                    self.skipped_message_keys.insert(
+                        (old_chain_key_bytes.clone(), self.receiving_chain_length),
+                        msg_key,
+                    );
+                    self.skipped_key_timestamps.insert(
+                        (old_chain_key_bytes.clone(), self.receiving_chain_length),
+                        timestamp,
+                    );
+                    self.receiving_chain_key = next_chain;
+                    self.receiving_chain_length += 1;
+                }
+            }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
             self.perform_dh_ratchet(&remote_dh_public)?;
         }
 
-        // Try to find skipped message key
-        if let Some(key) = self.skipped_message_keys.remove(&encrypted.message_number) {
+        // Try to find skipped message key (keyed by remote DH chain + message number)
+        if let Some(key) = self
+            .skipped_message_keys
+            .remove(&(encrypted.dh_public_key.to_vec(), encrypted.message_number))
+        {
             trace!(
                 target: "crypto::double_ratchet",
                 msg_num = %encrypted.message_number,
@@ -450,18 +480,20 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 self.receiving_chain_length += 1;
                 return self.decrypt_with_key(&msg_key, encrypted);
             } else {
-                // Store skipped key with timestamp
+                // Store skipped key keyed by (remote_dh_chain, msg_number)
+                // so keys from different DH chains never collide.
                 let timestamp = crate::utils::time::now();
+                let chain_key = encrypted.dh_public_key.to_vec();
 
                 self.skipped_message_keys
-                    .insert(self.receiving_chain_length, msg_key);
+                    .insert((chain_key.clone(), self.receiving_chain_length), msg_key);
                 self.skipped_key_timestamps
-                    .insert(self.receiving_chain_length, timestamp);
+                    .insert((chain_key, self.receiving_chain_length), timestamp);
                 self.receiving_chain_key = next_chain;
                 self.receiving_chain_length += 1;
 
-                // DoS protection
-                if self.skipped_message_keys.len() > Config::global().max_skipped_messages as usize
+                // DoS protection: reject if stored skipped key count reaches the configured max.
+                if self.skipped_message_keys.len() >= Config::global().max_skipped_messages as usize
                 {
                     return Err("Too many skipped messages".to_string());
                 }
@@ -485,19 +517,21 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         let now = crate::utils::time::now();
         let initial_count = self.skipped_message_keys.len();
 
-        // Удаляем старые ключи
-        self.skipped_message_keys.retain(|msg_num, _| {
-            if let Some(&timestamp) = self.skipped_key_timestamps.get(msg_num) {
-                (now as i64 - timestamp as i64) < max_age_seconds
-            } else {
-                // Если нет timestamp, удаляем ключ (safety measure)
-                false
-            }
-        });
+        // Collect keys to remove (avoids borrow conflict between two HashMaps)
+        let keys_to_remove: Vec<_> = self
+            .skipped_message_keys
+            .keys()
+            .filter(|key| match self.skipped_key_timestamps.get(*key) {
+                Some(&ts) => (now as i64 - ts as i64) >= max_age_seconds,
+                None => true, // no timestamp → remove
+            })
+            .cloned()
+            .collect();
 
-        // Также очищаем timestamps
-        self.skipped_key_timestamps
-            .retain(|msg_num, _| self.skipped_message_keys.contains_key(msg_num));
+        for key in &keys_to_remove {
+            self.skipped_message_keys.remove(key);
+            self.skipped_key_timestamps.remove(key);
+        }
 
         let removed_count = initial_count - self.skipped_message_keys.len();
         if removed_count > 0 {
@@ -509,6 +543,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             );
         }
     }
+
+    fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
+        DoubleRatchetSession::apply_pq_contribution(self, kem_shared_secret)
+    }
 }
 
 // Internal implementation details
@@ -516,6 +554,23 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// Cleanup старых skipped message keys с дефолтным периодом (7 дней)
     pub fn cleanup_old_skipped_keys_default(&mut self) {
         self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
+    }
+
+    /// Mix a post-quantum KEM shared secret into the session root key (PQXDH contribution).
+    ///
+    /// Both sender and receiver call this after `init_session`/`init_receiving_session`
+    /// with their respective KEM shared secret. The resulting root key is derived from
+    /// BOTH the classical X3DH and ML-KEM-768, providing HNDL (Harvest Now Decrypt Later)
+    /// protection: an attacker must break BOTH X25519 AND ML-KEM-768 to read messages.
+    ///
+    /// Derivation: `new_root_key = HKDF(salt=current_root_key, ikm=kem_ss, info="construct-pqxdh-v1")`
+    pub fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
+        let current_root = self.root_key.as_ref().to_vec();
+        let new_root_bytes =
+            P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
+                .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
+        self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+        Ok(())
     }
 
     /// Выполнить DH ratchet step
@@ -636,8 +691,23 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
     /// Сериализовать сессию для сохранения
     pub fn to_serializable(&self) -> SerializableSession {
+        let skipped_keys = self
+            .skipped_message_keys
+            .iter()
+            .map(|((dh_pub, msg_num), key)| SkippedKeyEntry {
+                dh_public: dh_pub.clone(),
+                msg_number: *msg_num,
+                key_bytes: key.as_ref().to_vec(),
+                timestamp: self
+                    .skipped_key_timestamps
+                    .get(&(dh_pub.clone(), *msg_num))
+                    .copied()
+                    .unwrap_or(0),
+            })
+            .collect();
+
         SerializableSession {
-            version: 1, // Current protocol version
+            version: 2,
             suite_id: self.suite_id.as_u16(),
             root_key: self.root_key.as_ref().to_vec(),
             sending_chain_key: self.sending_chain_key.as_ref().to_vec(),
@@ -651,12 +721,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             dh_ratchet_public: self.dh_ratchet_public.as_ref().to_vec(),
             remote_dh_public: self.remote_dh_public.as_ref().map(|k| k.as_ref().to_vec()),
             previous_sending_length: self.previous_sending_length,
-            skipped_message_keys: self
-                .skipped_message_keys
-                .iter()
-                .map(|(k, v)| (*k, v.as_ref().to_vec()))
-                .collect(),
-            skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            skipped_message_keys: Default::default(), // legacy field, no longer written
+            skipped_key_timestamps: Default::default(), // legacy field, no longer written
+            skipped_keys,
             session_id: self.session_id.clone(),
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
@@ -665,10 +732,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
     /// Десериализовать сессию
     pub fn from_serializable(data: SerializableSession) -> Result<Self, String> {
-        // Check version compatibility
-        if data.version != 1 {
+        // Accept both version 1 (legacy) and version 2 (current)
+        if data.version != 1 && data.version != 2 {
             return Err(format!(
-                "Unsupported session version: {}. Expected version 1.",
+                "Unsupported session version: {}. Expected 1 or 2.",
                 data.version
             ));
         }
@@ -676,6 +743,22 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         // Валидация suite_id при десериализации
         let suite_id = SuiteID::new(data.suite_id)
             .map_err(|e| format!("Invalid suite_id in serialized session: {}", e))?;
+
+        // Version 1 sessions lose their skipped keys (they had the collision bug anyway)
+        let skipped_message_keys = data
+            .skipped_keys
+            .iter()
+            .map(|entry| {
+                Self::bytes_to_aead_key(&entry.key_bytes)
+                    .map(|k| ((entry.dh_public.clone(), entry.msg_number), k))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let skipped_key_timestamps = data
+            .skipped_keys
+            .iter()
+            .map(|entry| ((entry.dh_public.clone(), entry.msg_number), entry.timestamp))
+            .collect();
 
         Ok(Self {
             suite_id,
@@ -694,17 +777,30 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .map(|bytes| Self::bytes_to_kem_public_key(&bytes))
                 .transpose()?,
             previous_sending_length: data.previous_sending_length,
-            skipped_message_keys: data
-                .skipped_message_keys
-                .into_iter()
-                .map(|(k, v)| Self::bytes_to_aead_key(&v).map(|key| (k, key)))
-                .collect::<Result<_, _>>()?,
-            skipped_key_timestamps: data.skipped_key_timestamps,
+            skipped_message_keys,
+            skipped_key_timestamps,
             session_id: data.session_id,
             contact_id: data.contact_id,
             local_user_id: data.local_user_id,
         })
     }
+}
+
+/// A single skipped message key entry, keyed by remote DH public key + message number.
+///
+/// Using the remote DH public key as part of the index prevents keys from different
+/// DH ratchet chains colliding when message numbers repeat after a ratchet step.
+/// (Fixes the bug where msg#1 from chain B was incorrectly matched by key#1 from chain A.)
+#[derive(Serialize, Deserialize, Default)]
+pub struct SkippedKeyEntry {
+    /// Remote DH public key (bytes) at the time this key was skipped
+    pub dh_public: Vec<u8>,
+    /// Message number within that DH chain
+    pub msg_number: u32,
+    /// The actual message key bytes
+    pub key_bytes: Vec<u8>,
+    /// Unix timestamp (seconds) when this entry was created
+    pub timestamp: u64,
 }
 
 /// Serializable session format for storage
@@ -759,8 +855,18 @@ pub struct SerializableSession {
     dh_ratchet_public: Vec<u8>,
     remote_dh_public: Option<Vec<u8>>,
     previous_sending_length: u32,
+    /// Legacy field (v1): flat map without DH chain context. Kept for reading old sessions
+    /// but no longer written. Old skipped keys are silently dropped on upgrade — they had
+    /// the cross-chain collision bug and would have produced wrong decryptions anyway.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     skipped_message_keys: HashMap<u32, Vec<u8>>,
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     skipped_key_timestamps: HashMap<u32, u64>,
+    /// v2: skipped keys properly namespaced by (remote_dh_public, msg_number)
+    #[serde(default)]
+    skipped_keys: Vec<SkippedKeyEntry>,
     session_id: String,
     contact_id: String,
     #[serde(default)]
@@ -771,6 +877,7 @@ pub struct SerializableSession {
 mod tests {
     use super::{DoubleRatchetSession, SuiteID};
     use crate::crypto::handshake::{x3dh::X3DHProtocol, KeyAgreement};
+    use crate::crypto::keys::build_prologue;
     use crate::crypto::messaging::SecureMessaging;
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
@@ -790,8 +897,12 @@ mod tests {
             ClassicSuiteProvider::generate_kem_keys().unwrap();
         let (bob_signing_key, bob_verifying_key) =
             ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature =
-            ClassicSuiteProvider::sign(&bob_signing_key, bob_signed_prekey_pub.as_ref()).unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
 
         // Bob's public bundle (what Alice gets from server)
         let bob_bundle = X3DHPublicKeyBundle {
@@ -800,6 +911,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice performs X3DH as initiator
@@ -835,6 +948,7 @@ mod tests {
             &bob_signed_prekey_priv,
             &alice_identity_pub,
             &alice_ephemeral_pub,
+            None,
         )
         .unwrap();
 
@@ -877,8 +991,12 @@ mod tests {
             ClassicSuiteProvider::generate_kem_keys().unwrap();
         let (bob_signing_key, bob_verifying_key) =
             ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature =
-            ClassicSuiteProvider::sign(&bob_signing_key, bob_signed_prekey_pub.as_ref()).unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
 
         let bob_bundle = X3DHPublicKeyBundle {
             identity_public: bob_identity_pub.clone(),
@@ -886,6 +1004,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         let (root_key, initiator_state) =
@@ -918,6 +1038,7 @@ mod tests {
             &bob_signed_prekey_priv,
             &alice_identity_pub,
             &alice_ephemeral_pub,
+            None,
         )
         .unwrap();
 

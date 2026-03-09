@@ -14,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// Build prologue for X3DH signature (как в Noise Protocol)
 /// Prologue включает протокол и suite ID для предотвращения key substitution attacks
 pub fn build_prologue(suite_id: SuiteID) -> Vec<u8> {
-    let protocol_name = b"X3DH";
-    let suite_id_bytes = suite_id.as_u16().to_le_bytes();
+    let protocol_name = b"KonstruktX3DH-v1";
+    let suite_id_bytes = suite_id.as_u16().to_be_bytes();
     let mut prologue = Vec::with_capacity(protocol_name.len() + suite_id_bytes.len());
     prologue.extend_from_slice(protocol_name);
     prologue.extend_from_slice(&suite_id_bytes);

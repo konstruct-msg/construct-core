@@ -227,6 +227,14 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
     /// # Параметры
     /// - `max_age_seconds`: Максимальный возраст ключа в секундах
     fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64);
+
+    /// Mix a post-quantum KEM shared secret into the session root key (PQXDH).
+    ///
+    /// Default implementation is a no-op for non-PQ session types.
+    /// `DoubleRatchetSession` overrides this to do the actual HKDF mixing.
+    fn apply_pq_contribution(&mut self, _kem_shared_secret: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // Re-exports

@@ -17,6 +17,7 @@ pub struct EncryptedMessage {
     pub nonce: Vec<u8>,
     pub message_number: u32,
     pub previous_chain_length: u32,
+    pub suite_id: u16,
 }
 
 impl From<EncryptedRatchetMessage> for EncryptedMessage {
@@ -28,6 +29,7 @@ impl From<EncryptedRatchetMessage> for EncryptedMessage {
             nonce: msg.nonce,
             message_number: msg.message_number,
             previous_chain_length: msg.previous_chain_length,
+            suite_id: msg.suite_id,
         }
     }
 }
@@ -40,7 +42,7 @@ impl From<EncryptedMessage> for EncryptedRatchetMessage {
             nonce: msg.nonce,
             message_number: msg.message_number,
             previous_chain_length: msg.previous_chain_length,
-            suite_id: crate::config::Config::global().classic_suite_id,
+            suite_id: msg.suite_id,
         }
     }
 }

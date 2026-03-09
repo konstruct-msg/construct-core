@@ -625,7 +625,23 @@ where
         self.sessions.remove(contact_id).is_some()
     }
 
-    /// Импортировать сессию из десериализованного состояния
+    /// Apply a post-quantum KEM shared secret to an existing session's root key.
+    ///
+    /// Call this immediately after `init_session` (sender) or `init_receiving_session`
+    /// (receiver) to mix ML-KEM-768 entropy into the session root key, providing
+    /// HNDL (Harvest Now Decrypt Later) protection.
+    pub fn apply_pq_contribution_to_session(
+        &mut self,
+        contact_id: &str,
+        kem_shared_secret: &[u8],
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(contact_id)
+            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
+        session.messaging_session_mut().apply_pq_contribution(kem_shared_secret)
+    }
+
     ///
     /// Используется для восстановления сессий из persistent storage (Keychain).
     ///
@@ -783,11 +799,13 @@ mod tests {
             signature: bob_prekey.signature.clone(),
             verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice initiates session with Bob
         let session_id = alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub)
+            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
             .unwrap();
         assert!(!session_id.is_empty());
         assert!(alice.has_session("bob"));
@@ -812,6 +830,7 @@ mod tests {
                 &alice_identity_pub,
                 &alice_ephemeral_pub,
                 &encrypted1,
+                0,
             )
             .unwrap();
 
@@ -849,10 +868,12 @@ mod tests {
             signature: bob_prekey.signature.clone(),
             verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub)
+            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
             .unwrap();
         assert!(alice.has_session("bob"));
 
@@ -996,10 +1017,12 @@ mod tests {
             signature: bob_bundle.signature.clone(),
             verifying_key: bob_bundle.verifying_key.clone(),
             suite_id: bob_bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         alice
-            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity)
+            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity, 0)
             .unwrap();
 
         // Alice отправляет первое сообщение
@@ -1049,10 +1072,12 @@ mod tests {
             signature: bob_bundle.signature.clone(),
             verifying_key: bob_bundle.verifying_key.clone(),
             suite_id: bob_bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         alice
-            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity)
+            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity, 0)
             .unwrap();
 
         let plaintext = b"Hello Bob!";
@@ -1101,10 +1126,12 @@ mod tests {
             signature: bob_bundle.signature.clone(),
             verifying_key: bob_bundle.verifying_key.clone(),
             suite_id: bob_bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         alice
-            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity)
+            .init_session(&bob_device_id, &bob_bundle_for_init, &bob_identity, 0)
             .unwrap();
 
         let plaintext = b"Hello Bob!";

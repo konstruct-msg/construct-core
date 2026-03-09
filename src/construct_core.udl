@@ -134,6 +134,16 @@ interface ClassicCryptoCore {
     void import_one_time_prekeys_json(string json);
 
     void set_local_user_id(string user_id);
+
+    // ── Post-Quantum Session Strengthening ───────────────────────────────────
+
+    /// Mix a ML-KEM-768 shared secret into an existing session's root key.
+    ///
+    /// Call after init_session (sender) with kem_ss from mlkem768_encapsulate,
+    /// or after init_receiving_session (receiver) with kem_ss from mlkem768_decapsulate.
+    /// Both sides must call this with the same shared secret to stay in sync.
+    [Throws=CryptoError]
+    void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
 };
 
 // ============================================================================
@@ -199,6 +209,20 @@ interface TrafficProtectionManager {
     boolean is_currently_active();
 };
 
+// ── Post-Quantum Cryptography (ML-KEM-768) ───────────────────────────────────
+
+/// Generated ML-KEM-768 keypair (for Kyber Signed Pre-Key or One-Time Pre-Key upload).
+dictionary MLKEMKeyPair {
+    sequence<u8> public_key;
+    sequence<u8> secret_key;
+};
+
+/// Result of ML-KEM-768 encapsulation (sender side of PQXDH handshake).
+dictionary MLKEMEncapsulation {
+    sequence<u8> ciphertext;
+    sequence<u8> shared_secret;
+};
+
 namespace construct_core {
     [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core();
@@ -247,4 +271,21 @@ namespace construct_core {
     u64 heartbeat_interval_ms(u64 base_interval_sec);
     u64 battery_aware_jitter_ms(u64 base_ms, u64 max_jitter_ms, float battery_level);
     u64 recommended_send_delay_ms(boolean is_high_priority, float battery_level);
+
+    // ── Post-Quantum KEM (ML-KEM-768) ────────────────────────────────────────
+
+    /// Generate an ML-KEM-768 keypair for PQC key registration.
+    [Throws=CryptoError]
+    MLKEMKeyPair mlkem768_keygen();
+
+    /// Encapsulate to a recipient's ML-KEM-768 public key (sender side PQXDH).
+    /// Returns ciphertext (to include in proto PreKeySignalMessage.kem_ciphertext)
+    /// and shared_secret (to pass to ClassicCryptoCore.apply_pq_contribution).
+    [Throws=CryptoError]
+    MLKEMEncapsulation mlkem768_encapsulate(sequence<u8> public_key);
+
+    /// Decapsulate a received ML-KEM-768 ciphertext (receiver side PQXDH).
+    /// Returns shared_secret to pass to ClassicCryptoCore.apply_pq_contribution.
+    [Throws=CryptoError]
+    sequence<u8> mlkem768_decapsulate(sequence<u8> secret_key, sequence<u8> ciphertext);
 };

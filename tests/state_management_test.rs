@@ -7,13 +7,15 @@
 //! 4. Cleanup old skipped keys
 //! 5. Session desync detection
 
+use construct_core::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
+use construct_core::crypto::handshake::KeyAgreement;
+use construct_core::crypto::keys::build_prologue;
 use construct_core::crypto::messaging::double_ratchet::DoubleRatchetSession;
 use construct_core::crypto::messaging::SecureMessaging;
-use construct_core::crypto::provider::classic::ClassicCryptoProvider;
-use construct_core::crypto::x3dh::{InitiatorState, X3DH};
-use construct_core::crypto::CryptoProvider;
+use construct_core::crypto::suites::classic::ClassicSuiteProvider;
+use construct_core::crypto::{CryptoProvider, SuiteID};
 
-type Provider = ClassicCryptoProvider;
+type Provider = ClassicSuiteProvider;
 
 /// Создать две сессии Alice <-> Bob после X3DH handshake
 fn setup_sessions() -> (
@@ -21,40 +23,66 @@ fn setup_sessions() -> (
     DoubleRatchetSession<Provider>,
 ) {
     // Generate identity keys
-    let (alice_identity_private, alice_identity_public) = Provider::generate_kem_keys().unwrap();
-    let (bob_identity_private, bob_identity_public) = Provider::generate_kem_keys().unwrap();
+    let (alice_identity_priv, alice_identity_pub) = Provider::generate_kem_keys().unwrap();
+    let (bob_identity_priv, bob_identity_pub) = Provider::generate_kem_keys().unwrap();
 
     // Bob generates signed prekey
-    let (bob_signed_prekey_private, bob_signed_prekey_public) =
-        Provider::generate_kem_keys().unwrap();
+    let (bob_signed_prekey_priv, bob_signed_prekey_pub) = Provider::generate_kem_keys().unwrap();
+    let (bob_signing_key, bob_verifying_key) =
+        Provider::generate_signature_keys().unwrap();
 
-    // Alice performs X3DH
-    let alice_initiator_state = InitiatorState {
-        ephemeral_private: Provider::generate_kem_keys().unwrap().0,
+    // Sign with prologue (required by X3DH verifier)
+    let bob_signature = {
+        let prologue = build_prologue(SuiteID::CLASSIC);
+        let mut msg = prologue;
+        msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+        Provider::sign(&bob_signing_key, &msg).unwrap()
     };
 
-    // Simplified X3DH shared secret (не полная реализация, для тестов)
-    // В реальности используется DH(alice_identity, bob_signed_prekey) + DH(alice_ephemeral, bob_identity) + ...
-    let shared_secret =
-        Provider::kem_decapsulate(&alice_identity_private, bob_signed_prekey_public.as_ref())
-            .unwrap();
+    let bob_bundle = X3DHPublicKeyBundle {
+        identity_public: bob_identity_pub.clone(),
+        signed_prekey_public: bob_signed_prekey_pub.clone(),
+        signature: bob_signature,
+        verifying_key: bob_verifying_key,
+        suite_id: SuiteID::CLASSIC,
+        one_time_prekey_public: None,
+        one_time_prekey_id: None,
+    };
 
-    // Alice создаёт сессию как initiator
-    let alice_session = DoubleRatchetSession::new_initiator_session(
-        &shared_secret,
-        alice_initiator_state.clone(),
-        &bob_identity_public,
+    // Alice performs X3DH as initiator
+    let (root_key_alice, initiator_state) =
+        X3DHProtocol::<Provider>::perform_as_initiator(&alice_identity_priv, &bob_bundle).unwrap();
+
+    let mut alice_session = DoubleRatchetSession::<Provider>::new_initiator_session(
+        &root_key_alice,
+        initiator_state,
+        &bob_identity_pub,
         "bob".to_string(),
         "alice".to_string(),
     )
     .unwrap();
 
-    // Bob создаёт сессию как receiver
-    let bob_session = DoubleRatchetSession::new_receiver_session(
-        &shared_secret,
-        &bob_signed_prekey_private,
-        &alice_identity_public,
+    // Alice sends handshake message — required to initialise Bob's responder session
+    let init_msg = alice_session.encrypt(b"__init__").unwrap();
+
+    // Bob performs X3DH as responder
+    let alice_ephemeral_pub =
+        Provider::kem_public_key_from_bytes(init_msg.dh_public_key.to_vec());
+    let root_key_bob = X3DHProtocol::<Provider>::perform_as_responder(
+        &bob_identity_priv,
+        &bob_signed_prekey_priv,
+        &alice_identity_pub,
+        &alice_ephemeral_pub,
+        None,
+    )
+    .unwrap();
+
+    let (bob_session, _) = DoubleRatchetSession::<Provider>::new_responder_session(
+        &root_key_bob,
+        &bob_identity_priv,
+        &init_msg,
         "alice".to_string(),
+        "bob".to_string(),
     )
     .unwrap();
 
@@ -154,14 +182,12 @@ fn test_max_skipped_messages_protection() {
         result.is_err(),
         "Should fail with 'Too many skipped messages'"
     );
-
-    if let Err(e) = result {
-        assert!(
-            e.contains("Too many skipped messages"),
-            "Error message should mention skipped messages limit, got: {}",
-            e
-        );
-    }
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("Too many skipped messages"),
+        "Error message should mention skipped messages limit, got: {}",
+        err_msg
+    );
 }
 
 #[test]

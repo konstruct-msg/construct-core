@@ -144,6 +144,19 @@ pub struct InviteSignature {
     pub signature: Vec<u8>, // 64 bytes
 }
 
+// Post-quantum KEM types (exported via UDL)
+#[derive(Debug, Clone)]
+pub struct MLKEMKeyPair {
+    pub public_key: Vec<u8>, // ML-KEM-768: 1184 bytes
+    pub secret_key: Vec<u8>, // ML-KEM-768: 2400 bytes
+}
+
+#[derive(Debug, Clone)]
+pub struct MLKEMEncapsulation {
+    pub ciphertext: Vec<u8>,    // ML-KEM-768: 1088 bytes
+    pub shared_secret: Vec<u8>, // 32 bytes
+}
+
 // UniFFI interface implementation (exported via UDL, not proc-macros)
 impl ClassicCryptoCore {
     /// Export registration bundle as JSON string
@@ -792,6 +805,24 @@ impl ClassicCryptoCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         client.set_local_user_id(user_id);
+    }
+
+    /// Mix a ML-KEM-768 shared secret into an existing session's root key (PQXDH).
+    ///
+    /// Call after init_session (sender) or init_receiving_session (receiver) with
+    /// the kem_shared_secret from mlkem768_encapsulate / mlkem768_decapsulate.
+    pub fn apply_pq_contribution(
+        &self,
+        contact_id: String,
+        kem_shared_secret: Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client
+            .apply_pq_contribution_to_session(&contact_id, &kem_shared_secret)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 }
 
@@ -1628,4 +1659,47 @@ pub fn derive_device_id(identity_public_key: Vec<u8>) -> String {
 /// UniFFI wrapper - accepts owned Strings
 pub fn format_federated_id(device_id: String, server_hostname: String) -> String {
     crate::device_id::format_federated_id(&device_id, &server_hostname)
+}
+
+
+// ── Post-Quantum KEM Namespace Functions ─────────────────────────────────────
+
+/// Generate an ML-KEM-768 keypair for registration/upload to key server.
+///
+/// Returns (public_key=1184 bytes, secret_key=2400 bytes).
+/// Store secret_key securely in Keychain; upload public_key as KyberSignedPreKey.
+pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
+    crate::crypto::pq_x3dh::mlkem768_keygen()
+        .map(|kp| MLKEMKeyPair {
+            public_key: kp.public_key,
+            secret_key: kp.secret_key,
+        })
+        .map_err(|_e| CryptoError::InitializationFailed)
+}
+
+/// Encapsulate to a recipient's ML-KEM-768 public key (sender side PQXDH).
+///
+/// - `public_key`: recipient's Kyber SPK public key (1184 bytes) from their PreKeyBundle
+/// - Returns: ciphertext (include in PreKeySignalMessage.kem_ciphertext) + shared_secret
+///   (pass to ClassicCryptoCore.apply_pq_contribution)
+pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
+    crate::crypto::pq_x3dh::mlkem768_encapsulate(&public_key)
+        .map(|enc| MLKEMEncapsulation {
+            ciphertext: enc.ciphertext,
+            shared_secret: enc.shared_secret,
+        })
+        .map_err(|e| CryptoError::EncryptionFailed { message: e })
+}
+
+/// Decapsulate a received ML-KEM-768 ciphertext (receiver side PQXDH).
+///
+/// - `secret_key`: our Kyber SPK secret key from Keychain (2400 bytes)
+/// - `ciphertext`: from PreKeySignalMessage.kem_ciphertext (1088 bytes)
+/// - Returns: shared_secret (pass to ClassicCryptoCore.apply_pq_contribution)
+pub fn mlkem768_decapsulate(
+    secret_key: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
+        .map_err(|e| CryptoError::DecryptionFailed { message: e })
 }

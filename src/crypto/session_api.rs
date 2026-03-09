@@ -384,6 +384,7 @@ pub type ClassicSession<P> = Session<
 mod tests {
     use super::*;
     use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
+    use crate::crypto::keys::build_prologue;
     use crate::crypto::messaging::double_ratchet::DoubleRatchetSession;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
     use crate::crypto::SuiteID;
@@ -407,8 +408,12 @@ mod tests {
             ClassicSuiteProvider::generate_kem_keys().unwrap();
         let (bob_signing_key, bob_verifying_key) =
             ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature =
-            ClassicSuiteProvider::sign(&bob_signing_key, bob_signed_prekey_pub.as_ref()).unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
 
         let bob_bundle = X3DHPublicKeyBundle {
             identity_public: bob_identity_pub.clone(),
@@ -416,6 +421,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice initializes session
@@ -448,8 +455,12 @@ mod tests {
             ClassicSuiteProvider::generate_kem_keys().unwrap();
         let (bob_signing_key, bob_verifying_key) =
             ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature =
-            ClassicSuiteProvider::sign(&bob_signing_key, bob_signed_prekey_pub.as_ref()).unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
 
         let bob_bundle = X3DHPublicKeyBundle {
             identity_public: bob_identity_pub.clone(),
@@ -457,6 +468,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice initializes session as initiator
@@ -487,6 +500,7 @@ mod tests {
             &encrypted1,
             "alice".to_string(),
             "bob".to_string(),
+            None,
         )
         .unwrap();
 
@@ -527,8 +541,12 @@ mod tests {
             ClassicSuiteProvider::generate_kem_keys().unwrap();
         let (bob_signing_key, bob_verifying_key) =
             ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature =
-            ClassicSuiteProvider::sign(&bob_signing_key, bob_signed_prekey_pub.as_ref()).unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
 
         let bob_bundle = X3DHPublicKeyBundle {
             identity_public: bob_identity_pub.clone(),
@@ -536,6 +554,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         let mut session = TestSession::init_as_initiator(

@@ -16,6 +16,7 @@ pub struct PQEncryptedMessage {
 }
 
 /// A Double Ratchet session that includes chains for post-quantum keys.
+#[allow(dead_code)]
 pub struct PQDoubleRatchetSession {
     // Классические цепочки
     classical_root_key: [u8; 32],

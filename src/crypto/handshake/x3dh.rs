@@ -60,21 +60,11 @@
 //! ```
 
 use crate::crypto::handshake::{InitiatorState, KeyAgreement};
+use crate::crypto::keys::build_prologue;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::SuiteID;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
-
-/// Build prologue for X3DH signature (как в Noise Protocol)
-/// Prologue включает протокол и suite ID для предотвращения key substitution attacks
-fn build_prologue(suite_id: SuiteID) -> Vec<u8> {
-    let protocol_name = b"X3DH";
-    let suite_id_bytes = suite_id.as_u16().to_le_bytes();
-    let mut prologue = Vec::with_capacity(protocol_name.len() + suite_id_bytes.len());
-    prologue.extend_from_slice(protocol_name);
-    prologue.extend_from_slice(&suite_id_bytes);
-    prologue
-}
 
 /// Публичные ключи для инициации сессии
 ///
@@ -251,79 +241,35 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         let remote_verifying_key =
             P::signature_public_key_from_bytes(remote_bundle.verifying_key.clone());
 
-        // 1. Verify signature on signed prekey with backward compatibility
-        // Сначала пробуем новый формат (с prologue), если не получается - старый (без prologue)
+        // 1. Verify signature on signed prekey
+        // message = "KonstruktX3DH-v1" || [0x00, suite_id] || signed_prekey_bytes
         debug!(
             target: "crypto::x3dh",
             suite_id = %remote_bundle.suite_id,
             signed_prekey_len = remote_signed_prekey_public.as_ref().len(),
             verifying_key_len = remote_verifying_key.as_ref().len(),
             signature_len = remote_bundle.signature.len(),
-            "Verifying signed prekey signature (with backward compatibility)"
+            "Verifying signed prekey signature"
         );
 
-        // Попытка 1: Новый формат с prologue (как в Noise Protocol)
         let prologue = build_prologue(remote_bundle.suite_id);
         let remote_signed_prekey_bytes: &[u8] = remote_signed_prekey_public.as_ref();
-        let mut message_with_prologue =
-            Vec::with_capacity(prologue.len() + remote_signed_prekey_bytes.len());
-        message_with_prologue.extend_from_slice(&prologue);
-        message_with_prologue.extend_from_slice(remote_signed_prekey_bytes);
+        let mut message = Vec::with_capacity(prologue.len() + remote_signed_prekey_bytes.len());
+        message.extend_from_slice(&prologue);
+        message.extend_from_slice(remote_signed_prekey_bytes);
 
-        let verification_result = P::verify(
-            &remote_verifying_key,
-            &message_with_prologue,
-            &remote_bundle.signature,
-        );
-
-        match verification_result {
-            Ok(()) => {
-                debug!(
-                    target: "crypto::x3dh",
-                    suite_id = %remote_bundle.suite_id,
-                    "Signature verified successfully (new format with prologue)"
-                );
-            }
-            Err(e1) => {
-                // Попытка 2: Старый формат без prologue (для обратной совместимости)
-                debug!(
-                    target: "crypto::x3dh",
-                    suite_id = %remote_bundle.suite_id,
-                    error = %e1,
-                    "New format failed, trying old format (backward compatibility)"
-                );
-                let old_format_result = P::verify(
-                    &remote_verifying_key,
-                    remote_signed_prekey_public.as_ref(),
-                    &remote_bundle.signature,
-                );
-
-                match old_format_result {
-                    Ok(()) => {
-                        debug!(
-                            target: "crypto::x3dh",
-                            suite_id = %remote_bundle.suite_id,
-                            "Signature verified successfully (old format, backward compatibility)"
-                        );
-                    }
-                    Err(e2) => {
-                        // ❌ SECURITY: Третий fallback (identity_public) удален - он позволял key substitution attack
-                        // Подробнее: SECURITY_AUDIT.md #5 - signature confusion attack
-                        error!(
-                            target: "crypto::x3dh",
-                            new_format_error = %e1,
-                            old_format_error = %e2,
-                            suite_id = %remote_bundle.suite_id,
-                            "Signature verification failed (both new and old formats). User needs to re-register."
-                        );
-                        return Err(format!(
-                            "Invalid signed prekey signature: {}. The user may need to re-register with the current code version.",
-                            e2
-                        ));
-                    }
-                }
-            }
-        }
+        P::verify(&remote_verifying_key, &message, &remote_bundle.signature).map_err(|e| {
+            error!(
+                target: "crypto::x3dh",
+                error = %e,
+                suite_id = %remote_bundle.suite_id,
+                "Signed prekey signature verification failed"
+            );
+            format!(
+                "Invalid signed prekey signature: {}. The contact needs to re-register.",
+                e
+            )
+        })?;
 
         // 2. Perform three DH operations (Full X3DH)
         debug!(target: "crypto::x3dh", "Step 2: Performing DH operations");
@@ -524,6 +470,8 @@ mod tests {
             signature: bob_signature,
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice выполняет X3DH как initiator
@@ -546,6 +494,7 @@ mod tests {
             &bob_signed_prekey_priv,
             &alice_identity_pub,
             &alice_ephemeral_pub,
+            None,
         )
         .unwrap();
 
@@ -572,6 +521,8 @@ mod tests {
             signature: vec![0xFF; 64], // Невалидная подпись
             verifying_key: bob_verifying_key,
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Alice должна отклонить невалидную подпись
@@ -597,16 +548,20 @@ mod tests {
         let suite_id = SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id());
         let prologue = build_prologue(suite_id);
 
-        // Prologue должен быть: "X3DH" (4 bytes) + suite_id (2 bytes, little-endian)
-        assert_eq!(prologue.len(), 6, "Prologue should be 6 bytes (4 + 2)");
-        assert_eq!(&prologue[0..4], b"X3DH", "First 4 bytes should be 'X3DH'");
-
-        // Suite ID 1 = 0x0001 in little-endian = [0x01, 0x00]
-        let expected_suite_id_bytes = suite_id.as_u16().to_le_bytes();
+        // Prologue must be: "KonstruktX3DH-v1" (16 bytes) + suite_id (2 bytes, big-endian)
+        assert_eq!(prologue.len(), 18, "Prologue should be 18 bytes (16 + 2)");
         assert_eq!(
-            &prologue[4..6],
+            &prologue[0..16],
+            b"KonstruktX3DH-v1",
+            "First 16 bytes should be 'KonstruktX3DH-v1'"
+        );
+
+        // Suite ID encoded as big-endian (to_be_bytes)
+        let expected_suite_id_bytes = suite_id.as_u16().to_be_bytes();
+        assert_eq!(
+            &prologue[16..18],
             &expected_suite_id_bytes,
-            "Last 2 bytes should be suite_id in little-endian"
+            "Last 2 bytes should be suite_id in big-endian"
         );
     }
 
@@ -661,6 +616,8 @@ mod tests {
             signature: signature_old,
             verifying_key,
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Проверка: perform_as_initiator должен принять старую подпись (обратная совместимость)
@@ -671,8 +628,8 @@ mod tests {
         );
 
         assert!(
-            result.is_ok(),
-            "X3DH should accept old format signature (backward compatibility)"
+            result.is_err(),
+            "X3DH should reject old format signature (no backward compatibility fallback)"
         );
     }
 
@@ -701,6 +658,8 @@ mod tests {
             signature: signature_new,
             verifying_key,
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         // Проверка: perform_as_initiator должен принять новую подпись
