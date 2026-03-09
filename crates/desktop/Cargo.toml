@@ -1,0 +1,12 @@
+[package]
+name = "construct-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Construct Messenger desktop client (Tauri)"
+
+[[bin]]
+name = "construct-desktop"
+path = "src/main.rs"
+
+[dependencies]
+construct-core = { path = "../..", features = ["post-quantum", "desktop"] }

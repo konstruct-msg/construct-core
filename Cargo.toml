@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/desktop"]
+resolver = "2"
+
 [package]
 name = "construct-core"
 version = "0.4.0"
@@ -8,7 +12,7 @@ license = "MIT"
 repository = "https://github.com/maximeliseyev/construct-core"
 description = "Core cryptographic engine for Construct Messenger with E2EE"
 keywords = ["crypto", "e2ee", "messaging", "x3dh", "double-ratchet"]
-categories = ["cryptography", "web-programming"]
+categories = ["cryptography"]
 
 [lib]
 crate-type = ["rlib", "staticlib", "cdylib"]
@@ -17,21 +21,16 @@ name = "construct_core"
 [lints.rust]
 unsafe_attr_outside_unsafe = "allow"
 
-# Feature flags для разных платформ
+# Feature flags
 [features]
 default = []
-# Платформенные features (взаимоисключающие)
 ios = ["uniffi", "dep:construct-ice"]
-wasm = []
-# Опциональные возможности
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",
     "dep:pqcrypto-mldsa",
     "dep:pqcrypto-traits",
 ]
-# Для тестов и разработки
-test = ["desktop"]
 desktop = ["tokio/rt"]
 
 [dependencies]
@@ -79,47 +78,7 @@ uniffi = { version = "0.30", features = ["build"], optional = true }
 # Traffic obfuscation — ICE (obfs4 pluggable transport)
 construct-ice = { path = "../construct-ice", features = ["ffi"], optional = true }
 
-# WASM bindings (optional)
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2" }
-web-sys = { version = "0.3", features = [
-    # REST API / Fetch
-    "Request",
-    "RequestInit",
-    "RequestMode",
-    "RequestCredentials",
-    "Response",
-    "Headers",
-    "AbortSignal",
-    # WebSocket (legacy, will be removed)
-    "WebSocket",
-    "CloseEvent",
-    "ErrorEvent",
-    "MessageEvent",
-    "BinaryType",
-    # IndexedDB
-    "IdbDatabase",
-    "IdbOpenDbRequest",
-    "IdbRequest",
-    "IdbTransaction",
-    "IdbTransactionMode",
-    "IdbObjectStoreParameters",
-    "IdbVersionChangeEvent",
-    "IdbObjectStore",
-    "IdbIndex",
-    "IdbFactory",
-    # Common
-    "Window",
-    "console",
-    "Event",
-] }
-serde-wasm-bindgen = { version = "0.6" }
-wasm-bindgen-futures = { version = "0.4" }
-js-sys = { version = "0.3" }
-getrandom = { version = "0.2", features = ["js"] }
-uuid = { version = "1.0", features = ["v4", "serde", "js"] }
-
-# Async runtime (optional, для desktop тестов)
+# Async runtime (optional, для desktop)
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]

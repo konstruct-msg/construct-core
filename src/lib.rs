@@ -5,38 +5,16 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(unsafe_attr_outside_unsafe)] // Allow UniFFI generated code
 
-// Platform-specific modules
-#[cfg(feature = "ios")]
-pub mod platforms {
-    pub mod ios;
-}
-
-#[cfg(feature = "wasm")]
-pub mod platforms {
-    pub mod wasm;
-    pub use wasm::*;
-}
-
-// Re-export wasm module for convenience
-#[cfg(feature = "wasm")]
-pub use platforms::wasm;
-
 // Core modules (platform-independent)
 pub mod api;
-pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod device_id;
 pub mod error;
 pub mod pow;
-pub mod protocol;
-pub mod state;
 pub mod storage;
 pub mod traffic_protection;
 pub mod utils;
-
-// Re-exports for convenience
-pub use api::MessengerAPI;
 
 // UniFFI bindings module (types and implementations)
 #[cfg(feature = "ios")]
