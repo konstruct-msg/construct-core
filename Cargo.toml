@@ -24,7 +24,10 @@ unsafe_attr_outside_unsafe = "allow"
 # Feature flags
 [features]
 default = []
-ios = ["uniffi", "dep:construct-ice"]
+ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls"]
+# mac = same capabilities as ios — UniFFI Swift bindings + construct-ice TLS proxy
+# Used when building libconstruct_core_mac.a for native macOS target
+mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",

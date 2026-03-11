@@ -17,13 +17,13 @@ pub mod traffic_protection;
 pub mod utils;
 
 // UniFFI bindings module (types and implementations)
-#[cfg(feature = "ios")]
+#[cfg(any(feature = "ios", feature = "mac"))]
 mod uniffi_bindings;
 
 // Re-export UniFFI bindings types so generated code can see them
-#[cfg(feature = "ios")]
+#[cfg(any(feature = "ios", feature = "mac"))]
 pub use uniffi_bindings::*;
 
-// Include UniFFI generated scaffolding when ios feature is enabled
-#[cfg(feature = "ios")]
+// Include UniFFI generated scaffolding when ios or mac feature is enabled
+#[cfg(any(feature = "ios", feature = "mac"))]
 include!(concat!(env!("OUT_DIR"), "/construct_core.uniffi.rs"));

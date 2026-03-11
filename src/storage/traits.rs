@@ -253,7 +253,7 @@ pub trait DataStorage {
 
 /// Токены аутентификации (JWT)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "ios", derive(uniffi::Record))]
+#[cfg_attr(any(feature = "ios", feature = "mac"), derive(uniffi::Record))]
 pub struct AuthTokens {
     /// Access token (JWT, живёт 1 час)
     #[serde(rename = "accessToken")]
