@@ -1,0 +1,553 @@
+/// Session Lifecycle Manager — Rust port of Swift `CryptoManager`.
+///
+/// Owns the `ClassicClient` and orchestrates:
+/// - Encrypt / Decrypt with automatic session restore from archive
+/// - Session archiving (retire → store JSON → GC)
+/// - Prekey change detection (reinstall)
+/// - Integration of AckStore, HealingQueue, PQContributionManager
+///
+/// All I/O is delegated via `Vec<Action>` returns; this struct is pure state.
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::client_api::ClassicClient;
+use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+use crate::crypto::suites::classic::ClassicSuiteProvider;
+use crate::orchestration::ack_store::AckStore;
+use crate::orchestration::actions::Action;
+use crate::orchestration::healing_queue::HealingQueue;
+use crate::orchestration::pq_contribution::PQContributionManager;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const ARCHIVE_GC_AGE_SECONDS: u64 = 24 * 60 * 60; // 24 h
+
+// ── Result types ──────────────────────────────────────────────────────────────
+
+/// Returned by `encrypt`.
+#[derive(Debug, Clone)]
+pub struct EncryptResult {
+    /// JSON-encoded `EncryptedRatchetMessage` ready for wire transmission.
+    pub ciphertext_json: String,
+    /// Actions the platform must execute (e.g. save updated session state).
+    pub actions: Vec<Action>,
+}
+
+/// Returned by `decrypt`.
+#[derive(Debug, Clone)]
+pub struct DecryptResult {
+    pub plaintext: Vec<u8>,
+    /// Actions the platform must execute after successful decryption.
+    pub actions: Vec<Action>,
+}
+
+// ── Serializable wire message ─────────────────────────────────────────────────
+
+/// JSON-serializable form of `EncryptedRatchetMessage`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireMessage {
+    pub dh_public_key: Vec<u8>,
+    pub message_number: u32,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub previous_chain_length: u32,
+    pub suite_id: u16,
+}
+
+impl From<EncryptedRatchetMessage> for WireMessage {
+    fn from(m: EncryptedRatchetMessage) -> Self {
+        Self {
+            dh_public_key: m.dh_public_key.to_vec(),
+            message_number: m.message_number,
+            ciphertext: m.ciphertext,
+            nonce: m.nonce,
+            previous_chain_length: m.previous_chain_length,
+            suite_id: m.suite_id,
+        }
+    }
+}
+
+impl TryFrom<WireMessage> for EncryptedRatchetMessage {
+    type Error = String;
+    fn try_from(w: WireMessage) -> Result<Self, String> {
+        let dh: [u8; 32] = w
+            .dh_public_key
+            .try_into()
+            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
+        Ok(EncryptedRatchetMessage {
+            dh_public_key: dh,
+            message_number: w.message_number,
+            ciphertext: w.ciphertext,
+            nonce: w.nonce,
+            previous_chain_length: w.previous_chain_length,
+            suite_id: w.suite_id,
+        })
+    }
+}
+
+// ── Serializable state (export / import) ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LifecycleState {
+    my_user_id: String,
+    archives: HashMap<String, String>,
+    archive_timestamps: HashMap<String, u64>,
+    prekey_tracker: HashMap<String, u32>,
+}
+
+// ── SessionLifecycleManager ───────────────────────────────────────────────────
+
+pub struct SessionLifecycleManager {
+    pub(crate) client: ClassicClient<ClassicSuiteProvider>,
+    pub ack_store: AckStore,
+    pub healing_queue: HealingQueue,
+    pub pq_manager: PQContributionManager,
+    /// contactId → archived session JSON (latest archive only).
+    archives: HashMap<String, String>,
+    /// contactId → Unix timestamp of the archive (for GC).
+    archive_timestamps: HashMap<String, u64>,
+    /// contactId → last seen OTPK ID (used to detect reinstall).
+    prekey_tracker: HashMap<String, u32>,
+    my_user_id: String,
+}
+
+impl SessionLifecycleManager {
+    /// Create a manager from an existing `ClassicClient`.
+    pub fn new(client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+        Self {
+            client,
+            ack_store: AckStore::default(),
+            healing_queue: HealingQueue::default(),
+            pq_manager: PQContributionManager::new(),
+            archives: HashMap::new(),
+            archive_timestamps: HashMap::new(),
+            prekey_tracker: HashMap::new(),
+            my_user_id,
+        }
+    }
+
+    // ── Session queries ───────────────────────────────────────────────────────
+
+    pub fn has_active_session(&self, contact_id: &str) -> bool {
+        self.client.has_session(contact_id)
+    }
+
+    pub fn has_archive(&self, contact_id: &str) -> bool {
+        self.archives.contains_key(contact_id)
+    }
+
+    pub fn my_user_id(&self) -> &str {
+        &self.my_user_id
+    }
+
+    // ── Encrypt ───────────────────────────────────────────────────────────────
+
+    /// Encrypt `plaintext` for `contact_id`.
+    ///
+    /// If no active session exists but an archive is available, it is restored
+    /// in-memory (the caller must have pre-loaded the archive JSON via
+    /// `restore_latest_archive`).
+    ///
+    /// Returns `EncryptResult` with ciphertext JSON and follow-up `Action`s
+    /// (always includes `SaveSessionToSecureStore` to persist the updated session).
+    pub fn encrypt(
+        &mut self,
+        contact_id: &str,
+        plaintext: &[u8],
+    ) -> Result<EncryptResult, String> {
+        // Ensure session is loaded.
+        if !self.client.has_session(contact_id) {
+            return Err(format!(
+                "No active session for {}: call restore_latest_archive first",
+                contact_id
+            ));
+        }
+
+        let encrypted = self.client.encrypt_message(contact_id, plaintext)?;
+        let wire: WireMessage = encrypted.into();
+        let ciphertext_json =
+            serde_json::to_string(&wire).map_err(|e| format!("serialize: {}", e))?;
+
+        // Always save updated session state after encrypt.
+        let session_json = self.export_session_json_for(contact_id)?;
+        let actions = vec![Action::SaveSessionToSecureStore {
+            key: session_key(contact_id),
+            data: session_json.into_bytes(),
+        }];
+
+        Ok(EncryptResult { ciphertext_json, actions })
+    }
+
+    // ── Decrypt ───────────────────────────────────────────────────────────────
+
+    /// Decrypt a wire-format message for `contact_id`.
+    ///
+    /// `wire_json` is a JSON-encoded `WireMessage`.
+    ///
+    /// On success, returns `DecryptResult` with plaintext and follow-up actions
+    /// (save updated session). On failure, returns `Err` so the caller (Phase 4
+    /// `MessageRouter`) can decide on healing or END_SESSION.
+    pub fn decrypt(
+        &mut self,
+        contact_id: &str,
+        wire_json: &str,
+    ) -> Result<DecryptResult, String> {
+        let wire: WireMessage =
+            serde_json::from_str(wire_json).map_err(|e| format!("parse wire: {}", e))?;
+        let msg = EncryptedRatchetMessage::try_from(wire)?;
+
+        if !self.client.has_session(contact_id) {
+            return Err(format!("No active session for {}", contact_id));
+        }
+
+        let plaintext = self.client.decrypt_message(contact_id, &msg)?;
+
+        // Persist updated session state.
+        let session_json = self.export_session_json_for(contact_id)?;
+        let actions = vec![Action::SaveSessionToSecureStore {
+            key: session_key(contact_id),
+            data: session_json.into_bytes(),
+        }];
+
+        Ok(DecryptResult { plaintext, actions })
+    }
+
+    // ── Archive lifecycle ─────────────────────────────────────────────────────
+
+    /// Serialize the active session for `contact_id` into the in-memory archive
+    /// and remove it from the active session map.
+    ///
+    /// Returns `Action`s to persist the archive and delete the hot session.
+    pub fn archive_session(&mut self, contact_id: &str) -> Vec<Action> {
+        let json = match self.export_session_json_for(contact_id) {
+            Ok(j) => j,
+            Err(_) => return vec![],
+        };
+
+        self.archives.insert(contact_id.to_string(), json.clone());
+        self.archive_timestamps
+            .insert(contact_id.to_string(), unix_now());
+        self.client.remove_session(contact_id);
+
+        vec![
+            // Persist archive under a separate key.
+            Action::SaveSessionToSecureStore {
+                key: archive_key(contact_id),
+                data: json.into_bytes(),
+            },
+            // Delete the hot session from secure store.
+            Action::SaveSessionToSecureStore {
+                key: session_key(contact_id),
+                data: vec![], // empty = delete sentinel
+            },
+        ]
+    }
+
+    /// Restore the latest archive for `contact_id` into the active session map.
+    ///
+    /// The archive JSON must already be in memory (either via a previous
+    /// `archive_session` call or loaded from the platform store via
+    /// `load_archive_json`).
+    pub fn restore_latest_archive(&mut self, contact_id: &str) -> Result<(), String> {
+        let json = self
+            .archives
+            .get(contact_id)
+            .cloned()
+            .ok_or_else(|| format!("No archive for {}", contact_id))?;
+        self.import_session_json(contact_id, &json)?;
+        Ok(())
+    }
+
+    /// Feed an archive JSON loaded from the platform secure store into memory.
+    pub fn load_archive_json(&mut self, contact_id: &str, json: String) {
+        self.archives.insert(contact_id.to_string(), json.clone());
+        // Also import as the active session.
+        let _ = self.import_session_json(contact_id, &json);
+    }
+
+    /// Garbage-collect archives older than 24 h.
+    ///
+    /// Returns `Action`s requesting the platform to delete the stale records.
+    pub fn gc_old_archives(&mut self) -> Vec<Action> {
+        let cutoff = unix_now().saturating_sub(ARCHIVE_GC_AGE_SECONDS);
+        let expired: Vec<String> = self
+            .archive_timestamps
+            .iter()
+            .filter(|(_, &ts)| ts < cutoff)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut actions = Vec::new();
+        for contact_id in &expired {
+            self.archives.remove(contact_id);
+            self.archive_timestamps.remove(contact_id);
+            actions.push(Action::SaveSessionToSecureStore {
+                key: archive_key(contact_id),
+                data: vec![], // empty = delete sentinel
+            });
+        }
+        actions
+    }
+
+    // ── Prekey tracking ───────────────────────────────────────────────────────
+
+    /// Record the OTPK ID used to initiate a session with `contact_id`.
+    pub fn track_prekey(&mut self, contact_id: &str, otpk_id: u32) {
+        self.prekey_tracker.insert(contact_id.to_string(), otpk_id);
+    }
+
+    /// `true` if `new_otpk_id` differs from the previously recorded value,
+    /// indicating the contact has reinstalled.
+    pub fn is_reinstall(&self, contact_id: &str, new_otpk_id: u32) -> bool {
+        self.prekey_tracker
+            .get(contact_id)
+            .map_or(false, |&prev| prev != new_otpk_id)
+    }
+
+    // ── PQ contribution helpers ───────────────────────────────────────────────
+
+    /// Apply a deferred PQ contribution for `contact_id` (if one exists).
+    ///
+    /// Returns `Vec<Action>` — empty if no contribution was pending.
+    pub fn maybe_apply_pq_contribution(&mut self, contact_id: &str) -> Vec<Action> {
+        let contribution = match self.pq_manager.consume_deferred(contact_id) {
+            Some(c) => c,
+            None => return vec![],
+        };
+        if let Err(e) = self
+            .client
+            .apply_pq_contribution_to_session(contact_id, &contribution.shared_secret)
+        {
+            return vec![Action::NotifyError {
+                code: "PQ_CONTRIBUTION_FAILED".to_string(),
+                message: e,
+            }];
+        }
+        // Save updated session state.
+        match self.export_session_json_for(contact_id) {
+            Ok(json) => vec![Action::SaveSessionToSecureStore {
+                key: session_key(contact_id),
+                data: json.into_bytes(),
+            }],
+            Err(e) => vec![Action::NotifyError {
+                code: "SESSION_EXPORT_FAILED".to_string(),
+                message: e,
+            }],
+        }
+    }
+
+    // ── State persistence ─────────────────────────────────────────────────────
+
+    /// Export non-crypto orchestration state to JSON.
+    ///
+    /// This does NOT include session keys (those are persisted separately via
+    /// `Action::SaveSessionToSecureStore`). Use this to snapshot coordinator
+    /// metadata (archives index, prekey tracker, user ID).
+    pub fn export_state_json(&self) -> Result<String, String> {
+        let state = LifecycleState {
+            my_user_id: self.my_user_id.clone(),
+            archives: self.archives.clone(),
+            archive_timestamps: self.archive_timestamps.clone(),
+            prekey_tracker: self.prekey_tracker.clone(),
+        };
+        serde_json::to_string(&state).map_err(|e| format!("export_state_json: {}", e))
+    }
+
+    /// Restore orchestration metadata from a previously exported JSON snapshot.
+    pub fn import_state_json(&mut self, json: &str) -> Result<(), String> {
+        let state: LifecycleState =
+            serde_json::from_str(json).map_err(|e| format!("import_state_json: {}", e))?;
+        self.my_user_id = state.my_user_id;
+        self.archives = state.archives;
+        self.archive_timestamps = state.archive_timestamps;
+        self.prekey_tracker = state.prekey_tracker;
+        Ok(())
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
+        let session = self
+            .client
+            .get_session(contact_id)
+            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
+        let serializable = session.messaging_session().to_serializable();
+        serde_json::to_string(&serializable).map_err(|e| format!("serialize session: {}", e))
+    }
+
+    fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
+        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
+
+        let serializable: SerializableSession =
+            serde_json::from_str(json).map_err(|e| format!("deserialize session: {}", e))?;
+        let ratchet =
+            DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)?;
+        let session_id = self.client.import_session(contact_id, ratchet);
+        Ok(session_id)
+    }
+}
+
+// ── Key helpers ───────────────────────────────────────────────────────────────
+
+pub fn session_key(contact_id: &str) -> String {
+    format!("session_{}", contact_id)
+}
+
+pub fn archive_key(contact_id: &str) -> String {
+    format!("archive_{}", contact_id)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::client_api::ClassicClient;
+    use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+    fn make_pair() -> (SessionLifecycleManager, SessionLifecycleManager) {
+        let alice_client =
+            ClassicClient::<ClassicSuiteProvider>::new().expect("alice client");
+        let bob_client = ClassicClient::<ClassicSuiteProvider>::new().expect("bob client");
+        let alice = SessionLifecycleManager::new(alice_client, "alice".to_string());
+        let bob = SessionLifecycleManager::new(bob_client, "bob".to_string());
+        (alice, bob)
+    }
+
+    #[test]
+    fn test_new_manager_has_no_sessions() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        assert!(!mgr.has_active_session("bob"));
+        assert!(!mgr.has_archive("bob"));
+        assert_eq!(mgr.my_user_id(), "alice");
+    }
+
+    #[test]
+    fn test_encrypt_without_session_returns_error() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let result = mgr.encrypt("bob", b"hello");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No active session"));
+    }
+
+    #[test]
+    fn test_decrypt_without_session_returns_error() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let result = mgr.decrypt("bob", r#"{"msg":"fake"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restore_archive_without_archive_returns_error() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        assert!(mgr.restore_latest_archive("bob").is_err());
+    }
+
+    #[test]
+    fn test_gc_empty_archives_is_noop() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let actions = mgr.gc_old_archives();
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_gc_removes_old_archives() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        // Inject an archive with a stale timestamp.
+        mgr.archives.insert("bob".to_string(), "{}".to_string());
+        mgr.archive_timestamps.insert("bob".to_string(), 0);
+
+        let actions = mgr.gc_old_archives();
+        assert!(!actions.is_empty());
+        assert!(!mgr.has_archive("bob"));
+    }
+
+    #[test]
+    fn test_gc_keeps_fresh_archives() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        mgr.archives.insert("bob".to_string(), "{}".to_string());
+        mgr.archive_timestamps.insert("bob".to_string(), unix_now());
+
+        mgr.gc_old_archives();
+        assert!(mgr.has_archive("bob"));
+    }
+
+    #[test]
+    fn test_prekey_tracking() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        assert!(!mgr.is_reinstall("bob", 42)); // no record yet → not a reinstall
+        mgr.track_prekey("bob", 42);
+        assert!(!mgr.is_reinstall("bob", 42)); // same key → not reinstall
+        assert!(mgr.is_reinstall("bob", 99));  // different → reinstall
+    }
+
+    #[test]
+    fn test_export_import_state_json() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        mgr.track_prekey("bob", 5);
+        mgr.archives.insert("carol".to_string(), "{}".to_string());
+
+        let json = mgr.export_state_json().unwrap();
+        assert!(json.contains("alice"));
+        assert!(json.contains("carol"));
+
+        let client2 = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr2 = SessionLifecycleManager::new(client2, "initial".to_string());
+        mgr2.import_state_json(&json).unwrap();
+        assert_eq!(mgr2.my_user_id(), "alice");
+        assert!(mgr2.has_archive("carol"));
+        assert!(!mgr2.is_reinstall("bob", 5));  // prekey tracker restored
+        assert!(mgr2.is_reinstall("bob", 99));
+    }
+
+    #[test]
+    fn test_session_and_archive_keys() {
+        assert_eq!(session_key("alice"), "session_alice");
+        assert_eq!(archive_key("alice"), "archive_alice");
+    }
+
+    #[test]
+    fn test_maybe_apply_pq_contribution_no_pending() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let actions = mgr.maybe_apply_pq_contribution("bob");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_wire_message_roundtrip() {
+        let original = EncryptedRatchetMessage {
+            dh_public_key: [42u8; 32],
+            message_number: 7,
+            ciphertext: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+            previous_chain_length: 0,
+            suite_id: 1,
+        };
+        let wire: WireMessage = original.clone().into();
+        let json = serde_json::to_string(&wire).unwrap();
+        let wire2: WireMessage = serde_json::from_str(&json).unwrap();
+        let restored = EncryptedRatchetMessage::try_from(wire2).unwrap();
+        assert_eq!(restored.dh_public_key, original.dh_public_key);
+        assert_eq!(restored.message_number, original.message_number);
+        assert_eq!(restored.ciphertext, original.ciphertext);
+    }
+}

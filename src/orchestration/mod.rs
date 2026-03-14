@@ -18,6 +18,7 @@ pub mod actions;
 pub mod healing_queue;
 pub mod platform_bridge;
 pub mod pq_contribution;
+pub mod session_lifecycle;
 
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus};
@@ -26,3 +27,4 @@ pub use platform_bridge::PlatformBridge;
 pub use pq_contribution::{
     DeferredContribution, EncapsulationResult, PQContributionManager, SPKRotationPending,
 };
+pub use session_lifecycle::{DecryptResult, EncryptResult, SessionLifecycleManager};
