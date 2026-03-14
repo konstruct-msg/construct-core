@@ -93,9 +93,49 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
 
+    /// RESPONDER-only: root key after the first DH ratchet, before the second.
+    /// Used by `apply_pq_contribution` to apply PQ at a point where both sides
+    /// have the same root key (RK1), ensuring symmetric PQXDH derivation.
+    /// Consumed (set to None) after PQ is applied.
+    pre_pq_root_key: Option<P::AeadKey>,
+
     session_id: String,
     contact_id: String,
     local_user_id: String,
+}
+
+/// Snapshot of mutable session fields captured before a DH ratchet in `decrypt()`.
+/// If AEAD decryption fails, the snapshot is restored to prevent permanent session corruption.
+struct DecryptSnapshot<P: CryptoProvider> {
+    root_key: P::AeadKey,
+    sending_chain_key: P::AeadKey,
+    sending_chain_length: u32,
+    receiving_chain_key: P::AeadKey,
+    receiving_chain_length: u32,
+    dh_ratchet_private: Option<P::KemPrivateKey>,
+    dh_ratchet_public: P::KemPublicKey,
+    remote_dh_public: Option<P::KemPublicKey>,
+    previous_sending_length: u32,
+    skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
+    skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
+}
+
+impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
+    fn clone(&self) -> Self {
+        Self {
+            root_key: self.root_key.clone(),
+            sending_chain_key: self.sending_chain_key.clone(),
+            sending_chain_length: self.sending_chain_length,
+            receiving_chain_key: self.receiving_chain_key.clone(),
+            receiving_chain_length: self.receiving_chain_length,
+            dh_ratchet_private: self.dh_ratchet_private.clone(),
+            dh_ratchet_public: self.dh_ratchet_public.clone(),
+            remote_dh_public: self.remote_dh_public.clone(),
+            previous_sending_length: self.previous_sending_length,
+            skipped_message_keys: self.skipped_message_keys.clone(),
+            skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+        }
+    }
 }
 
 /// Encrypted message in wire format
@@ -184,6 +224,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
+            pre_pq_root_key: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             contact_id,
             local_user_id,
@@ -239,6 +280,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             P::kdf_rk(&root_key_val, &dh_output).map_err(|e| format!("KDF_RK failed: {}", e))?;
         root_key_val = new_root_key;
 
+        // ⚡ Save the root key at this point (RK1) for PQXDH deferred contribution.
+        // Both INITIATOR and RESPONDER have RK1 after the first ratchet step, so
+        // applying PQ to RK1 produces identical results on both sides.
+        // Without this, INITIATOR applies PQ to RK1 but RESPONDER applies PQ to RK2
+        // (after the second ratchet below), causing irreversible key divergence.
+        let pre_pq_root_key = root_key_val.clone();
+
         // Generate new DH pair for sending
         let (dh_private, dh_public) =
             P::generate_kem_keys().map_err(|e| format!("Failed to generate DH keys: {}", e))?;
@@ -271,6 +319,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
+            pre_pq_root_key: Some(pre_pq_root_key),
             session_id: uuid::Uuid::new_v4().to_string(),
             contact_id: contact_id.clone(),
             local_user_id,
@@ -425,6 +474,26 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             None => true,
         };
 
+        // Snapshot mutable state before any ratchet mutations so we can roll back
+        // if AEAD decryption ultimately fails — prevents permanent session corruption.
+        let snapshot = if needs_ratchet {
+            Some(DecryptSnapshot {
+                root_key: self.root_key.clone(),
+                sending_chain_key: self.sending_chain_key.clone(),
+                sending_chain_length: self.sending_chain_length,
+                receiving_chain_key: self.receiving_chain_key.clone(),
+                receiving_chain_length: self.receiving_chain_length,
+                dh_ratchet_private: self.dh_ratchet_private.clone(),
+                dh_ratchet_public: self.dh_ratchet_public.clone(),
+                remote_dh_public: self.remote_dh_public.clone(),
+                previous_sending_length: self.previous_sending_length,
+                skipped_message_keys: self.skipped_message_keys.clone(),
+                skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            })
+        } else {
+            None
+        };
+
         if needs_ratchet {
             // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
             // current receiving chain so out-of-order messages from the old DH epoch
@@ -436,10 +505,14 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                     if self.skipped_message_keys.len()
                         >= crate::config::Config::global().max_skipped_messages as usize
                     {
+                        self.restore_snapshot(snapshot);
                         return Err("Too many skipped messages".to_string());
                     }
                     let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key)
-                        .map_err(|e| format!("KDF_CK failed: {}", e))?;
+                        .map_err(|e| {
+                            self.restore_snapshot(snapshot.clone());
+                            format!("KDF_CK failed: {}", e)
+                        })?;
                     let timestamp = crate::utils::time::now();
                     self.skipped_message_keys.insert(
                         (old_chain_key_bytes.clone(), self.receiving_chain_length),
@@ -454,7 +527,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public)?;
+            self.perform_dh_ratchet(&remote_dh_public).map_err(|e| {
+                self.restore_snapshot(snapshot.clone());
+                e
+            })?;
         }
 
         // Try to find skipped message key (keyed by remote DH chain + message number)
@@ -467,18 +543,27 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 msg_num = %encrypted.message_number,
                 "Found skipped message key"
             );
-            return self.decrypt_with_key(&key, encrypted);
+            return self.decrypt_with_key(&key, encrypted).map_err(|e| {
+                self.restore_snapshot(snapshot);
+                e
+            });
         }
 
         // Derive keys until we reach the message number
         while self.receiving_chain_length <= encrypted.message_number {
             let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key)
-                .map_err(|e| format!("KDF_CK failed: {}", e))?;
+                .map_err(|e| {
+                    self.restore_snapshot(snapshot.clone());
+                    format!("KDF_CK failed: {}", e)
+                })?;
 
             if self.receiving_chain_length == encrypted.message_number {
                 self.receiving_chain_key = next_chain;
                 self.receiving_chain_length += 1;
-                return self.decrypt_with_key(&msg_key, encrypted);
+                return self.decrypt_with_key(&msg_key, encrypted).map_err(|e| {
+                    self.restore_snapshot(snapshot);
+                    e
+                });
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)
                 // so keys from different DH chains never collide.
@@ -495,11 +580,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 // DoS protection: reject if stored skipped key count reaches the configured max.
                 if self.skipped_message_keys.len() >= Config::global().max_skipped_messages as usize
                 {
+                    self.restore_snapshot(snapshot);
                     return Err("Too many skipped messages".to_string());
                 }
             }
         }
 
+        self.restore_snapshot(snapshot);
         Err("Message key not found".to_string())
     }
 
@@ -565,12 +652,60 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     ///
     /// Derivation: `new_root_key = HKDF(salt=current_root_key, ikm=kem_ss, info="construct-pqxdh-v1")`
     pub fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
-        let current_root = self.root_key.as_ref().to_vec();
-        let new_root_bytes =
-            P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
-                .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
-        self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+        if let Some(saved_rk1) = self.pre_pq_root_key.take() {
+            // RESPONDER path: apply PQ to the saved RK1 (after 1st ratchet, before 2nd).
+            // The INITIATOR also applies PQ to RK1, so both sides derive the same PQ root key.
+            // After PQ-enhancing RK1, we must re-derive the second ratchet (sending chain)
+            // so that our sending_chain_key matches what the INITIATOR will compute when
+            // they perform a DH ratchet to receive our reply.
+            let rk1_bytes = saved_rk1.as_ref().to_vec();
+            let pq_rk1_bytes =
+                P::hkdf_derive_key(&rk1_bytes, kem_shared_secret, b"construct-pqxdh-v1", 32)
+                    .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
+            let pq_rk1 = Self::bytes_to_aead_key(&pq_rk1_bytes)?;
+
+            // Re-derive the second ratchet: KDF_RK(PQ_RK1, DH(our_priv, remote_pub))
+            let dh_priv = self
+                .dh_ratchet_private
+                .as_ref()
+                .ok_or("Missing DH ratchet private key during PQ re-derive")?;
+            let remote_pub = self
+                .remote_dh_public
+                .as_ref()
+                .ok_or("Missing remote DH public key during PQ re-derive")?;
+            let dh_output = P::kem_decapsulate(dh_priv, remote_pub.as_ref())
+                .map_err(|e| format!("DH failed during PQ re-derive: {}", e))?;
+            let (new_root_key, new_sending_chain) =
+                P::kdf_rk(&pq_rk1, &dh_output).map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
+
+            self.root_key = new_root_key;
+            self.sending_chain_key = new_sending_chain;
+        } else {
+            // INITIATOR path: root_key is already RK1, apply PQ directly.
+            let current_root = self.root_key.as_ref().to_vec();
+            let new_root_bytes =
+                P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
+                    .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
+            self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+        }
         Ok(())
+    }
+
+    /// Restore session state from a snapshot taken before a failed decrypt attempt.
+    fn restore_snapshot(&mut self, snapshot: Option<DecryptSnapshot<P>>) {
+        if let Some(s) = snapshot {
+            self.root_key = s.root_key;
+            self.sending_chain_key = s.sending_chain_key;
+            self.sending_chain_length = s.sending_chain_length;
+            self.receiving_chain_key = s.receiving_chain_key;
+            self.receiving_chain_length = s.receiving_chain_length;
+            self.dh_ratchet_private = s.dh_ratchet_private;
+            self.dh_ratchet_public = s.dh_ratchet_public;
+            self.remote_dh_public = s.remote_dh_public;
+            self.previous_sending_length = s.previous_sending_length;
+            self.skipped_message_keys = s.skipped_message_keys;
+            self.skipped_key_timestamps = s.skipped_key_timestamps;
+        }
     }
 
     /// Выполнить DH ratchet step
@@ -724,6 +859,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             skipped_message_keys: Default::default(), // legacy field, no longer written
             skipped_key_timestamps: Default::default(), // legacy field, no longer written
             skipped_keys,
+            pre_pq_root_key: self.pre_pq_root_key.as_ref().map(|k| k.as_ref().to_vec()),
             session_id: self.session_id.clone(),
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
@@ -779,6 +915,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             previous_sending_length: data.previous_sending_length,
             skipped_message_keys,
             skipped_key_timestamps,
+            pre_pq_root_key: data
+                .pre_pq_root_key
+                .map(|bytes| Self::bytes_to_aead_key(&bytes))
+                .transpose()?,
             session_id: data.session_id,
             contact_id: data.contact_id,
             local_user_id: data.local_user_id,
@@ -867,6 +1007,11 @@ pub struct SerializableSession {
     /// v2: skipped keys properly namespaced by (remote_dh_public, msg_number)
     #[serde(default)]
     skipped_keys: Vec<SkippedKeyEntry>,
+    /// RESPONDER-only: pre-second-ratchet root key for symmetric PQXDH derivation.
+    /// Consumed after PQ contribution is applied. Absent for INITIATOR sessions
+    /// and for sessions that have already applied their PQ contribution.
+    #[serde(default)]
+    pre_pq_root_key: Option<Vec<u8>>,
     session_id: String,
     contact_id: String,
     #[serde(default)]
@@ -1062,5 +1207,190 @@ mod tests {
         // Now receive msg2 - should use skipped key
         let dec2 = bob.decrypt(&msg2).unwrap();
         assert_eq!(dec2, b"Message 2");
+    }
+
+    /// Verify that apply_pq_contribution produces symmetric root keys on both sides.
+    ///
+    /// Before the fix, INITIATOR applied PQ to RK1 but RESPONDER applied PQ to RK2,
+    /// causing irreversible key divergence. After the fix, both sides apply PQ to RK1
+    /// (the root key after the first DH ratchet step), and RESPONDER re-derives its
+    /// second ratchet from the PQ-enhanced root key.
+    #[test]
+    fn test_pqxdh_symmetric_contribution() {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+
+        let (alice_identity_priv, alice_identity_pub) =
+            ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_identity_priv, bob_identity_pub) =
+            ClassicSuiteProvider::generate_kem_keys().unwrap();
+
+        let (bob_signed_prekey_priv, bob_signed_prekey_pub) =
+            ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_signing_key, bob_verifying_key) =
+            ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let bob_signature = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
+        };
+
+        let bob_bundle = X3DHPublicKeyBundle {
+            identity_public: bob_identity_pub.clone(),
+            signed_prekey_public: bob_signed_prekey_pub.clone(),
+            signature: bob_signature,
+            verifying_key: bob_verifying_key,
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+        };
+
+        // Alice: INITIATOR
+        let (root_key_alice, initiator_state) =
+            X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
+                &alice_identity_priv,
+                &bob_bundle,
+            )
+            .unwrap();
+
+        let mut alice =
+            DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+                &root_key_alice,
+                initiator_state,
+                &bob_identity_pub,
+                "bob".to_string(),
+                "alice".to_string(),
+            )
+            .unwrap();
+
+        // Alice encrypts msg0
+        let msg0 = alice.encrypt(b"Hello with PQ!").unwrap();
+
+        // Bob: RESPONDER
+        let alice_eph_pub =
+            ClassicSuiteProvider::kem_public_key_from_bytes(msg0.dh_public_key.to_vec());
+        let root_key_bob = X3DHProtocol::<ClassicSuiteProvider>::perform_as_responder(
+            &bob_identity_priv,
+            &bob_signed_prekey_priv,
+            &alice_identity_pub,
+            &alice_eph_pub,
+            None,
+        )
+        .unwrap();
+
+        let (mut bob, plaintext0) =
+            DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
+                &root_key_bob,
+                &bob_identity_priv,
+                &msg0,
+                "alice".to_string(),
+                "bob".to_string(),
+            )
+            .unwrap();
+        assert_eq!(plaintext0, b"Hello with PQ!");
+
+        // Simulate a KEM shared secret (same on both sides, as if from ML-KEM encaps/decaps)
+        let kem_shared_secret = b"fake-but-identical-kem-shared-secret-32b";
+
+        // Apply PQ contribution on both sides
+        alice.apply_pq_contribution(kem_shared_secret).unwrap();
+        bob.apply_pq_contribution(kem_shared_secret).unwrap();
+
+        // Bob sends reply AFTER PQ contribution — this is the critical test.
+        // Before the fix, Alice could NOT decrypt this because root keys diverged.
+        let reply = bob.encrypt(b"Reply after PQ!").unwrap();
+        let decrypted_reply = alice.decrypt(&reply).unwrap();
+        assert_eq!(decrypted_reply, b"Reply after PQ!");
+
+        // Continue with a multi-turn conversation to verify ratchet stays in sync
+        let msg2 = alice.encrypt(b"Message 2 from Alice").unwrap();
+        let dec2 = bob.decrypt(&msg2).unwrap();
+        assert_eq!(dec2, b"Message 2 from Alice");
+
+        let msg3 = bob.encrypt(b"Message 3 from Bob").unwrap();
+        let dec3 = alice.decrypt(&msg3).unwrap();
+        assert_eq!(dec3, b"Message 3 from Bob");
+    }
+
+    /// Verify that decrypt() rolls back session state on AEAD failure,
+    /// allowing subsequent valid messages to still be decrypted.
+    #[test]
+    fn test_decrypt_rollback_on_failure() {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+
+        let (alice_priv, alice_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_priv, bob_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+
+        let (bob_spk_priv, bob_spk_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_signing, bob_verifying) =
+            ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let bob_sig = {
+            let prologue = build_prologue(SuiteID::CLASSIC);
+            let mut msg = prologue;
+            msg.extend_from_slice(bob_spk_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_signing, &msg).unwrap()
+        };
+
+        let bob_bundle = X3DHPublicKeyBundle {
+            identity_public: bob_pub.clone(),
+            signed_prekey_public: bob_spk_pub.clone(),
+            signature: bob_sig,
+            verifying_key: bob_verifying,
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+        };
+
+        let (rk_alice, init_state) =
+            X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bob_bundle)
+                .unwrap();
+
+        let mut alice =
+            DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+                &rk_alice,
+                init_state,
+                &bob_pub,
+                "bob".to_string(),
+                "alice".to_string(),
+            )
+            .unwrap();
+
+        let msg0 = alice.encrypt(b"Init").unwrap();
+
+        let alice_eph =
+            ClassicSuiteProvider::kem_public_key_from_bytes(msg0.dh_public_key.to_vec());
+        let rk_bob = X3DHProtocol::<ClassicSuiteProvider>::perform_as_responder(
+            &bob_priv,
+            &bob_spk_priv,
+            &alice_pub,
+            &alice_eph,
+            None,
+        )
+        .unwrap();
+
+        let (mut bob, _) =
+            DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
+                &rk_bob,
+                &bob_priv,
+                &msg0,
+                "alice".to_string(),
+                "bob".to_string(),
+            )
+            .unwrap();
+
+        // Bob sends a valid reply
+        let reply = bob.encrypt(b"Real reply").unwrap();
+
+        // Craft a corrupted message with Bob's DH key but garbage ciphertext.
+        // This triggers a DH ratchet in Alice (new remote DH key) + AEAD failure.
+        let mut corrupt = reply.clone();
+        corrupt.ciphertext = vec![0xDE; corrupt.ciphertext.len()];
+
+        // Alice tries to decrypt the corrupted message — should fail
+        assert!(alice.decrypt(&corrupt).is_err());
+
+        // Alice decrypts the REAL reply — should succeed because state was rolled back
+        let dec = alice.decrypt(&reply).unwrap();
+        assert_eq!(dec, b"Real reply");
     }
 }

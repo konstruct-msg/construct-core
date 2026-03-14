@@ -44,6 +44,14 @@ dictionary RegistrationBundleJson {
     string suite_id;
 };
 
+/// Result of a signed pre-key rotation.
+/// All byte fields are base64-encoded for cross-language compatibility.
+dictionary RotatedSpkBundle {
+    u32 key_id;
+    string public_key;    // base64 X25519 public key (32 bytes)
+    string signature;     // base64 Ed25519 signature over prologue || public_key (64 bytes)
+};
+
 dictionary EncryptedMessageComponents {
     sequence<u8> ephemeral_public_key;
     u32 message_number;
@@ -134,6 +142,13 @@ interface ClassicCryptoCore {
     void import_one_time_prekeys_json(string json);
 
     void set_local_user_id(string user_id);
+
+    /// Rotate the signed pre-key. Generates a new X25519 keypair, signs it with
+    /// the device Ed25519 signing key, updates internal state, and returns the
+    /// new public key + signature for atomic upload to the key server.
+    /// The old SPK is kept in memory for a grace period to decrypt in-flight messages.
+    [Throws=CryptoError]
+    RotatedSpkBundle rotate_signed_prekey();
 
     // ── Post-Quantum Session Strengthening ───────────────────────────────────
 

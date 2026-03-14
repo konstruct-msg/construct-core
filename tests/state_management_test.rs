@@ -112,7 +112,7 @@ fn test_out_of_order_delivery() {
     let (mut alice, mut bob) = setup_sessions();
 
     // Alice отправляет 6 сообщений
-    let mut messages: Vec<_> = (0..6)
+    let messages: Vec<_> = (0..6)
         .map(|i| {
             let plaintext = format!("Message {}", i);
             alice.encrypt(plaintext.as_bytes()).unwrap()

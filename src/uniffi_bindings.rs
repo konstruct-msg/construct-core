@@ -74,6 +74,14 @@ pub struct RegistrationBundleJson {
     pub suite_id: String,
 }
 
+/// Returned by rotate_signed_prekey() — new SPK data ready for server upload.
+#[derive(Debug, Clone)]
+pub struct RotatedSpkBundle {
+    pub key_id: u32,
+    pub public_key: String,  // base64 X25519 public key (32 bytes)
+    pub signature: String,   // base64 Ed25519 signature over prologue || public_key (64 bytes)
+}
+
 // Encrypted message components for wire format (matches server ChatMessage)
 // Note: We use UDL definition for UniFFI
 #[derive(Debug, Clone)]
@@ -832,6 +840,47 @@ impl ClassicCryptoCore {
         client
             .apply_pq_contribution_to_session(&contact_id, &kem_shared_secret)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+
+    /// Rotate the signed pre-key atomically.
+    ///
+    /// Generates a new X25519 keypair, signs it with the device Ed25519 signing key,
+    /// updates internal KeyManager state (old SPK kept for grace period decryption),
+    /// and returns the new public key + signature ready for upload to the key server.
+    ///
+    /// MUST be called before the client sends the RotateSignedPreKeyRequest RPC.
+    /// The server response confirms the rotation; the Keychain is updated by the
+    /// caller (Swift) after confirmation so the on-disk state stays in sync.
+    pub fn rotate_signed_prekey(&self) -> Result<RotatedSpkBundle, CryptoError> {
+        use base64::Engine;
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Rotate in Rust core — old SPK is moved to history, new one becomes current.
+        client
+            .key_manager_mut()
+            .rotate_signed_prekey()
+            .map_err(|_| CryptoError::InitializationFailed)?;
+
+        // Export the new SPK for upload.
+        let bundle = client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|_| CryptoError::InitializationFailed)?;
+
+        let key_id = client
+            .key_manager()
+            .current_signed_prekey_id()
+            .unwrap_or(1);
+
+        Ok(RotatedSpkBundle {
+            key_id,
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(&bundle.signed_prekey_public),
+            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
+        })
     }
 }
 

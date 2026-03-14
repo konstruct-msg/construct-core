@@ -218,6 +218,11 @@ impl<P: CryptoProvider> KeyManager<P> {
         })
     }
 
+    /// Return the current signed pre-key ID, or None if not initialized.
+    pub fn current_signed_prekey_id(&self) -> Option<u32> {
+        self.current_signed_prekey.as_ref().map(|s| s.key_id)
+    }
+
     /// Ротация signed prekey
     pub fn rotate_signed_prekey(&mut self) -> Result<()> {
         let (signing_key, _) = self.signing_key.as_ref().ok_or_else(|| {
