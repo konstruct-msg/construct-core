@@ -4,6 +4,7 @@ use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::crypto::SuiteID;
+pub use crate::orchestration::PlatformBridge;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -1754,4 +1755,23 @@ pub fn mlkem768_decapsulate(
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
         .map_err(|e| CryptoError::DecryptionFailed { message: e })
+}
+
+// ── Orchestration — Phase 0: PlatformBridge ──────────────────────────────────
+
+/// Verify that a `PlatformBridge` implementation correctly round-trips data
+/// through its secure store (save → load → compare).
+///
+/// Called from Swift integration tests to confirm that `PlatformBridgeImpl`
+/// (Keychain adapter) is wired up correctly before higher-level phases rely on it.
+///
+/// Returns `true` if the loaded bytes equal the saved bytes, `false` otherwise.
+pub fn test_platform_bridge_roundtrip(
+    bridge: Box<dyn PlatformBridge>,
+    key: String,
+    data: Vec<u8>,
+) -> Result<bool, CryptoError> {
+    bridge.save_to_secure_store(key.clone(), data.clone());
+    let loaded = bridge.load_from_secure_store(key);
+    Ok(loaded.as_deref() == Some(data.as_slice()))
 }

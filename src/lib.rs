@@ -11,6 +11,7 @@ pub mod config;
 pub mod crypto;
 pub mod device_id;
 pub mod error;
+pub mod orchestration;
 pub mod pow;
 pub mod storage;
 pub mod traffic_protection;

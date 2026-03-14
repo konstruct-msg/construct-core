@@ -303,4 +303,40 @@ namespace construct_core {
     /// Returns shared_secret to pass to ClassicCryptoCore.apply_pq_contribution.
     [Throws=CryptoError]
     sequence<u8> mlkem768_decapsulate(sequence<u8> secret_key, sequence<u8> ciphertext);
+
+    // ── Orchestration (Phase 0) ───────────────────────────────────────────────
+
+    /// Verify that a PlatformBridge implementation correctly round-trips a
+    /// save → load through the platform secure store.
+    /// Returns true if the loaded bytes equal the saved bytes.
+    [Throws=CryptoError]
+    boolean test_platform_bridge_roundtrip(PlatformBridge bridge, string key, bytes data);
+};
+
+// ============================================================================
+// Orchestration — PlatformBridge (Phase 0)
+// ============================================================================
+
+/// Callback interface implemented by Swift / Kotlin.
+///
+/// Rust orchestration logic is I/O-free: it calls through this bridge to
+/// request platform operations (Keychain, Core Data, os_log / Logcat).
+/// Each method is synchronous from Rust's perspective.
+callback interface PlatformBridge {
+    /// Persist `data` under `key` in the platform secure store (Keychain / Keystore).
+    void save_to_secure_store(string key, bytes data);
+
+    /// Retrieve data previously saved under `key`. Returns null if absent.
+    bytes? load_from_secure_store(string key);
+
+    /// Append / upsert a JSON record in the platform data store (Core Data / Room).
+    /// `table` is a logical table name; `json` is the record payload.
+    void persist_record(string table, string json);
+
+    /// Query the platform data store. Returns a JSON-encoded result or null.
+    string? query_record(string table, string query_json);
+
+    /// Emit a log entry through the platform logging system (os_log / Logcat).
+    /// `level` ∈ {"debug", "info", "warn", "error"}.
+    void log_event(string level, string tag, string message);
 };
