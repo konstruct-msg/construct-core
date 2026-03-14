@@ -16,6 +16,8 @@
 pub mod ack_store;
 pub mod actions;
 pub mod healing_queue;
+pub mod message_router;
+pub mod orchestrator;
 pub mod platform_bridge;
 pub mod pq_contribution;
 pub mod session_lifecycle;
@@ -23,6 +25,8 @@ pub mod session_lifecycle;
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus};
 pub use healing_queue::{HealingDecision, HealingQueue, HealingRecord};
+pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
+pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
 pub use pq_contribution::{
     DeferredContribution, EncapsulationResult, PQContributionManager, SPKRotationPending,
