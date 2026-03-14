@@ -3,7 +3,7 @@
 /// Rust принимает события, вычисляет решения и возвращает `Vec<Action>`.
 /// Платформенный слой исполняет каждое действие и при необходимости передаёт
 /// результат обратно через `IncomingEvent`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     // ── Cryptographic operations ──────────────────────────────────────────────
     DecryptMessage {
@@ -81,7 +81,7 @@ pub enum Action {
 }
 
 /// Delivery / read receipt status.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ReceiptStatus {
     Sent,
     Delivered,
@@ -92,7 +92,7 @@ pub enum ReceiptStatus {
 /// Event — входящее событие, поступающее в Rust-ядро от платформенного слоя.
 ///
 /// Платформа вызывает `Orchestrator::handle_event(event)` после каждого I/O результата.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum IncomingEvent {
     MessageReceived {
         from: String,

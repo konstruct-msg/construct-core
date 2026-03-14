@@ -105,6 +105,18 @@ impl Orchestrator {
         self.router.pending_count(contact_id)
     }
 
+    pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
+        self.lifecycle.ack_store.is_processed(message_id)
+    }
+
+    pub fn ack_mark_processed(&mut self, message_id: &str) -> Vec<crate::orchestration::Action> {
+        self.lifecycle.ack_store.mark_processed(message_id)
+    }
+
+    pub fn export_state_json(&self) -> Result<String, String> {
+        self.lifecycle.export_state_json()
+    }
+
     // ── Event handlers ────────────────────────────────────────────────────────
 
     fn handle_message_received(

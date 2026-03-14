@@ -340,3 +340,115 @@ callback interface PlatformBridge {
     /// `level` ∈ {"debug", "info", "warn", "error"}.
     void log_event(string level, string tag, string message);
 };
+
+// ============================================================================
+// Orchestration — Module Interfaces (Phases 1a, 1b, 2)
+// ============================================================================
+
+// ── AckCheckResult ────────────────────────────────────────────────────────────
+
+/// Result of checking whether a message has already been processed.
+enum AckCheckResult {
+    /// Definitely a duplicate — found in the in-memory cache.
+    "InCache",
+    /// Not in cache; caller must query the persistent store before deciding.
+    "NeedDbCheck",
+    /// Confirmed not a duplicate (after DB check returned nothing).
+    "NotProcessed",
+};
+
+/// Thread-safe ACK deduplication store.
+///
+/// Replaces Swift `PersistentACKStore`. The in-memory `HashSet` lives here;
+/// CoreData / Room persistence is requested via returned `Action` JSON strings.
+interface RustAckStore {
+    constructor();
+
+    /// Returns `InCache` if the hot-path cache contains `message_id`, else `NeedDbCheck`.
+    AckCheckResult is_processed(string message_id);
+
+    /// Mark `message_id` as processed.  Returns a JSON-encoded `Action` array
+    /// (typically a single `PersistMessage` action) that the platform must execute.
+    string mark_processed(string message_id);
+
+    /// Returns a JSON-encoded `Action` requesting the platform to delete expired records.
+    string prune_expired();
+
+    /// Current in-memory cache size (diagnostic).
+    u64 cache_len();
+};
+
+// ── HealingDecision ───────────────────────────────────────────────────────────
+
+/// Packed result of `RustHealingQueue.record_attempt`.
+dictionary HealingAttemptResult {
+    /// "retry_allowed" | "max_attempts_reached" | "not_found"
+    string decision;
+    /// 1-based attempt number (valid when decision == "retry_allowed").
+    u32 attempt;
+};
+
+/// Thread-safe session healing queue.
+///
+/// Replaces Swift `SessionHealingService`.
+interface RustHealingQueue {
+    constructor();
+
+    /// `true` iff `msg_number == 0` — the only case eligible for healing.
+    boolean can_heal(u32 msg_number);
+
+    /// Enqueue `message_json` for `contact_id` (idempotent).
+    /// Returns JSON-encoded `Action` array for persistence.
+    string enqueue(string contact_id, string message_json);
+
+    /// Increment attempt counter for `contact_id`.
+    HealingAttemptResult record_attempt(string contact_id);
+
+    /// Remove the healing record after successful re-key.
+    boolean remove_record(string contact_id);
+
+    /// Returns JSON-encoded `Action` array to delete expired records.
+    string prune_expired();
+
+    /// Number of pending healing records.
+    u64 len();
+};
+
+// ── OrchestratorCore ──────────────────────────────────────────────────────────
+
+/// Top-level orchestration facade.
+///
+/// Swift / Kotlin call `handle_event_json` with a JSON-encoded `IncomingEvent`
+/// and receive a JSON-encoded `Vec<Action>`. All I/O is delegated back to the
+/// platform via these `Action` values.
+///
+/// Replaces: CryptoManager + MessageRouter + SessionCoordinator + SessionHealingService
+///           + PersistentACKStore + PQCKeyManager + SessionInitializationService.
+interface OrchestratorCore {
+    /// Construct from an existing `ClassicCryptoCore` key JSON export and a
+    /// `PlatformBridge` implementation.
+    [Throws=CryptoError]
+    constructor(string keys_json, string my_user_id);
+
+    /// Unified event handler.
+    ///
+    /// `event_json` — JSON-encoded `IncomingEvent` (see Rust `orchestration::actions`).
+    /// Returns a JSON array of `Action` objects for the platform to execute.
+    [Throws=CryptoError]
+    sequence<string> handle_event_json(string event_json);
+
+    // ── Direct query helpers (used during incremental migration) ──────────────
+
+    /// Check if a message ID is in the in-memory ACK cache.
+    AckCheckResult ack_is_processed(string message_id);
+
+    /// Mark a message as processed in the ACK cache. Returns action JSON.
+    string ack_mark_processed(string message_id);
+
+    /// `true` iff `msg_number == 0` (healing-eligible message).
+    boolean healing_can_heal(u32 msg_number);
+
+    /// Export non-crypto orchestration state to JSON.
+    [Throws=CryptoError]
+    string export_state_json();
+};

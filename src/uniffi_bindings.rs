@@ -1775,3 +1775,263 @@ pub fn test_platform_bridge_roundtrip(
     let loaded = bridge.load_from_secure_store(key);
     Ok(loaded.as_deref() == Some(data.as_slice()))
 }
+
+// ── Orchestration — RustAckStore (Phase 1a) ───────────────────────────────────
+
+pub struct RustAckStore {
+    inner: std::sync::Mutex<crate::orchestration::AckStore>,
+}
+
+impl RustAckStore {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(crate::orchestration::AckStore::default()),
+        }
+    }
+
+    pub fn is_processed(&self, message_id: String) -> AckCheckResult {
+        let store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match store.is_processed(&message_id) {
+            crate::orchestration::AckCheckResult::InCache => AckCheckResult::InCache,
+            crate::orchestration::AckCheckResult::NeedDbCheck => AckCheckResult::NeedDbCheck,
+            crate::orchestration::AckCheckResult::NotProcessed => AckCheckResult::NotProcessed,
+        }
+    }
+
+    pub fn mark_processed(&self, message_id: String) -> String {
+        let mut store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = store.mark_processed(&message_id);
+        actions_to_json(&actions)
+    }
+
+    pub fn prune_expired(&self) -> String {
+        let store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = store.prune_expired();
+        actions_to_json(&actions)
+    }
+
+    pub fn cache_len(&self) -> u64 {
+        let store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        store.cache_len() as u64
+    }
+}
+
+/// Mirror of the UDL `AckCheckResult` enum (must match UDL name exactly).
+pub enum AckCheckResult {
+    InCache,
+    NeedDbCheck,
+    NotProcessed,
+}
+
+// ── Orchestration — RustHealingQueue (Phase 1b) ───────────────────────────────
+
+pub struct RustHealingQueue {
+    inner: std::sync::Mutex<crate::orchestration::HealingQueue>,
+}
+
+impl RustHealingQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(crate::orchestration::HealingQueue::default()),
+        }
+    }
+
+    pub fn can_heal(&self, msg_number: u32) -> bool {
+        crate::orchestration::HealingQueue::can_heal(msg_number)
+    }
+
+    pub fn enqueue(&self, contact_id: String, message_json: String) -> String {
+        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = queue.enqueue(&contact_id, &message_json);
+        actions_to_json(&actions)
+    }
+
+    pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {
+        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match queue.record_attempt(&contact_id) {
+            crate::orchestration::HealingDecision::RetryAllowed { attempt } => {
+                HealingAttemptResult {
+                    decision: "retry_allowed".to_string(),
+                    attempt,
+                }
+            }
+            crate::orchestration::HealingDecision::MaxAttemptsReached => HealingAttemptResult {
+                decision: "max_attempts_reached".to_string(),
+                attempt: 0,
+            },
+            crate::orchestration::HealingDecision::NotFound => HealingAttemptResult {
+                decision: "not_found".to_string(),
+                attempt: 0,
+            },
+        }
+    }
+
+    pub fn remove_record(&self, contact_id: String) -> bool {
+        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        queue.remove(&contact_id)
+    }
+
+    pub fn prune_expired(&self) -> String {
+        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = queue.prune_expired();
+        actions_to_json(&actions)
+    }
+
+    pub fn len(&self) -> u64 {
+        let queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        queue.len() as u64
+    }
+}
+
+/// Mirror of UDL `HealingAttemptResult` dictionary.
+pub struct HealingAttemptResult {
+    pub decision: String,
+    pub attempt: u32,
+}
+
+// ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
+
+pub struct OrchestratorCore {
+    inner: std::sync::Mutex<crate::orchestration::Orchestrator>,
+}
+
+impl OrchestratorCore {
+    pub fn new(keys_json: String, my_user_id: String) -> Result<Self, CryptoError> {
+        let _ = crate::config::Config::init();
+
+        let private_keys: PrivateKeysJson =
+            serde_json::from_str(&keys_json).map_err(|_| CryptoError::SerializationFailed)?;
+
+        let identity_secret = base64::engine::general_purpose::STANDARD
+            .decode(&private_keys.identity_secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let signing_secret = base64::engine::general_purpose::STANDARD
+            .decode(&private_keys.signing_secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let prekey_secret = base64::engine::general_purpose::STANDARD
+            .decode(&private_keys.signed_prekey_secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let prekey_signature = base64::engine::general_purpose::STANDARD
+            .decode(&private_keys.prekey_signature)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+
+        let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+            identity_secret,
+            signing_secret,
+            prekey_secret,
+            prekey_signature,
+        )
+        .map_err(|_| CryptoError::InitializationFailed)?;
+
+        let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
+        Ok(Self {
+            inner: std::sync::Mutex::new(orchestrator),
+        })
+    }
+
+    pub fn handle_event_json(&self, event_json: String) -> Result<Vec<String>, CryptoError> {
+        let event = serde_json::from_str::<crate::orchestration::IncomingEvent>(&event_json)
+            .map_err(|e| CryptoError::SessionInitializationFailed {
+                message: format!("invalid event JSON: {}", e),
+            })?;
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = orch.handle_event(event);
+        Ok(actions.iter().map(action_to_json).collect())
+    }
+
+    pub fn ack_is_processed(&self, message_id: String) -> AckCheckResult {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match orch.ack_is_processed(&message_id) {
+            crate::orchestration::AckCheckResult::InCache => AckCheckResult::InCache,
+            crate::orchestration::AckCheckResult::NeedDbCheck => AckCheckResult::NeedDbCheck,
+            crate::orchestration::AckCheckResult::NotProcessed => AckCheckResult::NotProcessed,
+        }
+    }
+
+    pub fn ack_mark_processed(&self, message_id: String) -> String {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = orch.ack_mark_processed(&message_id);
+        actions_to_json(&actions)
+    }
+
+    pub fn healing_can_heal(&self, msg_number: u32) -> bool {
+        crate::orchestration::HealingQueue::can_heal(msg_number)
+    }
+
+    pub fn export_state_json(&self) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_state_json()
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+}
+
+// ── JSON serialization helpers ────────────────────────────────────────────────
+
+fn actions_to_json(actions: &[crate::orchestration::Action]) -> String {
+    let values: Vec<serde_json::Value> = actions.iter().map(|a| action_value(a)).collect();
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn action_to_json(action: &crate::orchestration::Action) -> String {
+    serde_json::to_string(&action_value(action)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
+    use crate::orchestration::Action;
+    match action {
+        Action::SaveSessionToSecureStore { key, data } => serde_json::json!({
+            "type": "SaveSessionToSecureStore", "key": key, "data": data
+        }),
+        Action::LoadSessionFromSecureStore { key } => serde_json::json!({
+            "type": "LoadSessionFromSecureStore", "key": key
+        }),
+        Action::PersistMessage { message_json } => serde_json::json!({
+            "type": "PersistMessage", "message_json": message_json
+        }),
+        Action::MarkMessageDelivered { message_id } => serde_json::json!({
+            "type": "MarkMessageDelivered", "message_id": message_id
+        }),
+        Action::FetchPublicKeyBundle { user_id } => serde_json::json!({
+            "type": "FetchPublicKeyBundle", "user_id": user_id
+        }),
+        Action::SendEncryptedMessage { to, payload } => serde_json::json!({
+            "type": "SendEncryptedMessage", "to": to, "payload": payload
+        }),
+        Action::SendReceipt { message_id, status } => serde_json::json!({
+            "type": "SendReceipt", "message_id": message_id, "status": format!("{:?}", status)
+        }),
+        Action::SendEndSession { contact_id } => serde_json::json!({
+            "type": "SendEndSession", "contact_id": contact_id
+        }),
+        Action::NotifyNewMessage { chat_id, preview } => serde_json::json!({
+            "type": "NotifyNewMessage", "chat_id": chat_id, "preview": preview
+        }),
+        Action::NotifySessionCreated { contact_id } => serde_json::json!({
+            "type": "NotifySessionCreated", "contact_id": contact_id
+        }),
+        Action::NotifyError { code, message } => serde_json::json!({
+            "type": "NotifyError", "code": code, "message": message
+        }),
+        Action::ScheduleTimer { timer_id, delay_ms } => serde_json::json!({
+            "type": "ScheduleTimer", "timer_id": timer_id, "delay_ms": delay_ms
+        }),
+        Action::CancelTimer { timer_id } => serde_json::json!({
+            "type": "CancelTimer", "timer_id": timer_id
+        }),
+        Action::DecryptMessage { contact_id, ciphertext } => serde_json::json!({
+            "type": "DecryptMessage", "contact_id": contact_id, "ciphertext": ciphertext
+        }),
+        Action::EncryptMessage { contact_id, plaintext } => serde_json::json!({
+            "type": "EncryptMessage", "contact_id": contact_id, "plaintext": plaintext
+        }),
+        Action::InitSession { contact_id, bundle_json } => serde_json::json!({
+            "type": "InitSession", "contact_id": contact_id, "bundle_json": bundle_json
+        }),
+        Action::ApplyPQContribution { contact_id, kem_ss } => serde_json::json!({
+            "type": "ApplyPQContribution", "contact_id": contact_id, "kem_ss": kem_ss
+        }),
+        Action::ArchiveSession { contact_id } => serde_json::json!({
+            "type": "ArchiveSession", "contact_id": contact_id
+        }),
+    }
+}
