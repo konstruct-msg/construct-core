@@ -2035,3 +2035,37 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         }),
     }
 }
+
+// ── Orchestration — RustPQContributions (Phase 2 / M3) ───────────────────────
+
+pub struct RustPQContributions {
+    inner: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl RustPQContributions {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn store_deferred(&self, contact_id: String, shared_secret: Vec<u8>) {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.insert(contact_id, shared_secret);
+    }
+
+    pub fn take_deferred(&self, contact_id: String) -> Option<Vec<u8>> {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&contact_id)
+    }
+
+    pub fn clear(&self, contact_id: String) {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&contact_id);
+    }
+
+    pub fn has_pending(&self, contact_id: String) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.contains_key(&contact_id)
+    }
+}

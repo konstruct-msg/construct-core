@@ -452,3 +452,28 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     string export_state_json();
 };
+
+// ── RustPQContributions ───────────────────────────────────────────────────────
+
+/// Thread-safe store for deferred PQXDH shared secrets.
+///
+/// Replaces `pendingPQContributions: [String: [UInt8]] + NSLock` in PQCKeyManager.
+///
+/// Protocol: encapsulate (session init) → store SS here → encrypt msg0 with
+/// classic-only DR state → consume SS here → applyPqContribution to DR session.
+/// Both sides must apply PQ at the same moment; if consume returns null, skip PQ.
+interface RustPQContributions {
+    constructor();
+
+    /// Store the KEM shared secret for `contact_id`.
+    void store_deferred(string contact_id, sequence<u8> shared_secret);
+
+    /// Remove and return the stored shared secret. Returns null if not found.
+    sequence<u8>? take_deferred(string contact_id);
+
+    /// Discard any pending contribution (e.g. on send failure).
+    void clear(string contact_id);
+
+    /// `true` if a deferred contribution exists for `contact_id`.
+    boolean has_pending(string contact_id);
+};
