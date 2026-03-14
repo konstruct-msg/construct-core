@@ -1963,6 +1963,158 @@ impl OrchestratorCore {
         orch.export_state_json()
             .map_err(|_| CryptoError::SerializationFailed)
     }
+
+    // ── Session crypto delegates ──────────────────────────────────────────────
+
+    pub fn export_private_keys_json(&self) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_private_keys_json_str()
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn export_registration_bundle_json(&self) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_registration_bundle_json_str()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.sign_bundle_bytes(&bundle_data_json)
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    pub fn export_session_json(&self, contact_id: String) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_session_json_for(&contact_id)
+            .map_err(|_| CryptoError::SessionNotFound)
+    }
+
+    pub fn import_session_json(
+        &self,
+        contact_id: String,
+        session_json: String,
+    ) -> Result<String, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_session_json(&contact_id, &session_json)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn get_all_session_contact_ids(&self) -> Vec<String> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.get_all_session_contact_ids()
+    }
+
+    pub fn has_session(&self, contact_id: String) -> bool {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.has_active_session(&contact_id)
+    }
+
+    pub fn init_session(
+        &self,
+        contact_id: String,
+        recipient_bundle: Vec<u8>,
+    ) -> Result<String, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.init_session_with_bundle(&contact_id, &recipient_bundle)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+
+    pub fn init_receiving_session(
+        &self,
+        contact_id: String,
+        recipient_bundle: Vec<u8>,
+        first_message: Vec<u8>,
+    ) -> Result<SessionInitResult, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (session_id, plaintext) = orch
+            .init_receiving_session_with_msg(&contact_id, &recipient_bundle, &first_message)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
+        let decrypted_message =
+            String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptionFailed {
+                message: format!("UTF-8: {}", e),
+            })?;
+        Ok(SessionInitResult { session_id, decrypted_message })
+    }
+
+    pub fn encrypt_message(
+        &self,
+        contact_id: String,
+        plaintext: String,
+    ) -> Result<EncryptedMessageComponents, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (ephemeral_public_key, message_number, content, one_time_prekey_id) = orch
+            .encrypt_message_for(&contact_id, &plaintext)
+            .map_err(|e| CryptoError::EncryptionFailed { message: e })?;
+        Ok(EncryptedMessageComponents { ephemeral_public_key, message_number, content, one_time_prekey_id })
+    }
+
+    pub fn decrypt_message(
+        &self,
+        contact_id: String,
+        ephemeral_public_key: Vec<u8>,
+        message_number: u32,
+        content: String,
+    ) -> Result<String, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)
+            .map_err(|e| CryptoError::DecryptionFailed { message: e })
+    }
+
+    pub fn remove_session(&self, contact_id: String) -> bool {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.remove_session_by_contact(&contact_id)
+    }
+
+    pub fn prekeys_available_count(&self) -> u32 {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.prekeys_available()
+    }
+
+    pub fn generate_one_time_prekeys(&self, count: u32) -> Result<Vec<OtpkPair>, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let pairs = orch.generate_otpks(count).map_err(|_| CryptoError::InitializationFailed)?;
+        Ok(pairs.into_iter().map(|(key_id, public_key)| OtpkPair { key_id, public_key }).collect())
+    }
+
+    pub fn one_time_prekey_count(&self) -> u32 {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.otpk_count()
+    }
+
+    pub fn export_one_time_prekeys_json(&self) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_otpks_json()
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_otpks_json(&json)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn set_local_user_id(&self, user_id: String) {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.set_my_user_id(user_id);
+    }
+
+    pub fn rotate_signed_prekey(&self) -> Result<RotatedSpkBundle, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (key_id, public_key, signature) =
+            orch.rotate_spk().map_err(|_| CryptoError::InitializationFailed)?;
+        Ok(RotatedSpkBundle { key_id, public_key, signature })
+    }
+
+    pub fn apply_pq_contribution(
+        &self,
+        contact_id: String,
+        kem_shared_secret: Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.apply_pq_contribution_delegate(&contact_id, &kem_shared_secret)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
 }
 
 // ── JSON serialization helpers ────────────────────────────────────────────────

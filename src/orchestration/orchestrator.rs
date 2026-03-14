@@ -18,6 +18,7 @@ use crate::orchestration::actions::{Action, IncomingEvent};
 use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::crypto::client_api::ClassicClient;
+use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -115,6 +116,376 @@ impl Orchestrator {
 
     pub fn export_state_json(&self) -> Result<String, String> {
         self.lifecycle.export_state_json()
+    }
+
+    // ── Session-crypto delegates ──────────────────────────────────────────────
+
+    pub fn get_all_session_contact_ids(&self) -> Vec<String> {
+        self.lifecycle.client.active_contacts()
+    }
+
+    pub fn init_session_with_bundle(
+        &mut self,
+        contact_id: &str,
+        recipient_bundle: &[u8],
+    ) -> Result<String, String> {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+        use crate::crypto::SuiteID;
+
+        #[derive(serde::Deserialize)]
+        struct KeyBundle {
+            identity_public: Vec<u8>,
+            signed_prekey_public: Vec<u8>,
+            signature: Vec<u8>,
+            verifying_key: Vec<u8>,
+            suite_id: u16,
+            #[serde(default)]
+            one_time_prekey_public: Option<Vec<u8>>,
+            #[serde(default)]
+            one_time_prekey_id: Option<u32>,
+        }
+
+        let bundle_str =
+            std::str::from_utf8(recipient_bundle).map_err(|_| "invalid UTF-8 in bundle".to_string())?;
+        let key_bundle: KeyBundle =
+            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+
+        let public_bundle = X3DHPublicKeyBundle {
+            identity_public: key_bundle.identity_public.clone(),
+            signed_prekey_public: key_bundle.signed_prekey_public.clone(),
+            signature: key_bundle.signature.clone(),
+            verifying_key: key_bundle.verifying_key.clone(),
+            suite_id: SuiteID::new(key_bundle.suite_id)
+                .map_err(|_| "invalid suite_id".to_string())?,
+            one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
+            one_time_prekey_id: key_bundle.one_time_prekey_id,
+        };
+
+        let remote_identity =
+            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
+        let one_time_prekey_id = key_bundle.one_time_prekey_id.unwrap_or(0);
+
+        self.lifecycle
+            .client
+            .init_session(contact_id, &public_bundle, &remote_identity, one_time_prekey_id)
+            .map_err(|e| e.to_string())?;
+
+        Ok(contact_id.to_string())
+    }
+
+    pub fn init_receiving_session_with_msg(
+        &mut self,
+        contact_id: &str,
+        recipient_bundle: &[u8],
+        first_message: &[u8],
+    ) -> Result<(String, Vec<u8>), String> {
+        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+
+        #[derive(serde::Deserialize)]
+        struct KeyBundle {
+            identity_public: Vec<u8>,
+            suite_id: u16,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct FirstMsg {
+            ephemeral_public_key: Vec<u8>,
+            message_number: u32,
+            content: String,
+            #[serde(default)]
+            one_time_prekey_id: u32,
+        }
+
+        let bundle_str =
+            std::str::from_utf8(recipient_bundle).map_err(|_| "invalid UTF-8 in bundle".to_string())?;
+        let key_bundle: KeyBundle =
+            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+
+        let msg_str =
+            std::str::from_utf8(first_message).map_err(|_| "invalid UTF-8 in first message".to_string())?;
+        let first_msg: FirstMsg =
+            serde_json::from_str(msg_str).map_err(|_| "invalid first message JSON".to_string())?;
+
+        use base64::Engine as _;
+        let sealed_box = base64::engine::general_purpose::STANDARD
+            .decode(&first_msg.content)
+            .map_err(|_| "invalid base64 content".to_string())?;
+
+        if sealed_box.len() < 12 {
+            return Err("sealed_box too short".to_string());
+        }
+        let nonce = sealed_box[..12].to_vec();
+        let ciphertext = sealed_box[12..].to_vec();
+
+        let dh_public_key: [u8; 32] = first_msg
+            .ephemeral_public_key
+            .clone()
+            .try_into()
+            .map_err(|_| "ephemeral_public_key must be 32 bytes".to_string())?;
+
+        let encrypted_first_message = EncryptedRatchetMessage {
+            dh_public_key,
+            message_number: first_msg.message_number,
+            ciphertext,
+            nonce,
+            previous_chain_length: 0,
+            suite_id: key_bundle.suite_id,
+        };
+
+        let remote_identity =
+            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
+        let remote_ephemeral =
+            ClassicSuiteProvider::kem_public_key_from_bytes(first_msg.ephemeral_public_key.clone());
+
+        let (_session_id, plaintext) = self
+            .lifecycle
+            .client
+            .init_receiving_session_with_ephemeral(
+                contact_id,
+                &remote_identity,
+                &remote_ephemeral,
+                &encrypted_first_message,
+                first_msg.one_time_prekey_id,
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok((contact_id.to_string(), plaintext))
+    }
+
+    pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
+        self.lifecycle.export_session_json_for(contact_id)
+    }
+
+    pub fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
+        self.lifecycle.import_session_json(contact_id, json)
+    }
+
+    pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
+        self.lifecycle.client.remove_session(contact_id)
+    }
+
+    pub fn export_private_keys_json_str(&self) -> Result<String, String> {
+        use base64::Engine as _;
+        let km = self.lifecycle.client.key_manager();
+        let identity_secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
+        let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
+
+        let identity_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
+        let signing_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
+        let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
+
+        use base64::engine::general_purpose::STANDARD;
+        let json = serde_json::json!({
+            "identity_secret": STANDARD.encode(&identity_bytes),
+            "signing_secret": STANDARD.encode(&signing_bytes),
+            "signed_prekey_secret": STANDARD.encode(&prekey_secret_bytes),
+            "prekey_signature": STANDARD.encode(&prekey.signature),
+            "suite_id": "1"
+        });
+        serde_json::to_string(&json).map_err(|e| e.to_string())
+    }
+
+    pub fn export_registration_bundle_json_str(&self) -> Result<String, String> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let bundle = self
+            .lifecycle
+            .client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|e| e.to_string())?;
+
+        let json = serde_json::json!({
+            "identity_public": STANDARD.encode(&bundle.identity_public),
+            "signed_prekey_public": STANDARD.encode(&bundle.signed_prekey_public),
+            "signature": STANDARD.encode(&bundle.signature),
+            "verifying_key": STANDARD.encode(&bundle.verifying_key),
+            "suite_id": bundle.suite_id.as_u16().to_string()
+        });
+        serde_json::to_string(&json).map_err(|e| e.to_string())
+    }
+
+    pub fn sign_bundle_bytes(&self, data: &[u8]) -> Result<String, String> {
+        use base64::Engine as _;
+        let signature = self
+            .lifecycle
+            .client
+            .key_manager()
+            .sign(data)
+            .map_err(|e| e.to_string())?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&signature))
+    }
+
+    pub fn set_my_user_id(&mut self, user_id: String) {
+        self.lifecycle.client.set_local_user_id(user_id);
+    }
+
+    pub fn prekeys_available(&self) -> u32 {
+        let old = self.lifecycle.client.key_manager().old_prekeys_count();
+        (old + 1) as u32
+    }
+
+    /// Returns `(key_id, public_key_bytes)` pairs for the new OTPKs.
+    pub fn generate_otpks(&mut self, count: u32) -> Result<Vec<(u32, Vec<u8>)>, String> {
+        self.lifecycle
+            .client
+            .generate_one_time_prekeys(count)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn otpk_count(&self) -> u32 {
+        self.lifecycle.client.one_time_prekey_count() as u32
+    }
+
+    pub fn export_otpks_json(&self) -> Result<String, String> {
+        #[derive(serde::Serialize)]
+        struct OtpkRecord {
+            key_id: u32,
+            private_key: Vec<u8>,
+            public_key: Vec<u8>,
+        }
+        let records: Vec<OtpkRecord> = self
+            .lifecycle
+            .client
+            .export_one_time_prekeys()
+            .into_iter()
+            .map(|(key_id, private_key, public_key)| OtpkRecord { key_id, private_key, public_key })
+            .collect();
+        serde_json::to_string(&records).map_err(|e| e.to_string())
+    }
+
+    pub fn import_otpks_json(&mut self, json: &str) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        struct OtpkRecord {
+            key_id: u32,
+            private_key: Vec<u8>,
+            public_key: Vec<u8>,
+        }
+        let records: Vec<OtpkRecord> =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = records
+            .into_iter()
+            .map(|r| (r.key_id, r.private_key, r.public_key))
+            .collect();
+        self.lifecycle.client.import_one_time_prekeys(keys);
+        Ok(())
+    }
+
+    /// Returns `(key_id, public_key_b64, signature_b64)`.
+    pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .rotate_signed_prekey()
+            .map_err(|e| e.to_string())?;
+
+        let bundle = self
+            .lifecycle
+            .client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|e| e.to_string())?;
+
+        let key_id = self
+            .lifecycle
+            .client
+            .key_manager()
+            .current_signed_prekey_id()
+            .unwrap_or(1);
+
+        Ok((
+            key_id,
+            STANDARD.encode(&bundle.signed_prekey_public),
+            STANDARD.encode(&bundle.signature),
+        ))
+    }
+
+    pub fn apply_pq_contribution_delegate(
+        &mut self,
+        contact_id: &str,
+        kem_shared_secret: &[u8],
+    ) -> Result<(), String> {
+        self.lifecycle
+            .client
+            .apply_pq_contribution_to_session(contact_id, kem_shared_secret)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Returns `(ephemeral_public_key, message_number, content_b64, one_time_prekey_id)`.
+    pub fn encrypt_message_for(
+        &mut self,
+        contact_id: &str,
+        plaintext: &str,
+    ) -> Result<(Vec<u8>, u32, String, u32), String> {
+        use base64::Engine as _;
+        let encrypted = self
+            .lifecycle
+            .client
+            .encrypt_message(contact_id, plaintext.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        let mut sealed_box = Vec::new();
+        sealed_box.extend_from_slice(&encrypted.nonce);
+        sealed_box.extend_from_slice(&encrypted.ciphertext);
+
+        let one_time_prekey_id = if encrypted.message_number == 0 {
+            self.lifecycle.client.take_pending_otpk_id(contact_id)
+        } else {
+            0
+        };
+
+        Ok((
+            encrypted.dh_public_key.to_vec(),
+            encrypted.message_number,
+            base64::engine::general_purpose::STANDARD.encode(&sealed_box),
+            one_time_prekey_id,
+        ))
+    }
+
+    pub fn decrypt_message_for(
+        &mut self,
+        contact_id: &str,
+        ephemeral_public_key: Vec<u8>,
+        message_number: u32,
+        content: &str,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+
+        let sealed_box = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .map_err(|_| "invalid base64 content".to_string())?;
+
+        if sealed_box.len() < 12 {
+            return Err("sealed_box too short".to_string());
+        }
+        let nonce = sealed_box[..12].to_vec();
+        let ciphertext = sealed_box[12..].to_vec();
+
+        let dh_public_key: [u8; 32] = ephemeral_public_key
+            .try_into()
+            .map_err(|_| "ephemeral_public_key must be 32 bytes".to_string())?;
+
+        let encrypted_message = EncryptedRatchetMessage {
+            dh_public_key,
+            message_number,
+            ciphertext,
+            nonce,
+            previous_chain_length: 0,
+            suite_id: crate::config::Config::global().classic_suite_id,
+        };
+
+        let plaintext = self
+            .lifecycle
+            .client
+            .decrypt_message(contact_id, &encrypted_message)
+            .map_err(|e| e.to_string())?;
+
+        String::from_utf8(plaintext)
+            .map_err(|e| format!("UTF-8 conversion failed: {}", e))
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────

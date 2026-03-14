@@ -451,6 +451,62 @@ interface OrchestratorCore {
     /// Export non-crypto orchestration state to JSON.
     [Throws=CryptoError]
     string export_state_json();
+
+    // ── Session crypto (delegation from ClassicCryptoCore) ───────────────────
+
+    [Throws=CryptoError]
+    string export_private_keys_json();
+
+    [Throws=CryptoError]
+    string export_registration_bundle_json();
+
+    [Throws=CryptoError]
+    string sign_bundle_data(sequence<u8> bundle_data_json);
+
+    [Throws=CryptoError]
+    string export_session_json(string contact_id);
+
+    [Throws=CryptoError]
+    string import_session_json(string contact_id, string session_json);
+
+    sequence<string> get_all_session_contact_ids();
+
+    boolean has_session(string contact_id);
+
+    [Throws=CryptoError]
+    string init_session(string contact_id, sequence<u8> recipient_bundle);
+
+    [Throws=CryptoError]
+    SessionInitResult init_receiving_session(string contact_id, sequence<u8> recipient_bundle, sequence<u8> first_message);
+
+    [Throws=CryptoError]
+    EncryptedMessageComponents encrypt_message(string contact_id, string plaintext);
+
+    [Throws=CryptoError]
+    string decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, string content);
+
+    boolean remove_session(string contact_id);
+
+    u32 prekeys_available_count();
+
+    [Throws=CryptoError]
+    sequence<OtpkPair> generate_one_time_prekeys(u32 count);
+
+    u32 one_time_prekey_count();
+
+    [Throws=CryptoError]
+    string export_one_time_prekeys_json();
+
+    [Throws=CryptoError]
+    void import_one_time_prekeys_json(string json);
+
+    void set_local_user_id(string user_id);
+
+    [Throws=CryptoError]
+    RotatedSpkBundle rotate_signed_prekey();
+
+    [Throws=CryptoError]
+    void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
 };
 
 // ── RustPQContributions ───────────────────────────────────────────────────────

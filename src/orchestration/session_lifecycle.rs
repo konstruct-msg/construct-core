@@ -368,7 +368,7 @@ impl SessionLifecycleManager {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
+    pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
         let session = self
             .client
             .get_session(contact_id)
@@ -377,7 +377,7 @@ impl SessionLifecycleManager {
         serde_json::to_string(&serializable).map_err(|e| format!("serialize session: {}", e))
     }
 
-    fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
+    pub fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
         let serializable: SerializableSession =
