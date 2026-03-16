@@ -14,12 +14,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::orchestration::actions::{Action, IncomingEvent};
-use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
-use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
+use crate::orchestration::actions::{Action, IncomingEvent};
+use crate::orchestration::message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
+use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -27,6 +27,7 @@ use crate::crypto::suites::classic::ClassicSuiteProvider;
 const END_SESSION_COOLDOWN_MS: u64 = 5_000;
 
 /// Minimum time between prewarm attempts for the same contact (ms).
+#[allow(dead_code)]
 const PREWARM_COOLDOWN_MS: u64 = 30_000;
 
 // ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ pub struct Orchestrator {
     /// contactId → Unix ms of last END_SESSION / prewarm (anti-loop cooldown).
     cooldowns: HashMap<String, u64>,
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
+    #[allow(dead_code)]
     prewarm_done: HashSet<String>,
 }
 
@@ -65,30 +67,30 @@ impl Orchestrator {
     /// results back via further `handle_event` calls.
     pub fn handle_event(&mut self, event: IncomingEvent) -> Vec<Action> {
         match event {
-            IncomingEvent::MessageReceived { from, data, msg_num, kem_ct, otpk_id } => {
-                self.handle_message_received(from, data, msg_num, kem_ct, otpk_id)
-            }
-            IncomingEvent::SessionInitCompleted { contact_id, session_json } => {
-                self.handle_session_init_completed(contact_id, session_json)
-            }
-            IncomingEvent::AckReceived { message_id } => {
-                self.handle_ack_received(message_id)
-            }
-            IncomingEvent::SessionLoaded { key, data } => {
-                self.handle_session_loaded(key, data)
-            }
-            IncomingEvent::KeyBundleFetched { user_id, bundle_json } => {
-                self.handle_key_bundle_fetched(user_id, bundle_json)
-            }
-            IncomingEvent::NetworkReconnected => {
-                self.handle_network_reconnected()
-            }
-            IncomingEvent::AppLaunched => {
-                self.handle_app_launched()
-            }
-            IncomingEvent::TimerFired { timer_id } => {
-                self.handle_timer_fired(timer_id)
-            }
+            IncomingEvent::MessageReceived {
+                message_id,
+                from,
+                data,
+                msg_num,
+                kem_ct,
+                otpk_id,
+                is_control,
+            } => self.handle_message_received(
+                message_id, from, data, msg_num, kem_ct, otpk_id, is_control,
+            ),
+            IncomingEvent::SessionInitCompleted {
+                contact_id,
+                session_json,
+            } => self.handle_session_init_completed(contact_id, session_json),
+            IncomingEvent::AckReceived { message_id } => self.handle_ack_received(message_id),
+            IncomingEvent::SessionLoaded { key, data } => self.handle_session_loaded(key, data),
+            IncomingEvent::KeyBundleFetched {
+                user_id,
+                bundle_json,
+            } => self.handle_key_bundle_fetched(user_id, bundle_json),
+            IncomingEvent::NetworkReconnected => self.handle_network_reconnected(),
+            IncomingEvent::AppLaunched => self.handle_app_launched(),
+            IncomingEvent::TimerFired { timer_id } => self.handle_timer_fired(timer_id),
         }
     }
 
@@ -143,10 +145,18 @@ impl Orchestrator {
             one_time_prekey_public: Option<Vec<u8>>,
             #[serde(default)]
             one_time_prekey_id: Option<u32>,
+            #[serde(default)]
+            spk_uploaded_at: Option<u64>,
+            #[serde(default)]
+            spk_rotation_epoch: Option<u32>,
+            #[serde(default)]
+            kyber_spk_uploaded_at: Option<u64>,
+            #[serde(default)]
+            kyber_spk_rotation_epoch: Option<u32>,
         }
 
-        let bundle_str =
-            std::str::from_utf8(recipient_bundle).map_err(|_| "invalid UTF-8 in bundle".to_string())?;
+        let bundle_str = std::str::from_utf8(recipient_bundle)
+            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
         let key_bundle: KeyBundle =
             serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
 
@@ -159,15 +169,32 @@ impl Orchestrator {
                 .map_err(|_| "invalid suite_id".to_string())?,
             one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
             one_time_prekey_id: key_bundle.one_time_prekey_id,
+            spk_uploaded_at: key_bundle.spk_uploaded_at.unwrap_or(0),
+            spk_rotation_epoch: key_bundle.spk_rotation_epoch.unwrap_or(0),
+            kyber_spk_uploaded_at: key_bundle.kyber_spk_uploaded_at.unwrap_or(0),
+            kyber_spk_rotation_epoch: key_bundle.kyber_spk_rotation_epoch.unwrap_or(0),
         };
 
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
         let one_time_prekey_id = key_bundle.one_time_prekey_id.unwrap_or(0);
 
+        tracing::debug!(
+            target: "crypto::orchestrator",
+            contact_id = %contact_id,
+            one_time_prekey_id = one_time_prekey_id,
+            has_otpk_public = key_bundle.one_time_prekey_public.is_some(),
+            "init_session_with_bundle: storing pending OTPK id"
+        );
+
         self.lifecycle
             .client
-            .init_session(contact_id, &public_bundle, &remote_identity, one_time_prekey_id)
+            .init_session(
+                contact_id,
+                &public_bundle,
+                &remote_identity,
+                one_time_prekey_id,
+            )
             .map_err(|e| e.to_string())?;
 
         Ok(contact_id.to_string())
@@ -196,13 +223,13 @@ impl Orchestrator {
             one_time_prekey_id: u32,
         }
 
-        let bundle_str =
-            std::str::from_utf8(recipient_bundle).map_err(|_| "invalid UTF-8 in bundle".to_string())?;
+        let bundle_str = std::str::from_utf8(recipient_bundle)
+            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
         let key_bundle: KeyBundle =
             serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
 
-        let msg_str =
-            std::str::from_utf8(first_message).map_err(|_| "invalid UTF-8 in first message".to_string())?;
+        let msg_str = std::str::from_utf8(first_message)
+            .map_err(|_| "invalid UTF-8 in first message".to_string())?;
         let first_msg: FirstMsg =
             serde_json::from_str(msg_str).map_err(|_| "invalid first message JSON".to_string())?;
 
@@ -276,19 +303,42 @@ impl Orchestrator {
         let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
 
         use base64::engine::general_purpose::STANDARD;
-        let json = serde_json::json!({
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        use crate::crypto::provider::CryptoProvider as _;
+
+        // Re-derive public keys for integrity verification on next load.
+        let identity_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
+            .ok()
+            .map(|b| STANDARD.encode(&b));
+        let verifying_key_check = ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
+            .ok()
+            .map(|b| STANDARD.encode(&b));
+        let spk_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
+            .ok()
+            .map(|b| STANDARD.encode(&b));
+
+        let mut json = serde_json::json!({
             "identity_secret": STANDARD.encode(&identity_bytes),
             "signing_secret": STANDARD.encode(&signing_bytes),
             "signed_prekey_secret": STANDARD.encode(&prekey_secret_bytes),
             "prekey_signature": STANDARD.encode(&prekey.signature),
             "suite_id": "1"
         });
+        if let Some(v) = identity_pub_check {
+            json["identity_public_check"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = verifying_key_check {
+            json["verifying_key_check"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = spk_pub_check {
+            json["signed_prekey_public_check"] = serde_json::Value::String(v);
+        }
         serde_json::to_string(&json).map_err(|e| e.to_string())
     }
 
     pub fn export_registration_bundle_json_str(&self) -> Result<String, String> {
-        use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
         let bundle = self
             .lifecycle
             .client
@@ -350,7 +400,11 @@ impl Orchestrator {
             .client
             .export_one_time_prekeys()
             .into_iter()
-            .map(|(key_id, private_key, public_key)| OtpkRecord { key_id, private_key, public_key })
+            .map(|(key_id, private_key, public_key)| OtpkRecord {
+                key_id,
+                private_key,
+                public_key,
+            })
             .collect();
         serde_json::to_string(&records).map_err(|e| e.to_string())
     }
@@ -362,8 +416,7 @@ impl Orchestrator {
             private_key: Vec<u8>,
             public_key: Vec<u8>,
         }
-        let records: Vec<OtpkRecord> =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let records: Vec<OtpkRecord> = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = records
             .into_iter()
             .map(|r| (r.key_id, r.private_key, r.public_key))
@@ -374,8 +427,8 @@ impl Orchestrator {
 
     /// Returns `(key_id, public_key_b64, signature_b64)`.
     pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
-        use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
         self.lifecycle
             .client
             .key_manager_mut()
@@ -452,8 +505,8 @@ impl Orchestrator {
         message_number: u32,
         content: &str,
     ) -> Result<String, String> {
-        use base64::Engine as _;
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+        use base64::Engine as _;
 
         let sealed_box = base64::engine::general_purpose::STANDARD
             .decode(content)
@@ -484,21 +537,21 @@ impl Orchestrator {
             .decrypt_message(contact_id, &encrypted_message)
             .map_err(|e| e.to_string())?;
 
-        String::from_utf8(plaintext)
-            .map_err(|e| format!("UTF-8 conversion failed: {}", e))
+        String::from_utf8(plaintext).map_err(|e| format!("UTF-8 conversion failed: {}", e))
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────
 
     fn handle_message_received(
         &mut self,
+        message_id: String,
         from: String,
         data: Vec<u8>,
         msg_num: u32,
         kem_ct: Vec<u8>,
-        otpk_id: u32,
+        _otpk_id: u32,
+        is_control: bool,
     ) -> Vec<Action> {
-        let message_id = derive_message_id(&data, msg_num);
         let wire_json = match String::from_utf8(data) {
             Ok(s) => s,
             Err(_) => {
@@ -514,7 +567,7 @@ impl Orchestrator {
             wire_json,
             message_id,
             msg_number: msg_num,
-            is_control: false,
+            is_control,
         };
 
         // Store KEM ciphertext for PQ decapsulation if non-empty.
@@ -630,36 +683,57 @@ impl Orchestrator {
 
     // ── Decision → Actions ────────────────────────────────────────────────────
 
-    fn decision_to_actions(&mut self, decision: RoutingDecision, contact_id: &str) -> Vec<Action> {
+    fn decision_to_actions(&mut self, decision: RoutingDecision, _contact_id: &str) -> Vec<Action> {
         match decision {
-            RoutingDecision::Decrypted { plaintext, actions, contact_id: cid } => {
+            RoutingDecision::Decrypted {
+                plaintext,
+                actions,
+                contact_id: cid,
+                message_id: mid,
+            } => {
                 let mut all = actions;
+                let plaintext_str = String::from_utf8_lossy(&plaintext).into_owned();
+                all.push(Action::MessageDecrypted {
+                    contact_id: cid.clone(),
+                    message_id: mid,
+                    plaintext_utf8: plaintext_str.clone(),
+                });
                 all.push(Action::NotifyNewMessage {
                     chat_id: cid,
                     preview: preview(&plaintext),
                 });
                 all
             }
-            RoutingDecision::NeedSessionInit { contact_id: cid, .. } => {
+            RoutingDecision::NeedSessionInit {
+                contact_id: cid, ..
+            } => {
                 if self.init_locks.contains(&cid) {
                     return vec![];
                 }
                 self.init_locks.insert(cid.clone());
                 vec![Action::FetchPublicKeyBundle { user_id: cid }]
             }
-            RoutingDecision::SessionHealNeeded { contact_id: cid, role } => {
+            RoutingDecision::SessionHealNeeded {
+                contact_id: cid,
+                role,
+            } => {
                 if self.on_cooldown(&cid) {
                     return vec![];
                 }
                 self.set_cooldown(cid.clone());
-                vec![
-                    Action::SendEndSession {
-                        contact_id: cid.clone(),
-                    },
-                    Action::FetchPublicKeyBundle { user_id: cid },
-                ]
+                let role_str = match role {
+                    Role::Initiator => "Initiator",
+                    Role::Responder => "Responder",
+                };
+                vec![Action::SessionHealNeeded {
+                    contact_id: cid,
+                    role: role_str.to_string(),
+                }]
             }
-            RoutingDecision::EndSessionNeeded { contact_id: cid, reason } => {
+            RoutingDecision::EndSessionNeeded {
+                contact_id: cid,
+                reason: _,
+            } => {
                 if self.on_cooldown(&cid) {
                     return vec![];
                 }
@@ -673,7 +747,10 @@ impl Orchestrator {
                     message: format!("Message queue full for {}", cid),
                 }]
             }
-            RoutingDecision::EndSessionReceived { contact_id: cid, actions } => actions,
+            RoutingDecision::EndSessionReceived {
+                contact_id: _,
+                actions,
+            } => actions,
             RoutingDecision::Error { message } => {
                 vec![Action::NotifyError {
                     code: "ROUTING_ERROR".to_string(),
@@ -686,11 +763,9 @@ impl Orchestrator {
     // ── Cooldown helpers ──────────────────────────────────────────────────────
 
     fn on_cooldown(&self, contact_id: &str) -> bool {
-        self.cooldowns
-            .get(contact_id)
-            .map_or(false, |&last_ms| {
-                unix_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS
-            })
+        self.cooldowns.get(contact_id).is_some_and(|&last_ms| {
+            unix_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS
+        })
     }
 
     fn set_cooldown(&mut self, contact_id: String) {
@@ -707,10 +782,12 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[allow(dead_code)]
 fn unix_now() -> u64 {
     unix_ms() / 1_000
 }
 
+#[allow(dead_code)]
 fn derive_message_id(data: &[u8], msg_num: u32) -> String {
     // Cheap deterministic ID: sha2 not available without feature, use a hash of
     // the first 16 bytes + message number. Good enough for deduplication.
@@ -752,11 +829,13 @@ mod tests {
         let mut o = make_orchestrator("alice");
         let wire = r#"{"dh_public_key":[0],"message_number":0,"ciphertext":[],"nonce":[],"previous_chain_length":0,"suite_id":1}"#;
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            message_id: "msg-001".to_string(),
             from: "bob".to_string(),
             data: wire.as_bytes().to_vec(),
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
+            is_control: false,
         });
         // Should ask to fetch bundle (no active session → NeedSessionInit).
         let fetches: Vec<_> = actions
@@ -771,17 +850,22 @@ mod tests {
         let mut o = make_orchestrator("alice");
         let wire = r#"{"dh_public_key":[0],"message_number":0,"ciphertext":[],"nonce":[],"previous_chain_length":0,"suite_id":1}"#;
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            message_id: "msg-002".to_string(),
             from: "bob".to_string(),
             data: wire.as_bytes().to_vec(),
             msg_num: 0,
             kem_ct: vec![1, 2, 3],
             otpk_id: 42,
+            is_control: false,
         });
         let pq_actions: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, Action::ApplyPQContribution { .. }))
             .collect();
-        assert!(!pq_actions.is_empty(), "expected ApplyPQContribution action");
+        assert!(
+            !pq_actions.is_empty(),
+            "expected ApplyPQContribution action"
+        );
     }
 
     #[test]
@@ -799,7 +883,9 @@ mod tests {
     fn test_network_reconnected_schedules_gc() {
         let mut o = make_orchestrator("alice");
         let actions = o.handle_event(IncomingEvent::NetworkReconnected);
-        assert!(actions.iter().any(|a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "gc_sweep")));
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "gc_sweep")
+        ));
     }
 
     #[test]
@@ -820,7 +906,9 @@ mod tests {
             message_id: "msg-xyz".to_string(),
         });
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], Action::MarkMessageDelivered { message_id } if message_id == "msg-xyz"));
+        assert!(
+            matches!(&actions[0], Action::MarkMessageDelivered { message_id } if message_id == "msg-xyz")
+        );
     }
 
     #[test]
@@ -833,7 +921,9 @@ mod tests {
         });
         assert!(!o.init_locks.contains("bob"));
         // Should include NotifySessionCreated.
-        assert!(actions.iter().any(|a| matches!(a, Action::NotifySessionCreated { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::NotifySessionCreated { .. })));
     }
 
     #[test]

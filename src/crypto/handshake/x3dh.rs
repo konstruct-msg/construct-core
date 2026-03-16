@@ -93,6 +93,28 @@ pub struct X3DHPublicKeyBundle {
     /// Key ID for one_time_prekey_public — must be sent in wire payload so Bob can consume it
     #[serde(skip_serializing_if = "Option::is_none")]
     pub one_time_prekey_id: Option<u32>,
+
+    // ---- SPK freshness fields (populated from server bundle, validated before X3DH) ----
+    /// Unix timestamp (seconds) when the SPK was uploaded to the server.
+    /// 0 = server did not provide this field (legacy); validation is skipped.
+    #[serde(default)]
+    pub spk_uploaded_at: u64,
+
+    /// Monotonically increasing counter incremented on every RotateSignedPreKey for this device.
+    /// Stored locally per contact to detect SPK replay attacks.
+    /// 0 = not provided by server (legacy).
+    #[serde(default)]
+    pub spk_rotation_epoch: u32,
+
+    /// Unix timestamp (seconds) when the Kyber SPK was uploaded.
+    /// 0 = not provided or no Kyber keys.
+    #[serde(default)]
+    pub kyber_spk_uploaded_at: u64,
+
+    /// Monotonically increasing counter for Kyber SPK rotations.
+    /// 0 = not provided.
+    #[serde(default)]
+    pub kyber_spk_rotation_epoch: u32,
 }
 
 /// Регистрационные данные для отправки на сервер
@@ -309,6 +331,18 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
                 None
             };
 
+        eprintln!("[X3DH INITIATOR] IK_A_priv[:4]={}", hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]));
+        eprintln!("[X3DH INITIATOR] SPK_B_pub[:4]={}", hex::encode(&remote_signed_prekey_public.as_ref()[..4.min(remote_signed_prekey_public.as_ref().len())]));
+        eprintln!("[X3DH INITIATOR] EK_A_pub[:4]={}", hex::encode(&P::from_private_key_to_public_key(&ephemeral_private).map(|k| k.as_ref()[..4.min(k.as_ref().len())].to_vec()).unwrap_or_default()));
+        eprintln!("[X3DH INITIATOR] IK_B_pub[:4]={}", hex::encode(&remote_identity_public.as_ref()[..4.min(remote_identity_public.as_ref().len())]));
+        eprintln!("[X3DH INITIATOR] DH1[:4]={}", hex::encode(&dh1[..4.min(dh1.len())]));
+        eprintln!("[X3DH INITIATOR] DH2[:4]={}", hex::encode(&dh2[..4.min(dh2.len())]));
+        eprintln!("[X3DH INITIATOR] DH3[:4]={}", hex::encode(&dh3[..4.min(dh3.len())]));
+        eprintln!("[X3DH INITIATOR] DH4[:4]={} has_dh4={}", dh4_opt.as_ref().map(|d| hex::encode(&d[..4.min(d.len())])).unwrap_or_else(|| "NONE".to_string()), dh4_opt.is_some());
+        if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
+            eprintln!("[X3DH INITIATOR] OTPK_B_pub[:4]={} id={:?}", hex::encode(&otpk_bytes[..4.min(otpk_bytes.len())]), remote_bundle.one_time_prekey_id);
+        }
+
         debug!(
             target: "crypto::x3dh",
             dh1_len = %dh1.len(),
@@ -341,10 +375,17 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         )
         .map_err(|e| format!("HKDF derivation failed: {}", e))?;
 
+        eprintln!("[X3DH INITIATOR] root_key[:8]={}", hex::encode(&root_key[..8.min(root_key.len())]));
+
         debug!(
             target: "crypto::x3dh",
             root_key_len = %root_key.len(),
             "X3DH completed successfully as initiator"
+        );
+        tracing::info!(
+            target: "crypto::x3dh",
+            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            "INITIATOR X3DH root_key"
         );
 
         // ===================================================================
@@ -397,6 +438,15 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             None
         };
 
+        eprintln!("[X3DH RESPONDER] SPK_B_priv[:4]={}", hex::encode(&local_signed_prekey.as_ref()[..4.min(local_signed_prekey.as_ref().len())]));
+        eprintln!("[X3DH RESPONDER] IK_B_priv[:4]={}", hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]));
+        eprintln!("[X3DH RESPONDER] IK_A_pub[:4]={}", hex::encode(&remote_identity.as_ref()[..4.min(remote_identity.as_ref().len())]));
+        eprintln!("[X3DH RESPONDER] EK_A_pub[:4]={}", hex::encode(&remote_ephemeral.as_ref()[..4.min(remote_ephemeral.as_ref().len())]));
+        eprintln!("[X3DH RESPONDER] DH1[:4]={}", hex::encode(&dh1[..4.min(dh1.len())]));
+        eprintln!("[X3DH RESPONDER] DH2[:4]={}", hex::encode(&dh2[..4.min(dh2.len())]));
+        eprintln!("[X3DH RESPONDER] DH3[:4]={}", hex::encode(&dh3[..4.min(dh3.len())]));
+        eprintln!("[X3DH RESPONDER] DH4[:4]={} has_dh4={}", dh4_opt.as_ref().map(|d| hex::encode(&d[..4.min(d.len())])).unwrap_or_else(|| "NONE".to_string()), dh4_opt.is_some());
+
         debug!(
             target: "crypto::x3dh",
             dh1_len = %dh1.len(),
@@ -427,6 +477,12 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             target: "crypto::x3dh",
             root_key_len = %root_key.len(),
             "X3DH completed successfully (responder)"
+        );
+        eprintln!("[X3DH RESPONDER] root_key[:8]={}", hex::encode(&root_key[..8.min(root_key.len())]));
+        tracing::info!(
+            target: "crypto::x3dh",
+            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            "RESPONDER X3DH root_key"
         );
 
         Ok(root_key)
@@ -477,6 +533,10 @@ mod tests {
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice выполняет X3DH как initiator
@@ -528,6 +588,10 @@ mod tests {
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice должна отклонить невалидную подпись
@@ -623,6 +687,10 @@ mod tests {
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Проверка: perform_as_initiator должен принять старую подпись (обратная совместимость)
@@ -665,6 +733,10 @@ mod tests {
             suite_id: SuiteID::from_u16_unchecked(ClassicSuiteProvider::suite_id()),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Проверка: perform_as_initiator должен принять новую подпись

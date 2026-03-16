@@ -99,7 +99,10 @@ mod tests {
     #[test]
     fn test_load_missing_key_returns_none() {
         let bridge = MockPlatformBridge::default();
-        assert_eq!(bridge.load_from_secure_store("nonexistent".to_string()), None);
+        assert_eq!(
+            bridge.load_from_secure_store("nonexistent".to_string()),
+            None
+        );
     }
 
     #[test]
@@ -113,7 +116,11 @@ mod tests {
     #[test]
     fn test_log_event() {
         let bridge = MockPlatformBridge::default();
-        bridge.log_event("info".to_string(), "Session".to_string(), "Initialized".to_string());
+        bridge.log_event(
+            "info".to_string(),
+            "Session".to_string(),
+            "Initialized".to_string(),
+        );
         let logs = bridge.logs.lock().unwrap();
         assert_eq!(logs[0], "[info] Session: Initialized");
     }

@@ -2,13 +2,14 @@
 
 use crate::error::CryptoError;
 use core::fmt::Debug;
+use zeroize::Zeroize;
 
 /// Trait that formalizes all cryptographic operations for a specific cipher suite.
 /// This enables crypto-agility by allowing different implementations (e.g., classic, PQ-hybrid).
 pub trait CryptoProvider: Send + Sync + 'static {
     // Associated types for key representation (using Vec<u8> for flexibility)
     type KemPublicKey: AsRef<[u8]> + Debug + Clone + 'static;
-    type KemPrivateKey: AsRef<[u8]> + Debug + Clone + 'static;
+    type KemPrivateKey: AsRef<[u8]> + Debug + Clone + Zeroize + 'static;
     type SignaturePublicKey: AsRef<[u8]> + Debug + Clone + 'static;
     type SignaturePrivateKey: AsRef<[u8]> + Debug + Clone + 'static;
     type AeadKey: AsRef<[u8]> + Debug + Clone + Default + 'static; // Added Default bound

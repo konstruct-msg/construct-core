@@ -61,9 +61,18 @@ impl HealingQueue {
     }
 
     /// Default configuration matching the Swift implementation.
-    pub fn default() -> Self {
+    pub fn new_default() -> Self {
         Self::new(DEFAULT_MAX_ATTEMPTS, DEFAULT_TTL_SECONDS)
     }
+}
+
+impl Default for HealingQueue {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+impl HealingQueue {
 
     // ── Query ─────────────────────────────────────────────────────────────────
 
@@ -174,12 +183,7 @@ impl HealingQueue {
     /// Insert a record with an explicit `created_at` timestamp.
     /// Used in tests to simulate aged records without sleeping.
     #[cfg(test)]
-    pub(crate) fn enqueue_at(
-        &mut self,
-        contact_id: &str,
-        message_json: &str,
-        created_at: u64,
-    ) {
+    pub(crate) fn enqueue_at(&mut self, contact_id: &str, message_json: &str, created_at: u64) {
         self.records.insert(
             contact_id.to_string(),
             HealingRecord {
@@ -228,10 +232,7 @@ mod tests {
         q.enqueue("bob", r#"{"msg":"first"}"#);
         q.enqueue("bob", r#"{"msg":"second"}"#);
         assert_eq!(q.len(), 1);
-        assert_eq!(
-            q.get("bob").unwrap().message_json,
-            r#"{"msg":"second"}"#
-        );
+        assert_eq!(q.get("bob").unwrap().message_json, r#"{"msg":"second"}"#);
     }
 
     #[test]

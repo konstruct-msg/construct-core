@@ -51,6 +51,30 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::SuiteID;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use zeroize::Zeroize;
+
+/// Derive a shared session identifier from the X3DH root key.
+///
+/// Both INITIATOR and RESPONDER hold the same `root_key_x3dh` after the X3DH
+/// handshake. Running the same HKDF on that shared secret yields an identical
+/// 16-byte `session_id` on both sides **without any extra round-trip**.
+///
+/// The result is hex-encoded (32 hex chars) so it can be stored in
+/// `SerializableSession.session_id` as a plain string without format changes.
+///
+/// Used as additional context in Associated Data (AD) of every AEAD message,
+/// binding ciphertexts to the specific session they were created in.
+fn derive_shared_session_id<P: CryptoProvider>(root_key_x3dh: &[u8]) -> Result<String, String> {
+    // HKDF(salt=root_key_x3dh, ikm=static-label, info=domain-string, len=16)
+    let bytes = P::hkdf_derive_key(
+        root_key_x3dh,
+        b"construct-session-id",
+        b"Construct-SessionID-v1",
+        16,
+    )
+    .map_err(|e| format!("Failed to derive shared session_id: {e}"))?;
+    Ok(hex::encode(&bytes))
+}
 
 /// Double Ratchet Session
 ///
@@ -186,6 +210,18 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             "Creating initiator session (Alice)"
         );
 
+        // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step.
+        let shared_session_id = derive_shared_session_id::<P>(root_key)
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+        tracing::info!(
+            target: "crypto::double_ratchet",
+            contact_id = %contact_id,
+            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            session_id = %shared_session_id,
+            "INITIATOR session_id derived"
+        );
+
         // Convert root_key bytes to P::AeadKey
         // ✅ SECURITY: Use dedicated salt for Double Ratchet (different from X3DH)
         let salt = [0xFE_u8; 32];
@@ -225,7 +261,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: None,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: shared_session_id,
             contact_id,
             local_user_id,
         })
@@ -264,6 +300,18 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         debug!(
             target: "crypto::double_ratchet",
             "Extracted Alice's ephemeral key from first message"
+        );
+
+        // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step,
+        // so both INITIATOR and RESPONDER compute the same value without a round-trip.
+        let shared_session_id = derive_shared_session_id::<P>(root_key)
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+        tracing::info!(
+            target: "crypto::double_ratchet",
+            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            session_id = %shared_session_id,
+            "RESPONDER session_id derived"
         );
 
         // Convert root_key bytes to P::AeadKey
@@ -320,7 +368,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: Some(pre_pq_root_key),
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
         };
@@ -396,14 +444,40 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .try_into()
             .map_err(|_| "Invalid public key length")?;
 
-        // Associated Data: dh_public_key || message_number (per Signal/Noise protocol)
-        // Associated Data: local_user_id || contact_id || dh_public_key || message_number
+        // Associated Data v2: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
+        // The session_id is derived from the shared X3DH root key so both sides compute the same value.
+        // For legacy sessions loaded from Keychain (UUID-format session_id), hex::decode will fail
+        // gracefully, falling back to 16 zero bytes — those sessions will fail AEAD and re-negotiate.
+        let session_id_bytes: Vec<u8> =
+            hex::decode(&self.session_id).unwrap_or_else(|_| vec![0u8; 16]);
         let mut associated_data =
-            Vec::with_capacity(self.local_user_id.len() + self.contact_id.len() + 32 + 4);
+            Vec::with_capacity(1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4);
+        associated_data.push(2u8); // AD version = 2
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(self.contact_id.as_bytes());
+        associated_data.extend_from_slice(&session_id_bytes);
         associated_data.extend_from_slice(&dh_public_key);
         associated_data.extend_from_slice(&message_number.to_be_bytes());
+
+        eprintln!("[DR ENCRYPT] sender={} receiver={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
+            &self.local_user_id[..8.min(self.local_user_id.len())],
+            &self.contact_id[..8.min(self.contact_id.len())],
+            &self.session_id[..8.min(self.session_id.len())],
+            hex::encode(&dh_public_key[..4]),
+            message_number,
+            associated_data.len()
+        );
+
+        tracing::info!(
+            target: "crypto::double_ratchet",
+            local_user_id = %self.local_user_id,
+            contact_id = %self.contact_id,
+            session_id = %self.session_id,
+            msg_num = %message_number,
+            dh_pub_prefix = %hex::encode(&dh_public_key[..4]),
+            ad_len = %associated_data.len(),
+            "ENCRYPT AD built"
+        );
 
         let ciphertext = P::aead_encrypt(
             &message_key,
@@ -508,8 +582,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                         self.restore_snapshot(snapshot);
                         return Err("Too many skipped messages".to_string());
                     }
-                    let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key)
-                        .map_err(|e| {
+                    let (msg_key, next_chain) =
+                        P::kdf_ck(&self.receiving_chain_key).map_err(|e| {
                             self.restore_snapshot(snapshot.clone());
                             format!("KDF_CK failed: {}", e)
                         })?;
@@ -527,9 +601,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public).map_err(|e| {
+            self.perform_dh_ratchet(&remote_dh_public).inspect_err(|_e| {
                 self.restore_snapshot(snapshot.clone());
-                e
             })?;
         }
 
@@ -543,26 +616,23 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 msg_num = %encrypted.message_number,
                 "Found skipped message key"
             );
-            return self.decrypt_with_key(&key, encrypted).map_err(|e| {
+            return self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
                 self.restore_snapshot(snapshot);
-                e
             });
         }
 
         // Derive keys until we reach the message number
         while self.receiving_chain_length <= encrypted.message_number {
-            let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key)
-                .map_err(|e| {
-                    self.restore_snapshot(snapshot.clone());
-                    format!("KDF_CK failed: {}", e)
-                })?;
+            let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key).map_err(|e| {
+                self.restore_snapshot(snapshot.clone());
+                format!("KDF_CK failed: {}", e)
+            })?;
 
             if self.receiving_chain_length == encrypted.message_number {
                 self.receiving_chain_key = next_chain;
                 self.receiving_chain_length += 1;
-                return self.decrypt_with_key(&msg_key, encrypted).map_err(|e| {
+                return self.decrypt_with_key(&msg_key, encrypted).inspect_err(|_e| {
                     self.restore_snapshot(snapshot);
-                    e
                 });
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)
@@ -675,8 +745,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .ok_or("Missing remote DH public key during PQ re-derive")?;
             let dh_output = P::kem_decapsulate(dh_priv, remote_pub.as_ref())
                 .map_err(|e| format!("DH failed during PQ re-derive: {}", e))?;
-            let (new_root_key, new_sending_chain) =
-                P::kdf_rk(&pq_rk1, &dh_output).map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
+            let (new_root_key, new_sending_chain) = P::kdf_rk(&pq_rk1, &dh_output)
+                .map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
 
             self.root_key = new_root_key;
             self.sending_chain_key = new_sending_chain;
@@ -756,7 +826,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.sending_chain_key = new_sending_chain;
         self.sending_chain_length = 0;
 
-        // 4. Update state
+        // 4. Update state — zeroize old private key before overwriting (forward secrecy)
+        if let Some(old_key) = self.dh_ratchet_private.as_mut() {
+            old_key.zeroize();
+        }
         self.dh_ratchet_private = Some(new_dh_private);
         self.dh_ratchet_public = new_dh_public;
         self.remote_dh_public = Some(new_remote_dh.clone());
@@ -785,13 +858,38 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             "Decrypting with message key"
         );
 
-        // Reconstruct Associated Data: contact_id (sender) || local_user_id (recipient) || dh_public_key || message_number
+        // Reconstruct Associated Data v2: must mirror encrypt() exactly.
+        // Decrypt uses contact_id as sender (= local_user_id on encrypt side) and vice versa.
+        let session_id_bytes: Vec<u8> =
+            hex::decode(&self.session_id).unwrap_or_else(|_| vec![0u8; 16]);
         let mut associated_data =
-            Vec::with_capacity(self.contact_id.len() + self.local_user_id.len() + 32 + 4);
+            Vec::with_capacity(1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4);
+        associated_data.push(2u8); // AD version = 2
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
+        associated_data.extend_from_slice(&session_id_bytes);
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
+
+        eprintln!("[DR DECRYPT] sender(contact)={} receiver(local)={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
+            &self.contact_id[..8.min(self.contact_id.len())],
+            &self.local_user_id[..8.min(self.local_user_id.len())],
+            &self.session_id[..8.min(self.session_id.len())],
+            hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
+            encrypted.message_number,
+            associated_data.len()
+        );
+
+        tracing::info!(
+            target: "crypto::double_ratchet",
+            local_user_id = %self.local_user_id,
+            contact_id = %self.contact_id,
+            session_id = %self.session_id,
+            msg_num = %encrypted.message_number,
+            dh_pub_prefix = %hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
+            ad_len = %associated_data.len(),
+            "DECRYPT AD built"
+        );
 
         let padded_plaintext = P::aead_decrypt(
             message_key,
@@ -1058,6 +1156,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice performs X3DH as initiator
@@ -1151,6 +1253,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         let (root_key, initiator_state) =
@@ -1243,6 +1349,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice: INITIATOR
@@ -1253,15 +1363,14 @@ mod tests {
             )
             .unwrap();
 
-        let mut alice =
-            DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
-                &root_key_alice,
-                initiator_state,
-                &bob_identity_pub,
-                "bob".to_string(),
-                "alice".to_string(),
-            )
-            .unwrap();
+        let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+            &root_key_alice,
+            initiator_state,
+            &bob_identity_pub,
+            "bob".to_string(),
+            "alice".to_string(),
+        )
+        .unwrap();
 
         // Alice encrypts msg0
         let msg0 = alice.encrypt(b"Hello with PQ!").unwrap();
@@ -1322,8 +1431,7 @@ mod tests {
         let (bob_priv, bob_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
 
         let (bob_spk_priv, bob_spk_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
-        let (bob_signing, bob_verifying) =
-            ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let (bob_signing, bob_verifying) = ClassicSuiteProvider::generate_signature_keys().unwrap();
         let bob_sig = {
             let prologue = build_prologue(SuiteID::CLASSIC);
             let mut msg = prologue;
@@ -1339,21 +1447,24 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         let (rk_alice, init_state) =
             X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bob_bundle)
                 .unwrap();
 
-        let mut alice =
-            DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
-                &rk_alice,
-                init_state,
-                &bob_pub,
-                "bob".to_string(),
-                "alice".to_string(),
-            )
-            .unwrap();
+        let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+            &rk_alice,
+            init_state,
+            &bob_pub,
+            "bob".to_string(),
+            "alice".to_string(),
+        )
+        .unwrap();
 
         let msg0 = alice.encrypt(b"Init").unwrap();
 
@@ -1368,15 +1479,14 @@ mod tests {
         )
         .unwrap();
 
-        let (mut bob, _) =
-            DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
-                &rk_bob,
-                &bob_priv,
-                &msg0,
-                "alice".to_string(),
-                "bob".to_string(),
-            )
-            .unwrap();
+        let (mut bob, _) = DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
+            &rk_bob,
+            &bob_priv,
+            &msg0,
+            "alice".to_string(),
+            "bob".to_string(),
+        )
+        .unwrap();
 
         // Bob sends a valid reply
         let reply = bob.encrypt(b"Real reply").unwrap();

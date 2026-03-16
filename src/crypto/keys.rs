@@ -339,6 +339,10 @@ impl<P: CryptoProvider> KeyManager<P> {
             suite_id: SuiteID::from_u16_unchecked(P::suite_id()), // Provider гарантирует валидный suite_id
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         })
     }
 
@@ -358,6 +362,10 @@ impl<P: CryptoProvider> KeyManager<P> {
             suite_id: SuiteID::from_u16_unchecked(P::suite_id()), // Provider гарантирует валидный suite_id
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         })
     }
 
@@ -450,15 +458,35 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Import previously exported OTPKs back into the store (used after core restore).
     /// Also restores next_otpk_id to avoid collisions with persisted keys.
+    /// Verifies each key pair: re-derives public from private and compares. Keys that
+    /// fail the check are silently dropped to prevent permanently broken sessions.
     pub fn import_one_time_prekeys(&mut self, keys: Vec<(u32, Vec<u8>, Vec<u8>)>) {
         for (key_id, priv_bytes, pub_bytes) in keys {
-            let private_key = P::kem_private_key_from_bytes(priv_bytes);
-            let public_key = P::kem_public_key_from_bytes(pub_bytes);
-            self.one_time_prekeys
-                .insert(key_id, (private_key, public_key));
-            // Keep next_otpk_id above all imported IDs to avoid collisions
-            if key_id >= self.next_otpk_id {
-                self.next_otpk_id = key_id.wrapping_add(1);
+            // Integrity check: re-derive pub from priv and compare.
+            let priv_key = P::kem_private_key_from_bytes(priv_bytes.clone());
+            match P::from_private_key_to_public_key(&priv_key) {
+                Ok(derived_pub) if derived_pub.as_ref() == pub_bytes.as_slice() => {
+                    let public_key = P::kem_public_key_from_bytes(pub_bytes);
+                    self.one_time_prekeys.insert(key_id, (priv_key, public_key));
+                    if key_id >= self.next_otpk_id {
+                        self.next_otpk_id = key_id.wrapping_add(1);
+                    }
+                }
+                Ok(_) => {
+                    tracing::error!(
+                        target: "crypto::keys",
+                        key_id = %key_id,
+                        "OTPK integrity check FAILED: derived public key does not match stored — dropping key"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "crypto::keys",
+                        key_id = %key_id,
+                        error = %e,
+                        "OTPK integrity check FAILED: cannot derive public key from private — dropping key"
+                    );
+                }
             }
         }
     }

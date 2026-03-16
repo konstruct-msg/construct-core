@@ -43,9 +43,18 @@ impl AckStore {
     }
 
     /// Default configuration: 30-day expiry (mirrors Swift implementation).
-    pub fn default() -> Self {
+    pub fn new_default() -> Self {
         Self::new(30 * 24 * 60 * 60)
     }
+}
+
+impl Default for AckStore {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+impl AckStore {
 
     // ── Query ─────────────────────────────────────────────────────────────────
 
@@ -80,11 +89,7 @@ impl AckStore {
         self.cache.insert(message_id.to_string());
 
         let now = unix_now();
-        let json = format!(
-            r#"{{"id":{},"ts":{}}}"#,
-            serde_json_string(message_id),
-            now
-        );
+        let json = format!(r#"{{"id":{},"ts":{}}}"#, serde_json_string(message_id), now);
 
         vec![Action::PersistMessage { message_json: json }]
     }
@@ -143,10 +148,7 @@ mod tests {
     #[test]
     fn test_is_processed_returns_need_db_check_on_miss() {
         let store = AckStore::default();
-        assert_eq!(
-            store.is_processed("msg-001"),
-            AckCheckResult::NeedDbCheck
-        );
+        assert_eq!(store.is_processed("msg-001"), AckCheckResult::NeedDbCheck);
     }
 
     #[test]

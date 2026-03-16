@@ -79,8 +79,8 @@ pub struct RegistrationBundleJson {
 #[derive(Debug, Clone)]
 pub struct RotatedSpkBundle {
     pub key_id: u32,
-    pub public_key: String,  // base64 X25519 public key (32 bytes)
-    pub signature: String,   // base64 Ed25519 signature over prologue || public_key (64 bytes)
+    pub public_key: String, // base64 X25519 public key (32 bytes)
+    pub signature: String,  // base64 Ed25519 signature over prologue || public_key (64 bytes)
 }
 
 // Encrypted message components for wire format (matches server ChatMessage)
@@ -138,6 +138,14 @@ pub struct PrivateKeysJson {
     pub signed_prekey_secret: String, // Base64
     pub prekey_signature: String,     // Base64
     pub suite_id: String,
+    // Integrity fields: public keys re-derived on load and compared to catch Keychain corruption.
+    // Optional for backward compatibility with keys exported before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_public_check: Option<String>,   // Base64 of identity public key
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifying_key_check: Option<String>,     // Base64 of Ed25519 verifying key
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_prekey_public_check: Option<String>, // Base64 of SPK public key
 }
 
 // Invite crypto types (exported via UDL)
@@ -268,8 +276,19 @@ impl ClassicCryptoCore {
         let signing_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
         let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
 
-        // Encode to base64
+        // Re-derive public keys from private keys for integrity checking on next load.
         use base64::Engine;
+        let identity_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
+            .ok()
+            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+        let signing_pub_check = ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
+            .ok()
+            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+        let spk_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
+            .ok()
+            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+
+        // Encode to base64
         let private_keys_json = PrivateKeysJson {
             identity_secret: base64::engine::general_purpose::STANDARD.encode(&identity_bytes),
             signing_secret: base64::engine::general_purpose::STANDARD.encode(&signing_bytes),
@@ -277,6 +296,9 @@ impl ClassicCryptoCore {
                 .encode(&prekey_secret_bytes),
             prekey_signature: base64::engine::general_purpose::STANDARD.encode(&prekey.signature),
             suite_id: "1".to_string(),
+            identity_public_check: identity_pub_check,
+            verifying_key_check: signing_pub_check,
+            signed_prekey_public_check: spk_pub_check,
         };
 
         serde_json::to_string(&private_keys_json).map_err(|_| CryptoError::SerializationFailed)
@@ -393,6 +415,10 @@ impl ClassicCryptoCore {
             suite_id: SuiteID::new(key_bundle.suite_id).map_err(|_| CryptoError::InvalidKeyData)?,
             one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
             one_time_prekey_id: key_bundle.one_time_prekey_id,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Extract remote identity public key
@@ -871,10 +897,7 @@ impl ClassicCryptoCore {
             .export_registration_bundle()
             .map_err(|_| CryptoError::InitializationFailed)?;
 
-        let key_id = client
-            .key_manager()
-            .current_signed_prekey_id()
-            .unwrap_or(1);
+        let key_id = client.key_manager().current_signed_prekey_id().unwrap_or(1);
 
         Ok(RotatedSpkBundle {
             key_id,
@@ -899,6 +922,63 @@ pub fn create_crypto_core() -> Result<Arc<ClassicCryptoCore>, CryptoError> {
     }))
 }
 
+/// Verify that private keys in `PrivateKeysJson` are internally consistent.
+/// Re-derives each public key from its corresponding private key and compares to the
+/// stored `*_check` field. If a check field is absent (old export), verification is skipped.
+/// Returns `Err` only if a check field IS present but does NOT match — indicating corruption.
+fn verify_private_keys_integrity(keys: &PrivateKeysJson) -> Result<(), CryptoError> {
+    use base64::Engine;
+
+    let decode = |b64: &str| -> Option<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+    };
+
+    if let Some(expected_b64) = &keys.identity_public_check {
+        let secret = decode(&keys.identity_secret).ok_or(CryptoError::InvalidKeyData)?;
+        let derived = ClassicSuiteProvider::from_private_key_to_public_key(&secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
+        if derived != expected {
+            tracing::error!(
+                target: "crypto::uniffi",
+                "Key integrity check FAILED: identity key mismatch — Keychain data may be corrupted"
+            );
+            return Err(CryptoError::InvalidKeyData);
+        }
+    }
+
+    if let Some(expected_b64) = &keys.verifying_key_check {
+        let secret = decode(&keys.signing_secret).ok_or(CryptoError::InvalidKeyData)?;
+        let derived = ClassicSuiteProvider::from_signature_private_to_public(&secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
+        if derived != expected {
+            tracing::error!(
+                target: "crypto::uniffi",
+                "Key integrity check FAILED: signing key mismatch — Keychain data may be corrupted"
+            );
+            return Err(CryptoError::InvalidKeyData);
+        }
+    }
+
+    if let Some(expected_b64) = &keys.signed_prekey_public_check {
+        let secret = decode(&keys.signed_prekey_secret).ok_or(CryptoError::InvalidKeyData)?;
+        let derived = ClassicSuiteProvider::from_private_key_to_public_key(&secret)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
+        if derived != expected {
+            tracing::error!(
+                target: "crypto::uniffi",
+                "Key integrity check FAILED: signed prekey mismatch — Keychain data may be corrupted"
+            );
+            return Err(CryptoError::InvalidKeyData);
+        }
+    }
+
+    tracing::debug!(target: "crypto::uniffi", "Key integrity checks passed");
+    Ok(())
+}
+
 /// Create a CryptoCore instance from existing private keys (exported via UDL)
 /// Used to restore cryptographic state from secure storage (e.g., iOS Keychain)
 pub fn create_crypto_core_from_keys_json(
@@ -910,6 +990,9 @@ pub fn create_crypto_core_from_keys_json(
     // Parse JSON
     let private_keys: PrivateKeysJson =
         serde_json::from_str(&keys_json).map_err(|_| CryptoError::SerializationFailed)?;
+
+    // Verify key integrity before using (catches Keychain corruption).
+    verify_private_keys_integrity(&private_keys)?;
 
     // Decode base64 to bytes
     use base64::Engine;
@@ -1721,6 +1804,7 @@ pub fn format_federated_id(device_id: String, server_hostname: String) -> String
 ///
 /// Returns (public_key=1184 bytes, secret_key=2400 bytes).
 /// Store secret_key securely in Keychain; upload public_key as KyberSignedPreKey.
+#[cfg(feature = "post-quantum")]
 pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_keygen()
         .map(|kp| MLKEMKeyPair {
@@ -1730,11 +1814,17 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
         .map_err(|_e| CryptoError::InitializationFailed)
 }
 
+#[cfg(not(feature = "post-quantum"))]
+pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
+    Err(CryptoError::InitializationFailed)
+}
+
 /// Encapsulate to a recipient's ML-KEM-768 public key (sender side PQXDH).
 ///
 /// - `public_key`: recipient's Kyber SPK public key (1184 bytes) from their PreKeyBundle
 /// - Returns: ciphertext (include in PreKeySignalMessage.kem_ciphertext) + shared_secret
 ///   (pass to ClassicCryptoCore.apply_pq_contribution)
+#[cfg(feature = "post-quantum")]
 pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_encapsulate(&public_key)
         .map(|enc| MLKEMEncapsulation {
@@ -1744,17 +1834,31 @@ pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, C
         .map_err(|e| CryptoError::EncryptionFailed { message: e })
 }
 
+#[cfg(not(feature = "post-quantum"))]
+pub fn mlkem768_encapsulate(_public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
+    Err(CryptoError::InitializationFailed)
+}
+
 /// Decapsulate a received ML-KEM-768 ciphertext (receiver side PQXDH).
 ///
 /// - `secret_key`: our Kyber SPK secret key from Keychain (2400 bytes)
 /// - `ciphertext`: from PreKeySignalMessage.kem_ciphertext (1088 bytes)
 /// - Returns: shared_secret (pass to ClassicCryptoCore.apply_pq_contribution)
+#[cfg(feature = "post-quantum")]
 pub fn mlkem768_decapsulate(
     secret_key: Vec<u8>,
     ciphertext: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
         .map_err(|e| CryptoError::DecryptionFailed { message: e })
+}
+
+#[cfg(not(feature = "post-quantum"))]
+pub fn mlkem768_decapsulate(
+    _secret_key: Vec<u8>,
+    _ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    Err(CryptoError::InitializationFailed)
 }
 
 // ── Orchestration — Phase 0: PlatformBridge ──────────────────────────────────
@@ -1902,6 +2006,9 @@ impl OrchestratorCore {
         let private_keys: PrivateKeysJson =
             serde_json::from_str(&keys_json).map_err(|_| CryptoError::SerializationFailed)?;
 
+        // Verify key integrity before using (catches Keychain corruption).
+        verify_private_keys_integrity(&private_keys)?;
+
         let identity_secret = base64::engine::general_purpose::STANDARD
             .decode(&private_keys.identity_secret)
             .map_err(|_| CryptoError::InvalidKeyData)?;
@@ -2034,7 +2141,10 @@ impl OrchestratorCore {
             String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptionFailed {
                 message: format!("UTF-8: {}", e),
             })?;
-        Ok(SessionInitResult { session_id, decrypted_message })
+        Ok(SessionInitResult {
+            session_id,
+            decrypted_message,
+        })
     }
 
     pub fn encrypt_message(
@@ -2046,7 +2156,12 @@ impl OrchestratorCore {
         let (ephemeral_public_key, message_number, content, one_time_prekey_id) = orch
             .encrypt_message_for(&contact_id, &plaintext)
             .map_err(|e| CryptoError::EncryptionFailed { message: e })?;
-        Ok(EncryptedMessageComponents { ephemeral_public_key, message_number, content, one_time_prekey_id })
+        Ok(EncryptedMessageComponents {
+            ephemeral_public_key,
+            message_number,
+            content,
+            one_time_prekey_id,
+        })
     }
 
     pub fn decrypt_message(
@@ -2073,8 +2188,13 @@ impl OrchestratorCore {
 
     pub fn generate_one_time_prekeys(&self, count: u32) -> Result<Vec<OtpkPair>, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let pairs = orch.generate_otpks(count).map_err(|_| CryptoError::InitializationFailed)?;
-        Ok(pairs.into_iter().map(|(key_id, public_key)| OtpkPair { key_id, public_key }).collect())
+        let pairs = orch
+            .generate_otpks(count)
+            .map_err(|_| CryptoError::InitializationFailed)?;
+        Ok(pairs
+            .into_iter()
+            .map(|(key_id, public_key)| OtpkPair { key_id, public_key })
+            .collect())
     }
 
     pub fn one_time_prekey_count(&self) -> u32 {
@@ -2101,9 +2221,14 @@ impl OrchestratorCore {
 
     pub fn rotate_signed_prekey(&self) -> Result<RotatedSpkBundle, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (key_id, public_key, signature) =
-            orch.rotate_spk().map_err(|_| CryptoError::InitializationFailed)?;
-        Ok(RotatedSpkBundle { key_id, public_key, signature })
+        let (key_id, public_key, signature) = orch
+            .rotate_spk()
+            .map_err(|_| CryptoError::InitializationFailed)?;
+        Ok(RotatedSpkBundle {
+            key_id,
+            public_key,
+            signature,
+        })
     }
 
     pub fn apply_pq_contribution(
@@ -2170,13 +2295,22 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         Action::CancelTimer { timer_id } => serde_json::json!({
             "type": "CancelTimer", "timer_id": timer_id
         }),
-        Action::DecryptMessage { contact_id, ciphertext } => serde_json::json!({
+        Action::DecryptMessage {
+            contact_id,
+            ciphertext,
+        } => serde_json::json!({
             "type": "DecryptMessage", "contact_id": contact_id, "ciphertext": ciphertext
         }),
-        Action::EncryptMessage { contact_id, plaintext } => serde_json::json!({
+        Action::EncryptMessage {
+            contact_id,
+            plaintext,
+        } => serde_json::json!({
             "type": "EncryptMessage", "contact_id": contact_id, "plaintext": plaintext
         }),
-        Action::InitSession { contact_id, bundle_json } => serde_json::json!({
+        Action::InitSession {
+            contact_id,
+            bundle_json,
+        } => serde_json::json!({
             "type": "InitSession", "contact_id": contact_id, "bundle_json": bundle_json
         }),
         Action::ApplyPQContribution { contact_id, kem_ss } => serde_json::json!({
@@ -2184,6 +2318,17 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         }),
         Action::ArchiveSession { contact_id } => serde_json::json!({
             "type": "ArchiveSession", "contact_id": contact_id
+        }),
+        Action::MessageDecrypted {
+            contact_id,
+            message_id,
+            plaintext_utf8,
+        } => serde_json::json!({
+            "type": "MessageDecrypted", "contact_id": contact_id,
+            "message_id": message_id, "plaintext_utf8": plaintext_utf8
+        }),
+        Action::SessionHealNeeded { contact_id, role } => serde_json::json!({
+            "type": "SessionHealNeeded", "contact_id": contact_id, "role": role
         }),
     }
 }

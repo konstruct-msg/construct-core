@@ -423,6 +423,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice initializes session
@@ -470,6 +474,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice initializes session as initiator
@@ -556,6 +564,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         let mut session = TestSession::init_as_initiator(

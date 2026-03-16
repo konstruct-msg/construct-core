@@ -152,11 +152,7 @@ impl SessionLifecycleManager {
     ///
     /// Returns `EncryptResult` with ciphertext JSON and follow-up `Action`s
     /// (always includes `SaveSessionToSecureStore` to persist the updated session).
-    pub fn encrypt(
-        &mut self,
-        contact_id: &str,
-        plaintext: &[u8],
-    ) -> Result<EncryptResult, String> {
+    pub fn encrypt(&mut self, contact_id: &str, plaintext: &[u8]) -> Result<EncryptResult, String> {
         // Ensure session is loaded.
         if !self.client.has_session(contact_id) {
             return Err(format!(
@@ -177,7 +173,10 @@ impl SessionLifecycleManager {
             data: session_json.into_bytes(),
         }];
 
-        Ok(EncryptResult { ciphertext_json, actions })
+        Ok(EncryptResult {
+            ciphertext_json,
+            actions,
+        })
     }
 
     // ── Decrypt ───────────────────────────────────────────────────────────────
@@ -189,11 +188,7 @@ impl SessionLifecycleManager {
     /// On success, returns `DecryptResult` with plaintext and follow-up actions
     /// (save updated session). On failure, returns `Err` so the caller (Phase 4
     /// `MessageRouter`) can decide on healing or END_SESSION.
-    pub fn decrypt(
-        &mut self,
-        contact_id: &str,
-        wire_json: &str,
-    ) -> Result<DecryptResult, String> {
+    pub fn decrypt(&mut self, contact_id: &str, wire_json: &str) -> Result<DecryptResult, String> {
         let wire: WireMessage =
             serde_json::from_str(wire_json).map_err(|e| format!("parse wire: {}", e))?;
         let msg = EncryptedRatchetMessage::try_from(wire)?;
@@ -303,7 +298,7 @@ impl SessionLifecycleManager {
     pub fn is_reinstall(&self, contact_id: &str, new_otpk_id: u32) -> bool {
         self.prekey_tracker
             .get(contact_id)
-            .map_or(false, |&prev| prev != new_otpk_id)
+            .is_some_and(|&prev| prev != new_otpk_id)
     }
 
     // ── PQ contribution helpers ───────────────────────────────────────────────
@@ -312,7 +307,8 @@ impl SessionLifecycleManager {
     ///
     /// Returns `Vec<Action>` — empty if no contribution was pending.
     pub fn maybe_apply_pq_contribution(&mut self, contact_id: &str) -> Vec<Action> {
-        let contribution = match self.pq_manager.consume_deferred(contact_id) {
+        let (contribution, delete_actions) = self.pq_manager.consume_deferred(contact_id);
+        let contribution = match contribution {
             Some(c) => c,
             None => return vec![],
         };
@@ -325,12 +321,16 @@ impl SessionLifecycleManager {
                 message: e,
             }];
         }
-        // Save updated session state.
+        // Save updated session state and delete the now-consumed deferred entry.
         match self.export_session_json_for(contact_id) {
-            Ok(json) => vec![Action::SaveSessionToSecureStore {
-                key: session_key(contact_id),
-                data: json.into_bytes(),
-            }],
+            Ok(json) => {
+                let mut actions = delete_actions;
+                actions.push(Action::SaveSessionToSecureStore {
+                    key: session_key(contact_id),
+                    data: json.into_bytes(),
+                });
+                actions
+            }
             Err(e) => vec![Action::NotifyError {
                 code: "SESSION_EXPORT_FAILED".to_string(),
                 message: e,
@@ -415,8 +415,7 @@ mod tests {
     use crate::crypto::suites::classic::ClassicSuiteProvider;
 
     fn make_pair() -> (SessionLifecycleManager, SessionLifecycleManager) {
-        let alice_client =
-            ClassicClient::<ClassicSuiteProvider>::new().expect("alice client");
+        let alice_client = ClassicClient::<ClassicSuiteProvider>::new().expect("alice client");
         let bob_client = ClassicClient::<ClassicSuiteProvider>::new().expect("bob client");
         let alice = SessionLifecycleManager::new(alice_client, "alice".to_string());
         let bob = SessionLifecycleManager::new(bob_client, "bob".to_string());
@@ -495,7 +494,7 @@ mod tests {
         assert!(!mgr.is_reinstall("bob", 42)); // no record yet → not a reinstall
         mgr.track_prekey("bob", 42);
         assert!(!mgr.is_reinstall("bob", 42)); // same key → not reinstall
-        assert!(mgr.is_reinstall("bob", 99));  // different → reinstall
+        assert!(mgr.is_reinstall("bob", 99)); // different → reinstall
     }
 
     #[test]
@@ -514,7 +513,7 @@ mod tests {
         mgr2.import_state_json(&json).unwrap();
         assert_eq!(mgr2.my_user_id(), "alice");
         assert!(mgr2.has_archive("carol"));
-        assert!(!mgr2.is_reinstall("bob", 5));  // prekey tracker restored
+        assert!(!mgr2.is_reinstall("bob", 5)); // prekey tracker restored
         assert!(mgr2.is_reinstall("bob", 99));
     }
 

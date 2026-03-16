@@ -89,24 +89,40 @@ impl PQContributionManager {
     /// included in the initial message. The shared secret is stored internally
     /// and retrieved via `consume_deferred` once the session is initialised.
     ///
+    /// The returned `Vec<Action>` contains a `SaveSessionToSecureStore` action
+    /// that the platform **must** execute to persist the deferred contribution
+    /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`,
+    /// data: `otpk_id (4 bytes LE) || shared_secret`.
+    ///
     /// Calls the actual ML-KEM-768 primitive from `crate::crypto::pq_x3dh`
     /// when the `post-quantum` feature is enabled; otherwise returns an error.
     pub fn encapsulate_and_defer(
         &mut self,
         contact_id: &str,
         kem_public: &[u8],
-    ) -> Result<EncapsulationResult, String> {
+    ) -> Result<(EncapsulationResult, Vec<Action>), String> {
         let (ciphertext, shared_secret) = pq_encapsulate(kem_public)?;
         let otpk_id = self.allocate_otpk_id();
 
+        let persist_action = serialize_pending_action(contact_id, otpk_id, &shared_secret);
+
         self.pending.insert(
             contact_id.to_string(),
-            PendingContribution { shared_secret, otpk_id },
+            PendingContribution {
+                shared_secret,
+                otpk_id,
+            },
         );
         self.pending_ciphertexts
             .insert(contact_id.to_string(), ciphertext.clone());
 
-        Ok(EncapsulationResult { ciphertext, otpk_id })
+        Ok((
+            EncapsulationResult {
+                ciphertext,
+                otpk_id,
+            },
+            vec![persist_action],
+        ))
     }
 
     // ── Receiver flow ─────────────────────────────────────────────────────────
@@ -116,33 +132,60 @@ impl PQContributionManager {
     /// `kem_secret` is the ML-KEM-768 secret key loaded from the platform
     /// secure store by the caller. The shared secret is stored and returned
     /// via `consume_deferred`.
+    ///
+    /// The returned `Vec<Action>` contains a `SaveSessionToSecureStore` action
+    /// that the platform **must** execute to persist the deferred contribution
+    /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`.
     pub fn decapsulate_and_store(
         &mut self,
         contact_id: &str,
         kem_ciphertext: &[u8],
         kem_secret: &[u8],
         otpk_id: u32,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Action>, String> {
         let shared_secret = pq_decapsulate(kem_secret, kem_ciphertext)?;
+        let persist_action = serialize_pending_action(contact_id, otpk_id, &shared_secret);
         self.pending.insert(
             contact_id.to_string(),
-            PendingContribution { shared_secret, otpk_id },
+            PendingContribution {
+                shared_secret,
+                otpk_id,
+            },
         );
-        Ok(())
+        Ok(vec![persist_action])
     }
 
     // ── Shared ────────────────────────────────────────────────────────────────
 
     /// Retrieve and remove the deferred contribution for `contact_id`.
     ///
-    /// Returns `None` if no deferred contribution exists (caller should skip
-    /// `apply_pq_contribution`).
-    pub fn consume_deferred(&mut self, contact_id: &str) -> Option<DeferredContribution> {
+    /// Returns `(None, [])` if no deferred contribution exists (caller should
+    /// skip `apply_pq_contribution`).
+    ///
+    /// When a contribution IS present, the second element of the tuple contains
+    /// a `SaveSessionToSecureStore` delete sentinel (empty `data`) that the
+    /// platform **must** execute to remove the previously persisted entry.
+    pub fn consume_deferred(
+        &mut self,
+        contact_id: &str,
+    ) -> (Option<DeferredContribution>, Vec<Action>) {
         self.pending_ciphertexts.remove(contact_id);
-        self.pending.remove(contact_id).map(|c| DeferredContribution {
-            shared_secret: c.shared_secret,
-            otpk_id: c.otpk_id,
-        })
+        match self.pending.remove(contact_id) {
+            None => (None, vec![]),
+            Some(c) => {
+                let delete_action = Action::SaveSessionToSecureStore {
+                    key: format!("pq_deferred_{}", contact_id),
+                    data: vec![],
+                };
+                (
+                    Some(DeferredContribution {
+                        shared_secret: c.shared_secret,
+                        otpk_id: c.otpk_id,
+                    }),
+                    vec![delete_action],
+                )
+            }
+        }
     }
 
     /// `true` if there is a pending contribution for `contact_id`.
@@ -211,6 +254,20 @@ impl Default for PQContributionManager {
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Serialize a pending contribution to `Action::SaveSessionToSecureStore`.
+/// Wire format: `otpk_id (4 bytes LE) || shared_secret`.
+fn serialize_pending_action(contact_id: &str, otpk_id: u32, shared_secret: &[u8]) -> Action {
+    let mut data = Vec::with_capacity(4 + shared_secret.len());
+    data.extend_from_slice(&otpk_id.to_le_bytes());
+    data.extend_from_slice(shared_secret);
+    Action::SaveSessionToSecureStore {
+        key: format!("pq_deferred_{}", contact_id),
+        data,
+    }
+}
+
 // ── Crypto primitives (feature-gated) ─────────────────────────────────────────
 
 /// Encapsulate to `public_key`. Returns `(ciphertext, shared_secret)`.
@@ -245,8 +302,7 @@ fn pq_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Strin
 fn pq_keygen() -> Result<(Vec<u8>, Vec<u8>), String> {
     #[cfg(feature = "post-quantum")]
     {
-        crate::crypto::pq_x3dh::mlkem768_keygen()
-            .map(|kp| (kp.public_key, kp.secret_key))
+        crate::crypto::pq_x3dh::mlkem768_keygen().map(|kp| (kp.public_key, kp.secret_key))
     }
     #[cfg(not(feature = "post-quantum"))]
     {
@@ -271,7 +327,9 @@ mod tests {
     #[test]
     fn test_consume_deferred_returns_none_when_absent() {
         let mut mgr = PQContributionManager::new();
-        assert!(mgr.consume_deferred("nobody").is_none());
+        let (result, actions) = mgr.consume_deferred("nobody");
+        assert!(result.is_none());
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -338,16 +396,58 @@ mod tests {
     fn test_encapsulate_and_consume_roundtrip() {
         let kp = crate::crypto::pq_x3dh::mlkem768_keygen().unwrap();
         let mut mgr = PQContributionManager::new();
-        let result = mgr.encapsulate_and_defer("bob", &kp.public_key).unwrap();
+        let (result, persist_actions) = mgr.encapsulate_and_defer("bob", &kp.public_key).unwrap();
         assert!(!result.ciphertext.is_empty());
+        assert_eq!(persist_actions.len(), 1);
+        assert!(
+            matches!(&persist_actions[0], Action::SaveSessionToSecureStore { key, data }
+                if key == "pq_deferred_bob" && !data.is_empty()),
+            "persist action must save deferred entry"
+        );
         assert!(mgr.has_pending("bob"));
 
-        let deferred = mgr.consume_deferred("bob").unwrap();
+        let (deferred, delete_actions) = mgr.consume_deferred("bob");
+        let deferred = deferred.unwrap();
         assert!(!deferred.shared_secret.is_empty());
         assert!(!mgr.has_pending("bob"));
+        assert_eq!(delete_actions.len(), 1);
+        assert!(
+            matches!(&delete_actions[0], Action::SaveSessionToSecureStore { key, data }
+                if key == "pq_deferred_bob" && data.is_empty()),
+            "delete action must be empty-data sentinel"
+        );
 
         // Verify decapsulate produces the same shared secret.
         let ss2 = pq_decapsulate(&kp.secret_key, &result.ciphertext).unwrap();
         assert_eq!(deferred.shared_secret, ss2);
+    }
+
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn test_decapsulate_and_store_returns_persist_action() {
+        let kp = crate::crypto::pq_x3dh::mlkem768_keygen().unwrap();
+        let mut mgr = PQContributionManager::new();
+
+        // Build a ciphertext using the public key
+        let enc = crate::crypto::pq_x3dh::mlkem768_encapsulate(&kp.public_key).unwrap();
+        let actions = mgr
+            .decapsulate_and_store("alice", &enc.ciphertext, &kp.secret_key, 42)
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::SaveSessionToSecureStore { key, data }
+                if key == "pq_deferred_alice" && !data.is_empty()),
+            "decapsulate must return persist action"
+        );
+        assert!(mgr.has_pending("alice"));
+
+        // Consume should return delete action
+        let (deferred, delete_actions) = mgr.consume_deferred("alice");
+        assert!(deferred.is_some());
+        assert_eq!(delete_actions.len(), 1);
+        assert!(
+            matches!(&delete_actions[0], Action::SaveSessionToSecureStore { key, data }
+                if key == "pq_deferred_alice" && data.is_empty()),
+        );
     }
 }

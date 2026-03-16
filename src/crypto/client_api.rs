@@ -57,6 +57,66 @@ use crate::crypto::session_api::Session;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+// ---- SPK freshness constants ----
+/// Maximum age of a Signed Pre-Key bundle before the client rejects it.
+/// 8 days = 7-day rotation period + 1 day propagation buffer.
+const SPK_MAX_AGE_SECS: u64 = 8 * 24 * 3600;
+
+/// Validate that a received `X3DHPublicKeyBundle` is not stale.
+///
+/// Checks `spk_uploaded_at` (and the Kyber equivalent) against the current time.
+/// When the field is 0 (legacy server that does not yet populate it), validation
+/// is skipped so existing deployments remain compatible.
+fn validate_bundle_freshness<P, H>(bundle: &H::PublicKeyBundle) -> Result<(), String>
+where
+    P: crate::crypto::provider::CryptoProvider,
+    H: crate::crypto::handshake::KeyAgreement<P>,
+{
+    // Serialize the bundle to JSON to extract timestamp fields generically.
+    // If serialization fails (shouldn't happen), skip validation safely.
+    let bundle_json = match serde_json::to_value(bundle) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let spk_uploaded_at = bundle_json
+        .get("spk_uploaded_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if spk_uploaded_at == 0 {
+        return Ok(()); // legacy server — no timestamp provided
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let age = now.saturating_sub(spk_uploaded_at);
+    if age > SPK_MAX_AGE_SECS {
+        return Err(format!(
+            "SPK bundle is stale: uploaded_at={spk_uploaded_at}, age={age}s > max={SPK_MAX_AGE_SECS}s — \
+             peer should rotate their keys"
+        ));
+    }
+
+    // Same check for Kyber SPK if present.
+    let kyber_uploaded_at = bundle_json
+        .get("kyber_spk_uploaded_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if kyber_uploaded_at > 0 && now.saturating_sub(kyber_uploaded_at) > SPK_MAX_AGE_SECS {
+        let kyber_age = now.saturating_sub(kyber_uploaded_at);
+        return Err(format!(
+            "Kyber SPK bundle is stale: uploaded_at={kyber_uploaded_at}, age={kyber_age}s > max={SPK_MAX_AGE_SECS}s"
+        ));
+    }
+
+    Ok(())
+}
+
 /// High-level Client для работы с криптографией
 ///
 /// Объединяет KeyManager (долгосрочные ключи) + SessionManager (множественные сессии).
@@ -234,6 +294,9 @@ where
                 contact_id
             ));
         }
+
+        // Validate SPK bundle freshness before doing any crypto work.
+        validate_bundle_freshness::<P, H>(remote_bundle)?;
 
         info!(
             target: "crypto::client",
@@ -457,16 +520,20 @@ where
             "Initializing session as responder (with ephemeral)"
         );
 
-        // Consume the OTPK (burn-on-use) BEFORE borrowing identity key
+        // Consume the OTPK (burn-on-use) BEFORE borrowing identity key.
+        // If the sender specified an OTPK ID but we no longer hold that key
+        // (device reset, reinstall, key exhaustion) the 4-DH and 3-DH root keys
+        // will diverge — silently falling back would cause every subsequent
+        // message to fail AEAD. We return an explicit error so the caller can
+        // trigger session healing rather than creating a permanently broken session.
         let consumed_otpk = if one_time_prekey_id != 0 {
             let key = self.key_manager.consume_one_time_prekey(one_time_prekey_id);
             if key.is_none() {
-                warn!(
-                    target: "crypto::client",
-                    contact_id = %contact_id,
-                    key_id = one_time_prekey_id,
-                    "OTPK key_id not found locally — falling back to 3-DH"
-                );
+                return Err(format!(
+                    "OTPK id={} not found — sender used 4-DH but we cannot reproduce it; \
+                     session healing required",
+                    one_time_prekey_id
+                ));
             }
             key
         } else {
@@ -731,7 +798,15 @@ where
     /// Pop the pending one-time prekey id for a contact (used by first encrypt, message_number==0).
     /// Returns 0 if no pending OTPK (fallback 3-DH mode).
     pub fn take_pending_otpk_id(&mut self, contact_id: &str) -> u32 {
-        self.pending_otpk_ids.remove(contact_id).unwrap_or(0)
+        let id = self.pending_otpk_ids.remove(contact_id).unwrap_or(0);
+        tracing::debug!(
+            target: "crypto::client",
+            contact_id = %contact_id,
+            one_time_prekey_id = id,
+            pending_count = self.pending_otpk_ids.len(),
+            "take_pending_otpk_id"
+        );
+        id
     }
 
     /// Generate new one-time prekeys and return (key_id, public_key_bytes) pairs for upload.
@@ -804,6 +879,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Alice initiates session with Bob
@@ -873,6 +952,10 @@ mod tests {
             suite_id: SuiteID::CLASSIC,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         alice
@@ -1022,6 +1105,10 @@ mod tests {
             suite_id: bob_bundle.suite_id,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         alice
@@ -1077,6 +1164,10 @@ mod tests {
             suite_id: bob_bundle.suite_id,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         alice
@@ -1131,6 +1222,10 @@ mod tests {
             suite_id: bob_bundle.suite_id,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         alice

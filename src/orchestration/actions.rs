@@ -26,6 +26,21 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Emitted when a message has been successfully decrypted.
+    /// Carries the full plaintext so the platform can persist + display it.
+    MessageDecrypted {
+        contact_id: String,
+        message_id: String,
+        plaintext_utf8: String,
+    },
+
+    /// Decryption failed on message 0; the session needs healing.
+    /// `role` is either `"Initiator"` (lower userId) or `"Responder"`.
+    SessionHealNeeded {
+        contact_id: String,
+        role: String,
+    },
+
     // ── Persistence ───────────────────────────────────────────────────────────
     SaveSessionToSecureStore {
         key: String,
@@ -95,12 +110,16 @@ pub enum ReceiptStatus {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum IncomingEvent {
     MessageReceived {
+        /// Server-assigned message UUID (used for ACK deduplication).
+        message_id: String,
         from: String,
         data: Vec<u8>,
         msg_num: u32,
         /// ML-KEM-768 ciphertext (empty if no PQ contribution in this message).
         kem_ct: Vec<u8>,
         otpk_id: u32,
+        /// `true` when this is a control message (e.g. END_SESSION).
+        is_control: bool,
     },
     SessionInitCompleted {
         contact_id: String,

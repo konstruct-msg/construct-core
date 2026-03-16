@@ -110,6 +110,10 @@ where
             .map_err(|e| ConstructError::ValidationError(format!("Invalid suite_id: {}", e)))?,
         one_time_prekey_public: None,
         one_time_prekey_id: None,
+        spk_uploaded_at: 0,
+        spk_rotation_epoch: 0,
+        kyber_spk_uploaded_at: 0,
+        kyber_spk_rotation_epoch: 0,
     };
 
     let remote_identity = P::kem_public_key_from_bytes(bundle_data.identity_public.clone());

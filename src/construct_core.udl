@@ -70,6 +70,9 @@ dictionary PrivateKeysJson {
     string signed_prekey_secret;
     string prekey_signature;
     string suite_id;
+    string? identity_public_check;
+    string? verifying_key_check;
+    string? signed_prekey_public_check;
 };
 
 [Error]

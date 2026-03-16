@@ -50,6 +50,10 @@ impl From<KeyBundle> for X3DHPublicKeyBundle {
             suite_id,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         }
     }
 }
@@ -150,6 +154,10 @@ where
                 .map_err(|e| ConstructError::ValidationError(format!("Invalid suite_id: {}", e)))?,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
         };
 
         // Extract remote identity from bundle

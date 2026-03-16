@@ -29,7 +29,6 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::orchestration::actions::Action;
-use crate::orchestration::healing_queue::HealingQueue;
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -54,6 +53,7 @@ pub enum RoutingDecision {
     /// Message decrypted successfully.
     Decrypted {
         contact_id: String,
+        message_id: String,
         plaintext: Vec<u8>,
         actions: Vec<Action>,
     },
@@ -63,32 +63,20 @@ pub enum RoutingDecision {
         queued_count: usize,
     },
     /// Decryption failed on message 0 — session healing required.
-    SessionHealNeeded {
-        contact_id: String,
-        role: Role,
-    },
+    SessionHealNeeded { contact_id: String, role: Role },
     /// Session is irrecoverably broken — send END_SESSION.
-    EndSessionNeeded {
-        contact_id: String,
-        reason: String,
-    },
+    EndSessionNeeded { contact_id: String, reason: String },
     /// Message already processed — discard.
-    Duplicate {
-        message_id: String,
-    },
+    Duplicate { message_id: String },
     /// Pending queue for this contact is full — apply backpressure.
-    QueueFull {
-        contact_id: String,
-    },
+    QueueFull { contact_id: String },
     /// END_SESSION control message received.
     EndSessionReceived {
         contact_id: String,
         actions: Vec<Action>,
     },
     /// Unrecoverable routing error.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 /// A raw incoming message before decryption.
@@ -174,6 +162,7 @@ impl MessageRouter {
 
                 RoutingDecision::Decrypted {
                     contact_id: msg.contact_id.clone(),
+                    message_id: msg.message_id.clone(),
                     plaintext: result.plaintext,
                     actions,
                 }
@@ -225,9 +214,7 @@ impl MessageRouter {
 
     /// Number of queued messages for `contact_id`.
     pub fn pending_count(&self, contact_id: &str) -> usize {
-        self.pending_queues
-            .get(contact_id)
-            .map_or(0, |q| q.len())
+        self.pending_queues.get(contact_id).map_or(0, |q| q.len())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -305,7 +292,10 @@ mod tests {
         let decision = router.route_message(&mut lifecycle, &m);
         assert!(matches!(
             decision,
-            RoutingDecision::NeedSessionInit { queued_count: 1, .. }
+            RoutingDecision::NeedSessionInit {
+                queued_count: 1,
+                ..
+            }
         ));
         assert_eq!(router.pending_count("bob"), 1);
     }
@@ -355,7 +345,10 @@ mod tests {
             is_control: true,
         };
         let decision = router.route_message(&mut lifecycle, &m);
-        assert!(matches!(decision, RoutingDecision::EndSessionReceived { .. }));
+        assert!(matches!(
+            decision,
+            RoutingDecision::EndSessionReceived { .. }
+        ));
     }
 
     #[test]
