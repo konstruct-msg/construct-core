@@ -73,7 +73,6 @@ impl Default for HealingQueue {
 }
 
 impl HealingQueue {
-
     // ── Query ─────────────────────────────────────────────────────────────────
 
     /// Returns `true` if `msg_number == 0` — the only case that warrants healing.

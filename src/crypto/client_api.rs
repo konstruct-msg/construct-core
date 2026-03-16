@@ -868,7 +868,7 @@ mod tests {
         // Bob's registration bundle
         let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
         let bob_identity_pub =
-            ClassicSuiteProvider::from_private_key_to_public_key(&bob_identity_priv).unwrap();
+            ClassicSuiteProvider::from_private_key_to_public_key(bob_identity_priv).unwrap();
 
         let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
         let bob_bundle = X3DHPublicKeyBundle {
@@ -902,7 +902,7 @@ mod tests {
             ClassicSuiteProvider::kem_public_key_from_bytes(encrypted1.dh_public_key.to_vec());
         let alice_identity_priv = alice.key_manager.identity_secret_key().unwrap();
         let alice_identity_pub =
-            ClassicSuiteProvider::from_private_key_to_public_key(&alice_identity_priv).unwrap();
+            ClassicSuiteProvider::from_private_key_to_public_key(alice_identity_priv).unwrap();
 
         // NB: init_receiving_session_with_ephemeral теперь возвращает (session_id, plaintext)
         // Первое сообщение уже расшифровано!
@@ -941,7 +941,7 @@ mod tests {
 
         let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
         let bob_identity_pub =
-            ClassicSuiteProvider::from_private_key_to_public_key(&bob_identity_priv).unwrap();
+            ClassicSuiteProvider::from_private_key_to_public_key(bob_identity_priv).unwrap();
 
         let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
         let bob_bundle = X3DHPublicKeyBundle {

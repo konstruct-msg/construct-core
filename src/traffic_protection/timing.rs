@@ -164,7 +164,7 @@ mod tests {
         for _ in 0..100 {
             let duration = jittered_interval(1000, 500);
             let ms = duration.as_millis() as u64;
-            assert!(ms >= 1000 && ms <= 1500);
+            assert!((1000..=1500).contains(&ms));
         }
     }
 
@@ -181,7 +181,7 @@ mod tests {
         // Heartbeat should be base ± 5 seconds
         let duration = heartbeat_interval(30);
         let ms = duration.as_millis() as u64;
-        assert!(ms >= 30000 && ms <= 35000); // 30s-35s
+        assert!((30000..=35000).contains(&ms)); // 30s-35s
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
         // Full battery should have full jitter
         let duration = battery_aware_jitter(1000, 500, 1.0);
         let ms = duration.as_millis() as u64;
-        assert!(ms >= 1000 && ms <= 1500);
+        assert!((1000..=1500).contains(&ms));
     }
 
     #[test]
@@ -199,7 +199,7 @@ mod tests {
             let duration = battery_aware_jitter(1000, 500, 0.1);
             let ms = duration.as_millis() as u64;
             // 50% of 500ms = 250ms, so range is 1000-1250
-            assert!(ms >= 1000 && ms <= 1250);
+            assert!((1000..=1250).contains(&ms));
         }
     }
 
@@ -210,7 +210,7 @@ mod tests {
             let duration = battery_aware_jitter(1000, 400, 0.4);
             let ms = duration.as_millis() as u64;
             // 75% of 400ms = 300ms, so range is 1000-1300
-            assert!(ms >= 1000 && ms <= 1300);
+            assert!((1000..=1300).contains(&ms));
         }
     }
 

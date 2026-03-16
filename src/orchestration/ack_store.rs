@@ -55,7 +55,6 @@ impl Default for AckStore {
 }
 
 impl AckStore {
-
     // ── Query ─────────────────────────────────────────────────────────────────
 
     /// Check whether `message_id` has been processed.

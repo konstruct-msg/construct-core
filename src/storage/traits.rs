@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_auth_tokens_expiration() {
-        let now = crate::utils::time::current_timestamp() as i64;
+        let now = crate::utils::time::current_timestamp();
 
         // Токен истекает через 2 минуты
         let tokens = AuthTokens {

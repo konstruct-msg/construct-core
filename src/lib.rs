@@ -7,6 +7,7 @@
 
 // Core modules (platform-independent)
 pub mod api;
+pub mod cfe;
 pub mod config;
 pub mod crypto;
 pub mod device_id;

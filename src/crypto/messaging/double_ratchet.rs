@@ -459,7 +459,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         associated_data.extend_from_slice(&dh_public_key);
         associated_data.extend_from_slice(&message_number.to_be_bytes());
 
-        eprintln!("[DR ENCRYPT] sender={} receiver={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
+        eprintln!(
+            "[DR ENCRYPT] sender={} receiver={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
             &self.local_user_id[..8.min(self.local_user_id.len())],
             &self.contact_id[..8.min(self.contact_id.len())],
             &self.session_id[..8.min(self.session_id.len())],
@@ -601,9 +602,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public).inspect_err(|_e| {
-                self.restore_snapshot(snapshot.clone());
-            })?;
+            self.perform_dh_ratchet(&remote_dh_public)
+                .inspect_err(|_e| {
+                    self.restore_snapshot(snapshot.clone());
+                })?;
         }
 
         // Try to find skipped message key (keyed by remote DH chain + message number)
@@ -631,9 +633,11 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             if self.receiving_chain_length == encrypted.message_number {
                 self.receiving_chain_key = next_chain;
                 self.receiving_chain_length += 1;
-                return self.decrypt_with_key(&msg_key, encrypted).inspect_err(|_e| {
-                    self.restore_snapshot(snapshot);
-                });
+                return self
+                    .decrypt_with_key(&msg_key, encrypted)
+                    .inspect_err(|_e| {
+                        self.restore_snapshot(snapshot);
+                    });
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)
                 // so keys from different DH chains never collide.

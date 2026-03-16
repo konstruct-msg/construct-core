@@ -141,9 +141,9 @@ pub struct PrivateKeysJson {
     // Integrity fields: public keys re-derived on load and compared to catch Keychain corruption.
     // Optional for backward compatibility with keys exported before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_public_check: Option<String>,   // Base64 of identity public key
+    pub identity_public_check: Option<String>, // Base64 of identity public key
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verifying_key_check: Option<String>,     // Base64 of Ed25519 verifying key
+    pub verifying_key_check: Option<String>, // Base64 of Ed25519 verifying key
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_prekey_public_check: Option<String>, // Base64 of SPK public key
 }
@@ -278,15 +278,18 @@ impl ClassicCryptoCore {
 
         // Re-derive public keys from private keys for integrity checking on next load.
         use base64::Engine;
-        let identity_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
-            .ok()
-            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
-        let signing_pub_check = ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
-            .ok()
-            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
-        let spk_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
-            .ok()
-            .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+        let identity_pub_check =
+            ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
+                .ok()
+                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+        let signing_pub_check =
+            ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
+                .ok()
+                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
+        let spk_pub_check =
+            ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
+                .ok()
+                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
 
         // Encode to base64
         let private_keys_json = PrivateKeysJson {
@@ -1341,6 +1344,7 @@ pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> 
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1381,6 +1385,8 @@ mod tests {
             signature,
             verifying_key,
             suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
         };
 
         serde_json::to_vec(&key_bundle).unwrap()
@@ -1627,7 +1633,7 @@ mod tests {
             ClassicSuiteProvider::kem_public_key_from_bytes(bob_bundle.identity_public.clone());
 
         alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub)
+            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
             .unwrap();
         eprintln!("[DIRECT TEST] Alice created session with Bob");
 
@@ -1636,7 +1642,7 @@ mod tests {
         let encrypted1 = alice.encrypt_message("bob", plaintext1).unwrap();
         eprintln!(
             "[DIRECT TEST] Alice encrypted message, dh_key: {}",
-            hex::encode(&encrypted1.dh_public_key)
+            hex::encode(encrypted1.dh_public_key)
         );
 
         // Bob creates receiving session
@@ -1649,6 +1655,7 @@ mod tests {
                 &alice_identity_pub,
                 &alice_ephemeral_pub,
                 &encrypted1,
+                0,
             )
             .unwrap();
 
@@ -1690,7 +1697,7 @@ mod tests {
 
         // Alice creates session with Bob
         alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub)
+            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
             .unwrap();
 
         // Alice encrypts message
@@ -1698,10 +1705,7 @@ mod tests {
         let encrypted1 = alice.encrypt_message("bob", plaintext1).unwrap();
 
         eprintln!("[UNIFFI FLOW TEST] Alice encrypted:");
-        eprintln!(
-            "  dh_public_key: {}",
-            hex::encode(&encrypted1.dh_public_key)
-        );
+        eprintln!("  dh_public_key: {}", hex::encode(encrypted1.dh_public_key));
         eprintln!("  nonce len: {}", encrypted1.nonce.len());
         eprintln!("  ciphertext len: {}", encrypted1.ciphertext.len());
         eprintln!("  suite_id: {}", encrypted1.suite_id);
@@ -1734,7 +1738,7 @@ mod tests {
         eprintln!("[UNIFFI FLOW TEST] Reconstructed message:");
         eprintln!(
             "  dh_public_key: {}",
-            hex::encode(&reconstructed_message.dh_public_key)
+            hex::encode(reconstructed_message.dh_public_key)
         );
         eprintln!("  suite_id: {}", reconstructed_message.suite_id);
 
@@ -1748,6 +1752,7 @@ mod tests {
             &alice_identity_pub,
             &alice_ephemeral_pub,
             &reconstructed_message,
+            0,
         );
 
         match &result {
@@ -1886,6 +1891,12 @@ pub struct RustAckStore {
     inner: std::sync::Mutex<crate::orchestration::AckStore>,
 }
 
+impl Default for RustAckStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RustAckStore {
     pub fn new() -> Self {
         Self {
@@ -1931,6 +1942,12 @@ pub enum AckCheckResult {
 
 pub struct RustHealingQueue {
     inner: std::sync::Mutex<crate::orchestration::HealingQueue>,
+}
+
+impl Default for RustHealingQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RustHealingQueue {
@@ -1984,6 +2001,10 @@ impl RustHealingQueue {
     pub fn len(&self) -> u64 {
         let queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         queue.len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -2245,7 +2266,7 @@ impl OrchestratorCore {
 // ── JSON serialization helpers ────────────────────────────────────────────────
 
 fn actions_to_json(actions: &[crate::orchestration::Action]) -> String {
-    let values: Vec<serde_json::Value> = actions.iter().map(|a| action_value(a)).collect();
+    let values: Vec<serde_json::Value> = actions.iter().map(action_value).collect();
     serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2337,6 +2358,12 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
 
 pub struct RustPQContributions {
     inner: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl Default for RustPQContributions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RustPQContributions {

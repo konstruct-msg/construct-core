@@ -302,20 +302,23 @@ impl Orchestrator {
         let signing_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
         let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
 
-        use base64::engine::general_purpose::STANDARD;
-        use crate::crypto::suites::classic::ClassicSuiteProvider;
         use crate::crypto::provider::CryptoProvider as _;
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        use base64::engine::general_purpose::STANDARD;
 
         // Re-derive public keys for integrity verification on next load.
-        let identity_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
-            .ok()
-            .map(|b| STANDARD.encode(&b));
-        let verifying_key_check = ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
-            .ok()
-            .map(|b| STANDARD.encode(&b));
-        let spk_pub_check = ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
-            .ok()
-            .map(|b| STANDARD.encode(&b));
+        let identity_pub_check =
+            ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
+                .ok()
+                .map(|b| STANDARD.encode(&b));
+        let verifying_key_check =
+            ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
+                .ok()
+                .map(|b| STANDARD.encode(&b));
+        let spk_pub_check =
+            ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
+                .ok()
+                .map(|b| STANDARD.encode(&b));
 
         let mut json = serde_json::json!({
             "identity_secret": STANDARD.encode(&identity_bytes),
@@ -763,9 +766,9 @@ impl Orchestrator {
     // ── Cooldown helpers ──────────────────────────────────────────────────────
 
     fn on_cooldown(&self, contact_id: &str) -> bool {
-        self.cooldowns.get(contact_id).is_some_and(|&last_ms| {
-            unix_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS
-        })
+        self.cooldowns
+            .get(contact_id)
+            .is_some_and(|&last_ms| unix_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS)
     }
 
     fn set_cooldown(&mut self, contact_id: String) {

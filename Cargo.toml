@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["Konstruct Team"]
 edition = "2021"
 rust-version = "1.80"
@@ -53,6 +53,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 time = { version = "0.3.47", features = ["formatting", "parsing"] }
 hex = "0.4"
 bytes = "1.11.1"  # Direct dependency to ensure security fix for RUSTSEC-2026-0007
+crc32fast = "1.3"
 
 # Криптография
 x25519-dalek = { version = "2.0", features = ["reusable_secrets", "static_secrets"] }

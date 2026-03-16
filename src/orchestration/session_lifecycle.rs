@@ -414,6 +414,7 @@ mod tests {
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
 
+    #[allow(dead_code)]
     fn make_pair() -> (SessionLifecycleManager, SessionLifecycleManager) {
         let alice_client = ClassicClient::<ClassicSuiteProvider>::new().expect("alice client");
         let bob_client = ClassicClient::<ClassicSuiteProvider>::new().expect("bob client");

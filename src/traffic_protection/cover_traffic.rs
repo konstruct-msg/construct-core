@@ -354,9 +354,11 @@ mod tests {
 
     #[test]
     fn test_battery_aware_behavior() {
-        let mut config = CoverTrafficConfig::default();
-        config.enabled = true;
-        config.battery_level_threshold = 0.2;
+        let config = CoverTrafficConfig {
+            enabled: true,
+            battery_level_threshold: 0.2,
+            ..Default::default()
+        };
 
         let mut manager = CoverTrafficManager::new(config);
 
@@ -372,10 +374,12 @@ mod tests {
 
     #[test]
     fn test_coalescing_behavior() {
-        let mut config = CoverTrafficConfig::default();
-        config.enabled = true;
-        config.coalesce_with_real_messages = true;
-        config.coalesce_window_ms = 100; // 100ms for faster testing
+        let config = CoverTrafficConfig {
+            enabled: true,
+            coalesce_with_real_messages: true,
+            coalesce_window_ms: 100, // 100ms for faster testing
+            ..Default::default()
+        };
 
         let mut manager = CoverTrafficManager::new(config);
         manager.update_battery_level(1.0);
@@ -396,10 +400,12 @@ mod tests {
 
     #[test]
     fn test_adaptive_interval() {
-        let mut config = CoverTrafficConfig::default();
-        config.enabled = true;
-        config.min_interval_ms = 10; // Very short for testing
-        config.max_interval_ms = 1000;
+        let config = CoverTrafficConfig {
+            enabled: true,
+            min_interval_ms: 10, // Very short for testing
+            max_interval_ms: 1000,
+            ..Default::default()
+        };
 
         let mut manager = CoverTrafficManager::new(config);
         manager.update_battery_level(1.0);
@@ -421,9 +427,11 @@ mod tests {
 
     #[test]
     fn test_metrics_tracking() {
-        let mut config = CoverTrafficConfig::default();
-        config.enabled = true;
-        config.min_interval_ms = 10; // Very short for testing
+        let config = CoverTrafficConfig {
+            enabled: true,
+            min_interval_ms: 10, // Very short for testing
+            ..Default::default()
+        };
 
         let mut manager = CoverTrafficManager::new(config);
         manager.update_battery_level(1.0);
@@ -448,9 +456,11 @@ mod tests {
 
     #[test]
     fn test_real_message_resets_adaptive_interval() {
-        let mut config = CoverTrafficConfig::default();
-        config.enabled = true;
-        config.min_interval_ms = 100;
+        let config = CoverTrafficConfig {
+            enabled: true,
+            min_interval_ms: 100,
+            ..Default::default()
+        };
 
         let mut manager = CoverTrafficManager::new(config);
         manager.update_battery_level(1.0);

@@ -1,5 +1,4 @@
 //! Post-quantum extensions for the Double Ratchet algorithm.
-#![cfg(feature = "post-quantum")]
 
 // Note: This is a placeholder implementation based on the documentation.
 // The actual implementation will require more detail, especially around KDF chains
