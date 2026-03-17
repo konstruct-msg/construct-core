@@ -43,4 +43,19 @@ pub enum CfeError {
 
     #[error("Deserialize failed: {0}")]
     DeserializeFailed(String),
+
+    #[error("Legacy JSON parse failed: {0}")]
+    LegacyJsonParseFailed(String),
+
+    #[error("Base64 decode failed: {0}")]
+    Base64DecodeFailed(String),
+
+    #[error("Hex decode failed: {0}")]
+    HexDecodeFailed(String),
+
+    #[error("Invalid field: {0}")]
+    InvalidField(String),
+
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailed(String),
 }

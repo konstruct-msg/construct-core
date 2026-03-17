@@ -1120,6 +1120,89 @@ pub struct SerializableSession {
     local_user_id: String,
 }
 
+impl SerializableSession {
+    pub fn to_cfe_v1(&self) -> Result<crate::cfe::CfeSessionStateV1, String> {
+        use serde_bytes::ByteBuf;
+
+        let suite_id: u8 = self
+            .suite_id
+            .try_into()
+            .map_err(|_| format!("suite_id out of range: {}", self.suite_id))?;
+
+        let session_id_raw =
+            hex::decode(&self.session_id).map_err(|e| format!("invalid session_id hex: {e}"))?;
+        if session_id_raw.len() != 16 {
+            return Err(format!(
+                "invalid session_id length: expected 16, got {}",
+                session_id_raw.len()
+            ));
+        }
+
+        Ok(crate::cfe::CfeSessionStateV1 {
+            ver: 1,
+            suite_id,
+            contact_id: self.contact_id.clone(),
+            local_uid: self.local_user_id.clone(),
+            session_id: ByteBuf::from(session_id_raw),
+            rk: ByteBuf::from(self.root_key.clone()),
+            sck: ByteBuf::from(self.sending_chain_key.clone()),
+            rck: ByteBuf::from(self.receiving_chain_key.clone()),
+            scl: self.sending_chain_length,
+            rcl: self.receiving_chain_length,
+            psl: self.previous_sending_length,
+            dh_priv: self.dh_ratchet_private.clone().map(ByteBuf::from),
+            dh_pub: ByteBuf::from(self.dh_ratchet_public.clone()),
+            rdh_pub: self.remote_dh_public.clone().map(ByteBuf::from),
+            skipped: self
+                .skipped_keys
+                .iter()
+                .map(|e| crate::cfe::CfeSkippedKeyEntryV1 {
+                    dh_pub: ByteBuf::from(e.dh_public.clone()),
+                    msg_number: e.msg_number,
+                    key_bytes: ByteBuf::from(e.key_bytes.clone()),
+                    timestamp: e.timestamp,
+                })
+                .collect(),
+            pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
+        })
+    }
+
+    pub fn from_cfe_v1(data: crate::cfe::CfeSessionStateV1) -> Result<Self, String> {
+        let suite_id: u16 = data.suite_id as u16;
+        let session_id_hex = hex::encode(data.session_id.as_ref());
+
+        Ok(Self {
+            version: 2,
+            suite_id,
+            root_key: data.rk.into_vec(),
+            sending_chain_key: data.sck.into_vec(),
+            sending_chain_length: data.scl,
+            receiving_chain_key: data.rck.into_vec(),
+            receiving_chain_length: data.rcl,
+            dh_ratchet_private: data.dh_priv.map(|b| b.into_vec()),
+            dh_ratchet_public: data.dh_pub.into_vec(),
+            remote_dh_public: data.rdh_pub.map(|b| b.into_vec()),
+            previous_sending_length: data.psl,
+            skipped_message_keys: Default::default(),
+            skipped_key_timestamps: Default::default(),
+            skipped_keys: data
+                .skipped
+                .into_iter()
+                .map(|e| SkippedKeyEntry {
+                    dh_public: e.dh_pub.into_vec(),
+                    msg_number: e.msg_number,
+                    key_bytes: e.key_bytes.into_vec(),
+                    timestamp: e.timestamp,
+                })
+                .collect(),
+            pre_pq_root_key: data.pq_rk1.map(|b| b.into_vec()),
+            session_id: session_id_hex,
+            contact_id: data.contact_id,
+            local_user_id: data.local_uid,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DoubleRatchetSession, SuiteID};

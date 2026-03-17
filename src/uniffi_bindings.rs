@@ -307,6 +307,96 @@ impl ClassicCryptoCore {
         serde_json::to_string(&private_keys_json).map_err(|_| CryptoError::SerializationFailed)
     }
 
+    /// Export private keys in CFE binary format (MessagePack + header).
+    pub fn export_private_keys(&self) -> Result<Vec<u8>, CryptoError> {
+        use crate::crypto::provider::CryptoProvider;
+        use serde_bytes::ByteBuf;
+
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let identity_secret = client
+            .key_manager()
+            .identity_secret_key()
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let signing_secret = client
+            .key_manager()
+            .signing_secret_key()
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let prekey = client
+            .key_manager()
+            .current_signed_prekey()
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+
+        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
+        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
+        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
+        let spk_sig: Vec<u8> = prekey.signature.clone();
+
+        let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let vk_pub = ClassicSuiteProvider::from_signature_private_to_public(&sk_priv)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let spk_pub = ClassicSuiteProvider::from_private_key_to_public_key(&spk_priv)
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+
+        let spk_id = client.key_manager().current_signed_prekey_id().unwrap_or(0);
+
+        let payload = crate::cfe::CfePrivateKeysV1 {
+            suite_id: 1,
+            ik_priv: ByteBuf::from(ik_priv),
+            sk_priv: ByteBuf::from(sk_priv),
+            spk_priv: ByteBuf::from(spk_priv),
+            spk_sig: ByteBuf::from(spk_sig),
+            spk_id,
+            ik_pub: ByteBuf::from(ik_pub),
+            vk_pub: ByteBuf::from(vk_pub),
+            spk_pub: ByteBuf::from(spk_pub),
+        };
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    /// Import private keys from CFE bytes (with legacy JSON fallback).
+    pub fn import_private_keys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let keys = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+            &data,
+            crate::cfe::CfeMessageType::PrivateKeys,
+        )
+        .or_else(|e| {
+            if matches!(e, crate::cfe::CfeError::LegacyJson) {
+                let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
+                crate::cfe::migrate_private_keys_json_str(s)
+                    .map_err(|_| CryptoError::InvalidKeyData)
+            } else {
+                Err(CryptoError::SerializationFailed)
+            }
+        })?;
+
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let local_uid = client.local_user_id().to_string();
+        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+            keys.ik_priv.into_vec(),
+            keys.sk_priv.into_vec(),
+            keys.spk_priv.into_vec(),
+            keys.spk_sig.into_vec(),
+        )
+        .map_err(|_| CryptoError::InitializationFailed)?;
+
+        *client = new_client;
+        if !local_uid.is_empty() {
+            client.set_local_user_id(local_uid);
+        }
+        Ok(())
+    }
+
     /// Export session to JSON for persistence in Keychain
     ///
     /// # Parameters
@@ -342,6 +432,25 @@ impl ClassicCryptoCore {
 
         // Convert to JSON
         serde_json::to_string(&serializable).map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    /// Export session in CFE binary format (MessagePack + header).
+    pub fn export_session(&self, contact_id: String) -> Result<Vec<u8>, CryptoError> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let session = client
+            .get_session(&contact_id)
+            .ok_or(CryptoError::SessionNotFound)?;
+        let serializable = session.messaging_session().to_serializable();
+        let payload = serializable
+            .to_cfe_v1()
+            .map_err(|_| CryptoError::SerializationFailed)?;
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
+            .map_err(|_| CryptoError::SerializationFailed)
     }
 
     /// Import session from JSON (restore from Keychain)
@@ -380,6 +489,34 @@ impl ClassicCryptoCore {
         // Import into Client
         let session_id = client.import_session(&contact_id, ratchet_session);
 
+        Ok(session_id)
+    }
+
+    /// Import session from CFE bytes (with legacy JSON fallback).
+    pub fn import_session(&self, contact_id: String, data: Vec<u8>) -> Result<String, CryptoError> {
+        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
+
+        let serializable = match crate::cfe::decode_as::<crate::cfe::CfeSessionStateV1>(
+            &data,
+            crate::cfe::CfeMessageType::SessionState,
+        ) {
+            Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
+                .map_err(|_| CryptoError::SerializationFailed)?,
+            Err(crate::cfe::CfeError::LegacyJson) => {
+                let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
+                serde_json::from_str(s).map_err(|_| CryptoError::SerializationFailed)?
+            }
+            Err(_) => return Err(CryptoError::SerializationFailed),
+        };
+
+        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
+            .map_err(|_| CryptoError::SerializationFailed)?;
+
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_id = client.import_session(&contact_id, ratchet);
         Ok(session_id)
     }
 
@@ -827,6 +964,32 @@ impl ClassicCryptoCore {
         serde_json::to_string(&records).map_err(|_| CryptoError::SerializationFailed)
     }
 
+    /// Export all locally stored OTPKs in CFE binary format.
+    pub fn export_one_time_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
+        use serde_bytes::ByteBuf;
+
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let records = client
+            .export_one_time_prekeys()
+            .into_iter()
+            .map(|(id, priv_key, pub_key)| crate::cfe::CfeOtpkRecordV1 {
+                id,
+                priv_key: ByteBuf::from(priv_key),
+                pub_key: ByteBuf::from(pub_key),
+            })
+            .collect();
+
+        let next_id = client.key_manager().next_otpk_id();
+        let payload = crate::cfe::CfeOtpkBundleV1 { records, next_id };
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::OtpkBundle, &payload)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
     /// Import previously persisted OTPKs from a JSON string back into the core.
     /// Call this after restoring the core from Keychain to ensure OTPK continuity.
     pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
@@ -841,6 +1004,38 @@ impl ClassicCryptoCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         client.import_one_time_prekeys(keys);
+        Ok(())
+    }
+
+    /// Import OTPKs from CFE bytes (with legacy JSON fallback).
+    pub fn import_one_time_prekeys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let bundle = crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
+            &data,
+            crate::cfe::CfeMessageType::OtpkBundle,
+        )
+        .or_else(|e| {
+            if matches!(e, crate::cfe::CfeError::LegacyJson) {
+                let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
+                crate::cfe::migrate_otpk_bundle_json_str(s)
+                    .map_err(|_| CryptoError::SerializationFailed)
+            } else {
+                Err(CryptoError::SerializationFailed)
+            }
+        })?;
+
+        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
+            .records
+            .iter()
+            .map(|r| (r.id, r.priv_key.to_vec(), r.pub_key.to_vec()))
+            .collect();
+
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        client.import_one_time_prekeys(keys);
+        client.key_manager_mut().set_next_otpk_id(bundle.next_id);
         Ok(())
     }
 
@@ -1022,6 +1217,37 @@ pub fn create_crypto_core_from_keys_json(
     .map_err(|_| CryptoError::InitializationFailed)?;
 
     tracing::debug!(target: "crypto::uniffi", "CryptoCore restored from saved keys");
+
+    Ok(Arc::new(ClassicCryptoCore {
+        inner: Mutex::new(client),
+    }))
+}
+
+/// Create a CryptoCore instance from existing private keys in CFE binary format
+/// (with legacy JSON fallback).
+pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCore>, CryptoError> {
+    let _ = crate::config::Config::init();
+
+    let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+        &keys,
+        crate::cfe::CfeMessageType::PrivateKeys,
+    )
+    .or_else(|e| {
+        if matches!(e, crate::cfe::CfeError::LegacyJson) {
+            let s = std::str::from_utf8(&keys).map_err(|_| CryptoError::InvalidKeyData)?;
+            crate::cfe::migrate_private_keys_json_str(s).map_err(|_| CryptoError::InvalidKeyData)
+        } else {
+            Err(CryptoError::SerializationFailed)
+        }
+    })?;
+
+    let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+        decoded.ik_priv.into_vec(),
+        decoded.sk_priv.into_vec(),
+        decoded.spk_priv.into_vec(),
+        decoded.spk_sig.into_vec(),
+    )
+    .map_err(|_| CryptoError::InitializationFailed)?;
 
     Ok(Arc::new(ClassicCryptoCore {
         inner: Mutex::new(client),

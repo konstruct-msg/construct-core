@@ -110,10 +110,22 @@ interface ClassicCryptoCore {
     string export_private_keys_json();
 
     [Throws=CryptoError]
+    sequence<u8> export_private_keys();
+
+    [Throws=CryptoError]
+    void import_private_keys(sequence<u8> data);
+
+    [Throws=CryptoError]
     string export_session_json(string contact_id);
 
     [Throws=CryptoError]
+    sequence<u8> export_session(string contact_id);
+
+    [Throws=CryptoError]
     string import_session_json(string contact_id, string session_json);
+
+    [Throws=CryptoError]
+    string import_session(string contact_id, sequence<u8> data);
 
     sequence<string> get_all_session_contact_ids();
 
@@ -142,7 +154,13 @@ interface ClassicCryptoCore {
     string export_one_time_prekeys_json();
 
     [Throws=CryptoError]
+    sequence<u8> export_one_time_prekeys();
+
+    [Throws=CryptoError]
     void import_one_time_prekeys_json(string json);
+
+    [Throws=CryptoError]
+    void import_one_time_prekeys(sequence<u8> data);
 
     void set_local_user_id(string user_id);
 
@@ -247,6 +265,9 @@ namespace construct_core {
 
     [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core_from_keys_json(string keys_json);
+
+    [Throws=CryptoError]
+    ClassicCryptoCore create_crypto_core_from_keys(sequence<u8> keys);
 
     // Invite Crypto Functions
     [Throws=CryptoError]

@@ -446,6 +446,19 @@ impl<P: CryptoProvider> KeyManager<P> {
         self.one_time_prekeys.len()
     }
 
+    pub fn next_otpk_id(&self) -> u32 {
+        self.next_otpk_id
+    }
+
+    /// Restore/override the OTPK counter from persisted state.
+    ///
+    /// Never decreases the counter to avoid collisions.
+    pub fn set_next_otpk_id(&mut self, next_id: u32) {
+        if next_id > self.next_otpk_id {
+            self.next_otpk_id = next_id;
+        }
+    }
+
     /// Export all stored OTPK (key_id, private_bytes, public_bytes) for persistence.
     pub fn export_one_time_prekeys(&self) -> Vec<(u32, Vec<u8>, Vec<u8>)> {
         self.one_time_prekeys

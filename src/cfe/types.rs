@@ -1,3 +1,6 @@
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CfeMessageType {
@@ -62,4 +65,119 @@ impl TryFrom<u8> for CfeMessageType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Self::from_u8(value).ok_or(())
     }
+}
+
+// ============================================================================
+// CFE payload schemas (v1)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePrivateKeysV1 {
+    #[serde(rename = "suite_id")]
+    pub suite_id: u8,
+
+    #[serde(rename = "ik_priv")]
+    pub ik_priv: ByteBuf,
+    #[serde(rename = "sk_priv")]
+    pub sk_priv: ByteBuf,
+    #[serde(rename = "spk_priv")]
+    pub spk_priv: ByteBuf,
+    #[serde(rename = "spk_sig")]
+    pub spk_sig: ByteBuf,
+
+    #[serde(rename = "spk_id")]
+    pub spk_id: u32,
+
+    #[serde(rename = "ik_pub")]
+    pub ik_pub: ByteBuf,
+    #[serde(rename = "vk_pub")]
+    pub vk_pub: ByteBuf,
+    #[serde(rename = "spk_pub")]
+    pub spk_pub: ByteBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeSkippedKeyEntryV1 {
+    #[serde(rename = "dh_pub")]
+    pub dh_pub: ByteBuf,
+    #[serde(rename = "n")]
+    pub msg_number: u32,
+    #[serde(rename = "k")]
+    pub key_bytes: ByteBuf,
+    #[serde(rename = "ts")]
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeSessionStateV1 {
+    #[serde(rename = "ver")]
+    pub ver: u8,
+
+    #[serde(rename = "suite_id")]
+    pub suite_id: u8,
+
+    #[serde(rename = "contact_id")]
+    pub contact_id: String,
+
+    #[serde(rename = "local_uid")]
+    pub local_uid: String,
+
+    /// 16 bytes derived shared session ID (hex → raw bytes)
+    #[serde(rename = "session_id")]
+    pub session_id: ByteBuf,
+
+    #[serde(rename = "rk")]
+    pub rk: ByteBuf,
+    #[serde(rename = "sck")]
+    pub sck: ByteBuf,
+    #[serde(rename = "rck")]
+    pub rck: ByteBuf,
+
+    #[serde(rename = "scl")]
+    pub scl: u32,
+    #[serde(rename = "rcl")]
+    pub rcl: u32,
+    #[serde(rename = "psl")]
+    pub psl: u32,
+
+    #[serde(rename = "dh_priv")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dh_priv: Option<ByteBuf>,
+
+    #[serde(rename = "dh_pub")]
+    pub dh_pub: ByteBuf,
+
+    #[serde(rename = "rdh_pub")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdh_pub: Option<ByteBuf>,
+
+    /// v2 skipped keys (remote DH pub + msg_number).
+    ///
+    /// Spec v2.0 describes `skipped` as a flat map, but the core tracks the
+    /// full (dh_pub, msg_number) tuple to avoid cross-chain collisions.
+    #[serde(rename = "skipped")]
+    #[serde(default)]
+    pub skipped: Vec<CfeSkippedKeyEntryV1>,
+
+    #[serde(rename = "pq_rk1")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_rk1: Option<ByteBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeOtpkRecordV1 {
+    #[serde(rename = "id")]
+    pub id: u32,
+    #[serde(rename = "priv")]
+    pub priv_key: ByteBuf,
+    #[serde(rename = "pub")]
+    pub pub_key: ByteBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeOtpkBundleV1 {
+    #[serde(rename = "records")]
+    pub records: Vec<CfeOtpkRecordV1>,
+    #[serde(rename = "next_id")]
+    pub next_id: u32,
 }
