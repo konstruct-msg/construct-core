@@ -608,7 +608,14 @@ impl Orchestrator {
         self.lifecycle
             .client
             .apply_pq_contribution_to_session(contact_id, kem_shared_secret)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // Consume the pending pq_manager entry so that `maybe_apply_pq_contribution`
+        // (called after every Rust-routed decrypt) does not apply the same shared
+        // secret a second time.  The returned delete actions are intentionally
+        // dropped here because Swift has already cleared the per-entry Keychain
+        // backup via KeychainManager in `applyDeferredPQContribution`.
+        let _ = self.lifecycle.pq_manager.consume_deferred(contact_id);
+        Ok(())
     }
 
     /// Register a KEM shared secret as a deferred contribution for `contact_id`.
