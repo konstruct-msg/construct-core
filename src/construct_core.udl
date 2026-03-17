@@ -561,6 +561,17 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     void import_kyber_session_state(sequence<u8> data);
 
+    /// Export the full orchestrator coordination state (ACK cache, healing queue,
+    /// init locks, archive index, prekey tracker) as a CFE binary blob.
+    /// Persist under key "orchestrator_state" in the secure store.
+    [Throws=CryptoError]
+    sequence<u8> export_orchestrator_state();
+
+    /// Restore the full orchestrator coordination state from a CFE blob.
+    /// Call at app start before processing any messages.
+    [Throws=CryptoError]
+    void import_orchestrator_state(sequence<u8> data);
+
     /// Register a KEM shared secret as a deferred contribution.
     /// Returns JSON action string (SaveSessionToSecureStore for per-entry backup).
     string register_pq_deferred(string contact_id, u32 otpk_id, sequence<u8> shared_secret);

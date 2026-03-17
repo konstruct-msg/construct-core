@@ -121,6 +121,18 @@ impl AckStore {
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
+
+    /// Export all in-memory message IDs for CFE snapshot serialisation.
+    pub fn snapshot_cache(&self) -> Vec<String> {
+        self.cache.iter().cloned().collect()
+    }
+
+    /// Restore in-memory cache from a CFE snapshot.
+    /// Existing entries are replaced (idempotent for identical snapshots).
+    pub fn restore_cache(&mut self, ids: Vec<String>) {
+        self.cache.clear();
+        self.cache.extend(ids);
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

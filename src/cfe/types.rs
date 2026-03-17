@@ -232,3 +232,78 @@ pub struct CfeKyberSessionStateV1 {
     #[serde(rename = "next_id")]
     pub next_otpk_id: u32,
 }
+
+// ── Orchestrator State CFE types (0x05) ───────────────────────────────────────
+
+/// A single entry in the ACK deduplication cache snapshot.
+/// Only the message ID is stored — timestamps are not needed for in-memory
+/// recovery (the platform persistent store handles expiry).
+///
+/// Part of `CfeOrchestratorStateV1`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeAckRecordV1 {
+    /// The stable message UUID that has been processed.
+    #[serde(rename = "id")]
+    pub message_id: String,
+}
+
+/// A serialised session-healing queue entry.
+/// Stores the original message so it can be replayed after session re-keying.
+///
+/// Part of `CfeOrchestratorStateV1`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeHealingRecordV1 {
+    /// Contact whose session needs healing.
+    #[serde(rename = "cid")]
+    pub contact_id: String,
+    /// JSON-serialised original message waiting for replay.
+    #[serde(rename = "msg")]
+    pub message_json: String,
+    /// Number of healing attempts already made (0-based).
+    #[serde(rename = "att")]
+    pub attempts: u32,
+    /// Unix timestamp (seconds) when the record was first enqueued.
+    #[serde(rename = "at")]
+    pub created_at: u64,
+}
+
+/// Full CFE snapshot of the orchestrator's transient coordination state.
+///
+/// msg_type = `OrchestratorState` (0x05).
+///
+/// Includes:
+/// - ACK dedup cache (in-memory processed message IDs)
+/// - Session healing queue (messages awaiting replay after re-key)
+/// - Session init locks (contacts currently in session-setup)
+/// - Archive index + prekey tracker (from `SessionLifecycleManager`)
+///
+/// Persisted on every state change that modifies ack_store, healing_queue,
+/// or init_locks.  On startup, importing this blob restores the in-memory
+/// queues without re-processing messages or losing pending heals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeOrchestratorStateV1 {
+    /// Schema version — always 1 for this format.
+    #[serde(rename = "ver")]
+    pub ver: u8,
+    /// The local user's stable UUID.
+    #[serde(rename = "uid")]
+    pub my_user_id: String,
+    /// Snapshot of the in-memory ACK dedup cache.
+    #[serde(rename = "acks")]
+    pub processed_ids: Vec<CfeAckRecordV1>,
+    /// Active session-healing queue entries.
+    #[serde(rename = "heals")]
+    pub healing_records: Vec<CfeHealingRecordV1>,
+    /// Contact IDs for which a session-init RPC is currently in flight.
+    #[serde(rename = "locks")]
+    pub init_locks: Vec<String>,
+    /// contactId → archived session JSON (latest archive per contact).
+    #[serde(rename = "arcs")]
+    pub archives: Vec<(String, String)>,
+    /// contactId → Unix timestamp of the archive (for GC).
+    #[serde(rename = "arc_ts")]
+    pub archive_timestamps: Vec<(String, u64)>,
+    /// contactId → last seen OTPK ID (reinstall detection).
+    #[serde(rename = "ptk")]
+    pub prekey_tracker: Vec<(String, u32)>,
+}

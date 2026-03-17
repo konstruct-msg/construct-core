@@ -120,6 +120,24 @@ impl Orchestrator {
         self.lifecycle.export_state_json()
     }
 
+    /// Export the full orchestrator coordination state as a CFE binary blob.
+    ///
+    /// Captures ACK dedup cache, healing queue, init locks, archive index, and
+    /// prekey tracker.  Persist under `"orchestrator_state"` in Keychain.
+    pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .export_orchestrator_state_cfe(&self.init_locks)
+    }
+
+    /// Restore the full orchestrator coordination state from a CFE binary blob.
+    ///
+    /// All in-memory queues and the init_locks set are replaced.
+    pub fn import_orchestrator_state_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        let restored_locks = self.lifecycle.import_orchestrator_state_cfe(data)?;
+        self.init_locks = restored_locks;
+        Ok(())
+    }
+
     // ── Session-crypto delegates ──────────────────────────────────────────────
 
     pub fn get_all_session_contact_ids(&self) -> Vec<String> {

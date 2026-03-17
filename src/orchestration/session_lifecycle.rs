@@ -397,6 +397,110 @@ impl SessionLifecycleManager {
         self.pq_manager.import_cfe(data)
     }
 
+    /// Export the full orchestrator coordination state (ACK cache, healing queue,
+    /// archive index, prekey tracker) as a CFE binary blob — msg_type 0x05.
+    ///
+    /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
+    /// The caller should persist the blob under `"orchestrator_state"` via
+    /// `SaveSessionToSecureStore` after every significant state change.
+    pub fn export_orchestrator_state_cfe(
+        &self,
+        init_locks: &std::collections::HashSet<String>,
+    ) -> Result<Vec<u8>, String> {
+        use crate::cfe::{
+            CfeAckRecordV1, CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1,
+        };
+
+        let state = CfeOrchestratorStateV1 {
+            ver: 1,
+            my_user_id: self.my_user_id.clone(),
+            processed_ids: self
+                .ack_store
+                .snapshot_cache()
+                .into_iter()
+                .map(|id| CfeAckRecordV1 { message_id: id })
+                .collect(),
+            healing_records: self
+                .healing_queue
+                .snapshot_records()
+                .into_iter()
+                .map(|r| CfeHealingRecordV1 {
+                    contact_id: r.contact_id.clone(),
+                    message_json: r.message_json.clone(),
+                    attempts: r.attempts,
+                    created_at: r.created_at,
+                })
+                .collect(),
+            init_locks: init_locks.iter().cloned().collect(),
+            archives: self
+                .archives
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            archive_timestamps: self
+                .archive_timestamps
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            prekey_tracker: self
+                .prekey_tracker
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+        };
+
+        crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
+    }
+
+    /// Restore the orchestrator coordination state from a CFE binary blob.
+    ///
+    /// Returns the `init_locks` set so the caller (`OrchestratorCore`) can
+    /// restore its own field.  All other fields are applied in-place.
+    pub fn import_orchestrator_state_cfe(
+        &mut self,
+        data: &[u8],
+    ) -> Result<std::collections::HashSet<String>, String> {
+        use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
+        use crate::orchestration::healing_queue::HealingRecord;
+
+        let state = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
+            data,
+            CfeMessageType::OrchestratorState,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Restore ACK cache.
+        self.ack_store.restore_cache(
+            state
+                .processed_ids
+                .into_iter()
+                .map(|r| r.message_id)
+                .collect(),
+        );
+
+        // Restore healing queue.
+        self.healing_queue.restore_records(
+            state
+                .healing_records
+                .into_iter()
+                .map(|r| HealingRecord {
+                    contact_id: r.contact_id,
+                    message_json: r.message_json,
+                    attempts: r.attempts,
+                    created_at: r.created_at,
+                })
+                .collect(),
+        );
+
+        // Restore archive index and prekey tracker.
+        self.archives = state.archives.into_iter().collect();
+        self.archive_timestamps = state.archive_timestamps.into_iter().collect();
+        self.prekey_tracker = state.prekey_tracker.into_iter().collect();
+
+        // Return init_locks for the caller to restore.
+        Ok(state.init_locks.into_iter().collect())
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {

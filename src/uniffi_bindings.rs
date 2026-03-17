@@ -2588,6 +2588,26 @@ impl OrchestratorCore {
         orch.import_kyber_session_state_cfe(&data)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
+
+    /// Export the full orchestrator coordination state (ACK cache, healing queue,
+    /// init locks, archive index, prekey tracker) as a CFE binary blob.
+    ///
+    /// Persist under the well-known key `"orchestrator_state"` via
+    /// `SaveSessionToSecureStore`.  Import at app startup to restore all queues.
+    pub fn export_orchestrator_state(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_orchestrator_state_cfe()
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+
+    /// Restore the full orchestrator coordination state from a CFE blob produced
+    /// by `export_orchestrator_state`.  Call at app start before processing any
+    /// messages to avoid duplicate-processing and lost healing records.
+    pub fn import_orchestrator_state(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_orchestrator_state_cfe(&data)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
 }
 
 // ── JSON serialization helpers ────────────────────────────────────────────────

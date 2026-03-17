@@ -193,6 +193,20 @@ impl HealingQueue {
             },
         );
     }
+
+    /// Export all active healing records for CFE snapshot serialisation.
+    pub fn snapshot_records(&self) -> Vec<&HealingRecord> {
+        self.records.values().collect()
+    }
+
+    /// Restore healing queue from a CFE snapshot.
+    /// Existing records are replaced.
+    pub fn restore_records(&mut self, records: Vec<HealingRecord>) {
+        self.records.clear();
+        for r in records {
+            self.records.insert(r.contact_id.clone(), r);
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
