@@ -157,6 +157,32 @@ impl PQContributionManager {
 
     // ── Shared ────────────────────────────────────────────────────────────────
 
+    /// Register an already-computed KEM shared secret as a deferred contribution.
+    ///
+    /// Use this when the KEM operation was performed externally (e.g. by a
+    /// platform ML-KEM call) and the result needs to be stored in the manager
+    /// so that it is included in CFE snapshots and consumed by
+    /// `consume_deferred`.
+    ///
+    /// Returns a `SaveSessionToSecureStore` persist action with the same wire
+    /// format as `encapsulate_and_defer` and `decapsulate_and_store`.
+    pub fn register_shared_secret(
+        &mut self,
+        contact_id: &str,
+        otpk_id: u32,
+        shared_secret: &[u8],
+    ) -> Action {
+        let persist_action = serialize_pending_action(contact_id, otpk_id, shared_secret);
+        self.pending.insert(
+            contact_id.to_string(),
+            PendingContribution {
+                shared_secret: shared_secret.to_vec(),
+                otpk_id,
+            },
+        );
+        persist_action
+    }
+
     /// Retrieve and remove the deferred contribution for `contact_id`.
     ///
     /// Returns `(None, [])` if no deferred contribution exists (caller should
@@ -245,6 +271,68 @@ impl PQContributionManager {
         let id = self.next_otpk_id;
         self.next_otpk_id += 1;
         id
+    }
+
+    // ── CFE serialization ─────────────────────────────────────────────────────
+
+    /// Serialize the complete manager state to a CFE binary blob
+    /// (`KyberSessionState` / msg_type 0x21).
+    ///
+    /// The caller should persist the returned bytes via
+    /// `SaveSessionToSecureStore { key: "kyber_session_state", data: ... }`
+    /// after any state change.
+    pub fn export_cfe(&self) -> Result<Vec<u8>, String> {
+        use crate::cfe::{CfeKyberDeferredEntryV1, CfeKyberSessionStateV1, CfeMessageType};
+        use serde_bytes::ByteBuf;
+
+        let entries: Vec<CfeKyberDeferredEntryV1> = self
+            .pending
+            .iter()
+            .map(|(contact_id, c)| CfeKyberDeferredEntryV1 {
+                contact_id: contact_id.clone(),
+                otpk_id: c.otpk_id,
+                shared_secret: ByteBuf::from(c.shared_secret.clone()),
+            })
+            .collect();
+
+        let payload = CfeKyberSessionStateV1 {
+            ver: 1,
+            entries,
+            next_otpk_id: self.next_otpk_id,
+        };
+
+        crate::cfe::encode(CfeMessageType::KyberSessionState, &payload).map_err(|e| e.to_string())
+    }
+
+    /// Restore manager state from a CFE binary blob produced by `export_cfe`.
+    ///
+    /// Replaces all in-memory state. The in-progress SPK rotation (if any) is
+    /// discarded because it is never written to the CFE snapshot — a rotation
+    /// that was in progress when the app was killed must be restarted.
+    pub fn import_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        use crate::cfe::{CfeKyberSessionStateV1, CfeMessageType};
+
+        let snapshot = crate::cfe::decode_as::<CfeKyberSessionStateV1>(
+            data,
+            CfeMessageType::KyberSessionState,
+        )
+        .map_err(|e| e.to_string())?;
+
+        self.pending.clear();
+        self.pending_ciphertexts.clear();
+        self.spk_rotation = None;
+
+        for entry in snapshot.entries {
+            self.pending.insert(
+                entry.contact_id,
+                PendingContribution {
+                    shared_secret: entry.shared_secret.into_vec(),
+                    otpk_id: entry.otpk_id,
+                },
+            );
+        }
+        self.next_otpk_id = snapshot.next_otpk_id;
+        Ok(())
     }
 }
 
@@ -449,5 +537,64 @@ mod tests {
             matches!(&delete_actions[0], Action::SaveSessionToSecureStore { key, data }
                 if key == "pq_deferred_alice" && data.is_empty()),
         );
+    }
+
+    // ── CFE roundtrip (feature-independent) ───────────────────────────────────
+
+    #[test]
+    fn test_export_import_cfe_empty() {
+        let mgr = PQContributionManager::new();
+        let blob = mgr.export_cfe().expect("export should succeed");
+        let mut mgr2 = PQContributionManager::new();
+        mgr2.import_cfe(&blob).expect("import should succeed");
+        assert_eq!(mgr2.next_otpk_id, mgr.next_otpk_id);
+        assert!(mgr2.pending.is_empty());
+    }
+
+    #[test]
+    fn test_export_import_cfe_with_pending() {
+        let mut mgr = PQContributionManager::new();
+        // Inject a fake deferred contribution without needing the post-quantum feature.
+        mgr.pending.insert(
+            "test-contact".to_string(),
+            PendingContribution {
+                shared_secret: vec![0xAB; 32],
+                otpk_id: 42,
+            },
+        );
+        mgr.next_otpk_id = 100;
+
+        let blob = mgr.export_cfe().expect("export should succeed");
+        let mut mgr2 = PQContributionManager::new();
+        mgr2.import_cfe(&blob).expect("import should succeed");
+
+        assert_eq!(mgr2.next_otpk_id, 100);
+        assert!(mgr2.has_pending("test-contact"));
+        let (deferred, _) = mgr2.consume_deferred("test-contact");
+        let d = deferred.unwrap();
+        assert_eq!(d.otpk_id, 42);
+        assert_eq!(d.shared_secret, vec![0xAB; 32]);
+    }
+
+    #[test]
+    fn test_import_cfe_resets_spk_rotation() {
+        let mut mgr = PQContributionManager::new();
+        // Simulate a rotation in progress.
+        mgr.spk_rotation = Some(SPKRotationPending {
+            new_public: vec![1u8; 32],
+            new_secret: vec![2u8; 32],
+            new_id: 5,
+        });
+        let blob = mgr.export_cfe().unwrap();
+
+        let mut mgr2 = PQContributionManager::new();
+        mgr2.spk_rotation = Some(SPKRotationPending {
+            new_public: vec![],
+            new_secret: vec![],
+            new_id: 99,
+        });
+        mgr2.import_cfe(&blob).unwrap();
+        // Import must clear any in-progress SPK rotation.
+        assert!(!mgr2.is_rotation_pending());
     }
 }

@@ -130,13 +130,3 @@ pub fn mlkem768_decapsulate(sk_bytes: &[u8], ct_bytes: &[u8]) -> Result<Vec<u8>,
 pub fn mlkem768_decapsulate(_sk_bytes: &[u8], _ct_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Err("post-quantum feature not enabled".to_string())
 }
-
-/// A post-quantum X3DH bundle (for future use with full PQXDH X3DH integration).
-pub struct PQX3DHBundle {
-    pub identity_public: [u8; 32],
-    pub signed_prekey_public: [u8; 32],
-    pub signature: [u8; 64],
-    pub mlkem_public_key: Vec<u8>,
-    pub mlkem_prekey_public: Vec<u8>,
-    pub pq_signature: Vec<u8>,
-}

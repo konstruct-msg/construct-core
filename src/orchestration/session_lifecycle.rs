@@ -115,7 +115,14 @@ pub struct SessionLifecycleManager {
 
 impl SessionLifecycleManager {
     /// Create a manager from an existing `ClassicClient`.
-    pub fn new(client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+    ///
+    /// `my_user_id` is propagated to `client.local_user_id` so that every
+    /// session created by this manager embeds the correct sender/receiver ID
+    /// in its Associated Data.  Without this the AD byte layout diverges
+    /// between the INITIATOR (encrypt) and RESPONDER (decrypt) sides, causing
+    /// every AEAD verification to fail.
+    pub fn new(mut client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+        client.set_local_user_id(my_user_id.clone());
         Self {
             client,
             ack_store: AckStore::default(),
@@ -140,6 +147,14 @@ impl SessionLifecycleManager {
 
     pub fn my_user_id(&self) -> &str {
         &self.my_user_id
+    }
+
+    /// Update the local user-id on both the lifecycle manager and the
+    /// underlying `ClassicClient`.  Both fields must stay in sync so that
+    /// newly created sessions bake in the correct sender/receiver ID.
+    pub fn set_my_user_id(&mut self, user_id: String) {
+        self.my_user_id = user_id.clone();
+        self.client.set_local_user_id(user_id);
     }
 
     // ── Encrypt ───────────────────────────────────────────────────────────────
@@ -364,6 +379,22 @@ impl SessionLifecycleManager {
         self.archive_timestamps = state.archive_timestamps;
         self.prekey_tracker = state.prekey_tracker;
         Ok(())
+    }
+
+    /// Export the Kyber `PQContributionManager` state as a CFE binary blob.
+    ///
+    /// The caller should persist the returned bytes under the well-known key
+    /// `"kyber_session_state"` via `SaveSessionToSecureStore`.
+    pub fn export_kyber_session_state_cfe(&self) -> Result<Vec<u8>, String> {
+        self.pq_manager.export_cfe()
+    }
+
+    /// Restore the Kyber `PQContributionManager` state from a CFE binary blob.
+    ///
+    /// Any previously-loaded state (including in-progress SPK rotations) is
+    /// replaced.  Returns an error if the blob is malformed.
+    pub fn import_kyber_session_state_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        self.pq_manager.import_cfe(data)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

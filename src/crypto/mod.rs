@@ -111,8 +111,6 @@ pub mod recovery;
 // ============================================================================
 
 #[cfg(feature = "post-quantum")]
-pub mod pq_double_ratchet;
-#[cfg(feature = "post-quantum")]
 pub mod pq_x3dh;
 
 // ============================================================================

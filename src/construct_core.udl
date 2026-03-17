@@ -330,6 +330,11 @@ namespace construct_core {
 
     // ── Orchestration (Phase 0) ───────────────────────────────────────────────
 
+    /// Create an OrchestratorCore from CFE binary or legacy JSON key bytes.
+    /// Accepts both formats — Rust handles detection and migration internally.
+    [Throws=CryptoError]
+    OrchestratorCore create_orchestrator_core_from_keys(sequence<u8> keys_data, string my_user_id);
+
     /// Verify that a PlatformBridge implementation correctly round-trips a
     /// save → load through the platform secure store.
     /// Returns true if the loaded bytes equal the saved bytes.
@@ -482,6 +487,9 @@ interface OrchestratorCore {
     string export_private_keys_json();
 
     [Throws=CryptoError]
+    sequence<u8> export_private_keys();
+
+    [Throws=CryptoError]
     string export_registration_bundle_json();
 
     [Throws=CryptoError]
@@ -491,7 +499,13 @@ interface OrchestratorCore {
     string export_session_json(string contact_id);
 
     [Throws=CryptoError]
+    sequence<u8> export_session(string contact_id);
+
+    [Throws=CryptoError]
     string import_session_json(string contact_id, string session_json);
+
+    [Throws=CryptoError]
+    string import_session(string contact_id, sequence<u8> data);
 
     sequence<string> get_all_session_contact_ids();
 
@@ -522,7 +536,13 @@ interface OrchestratorCore {
     string export_one_time_prekeys_json();
 
     [Throws=CryptoError]
+    sequence<u8> export_one_time_prekeys();
+
+    [Throws=CryptoError]
     void import_one_time_prekeys_json(string json);
+
+    [Throws=CryptoError]
+    void import_one_time_prekeys(sequence<u8> data);
 
     void set_local_user_id(string user_id);
 
@@ -531,6 +551,19 @@ interface OrchestratorCore {
 
     [Throws=CryptoError]
     void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
+
+    /// Export the PQContributionManager state as a CFE binary blob.
+    /// Persist under key "kyber_session_state" in the secure store.
+    [Throws=CryptoError]
+    sequence<u8> export_kyber_session_state();
+
+    /// Restore the PQContributionManager state from a CFE blob.
+    [Throws=CryptoError]
+    void import_kyber_session_state(sequence<u8> data);
+
+    /// Register a KEM shared secret as a deferred contribution.
+    /// Returns JSON action string (SaveSessionToSecureStore for per-entry backup).
+    string register_pq_deferred(string contact_id, u32 otpk_id, sequence<u8> shared_secret);
 };
 
 // ── RustPQContributions ───────────────────────────────────────────────────────

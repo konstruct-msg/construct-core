@@ -1254,6 +1254,41 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
     }))
 }
 
+/// Create an OrchestratorCore from CFE binary or legacy JSON key bytes.
+/// Accepts both formats — format is detected automatically.
+pub fn create_orchestrator_core_from_keys(
+    keys_data: Vec<u8>,
+    my_user_id: String,
+) -> Result<Arc<OrchestratorCore>, CryptoError> {
+    let _ = crate::config::Config::init();
+
+    let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+        &keys_data,
+        crate::cfe::CfeMessageType::PrivateKeys,
+    )
+    .or_else(|e| {
+        if matches!(e, crate::cfe::CfeError::LegacyJson) {
+            let s = std::str::from_utf8(&keys_data).map_err(|_| CryptoError::InvalidKeyData)?;
+            crate::cfe::migrate_private_keys_json_str(s).map_err(|_| CryptoError::InvalidKeyData)
+        } else {
+            Err(CryptoError::SerializationFailed)
+        }
+    })?;
+
+    let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+        decoded.ik_priv.into_vec(),
+        decoded.sk_priv.into_vec(),
+        decoded.spk_priv.into_vec(),
+        decoded.spk_sig.into_vec(),
+    )
+    .map_err(|_| CryptoError::InitializationFailed)?;
+
+    let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
+    Ok(Arc::new(OrchestratorCore {
+        inner: std::sync::Mutex::new(orchestrator),
+    }))
+}
+
 // ============================================================================
 // Invite Crypto Functions
 // ============================================================================
@@ -2326,6 +2361,12 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
+    pub fn export_private_keys(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_private_keys_cfe()
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
     pub fn export_registration_bundle_json(&self) -> Result<String, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_registration_bundle_json_str()
@@ -2344,6 +2385,12 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::SessionNotFound)
     }
 
+    pub fn export_session(&self, contact_id: String) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_session_cfe(&contact_id)
+            .map_err(|_| CryptoError::SessionNotFound)
+    }
+
     pub fn import_session_json(
         &self,
         contact_id: String,
@@ -2351,6 +2398,12 @@ impl OrchestratorCore {
     ) -> Result<String, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_session_json(&contact_id, &session_json)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn import_session(&self, contact_id: String, data: Vec<u8>) -> Result<String, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_session_cfe(&contact_id, &data)
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
@@ -2455,9 +2508,21 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
+    pub fn export_one_time_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_otpks_cfe()
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
     pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_otpks_json(&json)
+            .map_err(|_| CryptoError::SerializationFailed)
+    }
+
+    pub fn import_one_time_prekeys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_otpks_cfe(&data)
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
@@ -2478,6 +2543,23 @@ impl OrchestratorCore {
         })
     }
 
+    /// Register a KEM shared secret as a deferred contribution for `contact_id`.
+    ///
+    /// Call after ML-KEM encapsulation (INITIATOR) or decapsulation (RESPONDER).
+    /// Follow up with `exportKyberSessionState` + save to persist the new snapshot.
+    ///
+    /// Returns JSON action string with `SaveSessionToSecureStore` for crash-safety backup.
+    pub fn register_pq_deferred(
+        &self,
+        contact_id: String,
+        otpk_id: u32,
+        shared_secret: Vec<u8>,
+    ) -> String {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = orch.register_pq_deferred(&contact_id, otpk_id, &shared_secret);
+        actions_to_json(&actions)
+    }
+
     pub fn apply_pq_contribution(
         &self,
         contact_id: String,
@@ -2485,6 +2567,25 @@ impl OrchestratorCore {
     ) -> Result<(), CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.apply_pq_contribution_delegate(&contact_id, &kem_shared_secret)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+
+    /// Export the `PQContributionManager` state as a CFE binary blob.
+    ///
+    /// Persist the returned bytes under the key `"kyber_session_state"` in the
+    /// platform secure store.  Call after any encapsulate / decapsulate /
+    /// consume operation so that deferred contributions survive process restarts.
+    pub fn export_kyber_session_state(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_kyber_session_state_cfe()
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+
+    /// Restore the `PQContributionManager` from a CFE blob produced by
+    /// `export_kyber_session_state`.  Call at app start before any crypto.
+    pub fn import_kyber_session_state(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_kyber_session_state_cfe(&data)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 }

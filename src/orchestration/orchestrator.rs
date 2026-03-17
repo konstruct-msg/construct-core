@@ -371,7 +371,7 @@ impl Orchestrator {
     }
 
     pub fn set_my_user_id(&mut self, user_id: String) {
-        self.lifecycle.client.set_local_user_id(user_id);
+        self.lifecycle.set_my_user_id(user_id);
     }
 
     pub fn prekeys_available(&self) -> u32 {
@@ -428,7 +428,130 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Returns `(key_id, public_key_b64, signature_b64)`.
+    pub fn export_private_keys_cfe(&self) -> Result<Vec<u8>, String> {
+        use crate::crypto::provider::CryptoProvider as _;
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        use serde_bytes::ByteBuf;
+
+        let km = self.lifecycle.client.key_manager();
+        let identity_secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
+        let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
+
+        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
+        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
+        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
+        let spk_sig: Vec<u8> = prekey.signature.clone();
+
+        let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
+            .map_err(|e| e.to_string())?;
+        let vk_pub = ClassicSuiteProvider::from_signature_private_to_public(&sk_priv)
+            .map_err(|e| e.to_string())?;
+        let spk_pub = ClassicSuiteProvider::from_private_key_to_public_key(&spk_priv)
+            .map_err(|e| e.to_string())?;
+
+        let spk_id = km.current_signed_prekey_id().unwrap_or(0);
+
+        let payload = crate::cfe::CfePrivateKeysV1 {
+            suite_id: 1,
+            ik_priv: ByteBuf::from(ik_priv),
+            sk_priv: ByteBuf::from(sk_priv),
+            spk_priv: ByteBuf::from(spk_priv),
+            spk_sig: ByteBuf::from(spk_sig),
+            spk_id,
+            ik_pub: ByteBuf::from(ik_pub),
+            vk_pub: ByteBuf::from(vk_pub),
+            spk_pub: ByteBuf::from(spk_pub),
+        };
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn export_otpks_cfe(&self) -> Result<Vec<u8>, String> {
+        use serde_bytes::ByteBuf;
+
+        let records: Vec<crate::cfe::CfeOtpkRecordV1> = self
+            .lifecycle
+            .client
+            .export_one_time_prekeys()
+            .into_iter()
+            .map(|(id, priv_key, pub_key)| crate::cfe::CfeOtpkRecordV1 {
+                id,
+                priv_key: ByteBuf::from(priv_key),
+                pub_key: ByteBuf::from(pub_key),
+            })
+            .collect();
+
+        let next_id = self.lifecycle.client.key_manager().next_otpk_id();
+        let payload = crate::cfe::CfeOtpkBundleV1 { records, next_id };
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::OtpkBundle, &payload)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn import_otpks_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        let bundle = match crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
+            data,
+            crate::cfe::CfeMessageType::OtpkBundle,
+        ) {
+            Ok(b) => b,
+            Err(crate::cfe::CfeError::LegacyJson) => {
+                let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                crate::cfe::migrate_otpk_bundle_json_str(s).map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
+            .records
+            .iter()
+            .map(|r| (r.id, r.priv_key.to_vec(), r.pub_key.to_vec()))
+            .collect();
+
+        self.lifecycle.client.import_one_time_prekeys(keys);
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .set_next_otpk_id(bundle.next_id);
+        Ok(())
+    }
+
+    /// Export a session as a CFE binary blob (MessagePack + CRC32 header).
+    /// Falls back gracefully from JSON if needed by the caller.
+    pub fn export_session_cfe(&self, contact_id: &str) -> Result<Vec<u8>, String> {
+        use serde_bytes::ByteBuf;
+
+        let json = self
+            .lifecycle
+            .export_session_json_for(contact_id)
+            .map_err(|e| e.to_string())?;
+
+        let payload = crate::cfe::CfeSessionJsonWrapperV1 {
+            contact_id: contact_id.to_string(),
+            json_bytes: ByteBuf::from(json.into_bytes()),
+        };
+        crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Import a session from a CFE binary blob, or fall back to raw JSON.
+    /// Returns the session ID string on success.
+    pub fn import_session_cfe(&mut self, contact_id: &str, data: &[u8]) -> Result<String, String> {
+        let json = match crate::cfe::decode_as::<crate::cfe::CfeSessionJsonWrapperV1>(
+            data,
+            crate::cfe::CfeMessageType::SessionState,
+        ) {
+            Ok(s) => String::from_utf8(s.json_bytes.into_vec()).map_err(|e| e.to_string())?,
+            Err(crate::cfe::CfeError::LegacyJson) => std::str::from_utf8(data)
+                .map_err(|e| e.to_string())?
+                .to_string(),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.lifecycle
+            .import_session_json(contact_id, &json)
+            .map_err(|e| e.to_string())
+    }
     pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
@@ -468,6 +591,41 @@ impl Orchestrator {
             .client
             .apply_pq_contribution_to_session(contact_id, kem_shared_secret)
             .map_err(|e| e.to_string())
+    }
+
+    /// Register a KEM shared secret as a deferred contribution for `contact_id`.
+    ///
+    /// Call this AFTER performing ML-KEM encapsulation (INITIATOR) or
+    /// decapsulation (RESPONDER) so that the shared secret is stored in the
+    /// `PQContributionManager` and included in `export_kyber_session_state_cfe`
+    /// snapshots.
+    ///
+    /// Returns a `SaveSessionToSecureStore` action that the platform **must**
+    /// execute to persist the per-entry deferred secret for crash-safety.
+    pub fn register_pq_deferred(
+        &mut self,
+        contact_id: &str,
+        otpk_id: u32,
+        shared_secret: &[u8],
+    ) -> Vec<crate::orchestration::Action> {
+        let persist_action =
+            self.lifecycle
+                .pq_manager
+                .register_shared_secret(contact_id, otpk_id, shared_secret);
+        vec![persist_action]
+    }
+
+    /// Export the `PQContributionManager` state as a CFE binary blob.
+    ///
+    /// Persist the returned bytes under `"kyber_session_state"` in the platform
+    /// secure store after any encapsulate / decapsulate / consume operation.
+    pub fn export_kyber_session_state_cfe(&self) -> Result<Vec<u8>, String> {
+        self.lifecycle.export_kyber_session_state_cfe()
+    }
+
+    /// Restore the `PQContributionManager` state from a previously exported CFE blob.
+    pub fn import_kyber_session_state_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        self.lifecycle.import_kyber_session_state_cfe(data)
     }
 
     /// Returns `(ephemeral_public_key, message_number, content_b64, one_time_prekey_id)`.

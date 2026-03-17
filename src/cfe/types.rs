@@ -108,6 +108,18 @@ pub struct CfeSkippedKeyEntryV1 {
     pub timestamp: u64,
 }
 
+/// Thin CFE wrapper that stores a session as its raw JSON bytes with CRC32 protection.
+/// Used for Phase 4 migration — wraps the existing JSON session format so it gets
+/// integrity checking without requiring a full session state decomposition.
+/// msg_type = SessionState (0x02)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeSessionJsonWrapperV1 {
+    #[serde(rename = "cid")]
+    pub contact_id: String,
+    #[serde(rename = "json", with = "serde_bytes")]
+    pub json_bytes: ByteBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfeSessionStateV1 {
     #[serde(rename = "ver")]
@@ -180,4 +192,43 @@ pub struct CfeOtpkBundleV1 {
     pub records: Vec<CfeOtpkRecordV1>,
     #[serde(rename = "next_id")]
     pub next_id: u32,
+}
+
+// ── PQC / ML-KEM-768 CFE types ────────────────────────────────────────────────
+
+/// One entry in the Kyber session state: a deferred PQ contribution for a
+/// specific contact that has been encapsulated/decapsulated but not yet applied
+/// to the session root key.
+///
+/// Wire format is kept lean — the shared secret is 32 bytes, `otpk_id` is u32.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeKyberDeferredEntryV1 {
+    /// The contact's stable user ID (UUID string without braces).
+    #[serde(rename = "cid")]
+    pub contact_id: String,
+    /// ML-KEM OTPK identifier that was used for this contribution.
+    #[serde(rename = "id")]
+    pub otpk_id: u32,
+    /// 32-byte ML-KEM-768 shared secret, pending `apply_pq_contribution`.
+    #[serde(rename = "ss", with = "serde_bytes")]
+    pub shared_secret: ByteBuf,
+}
+
+/// Full CFE snapshot of the `PQContributionManager` — all deferred Kyber
+/// contributions plus the monotonic OTPK ID counter.
+///
+/// msg_type = `KyberSessionState` (0x21).
+/// Persisted to the secure store whenever a new deferred contribution is added
+/// or consumed so that the state survives process restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeKyberSessionStateV1 {
+    /// Version field — always 1 for this format.
+    #[serde(rename = "ver")]
+    pub ver: u8,
+    /// All per-contact deferred contributions currently in flight.
+    #[serde(rename = "entries")]
+    pub entries: Vec<CfeKyberDeferredEntryV1>,
+    /// Next OTPK ID to allocate (monotonically increasing across restarts).
+    #[serde(rename = "next_id")]
+    pub next_otpk_id: u32,
 }
