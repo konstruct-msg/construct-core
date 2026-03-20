@@ -224,11 +224,17 @@ impl Orchestrator {
         recipient_bundle: &[u8],
         first_message: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
+        use crate::crypto::keys::build_prologue;
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+        use crate::crypto::provider::CryptoProvider;
+        use crate::crypto::SuiteID;
 
         #[derive(serde::Deserialize)]
         struct KeyBundle {
             identity_public: Vec<u8>,
+            signed_prekey_public: Vec<u8>,
+            signature: Vec<u8>,
+            verifying_key: Vec<u8>,
             suite_id: u16,
         }
 
@@ -276,6 +282,25 @@ impl Orchestrator {
             previous_chain_length: 0,
             suite_id: key_bundle.suite_id,
         };
+
+        // Verify the initiator's signed prekey signature before doing any crypto.
+        // This prevents a malicious or corrupted bundle from being used to establish
+        // a session — the initiator must prove they hold the signing key that signed
+        // their SPK.  We do this here rather than delegating to init_receiving_session()
+        // because that function also checks contact_id == derive_device_id(identity_key),
+        // which is only valid in the device-based test model; in production contact_id
+        // is a user UUID and the check would always fail.
+        let suite_id =
+            SuiteID::new(key_bundle.suite_id).map_err(|_| "invalid suite_id".to_string())?;
+        let verifying_key =
+            ClassicSuiteProvider::signature_public_key_from_bytes(key_bundle.verifying_key.clone());
+        let prologue = build_prologue(suite_id);
+        let mut spk_msg =
+            Vec::with_capacity(prologue.len() + key_bundle.signed_prekey_public.len());
+        spk_msg.extend_from_slice(&prologue);
+        spk_msg.extend_from_slice(&key_bundle.signed_prekey_public);
+        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &key_bundle.signature)
+            .map_err(|_| "invalid signed prekey signature from initiator".to_string())?;
 
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
