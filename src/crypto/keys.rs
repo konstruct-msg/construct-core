@@ -531,6 +531,18 @@ impl<P: CryptoProvider> KeyManager<P> {
             ))
         })
     }
+
+    /// Raw bytes of the Ed25519 signing secret key.
+    pub fn signing_secret_key_bytes(&self) -> Result<Vec<u8>> {
+        let key = self.signing_secret_key()?;
+        Ok(<_ as AsRef<[u8]>>::as_ref(key).to_vec())
+    }
+
+    /// Raw bytes of the X25519 identity secret key.
+    pub fn identity_secret_key_bytes(&self) -> Result<Vec<u8>> {
+        let key = self.identity_secret_key()?;
+        Ok(<_ as AsRef<[u8]>>::as_ref(key).to_vec())
+    }
 }
 
 impl<P: CryptoProvider> Default for KeyManager<P> {

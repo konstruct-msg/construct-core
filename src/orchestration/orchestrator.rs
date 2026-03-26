@@ -413,6 +413,40 @@ impl Orchestrator {
         Ok(base64::engine::general_purpose::STANDARD.encode(&signature))
     }
 
+    /// Suite ID for the active session with `contact_id`. Returns 0 if no session.
+    pub fn get_session_suite_id(&self, contact_id: &str) -> u16 {
+        self.lifecycle
+            .client
+            .get_session(contact_id)
+            .map(|s| s.messaging_session().to_serializable().suite_id)
+            .unwrap_or(0)
+    }
+
+    /// Typed registration bundle fields (no JSON).
+    pub fn get_registration_bundle_fields(
+        &self,
+    ) -> Result<crate::crypto::handshake::x3dh::X3DHPublicKeyBundle, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Raw Ed25519 signing secret key bytes.
+    pub fn get_signing_key_bytes(&self) -> Result<Vec<u8>, String> {
+        let km = self.lifecycle.client.key_manager();
+        let secret = km.signing_secret_key().map_err(|e| e.to_string())?;
+        Ok(<_ as AsRef<[u8]>>::as_ref(secret).to_vec())
+    }
+
+    /// Raw X25519 identity secret key bytes.
+    pub fn get_identity_key_bytes(&self) -> Result<Vec<u8>, String> {
+        let km = self.lifecycle.client.key_manager();
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        Ok(<_ as AsRef<[u8]>>::as_ref(secret).to_vec())
+    }
+
     pub fn set_my_user_id(&mut self, user_id: String) {
         self.lifecycle.set_my_user_id(user_id);
     }

@@ -103,6 +103,18 @@ interface ClassicCryptoCore {
     [Throws=CryptoError]
     string export_registration_bundle_json();
 
+    /// Typed registration bundle fields — replaces JSON parsing.
+    [Throws=CryptoError]
+    RegistrationBundleJson get_registration_bundle_fields();
+
+    /// Raw Ed25519 signing secret key bytes (64 bytes).
+    [Throws=CryptoError]
+    bytes get_signing_key_bytes();
+
+    /// Raw identity secret key bytes (32 bytes, X25519).
+    [Throws=CryptoError]
+    bytes get_identity_key_bytes();
+
     [Throws=CryptoError]
     string sign_bundle_data(sequence<u8> bundle_data_json);
 
@@ -445,6 +457,48 @@ interface RustHealingQueue {
 
 // ── OrchestratorCore ──────────────────────────────────────────────────────────
 
+// ── Typed event bus ──────────────────────────────────────────────────────────
+
+/// Typed replacement for `IncomingEvent` JSON strings.
+/// Platform creates one of these variants and passes to `handle_event()`.
+[Enum]
+interface CfeIncomingEvent {
+    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control);
+    SessionInitCompleted(string contact_id, string session_json);
+    AckReceived(string message_id);
+    SessionLoaded(string key, bytes? data);
+    KeyBundleFetched(string user_id, string bundle_json);
+    NetworkReconnected();
+    AppLaunched();
+    TimerFired(string timer_id);
+};
+
+/// Typed replacement for `Action` JSON strings.
+/// Platform receives these from `handle_event()` and executes each one.
+[Enum]
+interface CfeAction {
+    DecryptMessage(string contact_id, bytes ciphertext);
+    EncryptMessage(string contact_id, bytes plaintext);
+    InitSession(string contact_id, string bundle_json);
+    ApplyPqContribution(string contact_id, bytes kem_ss);
+    ArchiveSession(string contact_id);
+    MessageDecrypted(string contact_id, string message_id, string plaintext_utf8);
+    SessionHealNeeded(string contact_id, string role);
+    SaveSessionToSecureStore(string key, bytes data);
+    LoadSessionFromSecureStore(string key);
+    PersistMessage(string message_json);
+    MarkMessageDelivered(string message_id);
+    FetchPublicKeyBundle(string user_id);
+    SendEncryptedMessage(string to, bytes payload);
+    SendReceipt(string message_id, string status);
+    SendEndSession(string contact_id);
+    NotifyNewMessage(string chat_id, string preview);
+    NotifySessionCreated(string contact_id);
+    NotifyError(string code, string message);
+    ScheduleTimer(string timer_id, u64 delay_ms);
+    CancelTimer(string timer_id);
+};
+
 /// Top-level orchestration facade.
 ///
 /// Swift / Kotlin call `handle_event_json` with a JSON-encoded `IncomingEvent`
@@ -459,12 +513,33 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     constructor(string keys_json, string my_user_id);
 
-    /// Unified event handler.
+    /// Typed event handler — replaces `handle_event_json`.
+    /// Accepts a typed `CfeIncomingEvent` and returns typed `CfeAction` list.
+    [Throws=CryptoError]
+    sequence<CfeAction> handle_event(CfeIncomingEvent event);
+
+    /// Unified event handler (legacy JSON interface — kept for fallback).
     ///
     /// `event_json` — JSON-encoded `IncomingEvent` (see Rust `orchestration::actions`).
     /// Returns a JSON array of `Action` objects for the platform to execute.
     [Throws=CryptoError]
     sequence<string> handle_event_json(string event_json);
+
+    /// Suite ID for the active session with `contact_id`.
+    /// Returns 0 if no session exists.
+    u16 get_session_suite_id(string contact_id);
+
+    /// Typed registration bundle — replaces `export_registration_bundle_json()` parsing.
+    [Throws=CryptoError]
+    RegistrationBundleJson get_registration_bundle_fields();
+
+    /// Raw Ed25519 signing secret key bytes (64 bytes).
+    [Throws=CryptoError]
+    bytes get_signing_key_bytes();
+
+    /// Raw identity secret key bytes (32 bytes, X25519).
+    [Throws=CryptoError]
+    bytes get_identity_key_bytes();
 
     // ── Direct query helpers (used during incremental migration) ──────────────
 

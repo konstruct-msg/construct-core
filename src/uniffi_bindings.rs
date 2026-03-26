@@ -230,6 +230,52 @@ impl ClassicCryptoCore {
         serde_json::to_string(&json_bundle).map_err(|_| CryptoError::SerializationFailed)
     }
 
+    /// Typed registration bundle fields — no JSON parsing needed on Swift side.
+    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleJson, CryptoError> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bundle = client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|_| CryptoError::InitializationFailed)?;
+        use base64::Engine;
+        Ok(RegistrationBundleJson {
+            identity_public: base64::engine::general_purpose::STANDARD
+                .encode(&bundle.identity_public),
+            signed_prekey_public: base64::engine::general_purpose::STANDARD
+                .encode(&bundle.signed_prekey_public),
+            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
+            verifying_key: base64::engine::general_purpose::STANDARD.encode(&bundle.verifying_key),
+            suite_id: bundle.suite_id.as_u16().to_string(),
+        })
+    }
+
+    /// Raw Ed25519 signing secret key bytes (64 bytes seed+public).
+    pub fn get_signing_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client
+            .key_manager()
+            .signing_secret_key_bytes()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    /// Raw X25519 identity secret key bytes (32 bytes).
+    pub fn get_identity_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client
+            .key_manager()
+            .identity_secret_key_bytes()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
     /// Sign BundleData JSON string with Ed25519 signing key
     /// This is used for creating the signature in UploadableKeyBundle
     pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String, CryptoError> {
@@ -2328,6 +2374,52 @@ impl OrchestratorCore {
         Ok(actions.iter().map(action_to_json).collect())
     }
 
+    /// Typed event handler — zero JSON overhead on the Swift↔Rust boundary.
+    pub fn handle_event(&self, event: CfeIncomingEvent) -> Result<Vec<CfeAction>, CryptoError> {
+        let incoming = event.into_incoming_event();
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let actions = orch.handle_event(incoming);
+        Ok(actions.into_iter().map(CfeAction::from_action).collect())
+    }
+
+    /// Suite ID for the active session with `contact_id`. Returns 0 if no session.
+    pub fn get_session_suite_id(&self, contact_id: String) -> u16 {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.get_session_suite_id(&contact_id)
+    }
+
+    /// Typed registration bundle fields.
+    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleJson, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let bundle = orch
+            .get_registration_bundle_fields()
+            .map_err(|_| CryptoError::InitializationFailed)?;
+        use base64::Engine as _;
+        Ok(RegistrationBundleJson {
+            identity_public: base64::engine::general_purpose::STANDARD
+                .encode(&bundle.identity_public),
+            signed_prekey_public: base64::engine::general_purpose::STANDARD
+                .encode(&bundle.signed_prekey_public),
+            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
+            verifying_key: base64::engine::general_purpose::STANDARD.encode(&bundle.verifying_key),
+            suite_id: bundle.suite_id.as_u16().to_string(),
+        })
+    }
+
+    /// Raw Ed25519 signing secret key bytes (64 bytes).
+    pub fn get_signing_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.get_signing_key_bytes()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    /// Raw X25519 identity secret key bytes (32 bytes).
+    pub fn get_identity_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.get_identity_key_bytes()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
     pub fn ack_is_processed(&self, message_id: String) -> AckCheckResult {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match orch.ack_is_processed(&message_id) {
@@ -2607,6 +2699,232 @@ impl OrchestratorCore {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_orchestrator_state_cfe(&data)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+    }
+}
+
+// ── Typed FFI event bus (CfeIncomingEvent / CfeAction) ───────────────────────
+//
+// These are the UDL-exposed counterparts of the Rust-internal
+// `orchestration::IncomingEvent` and `orchestration::Action` enums.
+// They mirror every variant 1:1 so we can convert without heap allocations.
+
+/// Typed platform event — UDL `[Enum] interface CfeIncomingEvent`.
+pub enum CfeIncomingEvent {
+    MessageReceived {
+        message_id: String,
+        from: String,
+        data: Vec<u8>,
+        msg_num: u32,
+        kem_ct: Vec<u8>,
+        otpk_id: u32,
+        is_control: bool,
+    },
+    SessionInitCompleted {
+        contact_id: String,
+        session_json: String,
+    },
+    AckReceived {
+        message_id: String,
+    },
+    SessionLoaded {
+        key: String,
+        data: Option<Vec<u8>>,
+    },
+    KeyBundleFetched {
+        user_id: String,
+        bundle_json: String,
+    },
+    NetworkReconnected,
+    AppLaunched,
+    TimerFired {
+        timer_id: String,
+    },
+}
+
+impl CfeIncomingEvent {
+    fn into_incoming_event(self) -> crate::orchestration::IncomingEvent {
+        use crate::orchestration::IncomingEvent::*;
+        match self {
+            Self::MessageReceived {
+                message_id,
+                from,
+                data,
+                msg_num,
+                kem_ct,
+                otpk_id,
+                is_control,
+            } => MessageReceived {
+                message_id,
+                from,
+                data,
+                msg_num,
+                kem_ct,
+                otpk_id,
+                is_control,
+            },
+            Self::SessionInitCompleted {
+                contact_id,
+                session_json,
+            } => SessionInitCompleted {
+                contact_id,
+                session_json,
+            },
+            Self::AckReceived { message_id } => AckReceived { message_id },
+            Self::SessionLoaded { key, data } => SessionLoaded { key, data },
+            Self::KeyBundleFetched {
+                user_id,
+                bundle_json,
+            } => KeyBundleFetched {
+                user_id,
+                bundle_json,
+            },
+            Self::NetworkReconnected => NetworkReconnected,
+            Self::AppLaunched => AppLaunched,
+            Self::TimerFired { timer_id } => TimerFired { timer_id },
+        }
+    }
+}
+
+/// Typed platform action — UDL `[Enum] interface CfeAction`.
+pub enum CfeAction {
+    DecryptMessage {
+        contact_id: String,
+        ciphertext: Vec<u8>,
+    },
+    EncryptMessage {
+        contact_id: String,
+        plaintext: Vec<u8>,
+    },
+    InitSession {
+        contact_id: String,
+        bundle_json: String,
+    },
+    ApplyPqContribution {
+        contact_id: String,
+        kem_ss: Vec<u8>,
+    },
+    ArchiveSession {
+        contact_id: String,
+    },
+    MessageDecrypted {
+        contact_id: String,
+        message_id: String,
+        plaintext_utf8: String,
+    },
+    SessionHealNeeded {
+        contact_id: String,
+        role: String,
+    },
+    SaveSessionToSecureStore {
+        key: String,
+        data: Vec<u8>,
+    },
+    LoadSessionFromSecureStore {
+        key: String,
+    },
+    PersistMessage {
+        message_json: String,
+    },
+    MarkMessageDelivered {
+        message_id: String,
+    },
+    FetchPublicKeyBundle {
+        user_id: String,
+    },
+    SendEncryptedMessage {
+        to: String,
+        payload: Vec<u8>,
+    },
+    SendReceipt {
+        message_id: String,
+        status: String,
+    },
+    SendEndSession {
+        contact_id: String,
+    },
+    NotifyNewMessage {
+        chat_id: String,
+        preview: String,
+    },
+    NotifySessionCreated {
+        contact_id: String,
+    },
+    NotifyError {
+        code: String,
+        message: String,
+    },
+    ScheduleTimer {
+        timer_id: String,
+        delay_ms: u64,
+    },
+    CancelTimer {
+        timer_id: String,
+    },
+}
+
+impl CfeAction {
+    fn from_action(action: crate::orchestration::Action) -> Self {
+        use crate::orchestration::Action::*;
+        use crate::orchestration::ReceiptStatus;
+        match action {
+            DecryptMessage {
+                contact_id,
+                ciphertext,
+            } => Self::DecryptMessage {
+                contact_id,
+                ciphertext,
+            },
+            EncryptMessage {
+                contact_id,
+                plaintext,
+            } => Self::EncryptMessage {
+                contact_id,
+                plaintext,
+            },
+            InitSession {
+                contact_id,
+                bundle_json,
+            } => Self::InitSession {
+                contact_id,
+                bundle_json,
+            },
+            ApplyPQContribution { contact_id, kem_ss } => {
+                Self::ApplyPqContribution { contact_id, kem_ss }
+            }
+            ArchiveSession { contact_id } => Self::ArchiveSession { contact_id },
+            MessageDecrypted {
+                contact_id,
+                message_id,
+                plaintext_utf8,
+            } => Self::MessageDecrypted {
+                contact_id,
+                message_id,
+                plaintext_utf8,
+            },
+            SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
+            SaveSessionToSecureStore { key, data } => Self::SaveSessionToSecureStore { key, data },
+            LoadSessionFromSecureStore { key } => Self::LoadSessionFromSecureStore { key },
+            PersistMessage { message_json } => Self::PersistMessage { message_json },
+            MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
+            FetchPublicKeyBundle { user_id } => Self::FetchPublicKeyBundle { user_id },
+            SendEncryptedMessage { to, payload } => Self::SendEncryptedMessage { to, payload },
+            SendReceipt { message_id, status } => Self::SendReceipt {
+                message_id,
+                status: match status {
+                    ReceiptStatus::Sent => "sent",
+                    ReceiptStatus::Delivered => "delivered",
+                    ReceiptStatus::Read => "read",
+                    ReceiptStatus::Failed => "failed",
+                }
+                .to_string(),
+            },
+            SendEndSession { contact_id } => Self::SendEndSession { contact_id },
+            NotifyNewMessage { chat_id, preview } => Self::NotifyNewMessage { chat_id, preview },
+            NotifySessionCreated { contact_id } => Self::NotifySessionCreated { contact_id },
+            NotifyError { code, message } => Self::NotifyError { code, message },
+            ScheduleTimer { timer_id, delay_ms } => Self::ScheduleTimer { timer_id, delay_ms },
+            CancelTimer { timer_id } => Self::CancelTimer { timer_id },
+        }
     }
 }
 

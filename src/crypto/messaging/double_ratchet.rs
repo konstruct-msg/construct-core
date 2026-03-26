@@ -1087,7 +1087,7 @@ pub struct SkippedKeyEntry {
 #[derive(Serialize, Deserialize)]
 pub struct SerializableSession {
     version: u16, // Protocol version for future compatibility
-    suite_id: u16,
+    pub suite_id: u16,
     root_key: Vec<u8>,
     sending_chain_key: Vec<u8>,
     sending_chain_length: u32,
