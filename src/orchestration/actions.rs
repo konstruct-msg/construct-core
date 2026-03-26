@@ -123,7 +123,9 @@ pub enum IncomingEvent {
     },
     SessionInitCompleted {
         contact_id: String,
-        session_json: String,
+        /// CFE binary session bytes. May be empty if the session is already in the
+        /// orchestrator (e.g. immediately after `initReceivingSession`).
+        session_data: Vec<u8>,
     },
     AckReceived {
         message_id: String,

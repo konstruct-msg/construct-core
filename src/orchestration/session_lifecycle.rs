@@ -277,6 +277,15 @@ impl SessionLifecycleManager {
         let _ = self.import_session_json(contact_id, &json);
     }
 
+    /// Feed an archive from CFE binary bytes into memory (preferred over `load_archive_json`).
+    pub fn load_archive_bytes(&mut self, contact_id: &str, data: Vec<u8>) {
+        // Decode CFE binary → import session (has LegacyJson fallback inside import_session).
+        if let Ok(json_str) = self.import_session_bytes(contact_id, &data) {
+            // Mirror into the JSON archive map so restore_latest_archive still works.
+            self.archives.insert(contact_id.to_string(), json_str);
+        }
+    }
+
     /// Garbage-collect archives older than 24 h.
     ///
     /// Returns `Action`s requesting the platform to delete the stale records.
@@ -521,6 +530,36 @@ impl SessionLifecycleManager {
             DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)?;
         let session_id = self.client.import_session(contact_id, ratchet);
         Ok(session_id)
+    }
+
+    /// Import a session from CFE binary bytes (preferred over `import_session_json`).
+    /// Returns the JSON-serialised session string for archive mirroring.
+    pub fn import_session_bytes(
+        &mut self,
+        contact_id: &str,
+        data: &[u8],
+    ) -> Result<String, String> {
+        use crate::cfe::{decode_as, CfeError, CfeMessageType};
+        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
+
+        let serializable =
+            match decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState) {
+                Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
+                    .map_err(|e| format!("from_cfe_v1: {}", e))?,
+                Err(CfeError::LegacyJson) => {
+                    let s = std::str::from_utf8(data).map_err(|_| "not utf8".to_string())?;
+                    serde_json::from_str(s).map_err(|e| format!("json fallback: {}", e))?
+                }
+                Err(e) => return Err(format!("decode_as: {}", e)),
+            };
+
+        // Mirror into JSON archive map for restore_latest_archive compat.
+        let json =
+            serde_json::to_string(&serializable).map_err(|e| format!("re-serialize: {}", e))?;
+        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
+            .map_err(|e| format!("from_serializable: {}", e))?;
+        self.client.import_session(contact_id, ratchet);
+        Ok(json)
     }
 }
 

@@ -2721,7 +2721,7 @@ pub enum CfeIncomingEvent {
     },
     SessionInitCompleted {
         contact_id: String,
-        session_json: String,
+        session_data: Vec<u8>,
     },
     AckReceived {
         message_id: String,
@@ -2764,10 +2764,10 @@ impl CfeIncomingEvent {
             },
             Self::SessionInitCompleted {
                 contact_id,
-                session_json,
+                session_data,
             } => SessionInitCompleted {
                 contact_id,
-                session_json,
+                session_data,
             },
             Self::AckReceived { message_id } => AckReceived { message_id },
             Self::SessionLoaded { key, data } => SessionLoaded { key, data },

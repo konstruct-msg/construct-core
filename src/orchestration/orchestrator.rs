@@ -80,8 +80,8 @@ impl Orchestrator {
             ),
             IncomingEvent::SessionInitCompleted {
                 contact_id,
-                session_json,
-            } => self.handle_session_init_completed(contact_id, session_json),
+                session_data,
+            } => self.handle_session_init_completed(contact_id, session_data),
             IncomingEvent::AckReceived { message_id } => self.handle_ack_received(message_id),
             IncomingEvent::SessionLoaded { key, data } => self.handle_session_loaded(key, data),
             IncomingEvent::KeyBundleFetched {
@@ -833,12 +833,24 @@ impl Orchestrator {
     fn handle_session_init_completed(
         &mut self,
         contact_id: String,
-        session_json: String,
+        session_data: Vec<u8>,
     ) -> Vec<Action> {
         self.init_locks.remove(&contact_id);
 
-        // Import the newly created session.
-        self.lifecycle.load_archive_json(&contact_id, session_json);
+        // Import the newly created session from CFE binary (or JSON legacy fallback).
+        if !session_data.is_empty() {
+            // Try binary first, fall back to legacy JSON interpretation.
+            if self
+                .lifecycle
+                .import_session_bytes(&contact_id, &session_data)
+                .is_err()
+            {
+                // Treat bytes as UTF-8 JSON for backward compat.
+                if let Ok(json) = std::str::from_utf8(&session_data) {
+                    let _ = self.lifecycle.import_session_json(&contact_id, json);
+                }
+            }
+        }
 
         // Save the session to secure store.
         let mut actions = vec![];
@@ -1162,7 +1174,7 @@ mod tests {
         o.init_locks.insert("bob".to_string());
         let actions = o.handle_event(IncomingEvent::SessionInitCompleted {
             contact_id: "bob".to_string(),
-            session_json: "{}".to_string(), // minimal, will fail to import gracefully
+            session_data: vec![], // empty → only clears init lock
         });
         assert!(!o.init_locks.contains("bob"));
         // Should include NotifySessionCreated.
