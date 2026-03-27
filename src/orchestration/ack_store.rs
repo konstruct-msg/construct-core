@@ -88,9 +88,10 @@ impl AckStore {
         self.cache.insert(message_id.to_string());
 
         let now = unix_now();
-        let json = format!(r#"{{"id":{},"ts":{}}}"#, serde_json_string(message_id), now);
-
-        vec![Action::PersistMessage { message_json: json }]
+        vec![Action::PersistAck {
+            message_id: message_id.to_string(),
+            timestamp: now,
+        }]
     }
 
     /// Remove the `message_id` from the in-memory cache (e.g. after a reset).
@@ -102,19 +103,11 @@ impl AckStore {
 
     /// Prune expired entries from the in-memory cache.
     ///
-    /// Note: the cache stores only IDs (no timestamps), so in-memory pruning
-    /// is not possible without a separate timestamp map. This method returns
-    /// a `Vec<Action>` requesting the platform to delete records older than
-    /// `max_age_seconds` from the persistent store.
+    /// Returns a `PruneAckStore` action so the platform can delete records
+    /// older than `max_age_seconds` from its persistent ACK store.
     pub fn prune_expired(&self) -> Vec<Action> {
         let cutoff = unix_now().saturating_sub(self.max_age_seconds);
-        // The real delete is issued as a PersistMessage with a special sentinel
-        // that the Swift Core Data adapter interprets as a batch-delete.
-        // TODO(Phase 3): add dedicated Action::PruneAckStore { cutoff_ts } once
-        //               the full Action enum is stabilised.
-        vec![Action::PersistMessage {
-            message_json: format!(r#"{{"_prune":true,"cutoff":{}}}"#, cutoff),
-        }]
+        vec![Action::PruneAckStore { cutoff_ts: cutoff }]
     }
 
     /// Current size of the in-memory deduplication cache.
@@ -143,13 +136,6 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-
-/// Minimal JSON string escape (handles only `"` and `\` for message IDs).
-fn serde_json_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{}\"", escaped)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

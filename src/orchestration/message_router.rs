@@ -171,11 +171,9 @@ impl MessageRouter {
                 if msg.msg_number == 0 {
                     // First message of a session — trigger healing.
                     let role = self.tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
-                    let heal_actions = lifecycle
+                    lifecycle
                         .healing_queue
                         .enqueue(&msg.contact_id, &msg.wire_json);
-                    // The platform must execute heal_actions before calling back.
-                    let _ = heal_actions; // actions are expressed in the decision variant
                     RoutingDecision::SessionHealNeeded {
                         contact_id: msg.contact_id.clone(),
                         role,

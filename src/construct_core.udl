@@ -439,8 +439,8 @@ interface RustHealingQueue {
     boolean can_heal(u32 msg_number);
 
     /// Enqueue `message_json` for `contact_id` (idempotent).
-    /// Returns JSON-encoded `Action` array for persistence.
-    string enqueue(string contact_id, string message_json);
+    /// Persistence is handled by the orchestrator CFE state export.
+    void enqueue(string contact_id, string message_json);
 
     /// Increment attempt counter for `contact_id`.
     HealingAttemptResult record_attempt(string contact_id);
@@ -448,8 +448,8 @@ interface RustHealingQueue {
     /// Remove the healing record after successful re-key.
     boolean remove_record(string contact_id);
 
-    /// Returns JSON-encoded `Action` array to delete expired records.
-    string prune_expired();
+    /// Remove expired healing records. Persistence handled by orchestrator CFE.
+    void prune_expired();
 
     /// Number of pending healing records.
     u64 len();
@@ -487,6 +487,8 @@ interface CfeAction {
     SaveSessionToSecureStore(string key, bytes data);
     LoadSessionFromSecureStore(string key);
     PersistMessage(string message_json);
+    PersistAck(string message_id, u64 timestamp);
+    PruneAckStore(u64 cutoff_ts);
     MarkMessageDelivered(string message_id);
     FetchPublicKeyBundle(string user_id);
     SendEncryptedMessage(string to, bytes payload);

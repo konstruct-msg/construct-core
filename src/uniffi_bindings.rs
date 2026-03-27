@@ -2268,10 +2268,9 @@ impl RustHealingQueue {
         crate::orchestration::HealingQueue::can_heal(msg_number)
     }
 
-    pub fn enqueue(&self, contact_id: String, message_json: String) -> String {
+    pub fn enqueue(&self, contact_id: String, message_json: String) {
         let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = queue.enqueue(&contact_id, &message_json);
-        actions_to_json(&actions)
+        queue.enqueue(&contact_id, &message_json);
     }
 
     pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {
@@ -2299,10 +2298,9 @@ impl RustHealingQueue {
         queue.remove(&contact_id)
     }
 
-    pub fn prune_expired(&self) -> String {
+    pub fn prune_expired(&self) {
         let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = queue.prune_expired();
-        actions_to_json(&actions)
+        queue.prune_expired();
     }
 
     pub fn len(&self) -> u64 {
@@ -2825,6 +2823,13 @@ pub enum CfeAction {
     PersistMessage {
         message_json: String,
     },
+    PersistAck {
+        message_id: String,
+        timestamp: u64,
+    },
+    PruneAckStore {
+        cutoff_ts: u64,
+    },
     MarkMessageDelivered {
         message_id: String,
     },
@@ -2905,6 +2910,14 @@ impl CfeAction {
             SaveSessionToSecureStore { key, data } => Self::SaveSessionToSecureStore { key, data },
             LoadSessionFromSecureStore { key } => Self::LoadSessionFromSecureStore { key },
             PersistMessage { message_json } => Self::PersistMessage { message_json },
+            PersistAck {
+                message_id,
+                timestamp,
+            } => Self::PersistAck {
+                message_id,
+                timestamp,
+            },
+            PruneAckStore { cutoff_ts } => Self::PruneAckStore { cutoff_ts },
             MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
             FetchPublicKeyBundle { user_id } => Self::FetchPublicKeyBundle { user_id },
             SendEncryptedMessage { to, payload } => Self::SendEncryptedMessage { to, payload },
@@ -2950,6 +2963,15 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         }),
         Action::PersistMessage { message_json } => serde_json::json!({
             "type": "PersistMessage", "message_json": message_json
+        }),
+        Action::PersistAck {
+            message_id,
+            timestamp,
+        } => serde_json::json!({
+            "type": "PersistAck", "message_id": message_id, "timestamp": timestamp
+        }),
+        Action::PruneAckStore { cutoff_ts } => serde_json::json!({
+            "type": "PruneAckStore", "cutoff_ts": cutoff_ts
         }),
         Action::MarkMessageDelivered { message_id } => serde_json::json!({
             "type": "MarkMessageDelivered", "message_id": message_id

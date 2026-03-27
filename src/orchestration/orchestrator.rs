@@ -826,7 +826,20 @@ impl Orchestrator {
         }
 
         let decision = self.router.route_message(&mut self.lifecycle, &incoming);
+        let needs_state_save = matches!(
+            &decision,
+            RoutingDecision::SessionHealNeeded { .. }
+                | RoutingDecision::NeedSessionInit { .. }
+                | RoutingDecision::EndSessionNeeded { .. }
+        );
         actions.extend(self.decision_to_actions(decision, &from));
+        // Persist coordination state (healing queue, ACK cache, init_locks) for
+        // paths that don't already trigger a session-keyed save on the Swift side.
+        if needs_state_save {
+            if let Some(save_action) = self.orchestrator_state_action() {
+                actions.push(save_action);
+            }
+        }
         actions
     }
 
@@ -931,7 +944,7 @@ impl Orchestrator {
             "gc_sweep" => {
                 let mut actions = self.lifecycle.gc_old_archives();
                 actions.extend(self.lifecycle.ack_store.prune_expired());
-                actions.extend(self.lifecycle.healing_queue.prune_expired());
+                self.lifecycle.healing_queue.prune_expired();
                 actions
             }
             _ => vec![],
@@ -1027,6 +1040,27 @@ impl Orchestrator {
 
     fn set_cooldown(&mut self, contact_id: String) {
         self.cooldowns.insert(contact_id, unix_ms());
+    }
+
+    // ── Orchestrator state persistence ────────────────────────────────────────
+
+    /// Build a `SaveSessionToSecureStore` action that persists the full
+    /// orchestrator coordination state (ACK cache, healing queue, init_locks,
+    /// archive index, prekey tracker) to the platform's secure store.
+    ///
+    /// Must be called after any event that mutates coordination state and does
+    /// NOT already trigger a session-keyed save (e.g. SessionHealNeeded,
+    /// NeedSessionInit, EndSessionNeeded).  The `Decrypted` path already causes
+    /// Swift to call `saveOrchestratorStateCFE()` as a side-effect of the
+    /// session save, so it does not need this action.
+    fn orchestrator_state_action(&self) -> Option<Action> {
+        self.lifecycle
+            .export_orchestrator_state_cfe(&self.init_locks)
+            .ok()
+            .map(|cfe| Action::SaveSessionToSecureStore {
+                key: "construct.orchestrator_state".to_string(),
+                data: cfe,
+            })
     }
 }
 

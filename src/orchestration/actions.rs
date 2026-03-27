@@ -52,6 +52,17 @@ pub enum Action {
     PersistMessage {
         message_json: String,
     },
+    /// Persist an ACK deduplication record across app restarts.
+    /// The platform must store `(message_id, timestamp)` and load them back
+    /// via `ack_mark_processed` on next launch to pre-populate the in-memory cache.
+    PersistAck {
+        message_id: String,
+        timestamp: u64,
+    },
+    /// Request the platform to delete ACK records older than `cutoff_ts` (unix seconds).
+    PruneAckStore {
+        cutoff_ts: u64,
+    },
     MarkMessageDelivered {
         message_id: String,
     },

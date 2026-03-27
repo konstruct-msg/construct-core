@@ -13,8 +13,6 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::orchestration::actions::Action;
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -96,9 +94,10 @@ impl HealingQueue {
 
     /// Enqueue a message for healing (idempotent).
     ///
-    /// If a record already exists for `contact_id`, it is replaced. Returns
-    /// `Action`s requesting the platform to persist the record.
-    pub fn enqueue(&mut self, contact_id: &str, message_json: &str) -> Vec<Action> {
+    /// If a record already exists for `contact_id`, it is replaced.
+    /// Persistence is handled by the orchestrator's CFE state export — no
+    /// individual `Action` is needed here.
+    pub fn enqueue(&mut self, contact_id: &str, message_json: &str) {
         let now = unix_now();
         let record = HealingRecord {
             contact_id: contact_id.to_string(),
@@ -107,13 +106,6 @@ impl HealingQueue {
             created_at: now,
         };
         self.records.insert(contact_id.to_string(), record);
-
-        let json = format!(
-            r#"{{"contact_id":"{}","created_at":{},"attempts":0}}"#,
-            contact_id.replace('"', "\\\""),
-            now
-        );
-        vec![Action::PersistMessage { message_json: json }]
     }
 
     /// Increment the attempt counter for `contact_id`.
@@ -144,30 +136,13 @@ impl HealingQueue {
 
     /// Evict records whose `created_at` timestamp is older than `ttl_seconds`.
     ///
-    /// Returns `Action`s requesting the platform to delete the expired rows from
-    /// persistent storage.
-    pub fn prune_expired(&mut self) -> Vec<Action> {
+    /// Expired records are removed from memory. Persistence is handled by the
+    /// orchestrator's CFE state export — no individual `Action` is needed here.
+    pub fn prune_expired(&mut self) {
         let now = unix_now();
         let cutoff = now.saturating_sub(self.ttl_seconds);
 
-        let expired: Vec<String> = self
-            .records
-            .iter()
-            .filter(|(_, r)| r.created_at < cutoff)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        let mut actions = Vec::new();
-        for contact_id in &expired {
-            self.records.remove(contact_id);
-            actions.push(Action::PersistMessage {
-                message_json: format!(
-                    r#"{{"_prune_healing":true,"contact_id":"{}"}}"#,
-                    contact_id.replace('"', "\\\"")
-                ),
-            });
-        }
-        actions
+        self.records.retain(|_, r| r.created_at >= cutoff);
     }
 
     /// Current number of pending healing records.
@@ -234,8 +209,7 @@ mod tests {
     #[test]
     fn test_enqueue_creates_record() {
         let mut q = HealingQueue::default();
-        let actions = q.enqueue("alice", r#"{"data":"..."}"#);
-        assert!(!actions.is_empty());
+        q.enqueue("alice", r#"{"data":"..."}"#);
         assert!(q.has_pending("alice"));
     }
 
@@ -288,8 +262,7 @@ mod tests {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
         // Inject a record with created_at = 0 (Unix epoch) → always expired.
         q.enqueue_at("old", "{}", 0);
-        let actions = q.prune_expired();
-        assert!(!actions.is_empty());
+        q.prune_expired();
         assert!(!q.has_pending("old"));
     }
 
