@@ -16,8 +16,13 @@ pub const FLAG_SIGNED: u8 = 0x08;
 
 pub const SUPPORTED_FLAGS_MASK: u8 = 0x00;
 
-/// Maximum allowed payload size (64 MiB). Protects against malformed length field.
-pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+/// Maximum allowed payload size (256 KiB).
+///
+/// Plaintext is limited to 64 KiB (`MAX_MESSAGE_SIZE`). After PKCS7 padding (~66 KB) and
+/// AEAD encryption (+16 bytes), plus double-ratchet header overhead, a legitimate envelope
+/// is always well under 128 KiB. We use 256 KiB as a generous upper bound to prevent an
+/// attacker from triggering a multi-MiB heap allocation before AEAD authentication fails.
+pub const MAX_PAYLOAD_LEN: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfeEnvelope {
