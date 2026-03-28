@@ -1,8 +1,8 @@
 // API для отправки и получения сообщений
 
 use crate::crypto::client_api::Client;
-use crate::crypto::handshake::x3dh::X3DHProtocol;
 use crate::crypto::handshake::KeyAgreement;
+use crate::crypto::handshake::x3dh::X3DHProtocol;
 use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, EncryptedRatchetMessage};
 use crate::crypto::{CryptoProvider, SuiteID};
 use crate::utils::error::{ConstructError, Result};

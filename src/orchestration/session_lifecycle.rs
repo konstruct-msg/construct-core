@@ -294,7 +294,7 @@ impl SessionLifecycleManager {
         let expired: Vec<String> = self
             .archive_timestamps
             .iter()
-            .filter(|(_, &ts)| ts < cutoff)
+            .filter(|&(_, &ts)| ts < cutoff)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -539,7 +539,7 @@ impl SessionLifecycleManager {
         contact_id: &str,
         data: &[u8],
     ) -> Result<String, String> {
-        use crate::cfe::{decode_as, CfeError, CfeMessageType};
+        use crate::cfe::{CfeError, CfeMessageType, decode_as};
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
         let serializable =

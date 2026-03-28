@@ -82,7 +82,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{test_support::MockPlatformBridge, PlatformBridge};
+    use super::{PlatformBridge, test_support::MockPlatformBridge};
 
     #[test]
     fn test_secure_store_roundtrip() {

@@ -73,7 +73,7 @@ pub fn pad_message(plaintext: &[u8], block_size: usize) -> Result<Vec<u8>, Paddi
     // Pre-allocate with exact capacity (energy efficient)
     let mut result = Vec::with_capacity(padded_len);
     result.extend_from_slice(plaintext);
-    result.extend(std::iter::repeat(padding_byte).take(padding_len));
+    result.extend(std::iter::repeat_n(padding_byte, padding_len));
 
     debug_assert_eq!(result.len() % block_size, 0);
     Ok(result)

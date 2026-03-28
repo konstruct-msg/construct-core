@@ -4,10 +4,10 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.6.0"
+version = "0.6.1"
 authors = ["Konstruct Team"]
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/maximeliseyev/construct-core"
 description = "Core cryptographic engine for Construct Messenger with E2EE"

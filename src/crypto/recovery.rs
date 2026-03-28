@@ -169,8 +169,7 @@ fn hmac_sha512(secret: &[u8], data: &[u8]) -> [u8; 64] {
 mod tests {
     use super::*;
 
-    const TEST_PHRASE: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn test_generate_12_words() {

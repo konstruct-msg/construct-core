@@ -51,7 +51,7 @@
 
 use crate::crypto::handshake::{KeyAgreement, X3DHProtocol};
 use crate::crypto::keys::KeyManager;
-use crate::crypto::messaging::{double_ratchet::DoubleRatchetSession, SecureMessaging};
+use crate::crypto::messaging::{SecureMessaging, double_ratchet::DoubleRatchetSession};
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::session_api::Session;
 use std::collections::HashMap;
@@ -838,9 +838,9 @@ pub type ClassicClient<P> = Client<P, X3DHProtocol<P>, DoubleRatchetSession<P>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::SuiteID;
     use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
-    use crate::crypto::SuiteID;
 
     type TestClient = Client<
         ClassicSuiteProvider,
@@ -1187,9 +1187,11 @@ mod tests {
         let result = bob.init_receiving_session(&alice_device_id, &alice_bundle, &first_message);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Invalid signed prekey signature"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Invalid signed prekey signature")
+        );
     }
 
     #[test]

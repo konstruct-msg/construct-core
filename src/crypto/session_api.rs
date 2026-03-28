@@ -383,11 +383,11 @@ pub type ClassicSession<P> = Session<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::SuiteID;
     use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
     use crate::crypto::keys::build_prologue;
     use crate::crypto::messaging::double_ratchet::DoubleRatchetSession;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
-    use crate::crypto::SuiteID;
 
     type TestSession = Session<
         ClassicSuiteProvider,

@@ -2,8 +2,8 @@ use super::compat::legacy_json_error_if_detected;
 use super::error::CfeError;
 use super::types::CfeMessageType;
 use crc32fast::Hasher as Crc32Hasher;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub const CFE_MAGIC: [u8; 2] = [0x43, 0x46]; // "CF"
 pub const CFE_VERSION: u8 = 0x01;

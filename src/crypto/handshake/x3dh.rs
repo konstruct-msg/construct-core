@@ -59,10 +59,10 @@
 //! Поэтому: DH(a, B) = DH(b, A)
 //! ```
 
+use crate::crypto::SuiteID;
 use crate::crypto::handshake::{InitiatorState, KeyAgreement};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::provider::CryptoProvider;
-use crate::crypto::SuiteID;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 

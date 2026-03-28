@@ -37,8 +37,8 @@ pub struct MLKEMEncapsulation {
 /// Returns `(public_key, secret_key)` as raw bytes.
 #[cfg(feature = "post-quantum")]
 pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
-    use getrandom_pq::rand_core::UnwrapErr;
     use getrandom_pq::SysRng;
+    use getrandom_pq::rand_core::UnwrapErr;
     #[allow(deprecated)]
     use ml_kem::{
         DecapsulationKey, EncapsulationKey, ExpandedKeyEncoding, Generate, KeyExport, MlKem768,
@@ -79,8 +79,8 @@ pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Strin
         .map_err(|_| "Failed to convert pk slice".to_string())?;
     let ek = EncapsulationKey::<MlKem768>::new(pk_arr)
         .map_err(|_| "Invalid ML-KEM-768 public key".to_string())?;
-    use getrandom_pq::rand_core::UnwrapErr;
     use getrandom_pq::SysRng;
+    use getrandom_pq::rand_core::UnwrapErr;
     let mut rng = UnwrapErr(SysRng);
     let (ct, ss) = ek.encapsulate_with_rng(&mut rng);
     Ok(MLKEMEncapsulation {

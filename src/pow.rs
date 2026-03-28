@@ -2,8 +2,8 @@
 // Memory-hard, ASIC-resistant PoW for anti-bot registration
 
 use argon2::{
-    password_hash::{PasswordHasher, SaltString},
     Argon2, Params, Version,
+    password_hash::{PasswordHasher, SaltString},
 };
 use serde::{Deserialize, Serialize};
 

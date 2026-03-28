@@ -7,11 +7,11 @@
 //! 4. Cleanup old skipped keys
 //! 5. Session desync detection
 
-use construct_core::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
 use construct_core::crypto::handshake::KeyAgreement;
+use construct_core::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
 use construct_core::crypto::keys::build_prologue;
-use construct_core::crypto::messaging::double_ratchet::DoubleRatchetSession;
 use construct_core::crypto::messaging::SecureMessaging;
+use construct_core::crypto::messaging::double_ratchet::DoubleRatchetSession;
 use construct_core::crypto::suites::classic::ClassicSuiteProvider;
 use construct_core::crypto::{CryptoProvider, SuiteID};
 

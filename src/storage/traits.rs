@@ -45,7 +45,7 @@ pub trait SecureStorage {
     /// - iOS: Keychain с `.afterFirstUnlock` accessibility
     /// - Web: IndexedDB (browser sandbox)
     fn save_auth_tokens(&self, tokens: &AuthTokens)
-        -> impl Future<Output = Result<()>> + MaybeSend;
+    -> impl Future<Output = Result<()>> + MaybeSend;
 
     /// Загрузить токены аутентификации
     fn load_auth_tokens(&self) -> impl Future<Output = Result<Option<AuthTokens>>> + MaybeSend;
@@ -133,7 +133,7 @@ pub trait DataStorage {
 
     /// Сохранить сообщение
     fn save_message(&self, message: &StoredMessage)
-        -> impl Future<Output = Result<()>> + MaybeSend;
+    -> impl Future<Output = Result<()>> + MaybeSend;
 
     /// Обновить статус сообщения
     fn update_message_status(
@@ -180,7 +180,7 @@ pub trait DataStorage {
 
     /// Сохранить контакт
     fn save_contact(&self, contact: &StoredContact)
-        -> impl Future<Output = Result<()>> + MaybeSend;
+    -> impl Future<Output = Result<()>> + MaybeSend;
 
     /// Загрузить контакт по ID
     fn load_contact(

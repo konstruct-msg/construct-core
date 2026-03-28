@@ -38,8 +38,8 @@ pub trait CryptoProvider: Send + Sync + 'static {
     fn signature_private_key_from_bytes(bytes: Vec<u8>) -> Self::SignaturePrivateKey;
 
     /// Generates a new Signature key pair.
-    fn generate_signature_keys(
-    ) -> Result<(Self::SignaturePrivateKey, Self::SignaturePublicKey), CryptoError>;
+    fn generate_signature_keys()
+    -> Result<(Self::SignaturePrivateKey, Self::SignaturePublicKey), CryptoError>;
 
     /// Derives a Signature public key from a Signature private key.
     fn from_signature_private_to_public(

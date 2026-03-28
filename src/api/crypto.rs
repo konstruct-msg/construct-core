@@ -1,6 +1,6 @@
 use crate::crypto::client_api::Client;
-use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
 use crate::crypto::handshake::KeyAgreement;
+use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
 use crate::crypto::messaging::double_ratchet::DoubleRatchetSession;
 use crate::crypto::{CryptoProvider, SuiteID};
 use crate::utils::error::{ConstructError, Result};
@@ -263,8 +263,8 @@ where
     }
 }
 
-pub fn create_client<P: CryptoProvider>(
-) -> Result<Client<P, X3DHProtocol<P>, DoubleRatchetSession<P>>>
+pub fn create_client<P: CryptoProvider>()
+-> Result<Client<P, X3DHProtocol<P>, DoubleRatchetSession<P>>>
 where
     X3DHProtocol<P>: KeyAgreement<P, PublicKeyBundle = X3DHPublicKeyBundle>,
     <X3DHProtocol<P> as KeyAgreement<P>>::SharedSecret: AsRef<[u8]>,

@@ -45,10 +45,10 @@
 //! ```
 
 use crate::config::Config;
+use crate::crypto::SuiteID;
 use crate::crypto::handshake::InitiatorState;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
-use crate::crypto::SuiteID;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zeroize::Zeroize;
@@ -726,41 +726,44 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     ///
     /// Derivation: `new_root_key = HKDF(salt=current_root_key, ikm=kem_ss, info="construct-pqxdh-v1")`
     pub fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
-        if let Some(saved_rk1) = self.pre_pq_root_key.take() {
-            // RESPONDER path: apply PQ to the saved RK1 (after 1st ratchet, before 2nd).
-            // The INITIATOR also applies PQ to RK1, so both sides derive the same PQ root key.
-            // After PQ-enhancing RK1, we must re-derive the second ratchet (sending chain)
-            // so that our sending_chain_key matches what the INITIATOR will compute when
-            // they perform a DH ratchet to receive our reply.
-            let rk1_bytes = saved_rk1.as_ref().to_vec();
-            let pq_rk1_bytes =
-                P::hkdf_derive_key(&rk1_bytes, kem_shared_secret, b"construct-pqxdh-v1", 32)
-                    .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
-            let pq_rk1 = Self::bytes_to_aead_key(&pq_rk1_bytes)?;
+        match self.pre_pq_root_key.take() {
+            Some(saved_rk1) => {
+                // RESPONDER path: apply PQ to the saved RK1 (after 1st ratchet, before 2nd).
+                // The INITIATOR also applies PQ to RK1, so both sides derive the same PQ root key.
+                // After PQ-enhancing RK1, we must re-derive the second ratchet (sending chain)
+                // so that our sending_chain_key matches what the INITIATOR will compute when
+                // they perform a DH ratchet to receive our reply.
+                let rk1_bytes = saved_rk1.as_ref().to_vec();
+                let pq_rk1_bytes =
+                    P::hkdf_derive_key(&rk1_bytes, kem_shared_secret, b"construct-pqxdh-v1", 32)
+                        .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
+                let pq_rk1 = Self::bytes_to_aead_key(&pq_rk1_bytes)?;
 
-            // Re-derive the second ratchet: KDF_RK(PQ_RK1, DH(our_priv, remote_pub))
-            let dh_priv = self
-                .dh_ratchet_private
-                .as_ref()
-                .ok_or("Missing DH ratchet private key during PQ re-derive")?;
-            let remote_pub = self
-                .remote_dh_public
-                .as_ref()
-                .ok_or("Missing remote DH public key during PQ re-derive")?;
-            let dh_output = P::kem_decapsulate(dh_priv, remote_pub.as_ref())
-                .map_err(|e| format!("DH failed during PQ re-derive: {}", e))?;
-            let (new_root_key, new_sending_chain) = P::kdf_rk(&pq_rk1, &dh_output)
-                .map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
+                // Re-derive the second ratchet: KDF_RK(PQ_RK1, DH(our_priv, remote_pub))
+                let dh_priv = self
+                    .dh_ratchet_private
+                    .as_ref()
+                    .ok_or("Missing DH ratchet private key during PQ re-derive")?;
+                let remote_pub = self
+                    .remote_dh_public
+                    .as_ref()
+                    .ok_or("Missing remote DH public key during PQ re-derive")?;
+                let dh_output = P::kem_decapsulate(dh_priv, remote_pub.as_ref())
+                    .map_err(|e| format!("DH failed during PQ re-derive: {}", e))?;
+                let (new_root_key, new_sending_chain) = P::kdf_rk(&pq_rk1, &dh_output)
+                    .map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
 
-            self.root_key = new_root_key;
-            self.sending_chain_key = new_sending_chain;
-        } else {
-            // INITIATOR path: root_key is already RK1, apply PQ directly.
-            let current_root = self.root_key.as_ref().to_vec();
-            let new_root_bytes =
-                P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
-                    .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
-            self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+                self.root_key = new_root_key;
+                self.sending_chain_key = new_sending_chain;
+            }
+            _ => {
+                // INITIATOR path: root_key is already RK1, apply PQ directly.
+                let current_root = self.root_key.as_ref().to_vec();
+                let new_root_bytes =
+                    P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
+                        .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
+                self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+            }
         }
         Ok(())
     }
@@ -875,7 +878,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
 
-        eprintln!("[DR DECRYPT] sender(contact)={} receiver(local)={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
+        eprintln!(
+            "[DR DECRYPT] sender(contact)={} receiver(local)={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
             &self.contact_id[..8.min(self.contact_id.len())],
             &self.local_user_id[..8.min(self.local_user_id.len())],
             &self.session_id[..8.min(self.session_id.len())],
@@ -1206,7 +1210,7 @@ impl SerializableSession {
 #[cfg(test)]
 mod tests {
     use super::{DoubleRatchetSession, SuiteID};
-    use crate::crypto::handshake::{x3dh::X3DHProtocol, KeyAgreement};
+    use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
     use crate::crypto::keys::build_prologue;
     use crate::crypto::messaging::SecureMessaging;
     use crate::crypto::provider::CryptoProvider;

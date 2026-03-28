@@ -1,8 +1,8 @@
 use crate::crypto::provider::CryptoProvider;
 use crate::error::CryptoError;
 use chacha20poly1305::{
-    aead::{Aead, Payload},
     ChaCha20Poly1305, Key as AeadKeyChacha, KeyInit, Nonce,
+    aead::{Aead, Payload},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -67,8 +67,8 @@ impl CryptoProvider for ClassicSuiteProvider {
         bytes
     }
 
-    fn generate_signature_keys(
-    ) -> Result<(Self::SignaturePrivateKey, Self::SignaturePublicKey), CryptoError> {
+    fn generate_signature_keys()
+    -> Result<(Self::SignaturePrivateKey, Self::SignaturePublicKey), CryptoError> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         Ok((

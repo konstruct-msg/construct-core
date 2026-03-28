@@ -18,13 +18,13 @@ pub mod timing;
 
 // Re-exports
 pub use cover_traffic::{
-    generate_dummy_message, is_dummy_message, CoverTrafficConfig, CoverTrafficManager,
-    EnergyMetrics,
+    CoverTrafficConfig, CoverTrafficManager, EnergyMetrics, generate_dummy_message,
+    is_dummy_message,
 };
 pub use padding::{
-    pad_message, pad_message_default, unpad_message, PaddingError, DEFAULT_BLOCK_SIZE,
+    DEFAULT_BLOCK_SIZE, PaddingError, pad_message, pad_message_default, unpad_message,
 };
 pub use timing::{
-    battery_aware_jitter, heartbeat_interval, jittered_interval, random_send_delay,
-    recommended_send_delay, TimingConfig,
+    TimingConfig, battery_aware_jitter, heartbeat_interval, jittered_interval, random_send_delay,
+    recommended_send_delay,
 };

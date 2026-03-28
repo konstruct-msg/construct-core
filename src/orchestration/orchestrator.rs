@@ -149,8 +149,8 @@ impl Orchestrator {
         contact_id: &str,
         recipient_bundle: &[u8],
     ) -> Result<String, String> {
-        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
         use crate::crypto::SuiteID;
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
 
         #[derive(serde::Deserialize)]
         struct KeyBundle {
@@ -224,10 +224,10 @@ impl Orchestrator {
         recipient_bundle: &[u8],
         first_message: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
+        use crate::crypto::SuiteID;
         use crate::crypto::keys::build_prologue;
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
         use crate::crypto::provider::CryptoProvider;
-        use crate::crypto::SuiteID;
 
         #[derive(serde::Deserialize)]
         struct KeyBundle {
@@ -383,8 +383,8 @@ impl Orchestrator {
     }
 
     pub fn export_registration_bundle_json_str(&self) -> Result<String, String> {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
         let bundle = self
             .lifecycle
             .client
@@ -630,8 +630,8 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
     pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
         self.lifecycle
             .client
             .key_manager_mut()
@@ -803,7 +803,7 @@ impl Orchestrator {
                 return vec![Action::NotifyError {
                     code: "INVALID_UTF8".to_string(),
                     message: "message data is not valid UTF-8".to_string(),
-                }]
+                }];
             }
         };
 
@@ -1212,9 +1212,11 @@ mod tests {
         });
         assert!(!o.init_locks.contains("bob"));
         // Should include NotifySessionCreated.
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::NotifySessionCreated { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::NotifySessionCreated { .. }))
+        );
     }
 
     #[test]

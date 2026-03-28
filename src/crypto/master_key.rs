@@ -6,8 +6,8 @@ use crate::storage::models::StoredPrivateKeys;
 use crate::utils::error::{ConstructError, Result};
 use crate::utils::time::current_timestamp;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit},
 };
 use ed25519_dalek::SigningKey;
 use pbkdf2::pbkdf2_hmac;
