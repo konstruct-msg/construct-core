@@ -86,6 +86,9 @@ impl Ed25519KeyPair {
     }
 
     pub fn get_verifying_key(&self) -> VerifyingKey {
+        // TODO(security): change return type to Result<VerifyingKey, CryptoError> so a corrupted
+        // stored key doesn't panic the process.  The unwrap is currently safe because public_key
+        // is always derived from OsRng via generate(), but explicit error propagation is better.
         VerifyingKey::from_bytes(&self.public_key).unwrap()
     }
 }
