@@ -2716,6 +2716,12 @@ pub enum CfeIncomingEvent {
         kem_ct: Vec<u8>,
         otpk_id: u32,
         is_control: bool,
+        content_type: u8,
+    },
+    OutgoingCallSignal {
+        contact_id: String,
+        message_id: String,
+        proto_bytes: Vec<u8>,
     },
     SessionInitCompleted {
         contact_id: String,
@@ -2751,6 +2757,7 @@ impl CfeIncomingEvent {
                 kem_ct,
                 otpk_id,
                 is_control,
+                content_type,
             } => MessageReceived {
                 message_id,
                 from,
@@ -2759,6 +2766,16 @@ impl CfeIncomingEvent {
                 kem_ct,
                 otpk_id,
                 is_control,
+                content_type,
+            },
+            Self::OutgoingCallSignal {
+                contact_id,
+                message_id,
+                proto_bytes,
+            } => OutgoingCallSignal {
+                contact_id,
+                message_id,
+                proto_bytes,
             },
             Self::SessionInitCompleted {
                 contact_id,
@@ -2839,6 +2856,8 @@ pub enum CfeAction {
     SendEncryptedMessage {
         to: String,
         payload: Vec<u8>,
+        message_id: String,
+        content_type: u8,
     },
     SendReceipt {
         message_id: String,
@@ -2864,6 +2883,11 @@ pub enum CfeAction {
     },
     CancelTimer {
         timer_id: String,
+    },
+    CallSignalDecrypted {
+        contact_id: String,
+        message_id: String,
+        proto_bytes: Vec<u8>,
     },
 }
 
@@ -2920,7 +2944,17 @@ impl CfeAction {
             PruneAckStore { cutoff_ts } => Self::PruneAckStore { cutoff_ts },
             MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
             FetchPublicKeyBundle { user_id } => Self::FetchPublicKeyBundle { user_id },
-            SendEncryptedMessage { to, payload } => Self::SendEncryptedMessage { to, payload },
+            SendEncryptedMessage {
+                to,
+                payload,
+                message_id,
+                content_type,
+            } => Self::SendEncryptedMessage {
+                to,
+                payload,
+                message_id,
+                content_type,
+            },
             SendReceipt { message_id, status } => Self::SendReceipt {
                 message_id,
                 status: match status {
@@ -2937,6 +2971,15 @@ impl CfeAction {
             NotifyError { code, message } => Self::NotifyError { code, message },
             ScheduleTimer { timer_id, delay_ms } => Self::ScheduleTimer { timer_id, delay_ms },
             CancelTimer { timer_id } => Self::CancelTimer { timer_id },
+            CallSignalDecrypted {
+                contact_id,
+                message_id,
+                proto_bytes,
+            } => Self::CallSignalDecrypted {
+                contact_id,
+                message_id,
+                proto_bytes,
+            },
         }
     }
 }
@@ -2979,8 +3022,14 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         Action::FetchPublicKeyBundle { user_id } => serde_json::json!({
             "type": "FetchPublicKeyBundle", "user_id": user_id
         }),
-        Action::SendEncryptedMessage { to, payload } => serde_json::json!({
-            "type": "SendEncryptedMessage", "to": to, "payload": payload
+        Action::SendEncryptedMessage {
+            to,
+            payload,
+            message_id,
+            content_type,
+        } => serde_json::json!({
+            "type": "SendEncryptedMessage", "to": to, "payload": payload,
+            "message_id": message_id, "content_type": content_type
         }),
         Action::SendReceipt { message_id, status } => serde_json::json!({
             "type": "SendReceipt", "message_id": message_id, "status": format!("{:?}", status)
@@ -3037,6 +3086,14 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         }),
         Action::SessionHealNeeded { contact_id, role } => serde_json::json!({
             "type": "SessionHealNeeded", "contact_id": contact_id, "role": role
+        }),
+        Action::CallSignalDecrypted {
+            contact_id,
+            message_id,
+            proto_bytes,
+        } => serde_json::json!({
+            "type": "CallSignalDecrypted", "contact_id": contact_id,
+            "message_id": message_id, "proto_bytes": proto_bytes
         }),
     }
 }

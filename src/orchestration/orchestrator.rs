@@ -75,9 +75,22 @@ impl Orchestrator {
                 kem_ct,
                 otpk_id,
                 is_control,
+                content_type,
             } => self.handle_message_received(
-                message_id, from, data, msg_num, kem_ct, otpk_id, is_control,
+                message_id,
+                from,
+                data,
+                msg_num,
+                kem_ct,
+                otpk_id,
+                is_control,
+                content_type,
             ),
+            IncomingEvent::OutgoingCallSignal {
+                contact_id,
+                message_id,
+                proto_bytes,
+            } => self.handle_outgoing_call_signal(contact_id, message_id, proto_bytes),
             IncomingEvent::SessionInitCompleted {
                 contact_id,
                 session_data,
@@ -743,6 +756,81 @@ impl Orchestrator {
         ))
     }
 
+    /// Encrypt arbitrary binary bytes using the Double Ratchet session and pack
+    /// the result into a WirePayload blob ready to send over gRPC.
+    ///
+    /// Used for binary content types (e.g. CALL_SIGNAL = 12) where no base64
+    /// round-trip should occur.
+    pub fn encrypt_bytes_for(
+        &mut self,
+        contact_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let encrypted = self
+            .lifecycle
+            .client
+            .encrypt_message(contact_id, plaintext)
+            .map_err(|e| e.to_string())?;
+
+        let mut sealed_box = Vec::new();
+        sealed_box.extend_from_slice(&encrypted.nonce);
+        sealed_box.extend_from_slice(&encrypted.ciphertext);
+
+        let otpk_id = if encrypted.message_number == 0 {
+            self.lifecycle.client.take_pending_otpk_id(contact_id)
+        } else {
+            0
+        };
+
+        crate::wire_payload::pack(
+            &encrypted.dh_public_key,
+            encrypted.message_number,
+            otpk_id,
+            0, // kyber_otpk_id — call signals always use existing sessions (no first-message PQC)
+            None,
+            &sealed_box,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Decrypt a WirePayload blob and return the raw plaintext bytes.
+    ///
+    /// Used for binary content types (e.g. CALL_SIGNAL = 12).
+    pub fn decrypt_bytes_for(
+        &mut self,
+        contact_id: &str,
+        wire_payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+
+        let decoded = crate::wire_payload::unpack(wire_payload).map_err(|e| e.to_string())?;
+
+        if decoded.sealed_box.len() < 12 {
+            return Err("sealed_box too short".to_string());
+        }
+        let nonce = decoded.sealed_box[..12].to_vec();
+        let ciphertext = decoded.sealed_box[12..].to_vec();
+
+        let dh_public_key: [u8; 32] = decoded
+            .dh_public_key
+            .try_into()
+            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
+
+        let encrypted_message = EncryptedRatchetMessage {
+            dh_public_key,
+            message_number: decoded.message_number,
+            ciphertext,
+            nonce,
+            previous_chain_length: 0,
+            suite_id: crate::config::Config::global().classic_suite_id,
+        };
+
+        self.lifecycle
+            .client
+            .decrypt_message(contact_id, &encrypted_message)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn decrypt_message_for(
         &mut self,
         contact_id: &str,
@@ -796,7 +884,15 @@ impl Orchestrator {
         kem_ct: Vec<u8>,
         _otpk_id: u32,
         is_control: bool,
+        content_type: u8,
     ) -> Vec<Action> {
+        // ── Binary content types (e.g. CALL_SIGNAL = 12) ─────────────────────
+        // `data` is a raw WirePayload blob; decrypt directly and return proto bytes.
+        if content_type == 12 {
+            return self.handle_call_signal_received(message_id, from, data);
+        }
+
+        // ── Standard text message path ─────────────────────────────────────────
         let wire_json = match String::from_utf8(data) {
             Ok(s) => s,
             Err(_) => {
@@ -841,6 +937,74 @@ impl Orchestrator {
             }
         }
         actions
+    }
+
+    /// Encrypt a call signal proto blob and pack it into a WirePayload ready to send.
+    ///
+    /// Called when Swift feeds `OutgoingCallSignal` — no base64, no JSON, no Strings.
+    /// Also emits `SaveSessionToSecureStore` to persist the updated DR state.
+    fn handle_outgoing_call_signal(
+        &mut self,
+        contact_id: String,
+        message_id: String,
+        proto_bytes: Vec<u8>,
+    ) -> Vec<Action> {
+        match self.encrypt_bytes_for(&contact_id, &proto_bytes) {
+            Ok(payload) => {
+                let mut actions = vec![Action::SendEncryptedMessage {
+                    to: contact_id.clone(),
+                    payload,
+                    message_id,
+                    content_type: 12,
+                }];
+                // Persist updated DR session state after encrypt.
+                if let Ok(session_json) = self.lifecycle.export_session_json_for(&contact_id) {
+                    actions.push(Action::SaveSessionToSecureStore {
+                        key: format!("session_{}", contact_id),
+                        data: session_json.into_bytes(),
+                    });
+                }
+                actions
+            }
+            Err(e) => vec![Action::NotifyError {
+                code: "CALL_SIGNAL_ENCRYPT_FAILED".to_string(),
+                message: e,
+            }],
+        }
+    }
+
+    /// Decrypt a CALL_SIGNAL message using the existing JSON wire format path.
+    ///
+    /// Called when `handle_message_received` sees `content_type == 12`.
+    /// `data` is the same JSON wire message used by standard messages — parsed and
+    /// decrypted via `SessionLifecycle::decrypt`, then returned as raw proto bytes
+    /// in a `CallSignalDecrypted` action.
+    fn handle_call_signal_received(
+        &mut self,
+        message_id: String,
+        from: String,
+        data: Vec<u8>,
+    ) -> Vec<Action> {
+        let wire_json = match String::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => {
+                return vec![Action::NotifyError {
+                    code: "CALL_SIGNAL_INVALID_UTF8".to_string(),
+                    message: "CALL_SIGNAL data is not valid UTF-8".to_string(),
+                }];
+            }
+        };
+        match self.lifecycle.decrypt(&from, &wire_json) {
+            Ok(result) => vec![Action::CallSignalDecrypted {
+                contact_id: from,
+                message_id,
+                proto_bytes: result.plaintext,
+            }],
+            Err(e) => vec![Action::NotifyError {
+                code: "CALL_SIGNAL_DECRYPT_FAILED".to_string(),
+                message: e,
+            }],
+        }
     }
 
     fn handle_session_init_completed(
@@ -1127,6 +1291,7 @@ mod tests {
             kem_ct: vec![],
             otpk_id: 0,
             is_control: false,
+            content_type: 0,
         });
         // Should ask to fetch bundle (no active session → NeedSessionInit).
         let fetches: Vec<_> = actions
@@ -1148,6 +1313,7 @@ mod tests {
             kem_ct: vec![1, 2, 3],
             otpk_id: 42,
             is_control: false,
+            content_type: 0,
         });
         let pq_actions: Vec<_> = actions
             .iter()

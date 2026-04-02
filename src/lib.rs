@@ -17,6 +17,7 @@ pub mod pow;
 pub mod storage;
 pub mod traffic_protection;
 pub mod utils;
+pub mod wire_payload;
 
 // UniFFI bindings module (types and implementations)
 #[cfg(any(feature = "ios", feature = "mac"))]

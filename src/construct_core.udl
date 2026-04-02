@@ -463,7 +463,8 @@ interface RustHealingQueue {
 /// Platform creates one of these variants and passes to `handle_event()`.
 [Enum]
 interface CfeIncomingEvent {
-    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control);
+    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type);
+    OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
     AckReceived(string message_id);
     SessionLoaded(string key, bytes? data);
@@ -491,7 +492,7 @@ interface CfeAction {
     PruneAckStore(u64 cutoff_ts);
     MarkMessageDelivered(string message_id);
     FetchPublicKeyBundle(string user_id);
-    SendEncryptedMessage(string to, bytes payload);
+    SendEncryptedMessage(string to, bytes payload, string message_id, u8 content_type);
     SendReceipt(string message_id, string status);
     SendEndSession(string contact_id);
     NotifyNewMessage(string chat_id, string preview);
@@ -499,6 +500,7 @@ interface CfeAction {
     NotifyError(string code, string message);
     ScheduleTimer(string timer_id, u64 delay_ms);
     CancelTimer(string timer_id);
+    CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
 };
 
 /// Top-level orchestration facade.

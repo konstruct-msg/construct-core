@@ -34,6 +34,16 @@ pub enum Action {
         plaintext_utf8: String,
     },
 
+    /// Binary payload decrypted from a CALL_SIGNAL envelope (content_type = 12).
+    /// Carries raw proto bytes — `WebRTCSignal` serialized with protobuf.
+    /// Never saved to Core Data; routed directly to the platform call manager.
+    CallSignalDecrypted {
+        contact_id: String,
+        message_id: String,
+        /// Serialised `WebRTCSignal` protobuf bytes.
+        proto_bytes: Vec<u8>,
+    },
+
     /// Decryption failed on message 0; the session needs healing.
     /// `role` is either `"Initiator"` (lower userId) or `"Responder"`.
     SessionHealNeeded {
@@ -74,6 +84,11 @@ pub enum Action {
     SendEncryptedMessage {
         to: String,
         payload: Vec<u8>,
+        /// Server-assigned message UUID.
+        message_id: String,
+        /// Content-type discriminator (matches proto ContentType enum).
+        /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
+        content_type: u8,
     },
     SendReceipt {
         message_id: String,
@@ -131,6 +146,20 @@ pub enum IncomingEvent {
         otpk_id: u32,
         /// `true` when this is a control message (e.g. END_SESSION).
         is_control: bool,
+        /// Content-type from the server envelope (proto ContentType enum value).
+        /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
+        content_type: u8,
+    },
+    /// Platform-side outgoing call signal.
+    /// Rust orchestrator encrypts `proto_bytes` with the Double Ratchet session,
+    /// packs a WirePayload, and returns `Action::SendEncryptedMessage`.
+    OutgoingCallSignal {
+        /// Contact (peer) user ID.
+        contact_id: String,
+        /// Platform-generated message UUID for deduplication / ACK tracking.
+        message_id: String,
+        /// Serialised `WebRTCSignal` protobuf bytes — encrypted opaquely by Rust.
+        proto_bytes: Vec<u8>,
     },
     SessionInitCompleted {
         contact_id: String,
