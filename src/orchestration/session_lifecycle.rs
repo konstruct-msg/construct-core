@@ -224,6 +224,54 @@ impl SessionLifecycleManager {
         Ok(DecryptResult { plaintext, actions })
     }
 
+    /// Decrypt using a binary WirePayload blob (no JSON round-trip).
+    ///
+    /// Functionally equivalent to `decrypt` but bypasses JSON serialization.
+    /// The payload is the raw wire format produced by `wire_payload::pack`.
+    pub fn decrypt_wire_payload(
+        &mut self,
+        contact_id: &str,
+        payload: &[u8],
+    ) -> Result<DecryptResult, String> {
+        use crate::wire_payload;
+
+        let decoded = wire_payload::unpack(payload).map_err(|e| e.to_string())?;
+
+        let dh: [u8; 32] = decoded
+            .dh_public_key
+            .try_into()
+            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
+
+        if decoded.sealed_box.len() < 12 {
+            return Err("sealed_box too short (< 12 bytes)".to_string());
+        }
+        let nonce = decoded.sealed_box[..12].to_vec();
+        let ciphertext = decoded.sealed_box[12..].to_vec();
+
+        let msg = EncryptedRatchetMessage {
+            dh_public_key: dh,
+            message_number: decoded.message_number,
+            ciphertext,
+            nonce,
+            previous_chain_length: 0,
+            suite_id: 1,
+        };
+
+        if !self.client.has_session(contact_id) {
+            return Err(format!("No active session for {}", contact_id));
+        }
+
+        let plaintext = self.client.decrypt_message(contact_id, &msg)?;
+
+        let session_json = self.export_session_json_for(contact_id)?;
+        let actions = vec![Action::SaveSessionToSecureStore {
+            key: session_key(contact_id),
+            data: session_json.into_bytes(),
+        }];
+
+        Ok(DecryptResult { plaintext, actions })
+    }
+
     // ── Archive lifecycle ─────────────────────────────────────────────────────
 
     /// Serialize the active session for `contact_id` into the in-memory archive
@@ -419,6 +467,7 @@ impl SessionLifecycleManager {
         use crate::cfe::{
             CfeAckRecordV1, CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1,
         };
+        use base64::Engine as _;
 
         let state = CfeOrchestratorStateV1 {
             ver: 1,
@@ -435,7 +484,8 @@ impl SessionLifecycleManager {
                 .into_iter()
                 .map(|r| CfeHealingRecordV1 {
                     contact_id: r.contact_id.clone(),
-                    message_json: r.message_json.clone(),
+                    message_b64: base64::engine::general_purpose::STANDARD
+                        .encode(&r.message_payload),
                     attempts: r.attempts,
                     created_at: r.created_at,
                 })
@@ -471,6 +521,7 @@ impl SessionLifecycleManager {
     ) -> Result<std::collections::HashSet<String>, String> {
         use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
         use crate::orchestration::healing_queue::HealingRecord;
+        use base64::Engine as _;
 
         let state = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
             data,
@@ -494,7 +545,9 @@ impl SessionLifecycleManager {
                 .into_iter()
                 .map(|r| HealingRecord {
                     contact_id: r.contact_id,
-                    message_json: r.message_json,
+                    message_payload: base64::engine::general_purpose::STANDARD
+                        .decode(&r.message_b64)
+                        .unwrap_or_default(),
                     attempts: r.attempts,
                     created_at: r.created_at,
                 })

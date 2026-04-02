@@ -256,9 +256,9 @@ pub struct CfeHealingRecordV1 {
     /// Contact whose session needs healing.
     #[serde(rename = "cid")]
     pub contact_id: String,
-    /// JSON-serialised original message waiting for replay.
+    /// Base64-encoded binary WirePayload waiting for replay.
     #[serde(rename = "msg")]
-    pub message_json: String,
+    pub message_b64: String,
     /// Number of healing attempts already made (0-based).
     #[serde(rename = "att")]
     pub attempts: u32,

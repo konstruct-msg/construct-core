@@ -36,6 +36,7 @@ use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 const MAX_PENDING_PER_USER: usize = 100;
 
 /// Magic content that signals an END_SESSION control message.
+#[allow(dead_code)]
 const END_SESSION_MARKER: &str = "__END_SESSION__";
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -83,8 +84,8 @@ pub enum RoutingDecision {
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     pub contact_id: String,
-    /// JSON-encoded `WireMessage`.
-    pub wire_json: String,
+    /// Binary WirePayload blob.
+    pub wire_payload: Vec<u8>,
     pub message_id: String,
     pub msg_number: u32,
     /// When `true` this is a KEY_SYNC / END_SESSION control frame.
@@ -129,7 +130,7 @@ impl MessageRouter {
         }
 
         // ── 2. END_SESSION control message ────────────────────────────────────
-        if msg.is_control || msg.wire_json.contains(END_SESSION_MARKER) {
+        if msg.is_control {
             let actions = lifecycle.archive_session(&msg.contact_id);
             return RoutingDecision::EndSessionReceived {
                 contact_id: msg.contact_id.clone(),
@@ -151,7 +152,7 @@ impl MessageRouter {
         }
 
         // ── 4. Decrypt ────────────────────────────────────────────────────────
-        match lifecycle.decrypt(&msg.contact_id, &msg.wire_json) {
+        match lifecycle.decrypt_wire_payload(&msg.contact_id, &msg.wire_payload) {
             Ok(result) => {
                 // Mark as processed.
                 let mut actions = lifecycle.ack_store.mark_processed(&msg.message_id);
@@ -173,7 +174,7 @@ impl MessageRouter {
                     let role = self.tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
                     lifecycle
                         .healing_queue
-                        .enqueue(&msg.contact_id, &msg.wire_json);
+                        .enqueue(&msg.contact_id, msg.wire_payload.clone());
                     RoutingDecision::SessionHealNeeded {
                         contact_id: msg.contact_id.clone(),
                         role,
@@ -275,7 +276,7 @@ mod tests {
     fn msg(contact_id: &str, msg_id: &str, msg_num: u32) -> IncomingMessage {
         IncomingMessage {
             contact_id: contact_id.to_string(),
-            wire_json: r#"{"msg":"data"}"#.to_string(),
+            wire_payload: vec![],
             message_id: msg_id.to_string(),
             msg_number: msg_num,
             is_control: false,
@@ -321,7 +322,7 @@ mod tests {
 
         let m = IncomingMessage {
             contact_id: "bob".to_string(),
-            wire_json: "{}".to_string(),
+            wire_payload: vec![],
             message_id: "dup-msg".to_string(),
             msg_number: 1,
             is_control: false,
@@ -337,7 +338,7 @@ mod tests {
 
         let m = IncomingMessage {
             contact_id: "bob".to_string(),
-            wire_json: "{}".to_string(),
+            wire_payload: vec![],
             message_id: "ctrl-1".to_string(),
             msg_number: 0,
             is_control: true,
@@ -391,7 +392,7 @@ mod tests {
         // The msg_num==0 path is covered in integration tests.
         let m = IncomingMessage {
             contact_id: "bob".to_string(),
-            wire_json: r#"{"corrupted":"true"}"#.to_string(),
+            wire_payload: vec![],
             message_id: "bad-msg".to_string(),
             msg_number: 5, // >0 → EndSessionNeeded on fail
             is_control: false,

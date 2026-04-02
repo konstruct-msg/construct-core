@@ -2270,7 +2270,7 @@ impl RustHealingQueue {
 
     pub fn enqueue(&self, contact_id: String, message_json: String) {
         let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.enqueue(&contact_id, &message_json);
+        queue.enqueue(&contact_id, message_json.into_bytes());
     }
 
     pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {

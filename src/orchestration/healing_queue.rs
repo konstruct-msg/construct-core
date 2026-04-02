@@ -35,8 +35,8 @@ pub enum HealingDecision {
 #[derive(Debug, Clone)]
 pub struct HealingRecord {
     pub contact_id: String,
-    /// JSON-serialised original message (stored for replay after re-key).
-    pub message_json: String,
+    /// Binary WirePayload blob (stored for replay after re-key).
+    pub message_payload: Vec<u8>,
     pub attempts: u32,
     pub created_at: u64,
 }
@@ -97,11 +97,11 @@ impl HealingQueue {
     /// If a record already exists for `contact_id`, it is replaced.
     /// Persistence is handled by the orchestrator's CFE state export — no
     /// individual `Action` is needed here.
-    pub fn enqueue(&mut self, contact_id: &str, message_json: &str) {
+    pub fn enqueue(&mut self, contact_id: &str, payload: Vec<u8>) {
         let now = unix_now();
         let record = HealingRecord {
             contact_id: contact_id.to_string(),
-            message_json: message_json.to_string(),
+            message_payload: payload,
             attempts: 0,
             created_at: now,
         };
@@ -157,12 +157,12 @@ impl HealingQueue {
     /// Insert a record with an explicit `created_at` timestamp.
     /// Used in tests to simulate aged records without sleeping.
     #[cfg(test)]
-    pub(crate) fn enqueue_at(&mut self, contact_id: &str, message_json: &str, created_at: u64) {
+    pub(crate) fn enqueue_at(&mut self, contact_id: &str, payload: Vec<u8>, created_at: u64) {
         self.records.insert(
             contact_id.to_string(),
             HealingRecord {
                 contact_id: contact_id.to_string(),
-                message_json: message_json.to_string(),
+                message_payload: payload,
                 attempts: 0,
                 created_at,
             },
@@ -209,23 +209,23 @@ mod tests {
     #[test]
     fn test_enqueue_creates_record() {
         let mut q = HealingQueue::default();
-        q.enqueue("alice", r#"{"data":"..."}"#);
+        q.enqueue("alice", b"payload".to_vec());
         assert!(q.has_pending("alice"));
     }
 
     #[test]
     fn test_enqueue_is_idempotent() {
         let mut q = HealingQueue::default();
-        q.enqueue("bob", r#"{"msg":"first"}"#);
-        q.enqueue("bob", r#"{"msg":"second"}"#);
+        q.enqueue("bob", b"first".to_vec());
+        q.enqueue("bob", b"second".to_vec());
         assert_eq!(q.len(), 1);
-        assert_eq!(q.get("bob").unwrap().message_json, r#"{"msg":"second"}"#);
+        assert_eq!(q.get("bob").unwrap().message_payload, b"second");
     }
 
     #[test]
     fn test_record_attempt_increments() {
         let mut q = HealingQueue::default();
-        q.enqueue("carol", "{}");
+        q.enqueue("carol", vec![]);
         let d = q.record_attempt("carol");
         assert_eq!(d, HealingDecision::RetryAllowed { attempt: 1 });
         let d = q.record_attempt("carol");
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn test_record_attempt_max_attempts_reached() {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
-        q.enqueue("dave", "{}");
+        q.enqueue("dave", vec![]);
         q.record_attempt("dave"); // 1
         q.record_attempt("dave"); // 2
         let d = q.record_attempt("dave"); // 3 → reached
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let mut q = HealingQueue::default();
-        q.enqueue("eve", "{}");
+        q.enqueue("eve", vec![]);
         assert!(q.remove("eve"));
         assert!(!q.has_pending("eve"));
         assert!(!q.remove("eve")); // already gone
@@ -261,7 +261,7 @@ mod tests {
     fn test_prune_expired_removes_old_records() {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
         // Inject a record with created_at = 0 (Unix epoch) → always expired.
-        q.enqueue_at("old", "{}", 0);
+        q.enqueue_at("old", vec![], 0);
         q.prune_expired();
         assert!(!q.has_pending("old"));
     }
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_prune_keeps_fresh_records() {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
-        q.enqueue("fresh", "{}");
+        q.enqueue("fresh", vec![]);
         q.prune_expired();
         assert!(q.has_pending("fresh")); // should survive
     }

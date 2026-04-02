@@ -893,19 +893,9 @@ impl Orchestrator {
         }
 
         // ── Standard text message path ─────────────────────────────────────────
-        let wire_json = match String::from_utf8(data) {
-            Ok(s) => s,
-            Err(_) => {
-                return vec![Action::NotifyError {
-                    code: "INVALID_UTF8".to_string(),
-                    message: "message data is not valid UTF-8".to_string(),
-                }];
-            }
-        };
-
         let incoming = IncomingMessage {
             contact_id: from.clone(),
-            wire_json,
+            wire_payload: data,
             message_id,
             msg_number: msg_num,
             is_control,
@@ -985,16 +975,7 @@ impl Orchestrator {
         from: String,
         data: Vec<u8>,
     ) -> Vec<Action> {
-        let wire_json = match String::from_utf8(data) {
-            Ok(s) => s,
-            Err(_) => {
-                return vec![Action::NotifyError {
-                    code: "CALL_SIGNAL_INVALID_UTF8".to_string(),
-                    message: "CALL_SIGNAL data is not valid UTF-8".to_string(),
-                }];
-            }
-        };
-        match self.lifecycle.decrypt(&from, &wire_json) {
+        match self.lifecycle.decrypt_wire_payload(&from, &data) {
             Ok(result) => vec![Action::CallSignalDecrypted {
                 contact_id: from,
                 message_id,
