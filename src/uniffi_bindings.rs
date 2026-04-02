@@ -89,7 +89,7 @@ pub struct RotatedSpkBundle {
 pub struct EncryptedMessageComponents {
     pub ephemeral_public_key: Vec<u8>, // 32 bytes
     pub message_number: u32,
-    pub content: String,         // Base64(nonce || ciphertext_with_tag)
+    pub content: Vec<u8>,        // raw bytes: nonce || ciphertext_with_tag
     pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
 }
 
@@ -874,7 +874,7 @@ impl ClassicCryptoCore {
         Ok(EncryptedMessageComponents {
             ephemeral_public_key: encrypted_message.dh_public_key.to_vec(),
             message_number: encrypted_message.message_number,
-            content: base64::engine::general_purpose::STANDARD.encode(&sealed_box),
+            content: sealed_box,
             one_time_prekey_id,
         })
     }
@@ -885,12 +885,9 @@ impl ClassicCryptoCore {
         session_id: String,
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
-        content: String,
+        content: Vec<u8>,
     ) -> Result<String, CryptoError> {
-        // Decode base64 sealed box
-        let sealed_box = base64::engine::general_purpose::STANDARD
-            .decode(&content)
-            .map_err(|_| CryptoError::InvalidCiphertext)?;
+        let sealed_box = content;
 
         // Extract nonce (first 12 bytes) and ciphertext (rest)
         if sealed_box.len() < 12 {
@@ -1768,7 +1765,7 @@ mod tests {
         let first_msg_json = serde_json::json!({
             "ephemeral_public_key": encrypted.ephemeral_public_key,
             "message_number": encrypted.message_number,
-            "content": encrypted.content
+            "content": base64::engine::general_purpose::STANDARD.encode(&encrypted.content)
         });
         let first_msg_bytes = serde_json::to_vec(&first_msg_json).unwrap();
 
@@ -1868,7 +1865,7 @@ mod tests {
         let first_msg_json = serde_json::json!({
             "ephemeral_public_key": msg1.ephemeral_public_key,
             "message_number": msg1.message_number,
-            "content": msg1.content
+            "content": base64::engine::general_purpose::STANDARD.encode(&msg1.content)
         });
 
         let bob_session_result = bob
@@ -2559,7 +2556,7 @@ impl OrchestratorCore {
         contact_id: String,
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
-        content: String,
+        content: Vec<u8>,
     ) -> Result<String, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)

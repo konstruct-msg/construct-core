@@ -730,8 +730,7 @@ impl Orchestrator {
         &mut self,
         contact_id: &str,
         plaintext: &str,
-    ) -> Result<(Vec<u8>, u32, String, u32), String> {
-        use base64::Engine as _;
+    ) -> Result<(Vec<u8>, u32, Vec<u8>, u32), String> {
         let encrypted = self
             .lifecycle
             .client
@@ -751,7 +750,7 @@ impl Orchestrator {
         Ok((
             encrypted.dh_public_key.to_vec(),
             encrypted.message_number,
-            base64::engine::general_purpose::STANDARD.encode(&sealed_box),
+            sealed_box,
             one_time_prekey_id,
         ))
     }
@@ -836,14 +835,11 @@ impl Orchestrator {
         contact_id: &str,
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
-        content: &str,
+        content: &[u8],
     ) -> Result<String, String> {
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
-        use base64::Engine as _;
 
-        let sealed_box = base64::engine::general_purpose::STANDARD
-            .decode(content)
-            .map_err(|_| "invalid base64 content".to_string())?;
+        let sealed_box = content;
 
         if sealed_box.len() < 12 {
             return Err("sealed_box too short".to_string());
