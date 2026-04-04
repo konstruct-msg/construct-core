@@ -93,3 +93,11 @@ uniffi = { version = "0.30", features = ["build"] }
 
 [package.metadata.uniffi.bindings]
 swift = true
+
+
+[profile.release]
+opt-level = "z"     # optimize for binary size (vs speed)
+lto = true          # link-time optimization: dead-code strip across crates
+codegen-units = 1   # single unit = better LTO, smaller output (slower compile)
+strip = "symbols"   # strip debug symbols from release binary
+panic = "abort"     # no unwinding machinery (~10-15% smaller)
