@@ -459,16 +459,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         associated_data.extend_from_slice(&dh_public_key);
         associated_data.extend_from_slice(&message_number.to_be_bytes());
 
-        eprintln!(
-            "[DR ENCRYPT] sender={} receiver={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
-            &self.local_user_id[..8.min(self.local_user_id.len())],
-            &self.contact_id[..8.min(self.contact_id.len())],
-            &self.session_id[..8.min(self.session_id.len())],
-            hex::encode(&dh_public_key[..4]),
-            message_number,
-            associated_data.len()
-        );
-
         tracing::info!(
             target: "crypto::double_ratchet",
             local_user_id = %self.local_user_id,
@@ -528,6 +518,12 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     /// - Automatic cleanup старых ключей по timestamp
     fn decrypt(&mut self, encrypted: &Self::EncryptedMessage) -> Result<Vec<u8>, String> {
         use tracing::{debug, trace};
+
+        // Periodically evict stale skipped-message keys to bound memory usage.
+        // Running every 100 received messages is cheap and avoids a 7-day accumulation.
+        if self.receiving_chain_length % 100 == 0 && !self.skipped_message_keys.is_empty() {
+            self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
+        }
 
         debug!(
             target: "crypto::double_ratchet",
@@ -878,16 +874,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
 
-        eprintln!(
-            "[DR DECRYPT] sender(contact)={} receiver(local)={} session_id={} dh_pub[:4]={} msg_num={} ad_len={}",
-            &self.contact_id[..8.min(self.contact_id.len())],
-            &self.local_user_id[..8.min(self.local_user_id.len())],
-            &self.session_id[..8.min(self.session_id.len())],
-            hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
-            encrypted.message_number,
-            associated_data.len()
-        );
-
         tracing::info!(
             target: "crypto::double_ratchet",
             local_user_id = %self.local_user_id,
@@ -1011,23 +997,26 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             receiving_chain_length: data.receiving_chain_length,
             dh_ratchet_private: data
                 .dh_ratchet_private
-                .map(|bytes| Self::bytes_to_kem_private_key(&bytes))
+                .as_deref()
+                .map(|bytes| Self::bytes_to_kem_private_key(bytes))
                 .transpose()?,
             dh_ratchet_public: Self::bytes_to_kem_public_key(&data.dh_ratchet_public)?,
             remote_dh_public: data
                 .remote_dh_public
-                .map(|bytes| Self::bytes_to_kem_public_key(&bytes))
+                .as_deref()
+                .map(|bytes| Self::bytes_to_kem_public_key(bytes))
                 .transpose()?,
             previous_sending_length: data.previous_sending_length,
             skipped_message_keys,
             skipped_key_timestamps,
             pre_pq_root_key: data
                 .pre_pq_root_key
-                .map(|bytes| Self::bytes_to_aead_key(&bytes))
+                .as_deref()
+                .map(|bytes| Self::bytes_to_aead_key(bytes))
                 .transpose()?,
-            session_id: data.session_id,
-            contact_id: data.contact_id,
-            local_user_id: data.local_user_id,
+            session_id: data.session_id.clone(),
+            contact_id: data.contact_id.clone(),
+            local_user_id: data.local_user_id.clone(),
         })
     }
 }
@@ -1122,6 +1111,23 @@ pub struct SerializableSession {
     contact_id: String,
     #[serde(default)]
     local_user_id: String,
+}
+
+impl Drop for SerializableSession {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+        self.sending_chain_key.zeroize();
+        self.receiving_chain_key.zeroize();
+        if let Some(ref mut k) = self.dh_ratchet_private {
+            k.zeroize();
+        }
+        if let Some(ref mut k) = self.pre_pq_root_key {
+            k.zeroize();
+        }
+        for entry in &mut self.skipped_keys {
+            entry.key_bytes.zeroize();
+        }
+    }
 }
 
 impl SerializableSession {

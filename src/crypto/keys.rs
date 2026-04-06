@@ -85,11 +85,12 @@ impl Ed25519KeyPair {
         SigningKey::from_bytes(&self.private_key)
     }
 
-    pub fn get_verifying_key(&self) -> VerifyingKey {
-        // TODO(security): change return type to Result<VerifyingKey, CryptoError> so a corrupted
-        // stored key doesn't panic the process.  The unwrap is currently safe because public_key
-        // is always derived from OsRng via generate(), but explicit error propagation is better.
-        VerifyingKey::from_bytes(&self.public_key).unwrap()
+    pub fn get_verifying_key(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.public_key).map_err(|e| {
+            ConstructError::Crypto(crate::error::CryptoError::InvalidInputError(format!(
+                "Corrupted Ed25519 public key in keystore: {e}"
+            )))
+        })
     }
 }
 
