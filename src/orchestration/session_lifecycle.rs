@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
@@ -19,6 +21,8 @@ use crate::orchestration::ack_store::AckStore;
 use crate::orchestration::actions::Action;
 use crate::orchestration::healing_queue::HealingQueue;
 use crate::orchestration::pq_contribution::PQContributionManager;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -133,6 +137,68 @@ impl SessionLifecycleManager {
             prekey_tracker: HashMap::new(),
             my_user_id,
         }
+    }
+
+    // ── Archive integrity (HMAC-SHA256) ─────────────────────────────────────
+    //
+    // Archives are session-state blobs stored in Keychain. Bit-rot, partial
+    // writes during a crash, or Keychain corruption can silently produce a
+    // malformed JSON that confuses the Double-Ratchet importer and sends the
+    // session into an endless heal loop. We protect against this by wrapping
+    // the JSON in an HMAC envelope using the device identity key.
+    //
+    // Envelope format:  "<hex(hmac32)>:<json>"
+    // The colon is safe as a separator because JSON never starts with `:`.
+
+    fn identity_key_bytes(&self) -> Vec<u8> {
+        let km = self.client.key_manager();
+        if let Ok(secret) = km.identity_secret_key() {
+            <_ as AsRef<[u8]>>::as_ref(secret).to_vec()
+        } else {
+            // Fallback: derive a stable key from the user-id (never empty).
+            self.my_user_id.as_bytes().to_vec()
+        }
+    }
+
+    fn hmac_sign(&self, data: &[u8]) -> [u8; 32] {
+        let key = self.identity_key_bytes();
+        let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    }
+
+    fn wrap_archive(&self, json: &str) -> String {
+        let mac = self.hmac_sign(json.as_bytes());
+        format!("{}:{}", hex::encode(mac), json)
+    }
+
+    /// Verify envelope integrity and return the inner JSON.
+    /// Returns `Err` if the envelope is malformed or the HMAC does not match.
+    fn unwrap_archive<'a>(&self, envelope: &'a str) -> Result<&'a str, String> {
+        // Legacy archives (created before this check was added) have no `:`
+        // prefix with a 64-char hex tag. Accept them as-is to avoid breaking
+        // existing users on upgrade; they will be re-written with a valid MAC
+        // on the next `archive_session` call.
+        let Some(colon_pos) = envelope.find(':') else {
+            return Ok(envelope); // legacy — no MAC prefix
+        };
+        let maybe_hex = &envelope[..colon_pos];
+        if maybe_hex.len() != 64 || !maybe_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(envelope); // legacy JSON that happens to contain a colon
+        }
+        let json = &envelope[colon_pos + 1..];
+        let expected = self.hmac_sign(json.as_bytes());
+        let actual =
+            hex::decode(maybe_hex).map_err(|e| format!("archive MAC decode error: {e}"))?;
+        if actual != expected.as_ref() {
+            return Err(
+                "archive integrity check failed — possible Keychain corruption".to_string(),
+            );
+        }
+        Ok(json)
     }
 
     // ── Session queries ───────────────────────────────────────────────────────
@@ -284,7 +350,11 @@ impl SessionLifecycleManager {
             Err(_) => return vec![],
         };
 
-        self.archives.insert(contact_id.to_string(), json.clone());
+        // Wrap with HMAC to detect Keychain corruption on restore.
+        let envelope = self.wrap_archive(&json);
+
+        self.archives
+            .insert(contact_id.to_string(), envelope.clone());
         self.archive_timestamps
             .insert(contact_id.to_string(), unix_now());
         self.client.remove_session(contact_id);
@@ -293,7 +363,7 @@ impl SessionLifecycleManager {
             // Persist archive under a separate key.
             Action::SaveSessionToSecureStore {
                 key: archive_key(contact_id),
-                data: json.into_bytes(),
+                data: envelope.into_bytes(),
             },
             // Delete the hot session from secure store.
             Action::SaveSessionToSecureStore {
@@ -309,20 +379,31 @@ impl SessionLifecycleManager {
     /// `archive_session` call or loaded from the platform store via
     /// `load_archive_json`).
     pub fn restore_latest_archive(&mut self, contact_id: &str) -> Result<(), String> {
-        let json = self
+        let envelope = self
             .archives
             .get(contact_id)
             .cloned()
             .ok_or_else(|| format!("No archive for {}", contact_id))?;
-        self.import_session_json(contact_id, &json)?;
+        let json = self.unwrap_archive(&envelope)?;
+        self.import_session_json(contact_id, json)?;
         Ok(())
     }
 
-    /// Feed an archive JSON loaded from the platform secure store into memory.
-    pub fn load_archive_json(&mut self, contact_id: &str, json: String) {
-        self.archives.insert(contact_id.to_string(), json.clone());
-        // Also import as the active session.
-        let _ = self.import_session_json(contact_id, &json);
+    /// Feed an archive JSON/envelope loaded from the platform secure store into memory.
+    pub fn load_archive_json(&mut self, contact_id: &str, envelope: String) {
+        // Verify integrity before importing the session; if the envelope is
+        // corrupted we still store it (so restore_latest_archive can return a
+        // meaningful error) but we don't import a broken session into memory.
+        match self.unwrap_archive(&envelope) {
+            Ok(json) => {
+                let _ = self.import_session_json(contact_id, json);
+            }
+            Err(e) => {
+                // Log via debug; will surface as Err from restore_latest_archive.
+                let _ = e; // suppress unused warning; platform will handle via restore error
+            }
+        }
+        self.archives.insert(contact_id.to_string(), envelope);
     }
 
     /// Feed an archive from CFE binary bytes into memory (preferred over `load_archive_json`).

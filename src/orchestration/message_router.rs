@@ -56,6 +56,7 @@ pub enum RoutingDecision {
         contact_id: String,
         message_id: String,
         plaintext: Vec<u8>,
+        content_type: u8,
         actions: Vec<Action>,
     },
     /// No active session; message queued — caller must fetch bundle and init session.
@@ -92,6 +93,8 @@ pub struct IncomingMessage {
     pub msg_number: u32,
     /// When `true` this is a KEY_SYNC / END_SESSION control frame.
     pub is_control: bool,
+    /// Original content_type from the wire envelope (e.g. 12 = CALL_SIGNAL).
+    pub content_type: u8,
 }
 
 // ── MessageRouter ─────────────────────────────────────────────────────────────
@@ -265,6 +268,7 @@ impl MessageRouter {
                     contact_id: msg.contact_id.clone(),
                     message_id: msg.message_id.clone(),
                     plaintext: result.plaintext,
+                    content_type: msg.content_type,
                     actions,
                 }
             }
@@ -352,6 +356,7 @@ mod tests {
             message_id: msg_id.to_string(),
             msg_number: msg_num,
             is_control: false,
+            content_type: 0,
         }
     }
 
@@ -398,6 +403,7 @@ mod tests {
             message_id: "dup-msg".to_string(),
             msg_number: 1,
             is_control: false,
+            content_type: 0,
         };
         let decision = router.route_message(&mut lifecycle, &m);
         assert!(matches!(decision, RoutingDecision::Duplicate { .. }));
@@ -414,6 +420,7 @@ mod tests {
             message_id: "ctrl-1".to_string(),
             msg_number: 0,
             is_control: true,
+            content_type: 0,
         };
         let decision = router.route_message(&mut lifecycle, &m);
         assert!(matches!(
@@ -468,6 +475,7 @@ mod tests {
             message_id: "bad-msg".to_string(),
             msg_number: 5, // >0 → EndSessionNeeded on fail
             is_control: false,
+            content_type: 0,
         };
         // Without a session → NeedSessionInit (queue)
         let decision = router.route_message(&mut lifecycle, &m);

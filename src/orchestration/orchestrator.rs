@@ -941,19 +941,15 @@ impl Orchestrator {
         is_control: bool,
         content_type: u8,
     ) -> Vec<Action> {
-        // ── Binary content types (e.g. CALL_SIGNAL = 12) ─────────────────────
-        // `data` is a raw WirePayload blob; decrypt directly and return proto bytes.
-        if content_type == 12 {
-            return self.handle_call_signal_received(message_id, from, data);
-        }
-
-        // ── Standard text message path ─────────────────────────────────────────
+        // All content types — including CALL_SIGNAL (12) — go through the full
+        // routing pipeline (ACK dedup, session check, heal path, PQ contribution).
         let incoming = IncomingMessage {
             contact_id: from.clone(),
             wire_payload: data,
             message_id,
             msg_number: msg_num,
             is_control,
+            content_type,
         };
 
         // Store KEM ciphertext for PQ decapsulation if non-empty.
@@ -1116,28 +1112,6 @@ impl Orchestrator {
     /// Decrypt a CALL_SIGNAL message using the existing JSON wire format path.
     ///
     /// Called when `handle_message_received` sees `content_type == 12`.
-    /// `data` is the same JSON wire message used by standard messages — parsed and
-    /// decrypted via `SessionLifecycle::decrypt`, then returned as raw proto bytes
-    /// in a `CallSignalDecrypted` action.
-    fn handle_call_signal_received(
-        &mut self,
-        message_id: String,
-        from: String,
-        data: Vec<u8>,
-    ) -> Vec<Action> {
-        match self.lifecycle.decrypt_wire_payload(&from, &data) {
-            Ok(result) => vec![Action::CallSignalDecrypted {
-                contact_id: from,
-                message_id,
-                proto_bytes: result.plaintext,
-            }],
-            Err(e) => vec![Action::NotifyError {
-                code: "CALL_SIGNAL_DECRYPT_FAILED".to_string(),
-                message: e,
-            }],
-        }
-    }
-
     fn handle_session_init_completed(
         &mut self,
         contact_id: String,
@@ -1262,18 +1236,28 @@ impl Orchestrator {
                 actions,
                 contact_id: cid,
                 message_id: mid,
+                content_type,
             } => {
                 let mut all = actions;
-                let plaintext_str = String::from_utf8_lossy(&plaintext).into_owned();
-                all.push(Action::MessageDecrypted {
-                    contact_id: cid.clone(),
-                    message_id: mid,
-                    plaintext_utf8: plaintext_str.clone(),
-                });
-                all.push(Action::NotifyNewMessage {
-                    chat_id: cid,
-                    preview: preview(&plaintext),
-                });
+                if content_type == 12 {
+                    // CALL_SIGNAL: return raw proto bytes, no chat notification.
+                    all.push(Action::CallSignalDecrypted {
+                        contact_id: cid,
+                        message_id: mid,
+                        proto_bytes: plaintext,
+                    });
+                } else {
+                    let plaintext_str = String::from_utf8_lossy(&plaintext).into_owned();
+                    all.push(Action::MessageDecrypted {
+                        contact_id: cid.clone(),
+                        message_id: mid,
+                        plaintext_utf8: plaintext_str,
+                    });
+                    all.push(Action::NotifyNewMessage {
+                        chat_id: cid,
+                        preview: preview(&plaintext),
+                    });
+                }
                 all
             }
             RoutingDecision::NeedSessionInit {
