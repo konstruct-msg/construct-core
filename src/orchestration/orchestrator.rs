@@ -26,6 +26,11 @@ use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 /// Minimum time between successive END_SESSION sends to the same contact (ms).
 const END_SESSION_COOLDOWN_MS: u64 = 5_000;
 
+/// Maximum time an init lock may be held before it is considered stale (ms).
+/// Prevents a permanent deadlock if FetchPublicKeyBundle is never completed
+/// (e.g. the network dropped mid-handshake).
+const INIT_LOCK_TTL_MS: u64 = 30_000;
+
 /// Minimum time between prewarm attempts for the same contact (ms).
 #[allow(dead_code)]
 const PREWARM_COOLDOWN_MS: u64 = 30_000;
@@ -36,7 +41,9 @@ pub struct Orchestrator {
     lifecycle: SessionLifecycleManager,
     router: MessageRouter,
     /// Contacts whose session initialisation is currently in progress.
-    init_locks: HashSet<String>,
+    /// Value is the Unix ms timestamp when the lock was acquired; locks older
+    /// than INIT_LOCK_TTL_MS are treated as expired and may be re-acquired.
+    init_locks: HashMap<String, u64>,
     /// contactId → Unix ms of last END_SESSION / prewarm (anti-loop cooldown).
     cooldowns: HashMap<String, u64>,
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
@@ -52,7 +59,7 @@ impl Orchestrator {
         Self {
             lifecycle: SessionLifecycleManager::new(client, my_user_id),
             router: MessageRouter::new(),
-            init_locks: HashSet::new(),
+            init_locks: HashMap::new(),
             cooldowns: HashMap::new(),
             prewarm_done: HashSet::new(),
         }
@@ -110,6 +117,10 @@ impl Orchestrator {
             IncomingEvent::NetworkReconnected => self.handle_network_reconnected(),
             IncomingEvent::AppLaunched => self.handle_app_launched(),
             IncomingEvent::TimerFired { timer_id } => self.handle_timer_fired(timer_id),
+            IncomingEvent::AckDbResult {
+                message_id,
+                is_processed,
+            } => self.handle_ack_db_result(message_id, is_processed),
         }
     }
 
@@ -144,16 +155,23 @@ impl Orchestrator {
     /// Captures ACK dedup cache, healing queue, init locks, archive index, and
     /// prekey tracker.  Persist under `"orchestrator_state"` in Keychain.
     pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
-        self.lifecycle
-            .export_orchestrator_state_cfe(&self.init_locks)
+        // Serialise only the contact IDs (keys) — timestamps are ephemeral.
+        let lock_ids: std::collections::HashSet<String> = self.init_locks.keys().cloned().collect();
+        self.lifecycle.export_orchestrator_state_cfe(&lock_ids)
     }
 
     /// Restore the full orchestrator coordination state from a CFE binary blob.
     ///
     /// All in-memory queues and the init_locks set are replaced.
     pub fn import_orchestrator_state_cfe(&mut self, data: &[u8]) -> Result<(), String> {
-        let restored_locks = self.lifecycle.import_orchestrator_state_cfe(data)?;
-        self.init_locks = restored_locks;
+        let restored_ids = self.lifecycle.import_orchestrator_state_cfe(data)?;
+        // Restored locks get a timestamp that puts them near expiry (5 s grace).
+        // This prevents a crash-survivor lock from blocking init indefinitely.
+        let near_expiry_ts = unix_ms().saturating_sub(INIT_LOCK_TTL_MS - 5_000);
+        self.init_locks = restored_ids
+            .into_iter()
+            .map(|id| (id, near_expiry_ts))
+            .collect();
         Ok(())
     }
 
@@ -825,6 +843,8 @@ impl Orchestrator {
             encrypted.message_number,
             otpk_id,
             0, // kyber_otpk_id — call signals always use existing sessions (no first-message PQC)
+            encrypted.previous_chain_length,
+            encrypted.suite_id,
             None,
             &sealed_box,
         )
@@ -859,8 +879,8 @@ impl Orchestrator {
             message_number: decoded.message_number,
             ciphertext,
             nonce,
-            previous_chain_length: 0,
-            suite_id: crate::config::Config::global().classic_suite_id,
+            previous_chain_length: decoded.previous_chain_length,
+            suite_id: decoded.suite_id,
         };
 
         self.lifecycle
@@ -1030,6 +1050,8 @@ impl Orchestrator {
             encrypted.message_number,
             otpk_id,
             pq_kyber_otpk_id,
+            encrypted.previous_chain_length,
+            encrypted.suite_id,
             kem_ct_ref,
             &sealed_box,
         ) {
@@ -1164,6 +1186,13 @@ impl Orchestrator {
         vec![Action::MarkMessageDelivered { message_id }]
     }
 
+    fn handle_ack_db_result(&mut self, message_id: String, is_processed: bool) -> Vec<Action> {
+        let decision =
+            self.router
+                .resume_after_ack_check(&message_id, is_processed, &mut self.lifecycle);
+        self.decision_to_actions(decision, "")
+    }
+
     fn handle_session_loaded(&mut self, key: String, data: Option<Vec<u8>>) -> Vec<Action> {
         // key format: "session_<contact_id>" or "archive_<contact_id>"
         let contact_id = key
@@ -1250,10 +1279,10 @@ impl Orchestrator {
             RoutingDecision::NeedSessionInit {
                 contact_id: cid, ..
             } => {
-                if self.init_locks.contains(&cid) {
+                if self.is_init_locked(&cid) {
                     return vec![];
                 }
-                self.init_locks.insert(cid.clone());
+                self.acquire_init_lock(cid.clone());
                 vec![Action::FetchPublicKeyBundle { user_id: cid }]
             }
             RoutingDecision::SessionHealNeeded {
@@ -1261,7 +1290,15 @@ impl Orchestrator {
                 role,
             } => {
                 if self.on_cooldown(&cid) {
-                    return vec![];
+                    // Return HealSuppressed so the platform knows NOT to ACK.
+                    // The server will re-deliver after the cooldown clears.
+                    let elapsed =
+                        unix_ms().saturating_sub(*self.cooldowns.get(&cid).unwrap_or(&unix_ms()));
+                    let remaining = END_SESSION_COOLDOWN_MS.saturating_sub(elapsed) + 100;
+                    return vec![Action::HealSuppressed {
+                        contact_id: cid,
+                        retry_after_ms: remaining,
+                    }];
                 }
                 self.set_cooldown(cid.clone());
                 let role_str = match role {
@@ -1284,6 +1321,9 @@ impl Orchestrator {
                 vec![Action::SendEndSession { contact_id: cid }]
             }
             RoutingDecision::Duplicate { .. } => vec![],
+            RoutingDecision::PendingAckCheck { message_id } => {
+                vec![Action::CheckAckInDb { message_id }]
+            }
             RoutingDecision::QueueFull { contact_id: cid } => {
                 vec![Action::NotifyError {
                     code: "QUEUE_FULL".to_string(),
@@ -1315,6 +1355,19 @@ impl Orchestrator {
         self.cooldowns.insert(contact_id, unix_ms());
     }
 
+    // ── Init-lock helpers ─────────────────────────────────────────────────────
+
+    /// Returns `true` if a live (non-expired) init lock exists for `contact_id`.
+    fn is_init_locked(&self, contact_id: &str) -> bool {
+        self.init_locks
+            .get(contact_id)
+            .is_some_and(|&acquired_at| unix_ms().saturating_sub(acquired_at) < INIT_LOCK_TTL_MS)
+    }
+
+    fn acquire_init_lock(&mut self, contact_id: String) {
+        self.init_locks.insert(contact_id, unix_ms());
+    }
+
     // ── Orchestrator state persistence ────────────────────────────────────────
 
     /// Build a `SaveSessionToSecureStore` action that persists the full
@@ -1327,8 +1380,9 @@ impl Orchestrator {
     /// Swift to call `saveOrchestratorStateCFE()` as a side-effect of the
     /// session save, so it does not need this action.
     fn orchestrator_state_action(&self) -> Option<Action> {
+        let lock_ids: std::collections::HashSet<String> = self.init_locks.keys().cloned().collect();
         self.lifecycle
-            .export_orchestrator_state_cfe(&self.init_locks)
+            .export_orchestrator_state_cfe(&lock_ids)
             .ok()
             .map(|cfe| Action::SaveSessionToSecureStore {
                 key: "construct.orchestrator_state".to_string(),
@@ -1480,12 +1534,12 @@ mod tests {
     #[test]
     fn test_session_init_completed_clears_lock() {
         let mut o = make_orchestrator("alice");
-        o.init_locks.insert("bob".to_string());
+        o.acquire_init_lock("bob".to_string());
         let actions = o.handle_event(IncomingEvent::SessionInitCompleted {
             contact_id: "bob".to_string(),
             session_data: vec![], // empty → only clears init lock
         });
-        assert!(!o.init_locks.contains("bob"));
+        assert!(!o.is_init_locked("bob"));
         // Should include NotifySessionCreated.
         assert!(
             actions

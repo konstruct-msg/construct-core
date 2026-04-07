@@ -2273,19 +2273,23 @@ impl RustHealingQueue {
     pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {
         let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match queue.record_attempt(&contact_id) {
-            crate::orchestration::HealingDecision::RetryAllowed { attempt } => {
-                HealingAttemptResult {
-                    decision: "retry_allowed".to_string(),
-                    attempt,
-                }
-            }
+            crate::orchestration::HealingDecision::RetryAllowed {
+                attempt,
+                retry_after_ms,
+            } => HealingAttemptResult {
+                decision: "retry_allowed".to_string(),
+                attempt,
+                retry_after_ms,
+            },
             crate::orchestration::HealingDecision::MaxAttemptsReached => HealingAttemptResult {
                 decision: "max_attempts_reached".to_string(),
                 attempt: 0,
+                retry_after_ms: 0,
             },
             crate::orchestration::HealingDecision::NotFound => HealingAttemptResult {
                 decision: "not_found".to_string(),
                 attempt: 0,
+                retry_after_ms: 0,
             },
         }
     }
@@ -2314,6 +2318,7 @@ impl RustHealingQueue {
 pub struct HealingAttemptResult {
     pub decision: String,
     pub attempt: u32,
+    pub retry_after_ms: u64,
 }
 
 // ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
@@ -2746,6 +2751,11 @@ pub enum CfeIncomingEvent {
     TimerFired {
         timer_id: String,
     },
+    /// Platform ACK DB lookup result — response to `CheckAckInDb` action.
+    AckDbResult {
+        message_id: String,
+        is_processed: bool,
+    },
 }
 
 impl CfeIncomingEvent {
@@ -2810,6 +2820,13 @@ impl CfeIncomingEvent {
             Self::NetworkReconnected => NetworkReconnected,
             Self::AppLaunched => AppLaunched,
             Self::TimerFired { timer_id } => TimerFired { timer_id },
+            Self::AckDbResult {
+                message_id,
+                is_processed,
+            } => AckDbResult {
+                message_id,
+                is_processed,
+            },
         }
     }
 }
@@ -2903,6 +2920,15 @@ pub enum CfeAction {
         message_id: String,
         proto_bytes: Vec<u8>,
     },
+    /// Platform must query its persistent ACK store for `message_id`.
+    CheckAckInDb {
+        message_id: String,
+    },
+    /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
+    HealSuppressed {
+        contact_id: String,
+        retry_after_ms: u64,
+    },
 }
 
 impl CfeAction {
@@ -2993,6 +3019,14 @@ impl CfeAction {
                 contact_id,
                 message_id,
                 proto_bytes,
+            },
+            CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
+            HealSuppressed {
+                contact_id,
+                retry_after_ms,
+            } => Self::HealSuppressed {
+                contact_id,
+                retry_after_ms,
             },
         }
     }
@@ -3108,6 +3142,15 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         } => serde_json::json!({
             "type": "CallSignalDecrypted", "contact_id": contact_id,
             "message_id": message_id, "proto_bytes": proto_bytes
+        }),
+        Action::CheckAckInDb { message_id } => serde_json::json!({
+            "type": "CheckAckInDb", "message_id": message_id
+        }),
+        Action::HealSuppressed {
+            contact_id,
+            retry_after_ms,
+        } => serde_json::json!({
+            "type": "HealSuppressed", "contact_id": contact_id, "retry_after_ms": retry_after_ms
         }),
     }
 }

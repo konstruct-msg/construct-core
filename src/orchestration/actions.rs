@@ -45,10 +45,18 @@ pub enum Action {
     },
 
     /// Decryption failed on message 0; the session needs healing.
-    /// `role` is either `"Initiator"` (lower userId) or `"Responder"`.
+    /// `role` is either `"Initiator"` (higher userId, wins tie-break) or `"Responder"`.
     SessionHealNeeded {
         contact_id: String,
         role: String,
+    },
+
+    /// A `SessionHealNeeded` decision was suppressed by the per-contact cooldown.
+    /// The platform must NOT acknowledge the message — leave it unread so the server
+    /// re-delivers it after `retry_after_ms` milliseconds when the cooldown clears.
+    HealSuppressed {
+        contact_id: String,
+        retry_after_ms: u64,
     },
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -109,6 +117,13 @@ pub enum Action {
     NotifyError {
         code: String,
         message: String,
+    },
+
+    /// Request platform to query its persistent ACK store for `message_id`.
+    /// The platform must respond with `IncomingEvent::AckDbResult`.
+    /// While the check is pending the message is held in a buffer and not ACK'd.
+    CheckAckInDb {
+        message_id: String,
     },
 
     // ── Scheduling ────────────────────────────────────────────────────────────
@@ -199,6 +214,13 @@ pub enum IncomingEvent {
     AppLaunched,
     TimerFired {
         timer_id: String,
+    },
+    /// Platform's response to `Action::CheckAckInDb`.
+    /// If `is_processed` is `true`, the buffered message is discarded as a duplicate.
+    /// If `false`, the message is re-routed as if freshly received.
+    AckDbResult {
+        message_id: String,
+        is_processed: bool,
     },
 }
 

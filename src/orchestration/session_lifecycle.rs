@@ -253,8 +253,8 @@ impl SessionLifecycleManager {
             message_number: decoded.message_number,
             ciphertext,
             nonce,
-            previous_chain_length: 0,
-            suite_id: 1,
+            previous_chain_length: decoded.previous_chain_length,
+            suite_id: decoded.suite_id,
         };
 
         if !self.client.has_session(contact_id) {

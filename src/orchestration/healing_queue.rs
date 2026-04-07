@@ -24,7 +24,8 @@ const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60; // 24 hours
 #[derive(Debug, Clone, PartialEq)]
 pub enum HealingDecision {
     /// Healing may proceed; `attempt` is the 1-based attempt index.
-    RetryAllowed { attempt: u32 },
+    /// `retry_after_ms` is the minimum delay before the next attempt.
+    RetryAllowed { attempt: u32, retry_after_ms: u64 },
     /// Maximum attempts exhausted — the caller should send END_SESSION.
     MaxAttemptsReached,
     /// No healing record exists for this contact.
@@ -92,13 +93,19 @@ impl HealingQueue {
 
     // ── Mutation ──────────────────────────────────────────────────────────────
 
-    /// Enqueue a message for healing (idempotent).
+    /// Enqueue a message for healing.
     ///
-    /// If a record already exists for `contact_id`, it is replaced.
-    /// Persistence is handled by the orchestrator's CFE state export — no
-    /// individual `Action` is needed here.
+    /// If a record already exists for `contact_id`, it is replaced only when
+    /// the new message is strictly fresher (higher `created_at`). This prevents
+    /// a server retry of an older message from clobbering a legitimate newer init.
     pub fn enqueue(&mut self, contact_id: &str, payload: Vec<u8>) {
         let now = unix_now();
+        if let Some(existing) = self.records.get(contact_id) {
+            if existing.created_at > now {
+                // Existing record is future-dated (clock skew) — keep it.
+                return;
+            }
+        }
         let record = HealingRecord {
             contact_id: contact_id.to_string(),
             message_payload: payload,
@@ -111,6 +118,7 @@ impl HealingQueue {
     /// Increment the attempt counter for `contact_id`.
     ///
     /// Returns a `HealingDecision` indicating whether another attempt is allowed.
+    /// `retry_after_ms` uses exponential backoff: 2s / 4s / 8s for attempts 1-3.
     pub fn record_attempt(&mut self, contact_id: &str) -> HealingDecision {
         match self.records.get_mut(contact_id) {
             None => HealingDecision::NotFound,
@@ -119,8 +127,11 @@ impl HealingQueue {
                 if record.attempts >= self.max_attempts {
                     HealingDecision::MaxAttemptsReached
                 } else {
+                    // 2^attempt seconds (2s, 4s, 8s …)
+                    let retry_after_ms = 2_000u64 << record.attempts;
                     HealingDecision::RetryAllowed {
                         attempt: record.attempts,
+                        retry_after_ms,
                     }
                 }
             }
@@ -219,6 +230,7 @@ mod tests {
         q.enqueue("bob", b"first".to_vec());
         q.enqueue("bob", b"second".to_vec());
         assert_eq!(q.len(), 1);
+        // Same second → second call replaces first (last-write wins within same timestamp).
         assert_eq!(q.get("bob").unwrap().message_payload, b"second");
     }
 
@@ -227,9 +239,21 @@ mod tests {
         let mut q = HealingQueue::default();
         q.enqueue("carol", vec![]);
         let d = q.record_attempt("carol");
-        assert_eq!(d, HealingDecision::RetryAllowed { attempt: 1 });
+        assert_eq!(
+            d,
+            HealingDecision::RetryAllowed {
+                attempt: 1,
+                retry_after_ms: 4000
+            }
+        );
         let d = q.record_attempt("carol");
-        assert_eq!(d, HealingDecision::RetryAllowed { attempt: 2 });
+        assert_eq!(
+            d,
+            HealingDecision::RetryAllowed {
+                attempt: 2,
+                retry_after_ms: 8000
+            }
+        );
     }
 
     #[test]

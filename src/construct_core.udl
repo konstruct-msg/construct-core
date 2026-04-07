@@ -427,6 +427,8 @@ dictionary HealingAttemptResult {
     string decision;
     /// 1-based attempt number (valid when decision == "retry_allowed").
     u32 attempt;
+    /// Minimum delay before the next retry in ms (exponential backoff: 2s/4s/8s).
+    u64 retry_after_ms;
 };
 
 /// Thread-safe session healing queue.
@@ -473,6 +475,8 @@ interface CfeIncomingEvent {
     NetworkReconnected();
     AppLaunched();
     TimerFired(string timer_id);
+    /// Platform ACK DB lookup result — response to `CheckAckInDb` action.
+    AckDbResult(string message_id, boolean is_processed);
 };
 
 /// Typed replacement for `Action` JSON strings.
@@ -486,6 +490,8 @@ interface CfeAction {
     ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, string plaintext_utf8);
     SessionHealNeeded(string contact_id, string role);
+    /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
+    HealSuppressed(string contact_id, u64 retry_after_ms);
     SaveSessionToSecureStore(string key, bytes data);
     LoadSessionFromSecureStore(string key);
     PersistMessage(string message_json);
@@ -502,6 +508,8 @@ interface CfeAction {
     ScheduleTimer(string timer_id, u64 delay_ms);
     CancelTimer(string timer_id);
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
+    /// Platform must query its persistent ACK store for `message_id` and reply with `AckDbResult`.
+    CheckAckInDb(string message_id);
 };
 
 /// Top-level orchestration facade.

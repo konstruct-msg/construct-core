@@ -32,6 +32,10 @@ pub struct AckStore {
     cache: HashSet<String>,
     /// Maximum age of a persisted ACK record before `prune_expired` removes it.
     max_age_seconds: u64,
+    /// When `true` (set after `restore_cache`), cache misses return `NeedDbCheck`
+    /// so the platform can catch messages that were processed between the last
+    /// snapshot and a crash. Cleared by `clear_post_restart_mode()`.
+    post_restart_mode: bool,
 }
 
 impl AckStore {
@@ -39,6 +43,7 @@ impl AckStore {
         Self {
             cache: HashSet::new(),
             max_age_seconds,
+            post_restart_mode: false,
         }
     }
 
@@ -59,13 +64,17 @@ impl AckStore {
 
     /// Check whether `message_id` has been processed.
     ///
-    /// Returns `InCache` immediately if found in the hot-path cache.
-    /// Returns `NeedDbCheck` otherwise — caller must query the platform store.
+    /// - `InCache`: definitely a duplicate (hot-path, O(1)).
+    /// - `NeedDbCheck`: cache miss in post-restart mode — caller must query the
+    ///   persistent store to cover the crash-window gap.
+    /// - `NotProcessed`: cache miss in normal operation — message is new.
     pub fn is_processed(&self, message_id: &str) -> AckCheckResult {
         if self.cache.contains(message_id) {
             AckCheckResult::InCache
-        } else {
+        } else if self.post_restart_mode {
             AckCheckResult::NeedDbCheck
+        } else {
+            AckCheckResult::NotProcessed
         }
     }
 
@@ -73,6 +82,12 @@ impl AckStore {
     /// Always returns `NotProcessed` (convenience for symmetric call-sites).
     pub fn confirm_not_in_db(&self) -> AckCheckResult {
         AckCheckResult::NotProcessed
+    }
+
+    /// Exit post-restart mode. Call once all in-flight `CheckAckInDb` responses
+    /// have been received, or after a fixed warm-up window.
+    pub fn clear_post_restart_mode(&mut self) {
+        self.post_restart_mode = false;
     }
 
     // ── Mutation ──────────────────────────────────────────────────────────────
@@ -122,9 +137,12 @@ impl AckStore {
 
     /// Restore in-memory cache from a CFE snapshot.
     /// Existing entries are replaced (idempotent for identical snapshots).
+    /// Enables `post_restart_mode` so cache misses trigger a DB check until
+    /// the crash-window gap is covered.
     pub fn restore_cache(&mut self, ids: Vec<String>) {
         self.cache.clear();
         self.cache.extend(ids);
+        self.post_restart_mode = true;
     }
 }
 
@@ -143,8 +161,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_processed_returns_need_db_check_on_miss() {
+    fn test_is_processed_returns_not_processed_on_miss_normal_mode() {
         let store = AckStore::default();
+        assert_eq!(store.is_processed("msg-001"), AckCheckResult::NotProcessed);
+    }
+
+    #[test]
+    fn test_is_processed_returns_need_db_check_after_restore() {
+        let mut store = AckStore::default();
+        store.restore_cache(vec![]);
         assert_eq!(store.is_processed("msg-001"), AckCheckResult::NeedDbCheck);
     }
 
@@ -177,7 +202,7 @@ mod tests {
         let mut store = AckStore::default();
         store.mark_processed("msg-002");
         store.evict("msg-002");
-        assert_eq!(store.is_processed("msg-002"), AckCheckResult::NeedDbCheck);
+        assert_eq!(store.is_processed("msg-002"), AckCheckResult::NotProcessed);
     }
 
     #[test]

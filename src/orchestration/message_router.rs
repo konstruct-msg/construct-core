@@ -69,6 +69,8 @@ pub enum RoutingDecision {
     EndSessionNeeded { contact_id: String, reason: String },
     /// Message already processed — discard.
     Duplicate { message_id: String },
+    /// ACK status unknown — buffered pending a DB check (platform feeds back `AckDbResult`).
+    PendingAckCheck { message_id: String },
     /// Pending queue for this contact is full — apply backpressure.
     QueueFull { contact_id: String },
     /// END_SESSION control message received.
@@ -98,6 +100,9 @@ pub struct MessageRouter {
     /// Per-contact queues for messages that arrived before session init.
     pending_queues: HashMap<String, VecDeque<IncomingMessage>>,
     max_pending_per_user: usize,
+    /// Messages awaiting a platform DB ACK-check response.
+    /// Key = message_id, Value = the buffered IncomingMessage.
+    pending_ack_checks: HashMap<String, IncomingMessage>,
 }
 
 impl MessageRouter {
@@ -105,6 +110,7 @@ impl MessageRouter {
         Self {
             pending_queues: HashMap::new(),
             max_pending_per_user: MAX_PENDING_PER_USER,
+            pending_ack_checks: HashMap::new(),
         }
     }
 
@@ -126,9 +132,109 @@ impl MessageRouter {
                     message_id: msg.message_id.clone(),
                 };
             }
-            AckCheckResult::NeedDbCheck | AckCheckResult::NotProcessed => {}
+            AckCheckResult::NeedDbCheck => {
+                // L1 cache miss after restart — buffer and ask platform to check L2 (DB).
+                self.pending_ack_checks
+                    .insert(msg.message_id.clone(), msg.clone());
+                return RoutingDecision::PendingAckCheck {
+                    message_id: msg.message_id.clone(),
+                };
+            }
+            AckCheckResult::NotProcessed => {}
         }
 
+        // Steps 2-4 shared with `resume_after_ack_check`.
+        self.route_after_ack_check(lifecycle, msg)
+    }
+
+    // ── Drain pending queue after session init ────────────────────────────────
+
+    /// Process all queued messages for `contact_id` now that a session exists.
+    ///
+    /// Returns one `RoutingDecision` per queued message.
+    /// Returns one `RoutingDecision` per queued message, stopping early on
+    /// the first error decision (EndSessionNeeded / SessionHealNeeded) to
+    /// avoid cascading 50+ failures from a single broken session.
+    pub fn drain_pending(
+        &mut self,
+        contact_id: &str,
+        lifecycle: &mut SessionLifecycleManager,
+    ) -> Vec<RoutingDecision> {
+        let queued: Vec<IncomingMessage> = self
+            .pending_queues
+            .remove(contact_id)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default();
+
+        let mut results = Vec::with_capacity(queued.len());
+        let mut remaining_start = queued.len(); // index after which messages should be re-queued
+        for (i, msg) in queued.iter().enumerate() {
+            let decision = self.route_message(lifecycle, msg);
+            let is_error = matches!(
+                &decision,
+                RoutingDecision::EndSessionNeeded { .. }
+                    | RoutingDecision::SessionHealNeeded { .. }
+            );
+            results.push(decision);
+            if is_error {
+                remaining_start = i + 1;
+                break;
+            }
+        }
+        // Re-queue any messages that were not processed due to early exit.
+        if remaining_start < queued.len() {
+            let queue = self
+                .pending_queues
+                .entry(contact_id.to_string())
+                .or_default();
+            for msg in queued.into_iter().skip(remaining_start) {
+                queue.push_front(msg);
+            }
+        }
+        results
+    }
+
+    /// Number of queued messages for `contact_id`.
+    pub fn pending_count(&self, contact_id: &str) -> usize {
+        self.pending_queues.get(contact_id).map_or(0, |q| q.len())
+    }
+
+    /// Handle the platform's response to `Action::CheckAckInDb`.
+    ///
+    /// - `is_processed = true`  → duplicate; returns `RoutingDecision::Duplicate`.
+    /// - `is_processed = false` → re-routes the buffered message, skipping the ACK check.
+    pub fn resume_after_ack_check(
+        &mut self,
+        message_id: &str,
+        is_processed: bool,
+        lifecycle: &mut SessionLifecycleManager,
+    ) -> RoutingDecision {
+        let Some(buffered_msg) = self.pending_ack_checks.remove(message_id) else {
+            return RoutingDecision::Error {
+                message: format!(
+                    "No buffered message for AckDbResult message_id={}",
+                    message_id
+                ),
+            };
+        };
+
+        if is_processed {
+            return RoutingDecision::Duplicate {
+                message_id: message_id.to_string(),
+            };
+        }
+
+        // DB confirmed not a duplicate — route from step 2 (skip ACK check).
+        self.route_after_ack_check(lifecycle, &buffered_msg)
+    }
+
+    /// Route steps 2-4 (post-ACK-check). Called by both `route_message` (for
+    /// `NotProcessed` fast path) and `resume_after_ack_check` (after DB confirms absent).
+    fn route_after_ack_check(
+        &mut self,
+        lifecycle: &mut SessionLifecycleManager,
+        msg: &IncomingMessage,
+    ) -> RoutingDecision {
         // ── 2. END_SESSION control message ────────────────────────────────────
         if msg.is_control {
             let actions = lifecycle.archive_session(&msg.contact_id);
@@ -140,12 +246,10 @@ impl MessageRouter {
 
         // ── 3. Session availability check ─────────────────────────────────────
         if !lifecycle.has_active_session(&msg.contact_id) {
-            // Try to restore from archive before queuing.
             if lifecycle.has_archive(&msg.contact_id) {
                 if lifecycle.restore_latest_archive(&msg.contact_id).is_err() {
                     return self.enqueue_or_reject(lifecycle, msg);
                 }
-                // Archive restored — fall through to decrypt.
             } else {
                 return self.enqueue_or_reject(lifecycle, msg);
             }
@@ -154,13 +258,9 @@ impl MessageRouter {
         // ── 4. Decrypt ────────────────────────────────────────────────────────
         match lifecycle.decrypt_wire_payload(&msg.contact_id, &msg.wire_payload) {
             Ok(result) => {
-                // Mark as processed.
                 let mut actions = lifecycle.ack_store.mark_processed(&msg.message_id);
                 actions.extend(result.actions);
-
-                // Apply any pending PQ contribution.
                 actions.extend(lifecycle.maybe_apply_pq_contribution(&msg.contact_id));
-
                 RoutingDecision::Decrypted {
                     contact_id: msg.contact_id.clone(),
                     message_id: msg.message_id.clone(),
@@ -170,7 +270,6 @@ impl MessageRouter {
             }
             Err(e) => {
                 if msg.msg_number == 0 {
-                    // First message of a session — trigger healing.
                     let role = self.tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
                     lifecycle
                         .healing_queue
@@ -187,33 +286,6 @@ impl MessageRouter {
                 }
             }
         }
-    }
-
-    // ── Drain pending queue after session init ────────────────────────────────
-
-    /// Process all queued messages for `contact_id` now that a session exists.
-    ///
-    /// Returns one `RoutingDecision` per queued message.
-    pub fn drain_pending(
-        &mut self,
-        contact_id: &str,
-        lifecycle: &mut SessionLifecycleManager,
-    ) -> Vec<RoutingDecision> {
-        let queued: Vec<IncomingMessage> = self
-            .pending_queues
-            .remove(contact_id)
-            .map(|q| q.into_iter().collect())
-            .unwrap_or_default();
-
-        queued
-            .into_iter()
-            .map(|msg| self.route_message(lifecycle, &msg))
-            .collect()
-    }
-
-    /// Number of queued messages for `contact_id`.
-    pub fn pending_count(&self, contact_id: &str) -> usize {
-        self.pending_queues.get(contact_id).map_or(0, |q| q.len())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
