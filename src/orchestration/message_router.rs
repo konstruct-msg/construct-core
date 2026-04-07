@@ -243,9 +243,9 @@ impl MessageRouter {
     }
 
     /// Determine the local node's role using the tie-break rule:
-    /// `my_user_id < contact_id` (lexicographic) → INITIATOR.
+    /// Higher userId (lexicographic) wins as INITIATOR — matches iOS `DeviceIdOrdering.isNaturalInitiator`.
     fn tie_break_role(&self, my_user_id: &str, contact_id: &str) -> Role {
-        if my_user_id < contact_id {
+        if my_user_id > contact_id {
             Role::Initiator
         } else {
             Role::Responder
@@ -353,15 +353,15 @@ mod tests {
     #[test]
     fn test_tie_break_role_initiator() {
         let router = MessageRouter::new();
-        // "alice" < "bob" → alice is INITIATOR
-        assert_eq!(router.tie_break_role("alice", "bob"), Role::Initiator);
+        // "bob" > "alice" → bob is INITIATOR (higher deviceId wins)
+        assert_eq!(router.tie_break_role("bob", "alice"), Role::Initiator);
     }
 
     #[test]
     fn test_tie_break_role_responder() {
         let router = MessageRouter::new();
-        // "bob" > "alice" → bob is RESPONDER
-        assert_eq!(router.tie_break_role("bob", "alice"), Role::Responder);
+        // "alice" < "bob" → alice is RESPONDER (lower deviceId loses)
+        assert_eq!(router.tie_break_role("alice", "bob"), Role::Responder);
     }
 
     #[test]
