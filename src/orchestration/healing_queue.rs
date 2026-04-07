@@ -11,7 +11,9 @@
 /// - Enqueue is idempotent: a second call for the same contact replaces the
 ///   existing record rather than creating a duplicate.
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+
+use crate::orchestration::clock::{Clock, system_clock};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,7 @@ pub struct HealingQueue {
     records: HashMap<String, HealingRecord>,
     max_attempts: u32,
     ttl_seconds: u64,
+    clock: Arc<dyn Clock>,
 }
 
 impl HealingQueue {
@@ -56,6 +59,16 @@ impl HealingQueue {
             records: HashMap::new(),
             max_attempts,
             ttl_seconds,
+            clock: system_clock(),
+        }
+    }
+
+    pub fn new_with_clock(max_attempts: u32, ttl_seconds: u64, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            records: HashMap::new(),
+            max_attempts,
+            ttl_seconds,
+            clock,
         }
     }
 
@@ -99,7 +112,7 @@ impl HealingQueue {
     /// the new message is strictly fresher (higher `created_at`). This prevents
     /// a server retry of an older message from clobbering a legitimate newer init.
     pub fn enqueue(&mut self, contact_id: &str, payload: Vec<u8>) {
-        let now = unix_now();
+        let now = self.clock.now_secs();
         if let Some(existing) = self.records.get(contact_id) {
             if existing.created_at > now {
                 // Existing record is future-dated (clock skew) — keep it.
@@ -150,9 +163,8 @@ impl HealingQueue {
     /// Expired records are removed from memory. Persistence is handled by the
     /// orchestrator's CFE state export — no individual `Action` is needed here.
     pub fn prune_expired(&mut self) {
-        let now = unix_now();
+        let now = self.clock.now_secs();
         let cutoff = now.saturating_sub(self.ttl_seconds);
-
         self.records.retain(|_, r| r.created_at >= cutoff);
     }
 
@@ -195,20 +207,19 @@ impl HealingQueue {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::clock::MockClock;
+
+    fn queue_with_clock(initial_secs: u64) -> (HealingQueue, Arc<MockClock>) {
+        let clock = Arc::new(MockClock::new(initial_secs * 1_000));
+        let q =
+            HealingQueue::new_with_clock(DEFAULT_MAX_ATTEMPTS, DEFAULT_TTL_SECONDS, clock.clone());
+        (q, clock)
+    }
 
     #[test]
     fn test_can_heal_only_msg_zero() {
@@ -296,5 +307,28 @@ mod tests {
         q.enqueue("fresh", vec![]);
         q.prune_expired();
         assert!(q.has_pending("fresh")); // should survive
+    }
+
+    #[test]
+    fn test_prune_uses_clock_not_system_time() {
+        // Place clock at exactly TTL boundary; record at t=0 should be pruned.
+        let ttl = DEFAULT_TTL_SECONDS;
+        let (mut q, _clock) = queue_with_clock(ttl + 1); // now = ttl+1 secs
+        q.enqueue_at("stale", vec![], 0);
+        q.prune_expired();
+        assert!(!q.has_pending("stale"));
+    }
+
+    #[test]
+    fn test_enqueue_timestamps_from_clock() {
+        let (mut q, clock) = queue_with_clock(100); // now = 100s
+        q.enqueue("frank", b"data".to_vec());
+        assert_eq!(q.get("frank").unwrap().created_at, 100);
+
+        // Advance to 200s — second enqueue should replace.
+        clock.advance_ms(100_000);
+        q.enqueue("frank", b"newer".to_vec());
+        assert_eq!(q.get("frank").unwrap().created_at, 200);
+        assert_eq!(q.get("frank").unwrap().message_payload, b"newer");
     }
 }

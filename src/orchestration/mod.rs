@@ -6,6 +6,7 @@
 /// orchestration/
 ///   platform_bridge  — PlatformBridge callback trait (Phase 0)
 ///   actions          — Action + IncomingEvent enums (Phase 0, used by all phases)
+///   clock            — Clock trait + SystemClock + MockClock (time injection)
 ///   ack_store        — ACK deduplication (Phase 1a)
 ///   healing_queue    — Session healing queue (Phase 1b)
 ///   pq_contribution  — PQ contribution manager (Phase 2)
@@ -15,6 +16,7 @@
 /// ```
 pub mod ack_store;
 pub mod actions;
+pub mod clock;
 pub mod healing_queue;
 pub mod message_router;
 pub mod orchestrator;
@@ -24,6 +26,7 @@ pub mod session_lifecycle;
 
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus};
+pub use clock::{Clock, SystemClock, system_clock};
 pub use healing_queue::{HealingDecision, HealingQueue, HealingRecord};
 pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
 pub use orchestrator::Orchestrator;

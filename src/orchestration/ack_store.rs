@@ -8,9 +8,10 @@
 /// When `is_processed` returns `NeedDbCheck`, the caller must query the
 /// platform data store and call `confirm_from_db` with the result.
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use crate::orchestration::actions::Action;
+use crate::orchestration::clock::{Clock, system_clock};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ pub struct AckStore {
     /// so the platform can catch messages that were processed between the last
     /// snapshot and a crash. Cleared by `clear_post_restart_mode()`.
     post_restart_mode: bool,
+    clock: Arc<dyn Clock>,
 }
 
 impl AckStore {
@@ -44,6 +46,16 @@ impl AckStore {
             cache: HashSet::new(),
             max_age_seconds,
             post_restart_mode: false,
+            clock: system_clock(),
+        }
+    }
+
+    pub fn new_with_clock(max_age_seconds: u64, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            cache: HashSet::new(),
+            max_age_seconds,
+            post_restart_mode: false,
+            clock,
         }
     }
 
@@ -102,7 +114,7 @@ impl AckStore {
         }
         self.cache.insert(message_id.to_string());
 
-        let now = unix_now();
+        let now = self.clock.now_secs();
         vec![Action::PersistAck {
             message_id: message_id.to_string(),
             timestamp: now,
@@ -121,7 +133,7 @@ impl AckStore {
     /// Returns a `PruneAckStore` action so the platform can delete records
     /// older than `max_age_seconds` from its persistent ACK store.
     pub fn prune_expired(&self) -> Vec<Action> {
-        let cutoff = unix_now().saturating_sub(self.max_age_seconds);
+        let cutoff = self.clock.now_secs().saturating_sub(self.max_age_seconds);
         vec![Action::PruneAckStore { cutoff_ts: cutoff }]
     }
 
@@ -146,19 +158,18 @@ impl AckStore {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::clock::MockClock;
+
+    fn store_with_clock(initial_ms: u64) -> (AckStore, Arc<MockClock>) {
+        let clock = Arc::new(MockClock::new(initial_ms));
+        let store = AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone());
+        (store, clock)
+    }
 
     #[test]
     fn test_is_processed_returns_not_processed_on_miss_normal_mode() {
@@ -240,5 +251,34 @@ mod tests {
                 AckCheckResult::InCache
             );
         }
+    }
+
+    #[test]
+    fn test_prune_uses_clock_not_system_time() {
+        // Verify that a frozen clock produces a deterministic cutoff timestamp.
+        let (store, _clock) = store_with_clock(1_000_000_000);
+        let actions = store.prune_expired();
+        let Action::PruneAckStore { cutoff_ts } = &actions[0] else {
+            panic!("expected PruneAckStore");
+        };
+        // now_secs = 1_000_000_000 / 1000 = 1_000_000; cutoff = 1_000_000 - 30d ≈ 997_408_000
+        assert_eq!(*cutoff_ts, 1_000_000u64.saturating_sub(30 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_mark_processed_timestamp_from_clock() {
+        let (mut store, clock) = store_with_clock(5_000); // 5 seconds in ms
+        let actions = store.mark_processed("ts-msg");
+        let Action::PersistAck { timestamp, .. } = &actions[0] else {
+            panic!("expected PersistAck");
+        };
+        assert_eq!(*timestamp, 5); // 5_000 ms / 1000 = 5 secs
+        // Advance clock and mark another message.
+        clock.advance_ms(3_000);
+        let actions2 = store.mark_processed("ts-msg-2");
+        let Action::PersistAck { timestamp: ts2, .. } = &actions2[0] else {
+            panic!("expected PersistAck");
+        };
+        assert_eq!(*ts2, 8); // 8_000 ms / 1000 = 8 secs
     }
 }

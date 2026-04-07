@@ -8,7 +8,7 @@
 ///
 /// All I/O is delegated via `Vec<Action>` returns; this struct is pure state.
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::ack_store::AckStore;
 use crate::orchestration::actions::Action;
+use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::healing_queue::HealingQueue;
 use crate::orchestration::pq_contribution::PQContributionManager;
 
@@ -115,6 +116,7 @@ pub struct SessionLifecycleManager {
     /// contactId → last seen OTPK ID (used to detect reinstall).
     prekey_tracker: HashMap<String, u32>,
     my_user_id: String,
+    clock: Arc<dyn Clock>,
 }
 
 impl SessionLifecycleManager {
@@ -125,17 +127,26 @@ impl SessionLifecycleManager {
     /// in its Associated Data.  Without this the AD byte layout diverges
     /// between the INITIATOR (encrypt) and RESPONDER (decrypt) sides, causing
     /// every AEAD verification to fail.
-    pub fn new(mut client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+    pub fn new(client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+        Self::new_with_clock(client, my_user_id, system_clock())
+    }
+
+    pub fn new_with_clock(
+        mut client: ClassicClient<ClassicSuiteProvider>,
+        my_user_id: String,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         client.set_local_user_id(my_user_id.clone());
         Self {
             client,
-            ack_store: AckStore::default(),
-            healing_queue: HealingQueue::default(),
+            ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
+            healing_queue: HealingQueue::new_with_clock(3, 24 * 60 * 60, clock.clone()),
             pq_manager: PQContributionManager::new(),
             archives: HashMap::new(),
             archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
             my_user_id,
+            clock,
         }
     }
 
@@ -356,7 +367,7 @@ impl SessionLifecycleManager {
         self.archives
             .insert(contact_id.to_string(), envelope.clone());
         self.archive_timestamps
-            .insert(contact_id.to_string(), unix_now());
+            .insert(contact_id.to_string(), self.clock.now_secs());
         self.client.remove_session(contact_id);
 
         vec![
@@ -419,7 +430,7 @@ impl SessionLifecycleManager {
     ///
     /// Returns `Action`s requesting the platform to delete the stale records.
     pub fn gc_old_archives(&mut self) -> Vec<Action> {
-        let cutoff = unix_now().saturating_sub(ARCHIVE_GC_AGE_SECONDS);
+        let cutoff = self.clock.now_secs().saturating_sub(ARCHIVE_GC_AGE_SECONDS);
         let expired: Vec<String> = self
             .archive_timestamps
             .iter()
@@ -707,7 +718,9 @@ pub fn archive_key(contact_id: &str) -> String {
     format!("archive_{}", contact_id)
 }
 
+#[cfg(test)]
 fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

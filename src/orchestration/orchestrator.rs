@@ -12,12 +12,13 @@
 /// - `MessageRouter` (routing decisions)
 /// - Coordinator state: init locks, cooldowns, prewarm tracking
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent};
+use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
@@ -49,6 +50,7 @@ pub struct Orchestrator {
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
     #[allow(dead_code)]
     prewarm_done: HashSet<String>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Orchestrator {
@@ -56,12 +58,21 @@ impl Orchestrator {
     ///
     /// `client` is a freshly constructed (or key-restored) `ClassicClient`.
     pub fn new(client: ClassicClient<ClassicSuiteProvider>, my_user_id: String) -> Self {
+        Self::new_with_clock(client, my_user_id, system_clock())
+    }
+
+    pub fn new_with_clock(
+        client: ClassicClient<ClassicSuiteProvider>,
+        my_user_id: String,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
-            lifecycle: SessionLifecycleManager::new(client, my_user_id),
+            lifecycle: SessionLifecycleManager::new_with_clock(client, my_user_id, clock.clone()),
             router: MessageRouter::new(),
             init_locks: HashMap::new(),
             cooldowns: HashMap::new(),
             prewarm_done: HashSet::new(),
+            clock,
         }
     }
 
@@ -167,7 +178,7 @@ impl Orchestrator {
         let restored_ids = self.lifecycle.import_orchestrator_state_cfe(data)?;
         // Restored locks get a timestamp that puts them near expiry (5 s grace).
         // This prevents a crash-survivor lock from blocking init indefinitely.
-        let near_expiry_ts = unix_ms().saturating_sub(INIT_LOCK_TTL_MS - 5_000);
+        let near_expiry_ts = self.clock.now_ms().saturating_sub(INIT_LOCK_TTL_MS - 5_000);
         self.init_locks = restored_ids
             .into_iter()
             .map(|id| (id, near_expiry_ts))
@@ -1276,8 +1287,9 @@ impl Orchestrator {
                 if self.on_cooldown(&cid) {
                     // Return HealSuppressed so the platform knows NOT to ACK.
                     // The server will re-deliver after the cooldown clears.
+                    let now_ms = self.clock.now_ms();
                     let elapsed =
-                        unix_ms().saturating_sub(*self.cooldowns.get(&cid).unwrap_or(&unix_ms()));
+                        now_ms.saturating_sub(*self.cooldowns.get(&cid).unwrap_or(&now_ms));
                     let remaining = END_SESSION_COOLDOWN_MS.saturating_sub(elapsed) + 100;
                     return vec![Action::HealSuppressed {
                         contact_id: cid,
@@ -1330,26 +1342,26 @@ impl Orchestrator {
     // ── Cooldown helpers ──────────────────────────────────────────────────────
 
     fn on_cooldown(&self, contact_id: &str) -> bool {
-        self.cooldowns
-            .get(contact_id)
-            .is_some_and(|&last_ms| unix_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS)
+        self.cooldowns.get(contact_id).is_some_and(|&last_ms| {
+            self.clock.now_ms().saturating_sub(last_ms) < END_SESSION_COOLDOWN_MS
+        })
     }
 
     fn set_cooldown(&mut self, contact_id: String) {
-        self.cooldowns.insert(contact_id, unix_ms());
+        self.cooldowns.insert(contact_id, self.clock.now_ms());
     }
 
     // ── Init-lock helpers ─────────────────────────────────────────────────────
 
     /// Returns `true` if a live (non-expired) init lock exists for `contact_id`.
     fn is_init_locked(&self, contact_id: &str) -> bool {
-        self.init_locks
-            .get(contact_id)
-            .is_some_and(|&acquired_at| unix_ms().saturating_sub(acquired_at) < INIT_LOCK_TTL_MS)
+        self.init_locks.get(contact_id).is_some_and(|&acquired_at| {
+            self.clock.now_ms().saturating_sub(acquired_at) < INIT_LOCK_TTL_MS
+        })
     }
 
     fn acquire_init_lock(&mut self, contact_id: String) {
-        self.init_locks.insert(contact_id, unix_ms());
+        self.init_locks.insert(contact_id, self.clock.now_ms());
     }
 
     // ── Orchestrator state persistence ────────────────────────────────────────
@@ -1376,18 +1388,6 @@ impl Orchestrator {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-#[allow(dead_code)]
-fn unix_now() -> u64 {
-    unix_ms() / 1_000
-}
 
 #[allow(dead_code)]
 fn derive_message_id(data: &[u8], msg_num: u32) -> String {
