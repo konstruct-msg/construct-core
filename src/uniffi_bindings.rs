@@ -2715,6 +2715,12 @@ pub enum CfeIncomingEvent {
         is_control: bool,
         content_type: u8,
     },
+    OutgoingMessage {
+        contact_id: String,
+        message_id: String,
+        plaintext_utf8: String,
+        content_type: u8,
+    },
     OutgoingCallSignal {
         contact_id: String,
         message_id: String,
@@ -2763,6 +2769,17 @@ impl CfeIncomingEvent {
                 kem_ct,
                 otpk_id,
                 is_control,
+                content_type,
+            },
+            Self::OutgoingMessage {
+                contact_id,
+                message_id,
+                plaintext_utf8,
+                content_type,
+            } => OutgoingMessage {
+                contact_id,
+                message_id,
+                plaintext_utf8,
                 content_type,
             },
             Self::OutgoingCallSignal {

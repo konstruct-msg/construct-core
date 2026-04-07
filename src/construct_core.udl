@@ -464,6 +464,7 @@ interface RustHealingQueue {
 [Enum]
 interface CfeIncomingEvent {
     MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type);
+    OutgoingMessage(string contact_id, string message_id, string plaintext_utf8, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
     AckReceived(string message_id);

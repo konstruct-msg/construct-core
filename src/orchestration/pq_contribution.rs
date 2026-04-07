@@ -4,7 +4,7 @@
 /// Manages the two-phase ML-KEM-768 (Kyber) contribution to Double Ratchet sessions:
 ///
 /// **Sender (INITIATOR) flow:**
-/// 1. `encapsulate_and_defer(contact_id, kem_public)` — encapsulate to the
+/// 1. `encapsulate_and_defer(contact_id, kem_public, recipient_otpk_id)` — encapsulate to the
 ///    recipient's Kyber OTPK, store shared secret + ciphertext locally.
 /// 2. After the session's first message is confirmed received, call
 ///    `consume_deferred(contact_id)` to retrieve the contribution for
@@ -85,6 +85,10 @@ impl PQContributionManager {
 
     /// Encapsulate to `kem_public` and defer the shared secret for later application.
     ///
+    /// `recipient_otpk_id` is the Kyber OTPK ID from the recipient's key bundle;
+    /// it is stored and returned by `take_pending_ciphertext` so that the wire
+    /// payload carries the correct key reference for the recipient to look up.
+    ///
     /// The returned `EncapsulationResult` contains the ciphertext that must be
     /// included in the initial message. The shared secret is stored internally
     /// and retrieved via `consume_deferred` once the session is initialised.
@@ -100,17 +104,18 @@ impl PQContributionManager {
         &mut self,
         contact_id: &str,
         kem_public: &[u8],
+        recipient_otpk_id: u32,
     ) -> Result<(EncapsulationResult, Vec<Action>), String> {
         let (ciphertext, shared_secret) = pq_encapsulate(kem_public)?;
-        let otpk_id = self.allocate_otpk_id();
 
-        let persist_action = serialize_pending_action(contact_id, otpk_id, &shared_secret);
+        let persist_action =
+            serialize_pending_action(contact_id, recipient_otpk_id, &shared_secret);
 
         self.pending.insert(
             contact_id.to_string(),
             PendingContribution {
                 shared_secret,
-                otpk_id,
+                otpk_id: recipient_otpk_id,
             },
         );
         self.pending_ciphertexts
@@ -119,7 +124,7 @@ impl PQContributionManager {
         Ok((
             EncapsulationResult {
                 ciphertext,
-                otpk_id,
+                otpk_id: recipient_otpk_id,
             },
             vec![persist_action],
         ))
@@ -212,6 +217,40 @@ impl PQContributionManager {
                 )
             }
         }
+    }
+
+    /// Consume the pending PQXDH contribution for sending the first message (msgNum=0).
+    ///
+    /// Returns `(kem_ciphertext, kyber_otpk_id, shared_secret)`.  The caller MUST:
+    /// 1. Apply `shared_secret` to the DR session (via `apply_pq_contribution_to_session`)
+    ///    **before** calling `encrypt_message` so the PQ SS is mixed into the root key.
+    /// 2. Include `kem_ciphertext` in the wire payload so the RESPONDER can decapsulate.
+    ///
+    /// All three values are `None`/0/empty when no pending contribution exists.
+    pub fn take_contribution_for_first_message(
+        &mut self,
+        contact_id: &str,
+    ) -> (Option<Vec<u8>>, u32, Option<Vec<u8>>) {
+        let ct = self.pending_ciphertexts.remove(contact_id);
+        match self.pending.remove(contact_id) {
+            None => (ct, 0, None),
+            Some(c) => (ct, c.otpk_id, Some(c.shared_secret)),
+        }
+    }
+
+    /// Consume only the pending KEM ciphertext for `contact_id`, leaving the
+    /// shared secret (`pending`) intact for later application via `consume_deferred`.
+    ///
+    /// This is called when packing the first outgoing message (msgNum=0): the
+    /// ciphertext must be included in the wire payload, but the SS must not be
+    /// applied until `maybe_apply_pq_contribution` processes the sent message.
+    ///
+    /// Returns `(ciphertext, kyber_otpk_id)`. Both fields are `None`/0 when no
+    /// pending ciphertext exists for this contact.
+    pub fn take_pending_ciphertext(&mut self, contact_id: &str) -> (Option<Vec<u8>>, u32) {
+        let ct = self.pending_ciphertexts.remove(contact_id);
+        let otpk_id = self.pending.get(contact_id).map(|c| c.otpk_id).unwrap_or(0);
+        (ct, otpk_id)
     }
 
     /// `true` if there is a pending contribution for `contact_id`.
@@ -484,8 +523,11 @@ mod tests {
     fn test_encapsulate_and_consume_roundtrip() {
         let kp = crate::crypto::pq_x3dh::mlkem768_keygen().unwrap();
         let mut mgr = PQContributionManager::new();
-        let (result, persist_actions) = mgr.encapsulate_and_defer("bob", &kp.public_key).unwrap();
+        let (result, persist_actions) = mgr
+            .encapsulate_and_defer("bob", &kp.public_key, 42)
+            .unwrap();
         assert!(!result.ciphertext.is_empty());
+        assert_eq!(result.otpk_id, 42);
         assert_eq!(persist_actions.len(), 1);
         assert!(
             matches!(&persist_actions[0], Action::SaveSessionToSecureStore { key, data }

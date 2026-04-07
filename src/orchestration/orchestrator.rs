@@ -86,6 +86,12 @@ impl Orchestrator {
                 is_control,
                 content_type,
             ),
+            IncomingEvent::OutgoingMessage {
+                contact_id,
+                message_id,
+                plaintext_utf8,
+                content_type,
+            } => self.handle_outgoing_message(contact_id, message_id, plaintext_utf8, content_type),
             IncomingEvent::OutgoingCallSignal {
                 contact_id,
                 message_id,
@@ -184,6 +190,13 @@ impl Orchestrator {
             kyber_spk_uploaded_at: Option<u64>,
             #[serde(default)]
             kyber_spk_rotation_epoch: Option<u32>,
+            // PQXDH: recipient's ML-KEM-768 public keys
+            #[serde(default)]
+            kyber_pre_key_public: Option<Vec<u8>>,
+            #[serde(default)]
+            kyber_one_time_prekey_public: Option<Vec<u8>>,
+            #[serde(default)]
+            kyber_one_time_prekey_id: Option<u32>,
         }
 
         let bundle_str = std::str::from_utf8(recipient_bundle)
@@ -227,6 +240,32 @@ impl Orchestrator {
                 one_time_prekey_id,
             )
             .map_err(|e| e.to_string())?;
+
+        // PQXDH: encapsulate to recipient's Kyber public key and defer SS application.
+        // Prefer one-time pre-key (consumed once) over the signed pre-key.
+        // `recipient_otpk_id` is 0 when Kyber SPK is used (no OTPK available).
+        let (kyber_public, recipient_otpk_id) =
+            if let Some(pk) = key_bundle.kyber_one_time_prekey_public {
+                (Some(pk), key_bundle.kyber_one_time_prekey_id.unwrap_or(0))
+            } else {
+                (key_bundle.kyber_pre_key_public, 0)
+            };
+        if let Some(kem_pk) = kyber_public {
+            if let Ok((_result, _persist_actions)) = self
+                .lifecycle
+                .pq_manager
+                .encapsulate_and_defer(contact_id, &kem_pk, recipient_otpk_id)
+            {
+                tracing::debug!(
+                    target: "crypto::orchestrator",
+                    contact_id = %contact_id,
+                    kyber_otpk_id = _result.otpk_id,
+                    "init_session_with_bundle: PQXDH encapsulated, ciphertext deferred"
+                );
+                // persist_actions (SaveSessionToSecureStore for pq_deferred_<id>) are
+                // handled by the caller via saveOrchestratorStateCFE on the Swift side.
+            }
+        }
 
         Ok(contact_id.to_string())
     }
@@ -921,6 +960,99 @@ impl Orchestrator {
             if let Some(save_action) = self.orchestrator_state_action() {
                 actions.push(save_action);
             }
+        }
+        actions
+    }
+
+    /// Encrypt a regular outgoing message and pack it into a WirePayload ready to send.
+    ///
+    /// Called when Swift feeds `OutgoingMessage` — single source of truth for all outgoing
+    /// E2EE text encryption. Emits `SaveSessionToSecureStore` to persist updated DR state.
+    fn handle_outgoing_message(
+        &mut self,
+        contact_id: String,
+        message_id: String,
+        plaintext_utf8: String,
+        content_type: u8,
+    ) -> Vec<Action> {
+        // For the first message (msgNum=0) after a fresh PQXDH session init, apply the
+        // deferred KEM shared secret to the DR root key BEFORE encrypting.  This ensures
+        // the INITIATOR's DR state matches what the RESPONDER will derive after
+        // decapsulating the KEM ciphertext they receive in the wire payload.
+        let (pq_kem_ct, pq_kyber_otpk_id) = {
+            let (kem_ct, otpk_id, ss) = self
+                .lifecycle
+                .pq_manager
+                .take_contribution_for_first_message(&contact_id);
+            if let Some(shared_secret) = ss {
+                if let Err(e) = self
+                    .lifecycle
+                    .client
+                    .apply_pq_contribution_to_session(&contact_id, &shared_secret)
+                {
+                    return vec![Action::NotifyError {
+                        code: "OUTGOING_MESSAGE_PQXDH_APPLY_FAILED".to_string(),
+                        message: e.to_string(),
+                    }];
+                }
+            }
+            (kem_ct, otpk_id)
+        };
+
+        let encrypted = match self
+            .lifecycle
+            .client
+            .encrypt_message(&contact_id, plaintext_utf8.as_bytes())
+        {
+            Ok(e) => e,
+            Err(e) => {
+                return vec![Action::NotifyError {
+                    code: "OUTGOING_MESSAGE_ENCRYPT_FAILED".to_string(),
+                    message: e.to_string(),
+                }];
+            }
+        };
+
+        let mut sealed_box = Vec::new();
+        sealed_box.extend_from_slice(&encrypted.nonce);
+        sealed_box.extend_from_slice(&encrypted.ciphertext);
+
+        let otpk_id = if encrypted.message_number == 0 {
+            self.lifecycle.client.take_pending_otpk_id(&contact_id)
+        } else {
+            0
+        };
+
+        let kem_ct_ref: Option<&[u8]> = pq_kem_ct.as_deref();
+
+        let payload = match crate::wire_payload::pack(
+            &encrypted.dh_public_key,
+            encrypted.message_number,
+            otpk_id,
+            pq_kyber_otpk_id,
+            kem_ct_ref,
+            &sealed_box,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return vec![Action::NotifyError {
+                    code: "OUTGOING_MESSAGE_PACK_FAILED".to_string(),
+                    message: e.to_string(),
+                }];
+            }
+        };
+
+        let mut actions = vec![Action::SendEncryptedMessage {
+            to: contact_id.clone(),
+            payload,
+            message_id,
+            content_type,
+        }];
+        if let Ok(session_json) = self.lifecycle.export_session_json_for(&contact_id) {
+            actions.push(Action::SaveSessionToSecureStore {
+                key: format!("session_{}", contact_id),
+                data: session_json.into_bytes(),
+            });
         }
         actions
     }

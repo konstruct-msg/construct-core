@@ -150,6 +150,21 @@ pub enum IncomingEvent {
         /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
         content_type: u8,
     },
+    /// Platform-side outgoing regular message.
+    /// Rust orchestrator encrypts `plaintext_utf8` bytes with the Double Ratchet session,
+    /// packs a WirePayload (including PQXDH KEM ciphertext for msgNum=0, sourced
+    /// internally from `pq_manager`), and returns `Action::SendEncryptedMessage`.
+    OutgoingMessage {
+        /// Contact (peer) user ID.
+        contact_id: String,
+        /// Platform-generated message UUID for deduplication / ACK tracking.
+        message_id: String,
+        /// Raw UTF-8 text of the plaintext message.
+        plaintext_utf8: String,
+        /// Content-type discriminator (matches proto ContentType enum).
+        /// 0 = regular E2EE message.
+        content_type: u8,
+    },
     /// Platform-side outgoing call signal.
     /// Rust orchestrator encrypts `proto_bytes` with the Double Ratchet session,
     /// packs a WirePayload, and returns `Action::SendEncryptedMessage`.
