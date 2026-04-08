@@ -8,18 +8,25 @@ on:
   release:
     types: [ created ]
 
+# Единый Cargo cache key для всех jobs.
+env:
+  CARGO_TERM_COLOR: always
+  UNIFFI_VERSION: "0.30.0"
+
 jobs:
+  # ── 1. Lint + Unit tests (Linux, быстро) ──────────────────────────────────
   test:
+    name: Lint + Tests (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
+
+      - name: Install Rust (stable + fmt + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      
-      - name: Cache Cargo dependencies
+
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -28,31 +35,104 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-      
-      - name: Check formatting
-        run: cargo fmt -- --check
-      
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-      
-      - name: Run tests
-        run: cargo test --features test
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (post-quantum)
+        run: cargo clippy --all-targets --features post-quantum -- -D warnings
+
+      - name: Run tests (default)
+        run: cargo test
+
+      - name: Run tests (post-quantum)
+        run: cargo test --features post-quantum
+
+  # ── 2. iOS cross-compilation + UniFFI bindings (macOS) ───────────────────
+  build-ios:
+    name: iOS Cross-compile + UniFFI
+    runs-on: macos-14   # Apple Silicon runner — faster Rust compilation
+    needs: test
+    steps:
+      - name: Checkout construct-messenger (for construct-ice path)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/construct-ice
+          path: ../construct-ice
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-cargo-ios-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-ios-
+
+      - name: Install uniffi-bindgen-cli v${{ env.UNIFFI_VERSION }}
+        run: |
+          cargo install uniffi-bindgen-cli \
+            --version ${{ env.UNIFFI_VERSION }} \
+            --locked \
+            --quiet
+
+      # cargo check validates the full dependency graph without linking —
+      # much faster than cargo build for a cross-compilation sanity check.
+      - name: Check iOS device target (aarch64-apple-ios)
+        run: cargo check --features ios --target aarch64-apple-ios
+
+      - name: Check iOS simulator target (aarch64-apple-ios-sim)
+        run: cargo check --features ios --target aarch64-apple-ios-sim
+
+      - name: Check mac target (aarch64-apple-darwin)
+        run: cargo check --features mac
+
+      # UDL gate: generate Swift bindings and detect drift.
+      # If this diff is non-empty, a developer changed the UDL without
+      # regenerating construct_core.swift in construct-messenger.
+      - name: Generate Swift bindings
+        run: |
+          uniffi-bindgen-cli generate \
+            src/construct_core.udl \
+            --language swift \
+            --out-dir /tmp/bindings
+
+      - name: Upload generated Swift bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-bindings-${{ github.sha }}
+          path: /tmp/bindings/
+          retention-days: 7
+
+  # ── 3. WASM build ─────────────────────────────────────────────────────────
   build-wasm:
+    name: WASM Build
     runs-on: ubuntu-latest
     needs: test
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
+
+      - name: Install Rust + wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      
-      - name: Cache Cargo dependencies
+
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -61,96 +141,50 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-wasm-
-      
+          key: linux-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-wasm-
+
       - name: Install wasm-pack
-        run: |
-          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
       - name: Build WASM
-        run: |
-          wasm-pack build --target web --out-dir pkg --features wasm
-      
+        run: wasm-pack build --target web --out-dir pkg --features wasm
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wasm-pkg
+          name: wasm-pkg-${{ github.sha }}
           path: pkg/
-          retention-days: 30
+          retention-days: 7
 
-  build-ios:
-    runs-on: macos-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-ios-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ios-
-      
-      - name: Install UniFFI bindgen
-        run: |
-          cargo install --git https://github.com/mozilla/uniffi-rs \
-            --tag v0.30.0 \
-            --bin uniffi-bindgen \
-            uniffi-bindgen-cli \
-            --locked \
-            --force
-      
-      - name: Build iOS framework
-        run: |
-          cargo build --release --features ios
-          uniffi-bindgen generate src/construct_core.udl --language swift --out-dir bindings/ios
-      
-      - name: Upload iOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-bindings
-          path: |
-            bindings/ios/
-            target/release/libconstruct_core.a
-          retention-days: 30
-
+  # ── 4. Release ────────────────────────────────────────────────────────────
   release:
+    name: Upload Release Assets
     runs-on: ubuntu-latest
     needs: [build-wasm, build-ios]
     if: github.event_name == 'release'
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wasm-pkg
+          name: wasm-pkg-${{ github.sha }}
           path: release/wasm/
-      
+
       - uses: actions/download-artifact@v4
         with:
-          name: ios-bindings
+          name: swift-bindings-${{ github.sha }}
           path: release/ios/
-      
-      - name: Create release archives
+
+      - name: Create archives
         run: |
           cd release
           tar -czf construct-core-wasm.tar.gz wasm/
-          tar -czf construct-core-ios.tar.gz ios/
-      
+          tar -czf construct-core-ios-bindings.tar.gz ios/
+
       - name: Upload to release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             release/construct-core-wasm.tar.gz
-            release/construct-core-ios.tar.gz
+            release/construct-core-ios-bindings.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
