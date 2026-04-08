@@ -202,6 +202,15 @@ impl MessageRouter {
         self.pending_queues.get(contact_id).map_or(0, |q| q.len())
     }
 
+    /// All contact IDs that currently have at least one queued message.
+    pub fn contacts_with_pending(&self) -> Vec<String> {
+        self.pending_queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Handle the platform's response to `Action::CheckAckInDb`.
     ///
     /// - `is_processed = true`  → duplicate; returns `RoutingDecision::Duplicate`.

@@ -161,33 +161,35 @@ impl SessionLifecycleManager {
     // Envelope format:  "<hex(hmac32)>:<json>"
     // The colon is safe as a separator because JSON never starts with `:`.
 
-    fn identity_key_bytes(&self) -> Vec<u8> {
+    /// Returns the device identity secret key bytes used to sign archive envelopes.
+    /// Fails if the key is unavailable (e.g. Keychain locked after reboot).
+    /// Callers must NOT fall back to any public material — an integrity check
+    /// computed with a known value (like user_id) provides no security guarantee.
+    fn identity_key_bytes(&self) -> Result<Vec<u8>, String> {
         let km = self.client.key_manager();
-        if let Ok(secret) = km.identity_secret_key() {
-            <_ as AsRef<[u8]>>::as_ref(secret).to_vec()
-        } else {
-            // Fallback: derive a stable key from the user-id (never empty).
-            self.my_user_id.as_bytes().to_vec()
-        }
+        km.identity_secret_key()
+            .map(|secret| <_ as AsRef<[u8]>>::as_ref(secret).to_vec())
+            .map_err(|e| format!("identity key unavailable for HMAC: {e}"))
     }
 
-    fn hmac_sign(&self, data: &[u8]) -> [u8; 32] {
-        let key = self.identity_key_bytes();
+    fn hmac_sign(&self, data: &[u8]) -> Result<[u8; 32], String> {
+        let key = self.identity_key_bytes()?;
         let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
         mac.update(data);
         let result = mac.finalize().into_bytes();
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
-        out
+        Ok(out)
     }
 
-    fn wrap_archive(&self, json: &str) -> String {
-        let mac = self.hmac_sign(json.as_bytes());
-        format!("{}:{}", hex::encode(mac), json)
+    fn wrap_archive(&self, json: &str) -> Result<String, String> {
+        let mac = self.hmac_sign(json.as_bytes())?;
+        Ok(format!("{}:{}", hex::encode(mac), json))
     }
 
     /// Verify envelope integrity and return the inner JSON.
-    /// Returns `Err` if the envelope is malformed or the HMAC does not match.
+    /// Returns `Err` if the identity key is unavailable, the envelope is
+    /// malformed, or the HMAC does not match.
     fn unwrap_archive<'a>(&self, envelope: &'a str) -> Result<&'a str, String> {
         // Legacy archives (created before this check was added) have no `:`
         // prefix with a 64-char hex tag. Accept them as-is to avoid breaking
@@ -201,7 +203,7 @@ impl SessionLifecycleManager {
             return Ok(envelope); // legacy JSON that happens to contain a colon
         }
         let json = &envelope[colon_pos + 1..];
-        let expected = self.hmac_sign(json.as_bytes());
+        let expected = self.hmac_sign(json.as_bytes())?;
         let actual =
             hex::decode(maybe_hex).map_err(|e| format!("archive MAC decode error: {e}"))?;
         if actual != expected.as_ref() {
@@ -362,7 +364,16 @@ impl SessionLifecycleManager {
         };
 
         // Wrap with HMAC to detect Keychain corruption on restore.
-        let envelope = self.wrap_archive(&json);
+        // If the identity key is unavailable (e.g. Keychain locked), we cannot
+        // create an integrity-checked archive — return empty rather than storing
+        // an unprotected blob that would silently pass HMAC verification later.
+        let envelope = match self.wrap_archive(&json) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("archive_session: {e} — session NOT archived");
+                return vec![];
+            }
+        };
 
         self.archives
             .insert(contact_id.to_string(), envelope.clone());

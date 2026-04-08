@@ -1205,11 +1205,22 @@ impl Orchestrator {
     }
 
     fn handle_network_reconnected(&mut self) -> Vec<Action> {
-        // Schedule a GC sweep after reconnect.
-        vec![Action::ScheduleTimer {
+        let mut actions = vec![Action::ScheduleTimer {
             timer_id: "gc_sweep".to_string(),
             delay_ms: 1_000,
-        }]
+        }];
+
+        // Drain any messages that were queued while offline.
+        // Collect contact IDs first to avoid borrow conflicts.
+        let pending_ids = self.router.contacts_with_pending();
+        for contact_id in pending_ids {
+            let decisions = self.router.drain_pending(&contact_id, &mut self.lifecycle);
+            for decision in decisions {
+                actions.extend(self.decision_to_actions(decision, &contact_id));
+            }
+        }
+
+        actions
     }
 
     fn handle_app_launched(&mut self) -> Vec<Action> {
