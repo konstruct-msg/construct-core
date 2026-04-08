@@ -29,6 +29,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::orchestration::actions::Action;
+use crate::orchestration::healing_queue::HealDirection;
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -284,9 +285,26 @@ impl MessageRouter {
             Err(e) => {
                 if msg.msg_number == 0 {
                     let role = self.tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
-                    lifecycle
+                    // Reject if attacker has exhausted the incoming-trigger budget
+                    // for this contact. This preserves the 3-retry heal budget for
+                    // a legitimate peer that sends a real session-init later.
+                    if lifecycle
                         .healing_queue
-                        .enqueue(&msg.contact_id, msg.wire_payload.clone());
+                        .is_incoming_throttled(&msg.contact_id)
+                    {
+                        return RoutingDecision::EndSessionNeeded {
+                            contact_id: msg.contact_id.clone(),
+                            reason: format!(
+                                "incoming heal throttled for {} — possible heal exhaustion attack",
+                                &msg.contact_id
+                            ),
+                        };
+                    }
+                    lifecycle.healing_queue.enqueue(
+                        &msg.contact_id,
+                        msg.wire_payload.clone(),
+                        HealDirection::Incoming,
+                    );
                     RoutingDecision::SessionHealNeeded {
                         contact_id: msg.contact_id.clone(),
                         role,

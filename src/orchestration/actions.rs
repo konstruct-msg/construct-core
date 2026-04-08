@@ -134,6 +134,24 @@ pub enum Action {
     CancelTimer {
         timer_id: String,
     },
+
+    // ── Session health ────────────────────────────────────────────────────────
+    /// Platform should encrypt a lightweight heartbeat payload and send it to
+    /// `contact_id` using the existing DR session. If encryption fails (no
+    /// session), the platform should treat this as a desync signal and trigger
+    /// a heal. Using a regular encrypted message with `content_type = HEARTBEAT`
+    /// means the server forwards it without modification — no server changes needed.
+    SendHeartbeat {
+        contact_id: String,
+    },
+
+    // ── Multi-device ──────────────────────────────────────────────────────────
+    /// Notify all linked devices that the session with `contact_id` was reset.
+    /// Each device should independently trigger a heal with that contact.
+    /// The platform broadcasts this via the existing "send to own devices" path.
+    NotifyLinkedDevicesOfSessionReset {
+        contact_id: String,
+    },
 }
 
 /// Delivery / read receipt status.
@@ -221,6 +239,23 @@ pub enum IncomingEvent {
     AckDbResult {
         message_id: String,
         is_processed: bool,
+    },
+    /// Platform signals that the user opened or closed a specific chat.
+    /// When `is_active = true`, the orchestrator schedules a heartbeat timer for
+    /// `contact_id`. When `false`, the timer is cancelled.
+    ActiveChatChanged {
+        contact_id: String,
+        is_active: bool,
+    },
+    /// The platform received a heartbeat message from `contact_id`.
+    /// The orchestrator should attempt to decrypt it — if decryption fails,
+    /// it triggers heal proactively (before the user sends any message).
+    HeartbeatReceived {
+        contact_id: String,
+        message_id: String,
+        /// Encrypted heartbeat payload (wire format, same as regular DR message).
+        data: Vec<u8>,
+        msg_num: u32,
     },
 }
 

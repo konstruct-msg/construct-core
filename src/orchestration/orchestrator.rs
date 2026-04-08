@@ -50,6 +50,9 @@ pub struct Orchestrator {
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
     #[allow(dead_code)]
     prewarm_done: HashSet<String>,
+    /// Contacts whose chat is currently open in the UI. The orchestrator
+    /// schedules periodic heartbeat timers for these contacts.
+    active_chats: HashSet<String>,
     clock: Arc<dyn Clock>,
 }
 
@@ -72,6 +75,7 @@ impl Orchestrator {
             init_locks: HashMap::new(),
             cooldowns: HashMap::new(),
             prewarm_done: HashSet::new(),
+            active_chats: HashSet::new(),
             clock,
         }
     }
@@ -132,6 +136,16 @@ impl Orchestrator {
                 message_id,
                 is_processed,
             } => self.handle_ack_db_result(message_id, is_processed),
+            IncomingEvent::ActiveChatChanged {
+                contact_id,
+                is_active,
+            } => self.handle_active_chat_changed(contact_id, is_active),
+            IncomingEvent::HeartbeatReceived {
+                contact_id,
+                message_id,
+                data,
+                msg_num,
+            } => self.handle_heartbeat_received(contact_id, message_id, data, msg_num),
         }
     }
 
@@ -1245,7 +1259,88 @@ impl Orchestrator {
                 self.lifecycle.healing_queue.prune_expired();
                 actions
             }
+            _ if timer_id.starts_with("heartbeat:") => {
+                let contact_id = &timer_id["heartbeat:".len()..];
+                if self.active_chats.contains(contact_id) {
+                    // Re-schedule heartbeat for the next interval.
+                    vec![
+                        Action::SendHeartbeat {
+                            contact_id: contact_id.to_string(),
+                        },
+                        Action::ScheduleTimer {
+                            timer_id: timer_id.clone(),
+                            delay_ms: 6 * 60 * 60 * 1_000, // 6 hours
+                        },
+                    ]
+                } else {
+                    vec![] // Chat closed — timer fires once more, then stops.
+                }
+            }
             _ => vec![],
+        }
+    }
+
+    fn handle_active_chat_changed(&mut self, contact_id: String, is_active: bool) -> Vec<Action> {
+        if is_active {
+            self.active_chats.insert(contact_id.clone());
+            // Schedule initial heartbeat after 6 hours.
+            vec![Action::ScheduleTimer {
+                timer_id: format!("heartbeat:{}", contact_id),
+                delay_ms: 6 * 60 * 60 * 1_000,
+            }]
+        } else {
+            self.active_chats.remove(&contact_id);
+            vec![Action::CancelTimer {
+                timer_id: format!("heartbeat:{}", contact_id),
+            }]
+        }
+    }
+
+    fn handle_heartbeat_received(
+        &mut self,
+        contact_id: String,
+        message_id: String,
+        data: Vec<u8>,
+        msg_num: u32,
+    ) -> Vec<Action> {
+        // Route the heartbeat through the normal decrypt path.
+        // A content_type we treat as "heartbeat" — content type 13.
+        let msg = crate::orchestration::message_router::IncomingMessage {
+            message_id,
+            contact_id: contact_id.clone(),
+            wire_payload: data,
+            msg_number: msg_num,
+            content_type: 13, // HEARTBEAT content type
+            is_control: false,
+        };
+        let decision = self.router.route_message(&mut self.lifecycle, &msg);
+        match decision {
+            RoutingDecision::Decrypted { .. } => {
+                // Heartbeat decrypted successfully — session is healthy, no action needed.
+                vec![]
+            }
+            RoutingDecision::SessionHealNeeded {
+                contact_id: cid,
+                role,
+            } => {
+                // Decrypt failed on heartbeat msgNum=0 — proactively trigger heal.
+                if self.on_cooldown(&cid) {
+                    return vec![Action::HealSuppressed {
+                        contact_id: cid,
+                        retry_after_ms: 100,
+                    }];
+                }
+                self.set_cooldown(cid.clone());
+                let role_str = match role {
+                    Role::Initiator => "Initiator",
+                    Role::Responder => "Responder",
+                };
+                vec![Action::SessionHealNeeded {
+                    contact_id: cid,
+                    role: role_str.to_string(),
+                }]
+            }
+            other => self.decision_to_actions(other, &contact_id),
         }
     }
 
@@ -1325,7 +1420,13 @@ impl Orchestrator {
                     return vec![];
                 }
                 self.set_cooldown(cid.clone());
-                vec![Action::SendEndSession { contact_id: cid }]
+                vec![
+                    Action::SendEndSession {
+                        contact_id: cid.clone(),
+                    },
+                    // Notify linked devices so they can proactively heal with this contact.
+                    Action::NotifyLinkedDevicesOfSessionReset { contact_id: cid },
+                ]
             }
             RoutingDecision::Duplicate { .. } => vec![],
             RoutingDecision::PendingAckCheck { message_id } => {

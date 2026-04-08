@@ -12,7 +12,7 @@ pub trait CryptoProvider: Send + Sync + 'static {
     type KemPrivateKey: AsRef<[u8]> + Debug + Clone + Zeroize + 'static;
     type SignaturePublicKey: AsRef<[u8]> + Debug + Clone + 'static;
     type SignaturePrivateKey: AsRef<[u8]> + Debug + Clone + 'static;
-    type AeadKey: AsRef<[u8]> + Debug + Clone + Default + 'static; // Added Default bound
+    type AeadKey: AsRef<[u8]> + Debug + Clone + Default + Zeroize + 'static;
 
     /// Generates a new KEM key pair.
     fn generate_kem_keys() -> Result<(Self::KemPrivateKey, Self::KemPublicKey), CryptoError>;

@@ -10,6 +10,15 @@
 /// - Records expire after 24 hours (TTL).
 /// - Enqueue is idempotent: a second call for the same contact replaces the
 ///   existing record rather than creating a duplicate.
+///
+/// ## Heal budget: protection against attacker exhaustion (Изъян 6)
+///
+/// A remote peer can force `enqueue(Incoming)` calls by sending crafted
+/// `msgNum=0` messages. To prevent an attacker from exhausting the retry
+/// budget for a legitimate contact, incoming-triggered heal enqueues are
+/// capped by `MAX_INCOMING_TRIGGERS`. When exceeded, the router returns
+/// `EndSessionNeeded` without touching `attempts`, so the 3-retry budget
+/// for legitimate heals is preserved.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,8 +28,21 @@ use crate::orchestration::clock::{Clock, system_clock};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60; // 24 hours
+/// Hard cap on how many incoming-triggered enqueues are allowed per record
+/// lifetime. Prevents an attacker from exhausting legitimate retry budget.
+const MAX_INCOMING_TRIGGERS: u32 = 10;
 
 // ── Public types ──────────────────────────────────────────────────────────────
+
+/// Whether a heal was triggered by receiving an incoming msgNum=0 (attacker-
+/// controllable) or by an outgoing send failure (locally initiated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealDirection {
+    /// Incoming msgNum=0 failed to decrypt — potentially attacker-crafted.
+    Incoming,
+    /// Outgoing send failure or locally initiated re-sync.
+    Outgoing,
+}
 
 /// Decision returned by `record_attempt`.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +63,10 @@ pub struct HealingRecord {
     /// Binary WirePayload blob (stored for replay after re-key).
     pub message_payload: Vec<u8>,
     pub attempts: u32,
+    /// Number of times an *incoming* msgNum=0 has triggered `enqueue` for
+    /// this record. Capped externally via `is_incoming_throttled`. Persisted
+    /// in CFE so the limit survives app restarts.
+    pub incoming_triggers: u32,
     pub created_at: u64,
 }
 
@@ -104,28 +130,55 @@ impl HealingQueue {
         self.records.contains_key(contact_id)
     }
 
+    /// Returns `true` if the incoming-trigger counter for `contact_id` has
+    /// reached `MAX_INCOMING_TRIGGERS`. The router should return
+    /// `EndSessionNeeded` immediately instead of enqueuing another heal attempt.
+    pub fn is_incoming_throttled(&self, contact_id: &str) -> bool {
+        self.records
+            .get(contact_id)
+            .is_some_and(|r| r.incoming_triggers >= MAX_INCOMING_TRIGGERS)
+    }
+
     // ── Mutation ──────────────────────────────────────────────────────────────
 
     /// Enqueue a message for healing.
     ///
+    /// `direction` determines whether the incoming-trigger counter is bumped.
+    /// Call `is_incoming_throttled` *before* this for `Incoming` heals — the
+    /// router should return `EndSessionNeeded` without enqueueing if throttled.
+    ///
     /// If a record already exists for `contact_id`, it is replaced only when
     /// the new message is strictly fresher (higher `created_at`). This prevents
     /// a server retry of an older message from clobbering a legitimate newer init.
-    pub fn enqueue(&mut self, contact_id: &str, payload: Vec<u8>) {
+    pub fn enqueue(&mut self, contact_id: &str, payload: Vec<u8>, direction: HealDirection) {
         let now = self.clock.now_secs();
-        if let Some(existing) = self.records.get(contact_id) {
+        if let Some(existing) = self.records.get_mut(contact_id) {
             if existing.created_at > now {
                 // Existing record is future-dated (clock skew) — keep it.
                 return;
             }
+            existing.message_payload = payload;
+            existing.created_at = now;
+            if direction == HealDirection::Incoming {
+                existing.incoming_triggers = existing.incoming_triggers.saturating_add(1);
+            }
+            return;
         }
-        let record = HealingRecord {
-            contact_id: contact_id.to_string(),
-            message_payload: payload,
-            attempts: 0,
-            created_at: now,
+        let incoming_triggers = if direction == HealDirection::Incoming {
+            1
+        } else {
+            0
         };
-        self.records.insert(contact_id.to_string(), record);
+        self.records.insert(
+            contact_id.to_string(),
+            HealingRecord {
+                contact_id: contact_id.to_string(),
+                message_payload: payload,
+                attempts: 0,
+                incoming_triggers,
+                created_at: now,
+            },
+        );
     }
 
     /// Increment the attempt counter for `contact_id`.
@@ -187,6 +240,7 @@ impl HealingQueue {
                 contact_id: contact_id.to_string(),
                 message_payload: payload,
                 attempts: 0,
+                incoming_triggers: 0,
                 created_at,
             },
         );
@@ -231,15 +285,15 @@ mod tests {
     #[test]
     fn test_enqueue_creates_record() {
         let mut q = HealingQueue::default();
-        q.enqueue("alice", b"payload".to_vec());
+        q.enqueue("alice", b"payload".to_vec(), HealDirection::Incoming);
         assert!(q.has_pending("alice"));
     }
 
     #[test]
     fn test_enqueue_is_idempotent() {
         let mut q = HealingQueue::default();
-        q.enqueue("bob", b"first".to_vec());
-        q.enqueue("bob", b"second".to_vec());
+        q.enqueue("bob", b"first".to_vec(), HealDirection::Incoming);
+        q.enqueue("bob", b"second".to_vec(), HealDirection::Incoming);
         assert_eq!(q.len(), 1);
         // Same second → second call replaces first (last-write wins within same timestamp).
         assert_eq!(q.get("bob").unwrap().message_payload, b"second");
@@ -248,7 +302,7 @@ mod tests {
     #[test]
     fn test_record_attempt_increments() {
         let mut q = HealingQueue::default();
-        q.enqueue("carol", vec![]);
+        q.enqueue("carol", vec![], HealDirection::Incoming);
         let d = q.record_attempt("carol");
         assert_eq!(
             d,
@@ -270,7 +324,7 @@ mod tests {
     #[test]
     fn test_record_attempt_max_attempts_reached() {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
-        q.enqueue("dave", vec![]);
+        q.enqueue("dave", vec![], HealDirection::Incoming);
         q.record_attempt("dave"); // 1
         q.record_attempt("dave"); // 2
         let d = q.record_attempt("dave"); // 3 → reached
@@ -286,7 +340,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let mut q = HealingQueue::default();
-        q.enqueue("eve", vec![]);
+        q.enqueue("eve", vec![], HealDirection::Incoming);
         assert!(q.remove("eve"));
         assert!(!q.has_pending("eve"));
         assert!(!q.remove("eve")); // already gone
@@ -304,7 +358,7 @@ mod tests {
     #[test]
     fn test_prune_keeps_fresh_records() {
         let mut q = HealingQueue::new(3, DEFAULT_TTL_SECONDS);
-        q.enqueue("fresh", vec![]);
+        q.enqueue("fresh", vec![], HealDirection::Incoming);
         q.prune_expired();
         assert!(q.has_pending("fresh")); // should survive
     }
@@ -322,12 +376,12 @@ mod tests {
     #[test]
     fn test_enqueue_timestamps_from_clock() {
         let (mut q, clock) = queue_with_clock(100); // now = 100s
-        q.enqueue("frank", b"data".to_vec());
+        q.enqueue("frank", b"data".to_vec(), HealDirection::Incoming);
         assert_eq!(q.get("frank").unwrap().created_at, 100);
 
         // Advance to 200s — second enqueue should replace.
         clock.advance_ms(100_000);
-        q.enqueue("frank", b"newer".to_vec());
+        q.enqueue("frank", b"newer".to_vec(), HealDirection::Incoming);
         assert_eq!(q.get("frank").unwrap().created_at, 200);
         assert_eq!(q.get("frank").unwrap().message_payload, b"newer");
     }

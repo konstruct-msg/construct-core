@@ -262,6 +262,10 @@ pub struct CfeHealingRecordV1 {
     /// Number of healing attempts already made (0-based).
     #[serde(rename = "att")]
     pub attempts: u32,
+    /// Number of times an incoming msgNum=0 triggered enqueue for this record.
+    /// Used to enforce the `MAX_INCOMING_TRIGGERS` cap across app restarts.
+    #[serde(rename = "itr", default)]
+    pub incoming_triggers: u32,
     /// Unix timestamp (seconds) when the record was first enqueued.
     #[serde(rename = "at")]
     pub created_at: u64,

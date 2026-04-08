@@ -590,6 +590,7 @@ impl SessionLifecycleManager {
                     message_b64: base64::engine::general_purpose::STANDARD
                         .encode(&r.message_payload),
                     attempts: r.attempts,
+                    incoming_triggers: r.incoming_triggers,
                     created_at: r.created_at,
                 })
                 .collect(),
@@ -652,6 +653,7 @@ impl SessionLifecycleManager {
                         .decode(&r.message_b64)
                         .unwrap_or_default(),
                     attempts: r.attempts,
+                    incoming_triggers: r.incoming_triggers,
                     created_at: r.created_at,
                 })
                 .collect(),

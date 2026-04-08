@@ -179,6 +179,23 @@ pub struct EncryptedRatchetMessage {
     pub suite_id: u16,
 }
 
+impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+        self.sending_chain_key.zeroize();
+        self.receiving_chain_key.zeroize();
+        if let Some(k) = self.dh_ratchet_private.as_mut() {
+            k.zeroize();
+        }
+        if let Some(k) = self.pre_pq_root_key.as_mut() {
+            k.zeroize();
+        }
+        for key in self.skipped_message_keys.values_mut() {
+            key.zeroize();
+        }
+    }
+}
+
 impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     type EncryptedMessage = EncryptedRatchetMessage;
 

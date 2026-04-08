@@ -2266,8 +2266,13 @@ impl RustHealingQueue {
     }
 
     pub fn enqueue(&self, contact_id: String, message_json: String) {
+        use crate::orchestration::HealDirection;
         let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.enqueue(&contact_id, message_json.into_bytes());
+        queue.enqueue(
+            &contact_id,
+            message_json.into_bytes(),
+            HealDirection::Outgoing,
+        );
     }
 
     pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {
@@ -2756,6 +2761,16 @@ pub enum CfeIncomingEvent {
         message_id: String,
         is_processed: bool,
     },
+    ActiveChatChanged {
+        contact_id: String,
+        is_active: bool,
+    },
+    HeartbeatReceived {
+        contact_id: String,
+        message_id: String,
+        data: Vec<u8>,
+        msg_num: u32,
+    },
 }
 
 impl CfeIncomingEvent {
@@ -2826,6 +2841,24 @@ impl CfeIncomingEvent {
             } => AckDbResult {
                 message_id,
                 is_processed,
+            },
+            Self::ActiveChatChanged {
+                contact_id,
+                is_active,
+            } => ActiveChatChanged {
+                contact_id,
+                is_active,
+            },
+            Self::HeartbeatReceived {
+                contact_id,
+                message_id,
+                data,
+                msg_num,
+            } => HeartbeatReceived {
+                contact_id,
+                message_id,
+                data,
+                msg_num,
             },
         }
     }
@@ -2929,6 +2962,14 @@ pub enum CfeAction {
         contact_id: String,
         retry_after_ms: u64,
     },
+    /// Platform should encrypt and send a heartbeat to this contact.
+    SendHeartbeat {
+        contact_id: String,
+    },
+    /// Platform should notify all linked devices of session reset with this contact.
+    NotifyLinkedDevicesOfSessionReset {
+        contact_id: String,
+    },
 }
 
 impl CfeAction {
@@ -3028,6 +3069,10 @@ impl CfeAction {
                 contact_id,
                 retry_after_ms,
             },
+            SendHeartbeat { contact_id } => Self::SendHeartbeat { contact_id },
+            NotifyLinkedDevicesOfSessionReset { contact_id } => {
+                Self::NotifyLinkedDevicesOfSessionReset { contact_id }
+            }
         }
     }
 }
@@ -3151,6 +3196,12 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
             retry_after_ms,
         } => serde_json::json!({
             "type": "HealSuppressed", "contact_id": contact_id, "retry_after_ms": retry_after_ms
+        }),
+        Action::SendHeartbeat { contact_id } => serde_json::json!({
+            "type": "SendHeartbeat", "contact_id": contact_id
+        }),
+        Action::NotifyLinkedDevicesOfSessionReset { contact_id } => serde_json::json!({
+            "type": "NotifyLinkedDevicesOfSessionReset", "contact_id": contact_id
         }),
     }
 }

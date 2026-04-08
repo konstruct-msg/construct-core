@@ -477,6 +477,10 @@ interface CfeIncomingEvent {
     TimerFired(string timer_id);
     /// Platform ACK DB lookup result — response to `CheckAckInDb` action.
     AckDbResult(string message_id, boolean is_processed);
+    /// Signal that the user opened or closed a chat — controls heartbeat scheduling.
+    ActiveChatChanged(string contact_id, boolean is_active);
+    /// A heartbeat message was received from the peer.
+    HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
 };
 
 /// Typed replacement for `Action` JSON strings.
@@ -510,6 +514,11 @@ interface CfeAction {
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
     /// Platform must query its persistent ACK store for `message_id` and reply with `AckDbResult`.
     CheckAckInDb(string message_id);
+    /// Encrypt and send a heartbeat to `contact_id` using the current DR session.
+    /// If no session exists, treat as a desync signal and trigger heal.
+    SendHeartbeat(string contact_id);
+    /// Broadcast to all linked devices that the session with `contact_id` was reset.
+    NotifyLinkedDevicesOfSessionReset(string contact_id);
 };
 
 /// Top-level orchestration facade.
