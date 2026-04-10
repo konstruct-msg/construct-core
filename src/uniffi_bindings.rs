@@ -778,6 +778,15 @@ impl ClassicCryptoCore {
             message_number = first_msg.message_number,
             "Initializing receiving session (receiver side)"
         );
+        tracing::info!(
+            target: "crypto::uniffi",
+            local_ik_pub_prefix = %hex::encode(&local_bundle.identity_public[..4.min(local_bundle.identity_public.len())]),
+            local_spk_pub_prefix = %hex::encode(&local_bundle.signed_prekey_public[..4.min(local_bundle.signed_prekey_public.len())]),
+            remote_ik_pub_prefix = %hex::encode(&key_bundle.identity_public[..4.min(key_bundle.identity_public.len())]),
+            remote_ek_pub_prefix = %hex::encode(&first_msg.ephemeral_public_key[..4.min(first_msg.ephemeral_public_key.len())]),
+            otpk_id = first_msg.one_time_prekey_id,
+            "[RESPONDER keys] local_ik_pub, local_spk_pub, remote_ik_pub, remote_ek_pub, otpk_id"
+        );
 
         let (_internal_session_id, plaintext_bytes) = client
             .init_receiving_session_with_ephemeral(

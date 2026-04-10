@@ -482,41 +482,46 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             None
         };
 
-        eprintln!(
-            "[X3DH RESPONDER] SPK_B_priv[:4]={}",
-            hex::encode(&local_signed_prekey.as_ref()[..4.min(local_signed_prekey.as_ref().len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            spk_b_priv_prefix = %hex::encode(&local_signed_prekey.as_ref()[..4.min(local_signed_prekey.as_ref().len())]),
+            "[X3DH RESPONDER] SPK_B_priv[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] IK_B_priv[:4]={}",
-            hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            ik_b_priv_prefix = %hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]),
+            "[X3DH RESPONDER] IK_B_priv[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] IK_A_pub[:4]={}",
-            hex::encode(&remote_identity.as_ref()[..4.min(remote_identity.as_ref().len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            ik_a_pub_prefix = %hex::encode(&remote_identity.as_ref()[..4.min(remote_identity.as_ref().len())]),
+            "[X3DH RESPONDER] IK_A_pub[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] EK_A_pub[:4]={}",
-            hex::encode(&remote_ephemeral.as_ref()[..4.min(remote_ephemeral.as_ref().len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            ek_a_pub_prefix = %hex::encode(&remote_ephemeral.as_ref()[..4.min(remote_ephemeral.as_ref().len())]),
+            "[X3DH RESPONDER] EK_A_pub[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] DH1[:4]={}",
-            hex::encode(&dh1[..4.min(dh1.len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            dh1_prefix = %hex::encode(&dh1[..4.min(dh1.len())]),
+            "[X3DH RESPONDER] DH1[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] DH2[:4]={}",
-            hex::encode(&dh2[..4.min(dh2.len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            dh2_prefix = %hex::encode(&dh2[..4.min(dh2.len())]),
+            "[X3DH RESPONDER] DH2[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] DH3[:4]={}",
-            hex::encode(&dh3[..4.min(dh3.len())])
+        tracing::info!(
+            target: "crypto::x3dh",
+            dh3_prefix = %hex::encode(&dh3[..4.min(dh3.len())]),
+            "[X3DH RESPONDER] DH3[:4]"
         );
-        eprintln!(
-            "[X3DH RESPONDER] DH4[:4]={} has_dh4={}",
-            dh4_opt
-                .as_ref()
-                .map(|d| hex::encode(&d[..4.min(d.len())]))
-                .unwrap_or_else(|| "NONE".to_string()),
-            dh4_opt.is_some()
+        tracing::info!(
+            target: "crypto::x3dh",
+            dh4_prefix = %dh4_opt.as_ref().map(|d| hex::encode(&d[..4.min(d.len())])).unwrap_or_else(|| "NONE".to_string()),
+            has_dh4 = dh4_opt.is_some(),
+            "[X3DH RESPONDER] DH4[:4]"
         );
 
         debug!(
@@ -549,10 +554,6 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             target: "crypto::x3dh",
             root_key_len = %root_key.len(),
             "X3DH completed successfully (responder)"
-        );
-        eprintln!(
-            "[X3DH RESPONDER] root_key[:8]={}",
-            hex::encode(&root_key[..8.min(root_key.len())])
         );
         tracing::info!(
             target: "crypto::x3dh",

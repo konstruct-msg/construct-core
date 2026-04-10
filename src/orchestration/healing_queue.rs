@@ -184,7 +184,7 @@ impl HealingQueue {
     /// Increment the attempt counter for `contact_id`.
     ///
     /// Returns a `HealingDecision` indicating whether another attempt is allowed.
-    /// `retry_after_ms` uses exponential backoff: 2s / 4s / 8s for attempts 1-3.
+    /// `retry_after_ms` uses exponential backoff: 5s / 30s / 120s for attempts 1-3.
     pub fn record_attempt(&mut self, contact_id: &str) -> HealingDecision {
         match self.records.get_mut(contact_id) {
             None => HealingDecision::NotFound,
@@ -193,8 +193,12 @@ impl HealingQueue {
                 if record.attempts >= self.max_attempts {
                     HealingDecision::MaxAttemptsReached
                 } else {
-                    // 2^attempt seconds (2s, 4s, 8s …)
-                    let retry_after_ms = 2_000u64 << record.attempts;
+                    // Exponential backoff: 5s / 30s / 120s for attempts 1-3.
+                    let retry_after_ms = match record.attempts {
+                        1 => 5_000,
+                        2 => 30_000,
+                        _ => 120_000,
+                    };
                     HealingDecision::RetryAllowed {
                         attempt: record.attempts,
                         retry_after_ms,
@@ -308,7 +312,7 @@ mod tests {
             d,
             HealingDecision::RetryAllowed {
                 attempt: 1,
-                retry_after_ms: 4000
+                retry_after_ms: 5_000
             }
         );
         let d = q.record_attempt("carol");
@@ -316,7 +320,7 @@ mod tests {
             d,
             HealingDecision::RetryAllowed {
                 attempt: 2,
-                retry_after_ms: 8000
+                retry_after_ms: 30_000
             }
         );
     }

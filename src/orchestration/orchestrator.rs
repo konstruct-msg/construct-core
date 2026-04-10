@@ -1259,6 +1259,15 @@ impl Orchestrator {
                 self.lifecycle.healing_queue.prune_expired();
                 actions
             }
+            _ if timer_id.starts_with("cooldown_expired:") => {
+                // Cooldown expired — schedule a GC so stale locks/cooldowns are evicted.
+                // The server will re-deliver any unACKed messages; this just ensures
+                // the orchestrator is ready to process them.
+                vec![Action::ScheduleTimer {
+                    timer_id: "gc_sweep".to_string(),
+                    delay_ms: 100,
+                }]
+            }
             _ if timer_id.starts_with("heartbeat:") => {
                 let contact_id = &timer_id["heartbeat:".len()..];
                 if self.active_chats.contains(contact_id) {
@@ -1397,10 +1406,16 @@ impl Orchestrator {
                     let elapsed =
                         now_ms.saturating_sub(*self.cooldowns.get(&cid).unwrap_or(&now_ms));
                     let remaining = END_SESSION_COOLDOWN_MS.saturating_sub(elapsed) + 100;
-                    return vec![Action::HealSuppressed {
-                        contact_id: cid,
-                        retry_after_ms: remaining,
-                    }];
+                    return vec![
+                        Action::HealSuppressed {
+                            contact_id: cid.clone(),
+                            retry_after_ms: remaining,
+                        },
+                        Action::ScheduleTimer {
+                            timer_id: format!("cooldown_expired:{cid}"),
+                            delay_ms: remaining,
+                        },
+                    ];
                 }
                 self.set_cooldown(cid.clone());
                 let role_str = match role {

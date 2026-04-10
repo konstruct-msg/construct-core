@@ -99,5 +99,5 @@ swift = true
 opt-level = "z"     # optimize for binary size (vs speed)
 lto = "thin"        # thin LTO: cross-crate dead-code strip without fat objects
 codegen-units = 1   # single unit = better optimization (slower compile)
-strip = "symbols"   # strip debug symbols from release binary
+strip = "debuginfo" # strip DWARF debug info only; keep symbol table for C FFI exports
 panic = "abort"     # no unwinding machinery (~10-15% smaller)
