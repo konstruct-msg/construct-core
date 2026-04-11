@@ -563,6 +563,17 @@ impl Orchestrator {
         self.lifecycle.client.one_time_prekey_count() as u32
     }
 
+    /// Returns the raw bytes of our X3DH identity public key.
+    /// Used by the UI for safety-number display and key export.
+    pub fn identity_public_key_bytes(&self) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .identity_public_key()
+            .map(|k| <_ as AsRef<[u8]>>::as_ref(k).to_vec())
+            .map_err(|e| format!("identity key unavailable: {e}"))
+    }
+
     pub fn export_otpks_json(&self) -> Result<String, String> {
         #[derive(serde::Serialize)]
         struct OtpkRecord {
