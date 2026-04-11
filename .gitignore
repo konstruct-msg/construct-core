@@ -1,6 +1,7 @@
 # Rust
 /target/
 /target_host/
+/fuzz/
 **/*.rs.bk
 Cargo.lock
 
