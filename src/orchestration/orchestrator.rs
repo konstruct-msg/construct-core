@@ -429,6 +429,19 @@ impl Orchestrator {
         self.lifecycle.client.remove_session(contact_id)
     }
 
+    /// Return the queued heal payload for `contact_id` (the raw wire bytes of the
+    /// failed msgNum=0 message), or `None` if no heal record exists.
+    ///
+    /// Used by the TUI / other non-UniFFI platforms to implement the RESPONDER
+    /// healing path: fetch the contact's bundle, then call
+    /// `init_receiving_session_with_msg(contact_id, bundle, wire_payload)`.
+    pub fn take_heal_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
+        self.lifecycle
+            .healing_queue
+            .get(contact_id)
+            .map(|r| r.message_payload.clone())
+    }
+
     pub fn export_private_keys_json_str(&self) -> Result<String, String> {
         use base64::Engine as _;
         let km = self.lifecycle.client.key_manager();
