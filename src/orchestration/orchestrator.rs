@@ -417,6 +417,106 @@ impl Orchestrator {
         Ok((contact_id.to_string(), plaintext))
     }
 
+    /// RESPONDER X3DH init from a raw CFE wire payload.
+    ///
+    /// Drop-in replacement for `init_receiving_session_with_msg` when the caller
+    /// has the raw binary WirePayload rather than a JSON-decoded first message.
+    /// Used by non-UniFFI platforms (TUI, Android) in `Action::InitSession` when
+    /// `pending_message_count(contact_id) > 0`, i.e. the local node is the RESPONDER.
+    ///
+    /// Returns `(contact_id, plaintext_of_first_message)` on success.
+    pub fn init_receiving_session_from_wire_payload(
+        &mut self,
+        contact_id: &str,
+        recipient_bundle: &[u8],
+        wire_payload: &[u8],
+    ) -> Result<(String, Vec<u8>), String> {
+        use crate::crypto::SuiteID;
+        use crate::crypto::keys::build_prologue;
+        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
+        use crate::crypto::provider::CryptoProvider;
+
+        #[derive(serde::Deserialize)]
+        struct KeyBundle {
+            identity_public: Vec<u8>,
+            signed_prekey_public: Vec<u8>,
+            signature: Vec<u8>,
+            verifying_key: Vec<u8>,
+            suite_id: u16,
+        }
+
+        let bundle_str = std::str::from_utf8(recipient_bundle)
+            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
+        let key_bundle: KeyBundle =
+            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+
+        let decoded = crate::wire_payload::unpack(wire_payload)
+            .map_err(|e| format!("wire_payload unpack failed: {e:?}"))?;
+
+        if decoded.sealed_box.len() < 12 {
+            return Err("sealed_box too short in wire_payload".to_string());
+        }
+        let nonce = decoded.sealed_box[..12].to_vec();
+        let ciphertext = decoded.sealed_box[12..].to_vec();
+
+        let dh_public_key: [u8; 32] = decoded
+            .dh_public_key
+            .clone()
+            .try_into()
+            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
+
+        let encrypted_first_message = EncryptedRatchetMessage {
+            dh_public_key,
+            message_number: decoded.message_number,
+            ciphertext,
+            nonce,
+            previous_chain_length: decoded.previous_chain_length,
+            suite_id: key_bundle.suite_id,
+        };
+
+        // Verify the initiator's SPK signature — same check as init_receiving_session_with_msg.
+        let suite_id =
+            SuiteID::new(key_bundle.suite_id).map_err(|_| "invalid suite_id".to_string())?;
+        let verifying_key =
+            ClassicSuiteProvider::signature_public_key_from_bytes(key_bundle.verifying_key.clone());
+        let prologue = build_prologue(suite_id);
+        let mut spk_msg =
+            Vec::with_capacity(prologue.len() + key_bundle.signed_prekey_public.len());
+        spk_msg.extend_from_slice(&prologue);
+        spk_msg.extend_from_slice(&key_bundle.signed_prekey_public);
+        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &key_bundle.signature)
+            .map_err(|_| "invalid signed prekey signature from initiator".to_string())?;
+
+        let remote_identity =
+            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
+        let remote_ephemeral =
+            ClassicSuiteProvider::kem_public_key_from_bytes(decoded.dh_public_key);
+
+        let (_session_id, plaintext) = self
+            .lifecycle
+            .client
+            .init_receiving_session_with_ephemeral(
+                contact_id,
+                &remote_identity,
+                &remote_ephemeral,
+                &encrypted_first_message,
+                decoded.one_time_prekey_id,
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok((contact_id.to_string(), plaintext))
+    }
+
+    /// Return the raw WirePayload bytes of the first queued incoming message
+    /// for `contact_id` without removing it from the queue.
+    ///
+    /// Use this in `Action::InitSession` to detect RESPONDER case:
+    /// if this returns `Some(_)`, call `init_receiving_session_from_wire_payload()`
+    /// instead of `init_session_with_bundle()`.
+    pub fn peek_first_pending_wire_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
+        self.router.peek_first_pending_wire_payload(contact_id)
+    }
+
     pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
         self.lifecycle.export_session_json_for(contact_id)
     }

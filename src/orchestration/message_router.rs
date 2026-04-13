@@ -203,6 +203,20 @@ impl MessageRouter {
         self.pending_queues.get(contact_id).map_or(0, |q| q.len())
     }
 
+    /// Return the raw WirePayload bytes of the first queued message for `contact_id`
+    /// without removing it from the queue.
+    ///
+    /// Used by non-UniFFI platforms (TUI, Android) to detect the RESPONDER case
+    /// when handling `Action::InitSession`: if this returns `Some(bytes)`, the
+    /// platform should call `init_receiving_session_from_wire_payload()` instead of
+    /// `init_session_with_bundle()`.
+    pub fn peek_first_pending_wire_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
+        self.pending_queues
+            .get(contact_id)
+            .and_then(|q| q.front())
+            .map(|msg| msg.wire_payload.clone())
+    }
+
     /// All contact IDs that currently have at least one queued message.
     pub fn contacts_with_pending(&self) -> Vec<String> {
         self.pending_queues
