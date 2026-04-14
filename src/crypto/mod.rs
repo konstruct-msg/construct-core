@@ -106,6 +106,9 @@ pub mod invite_crypto;
 /// Account recovery via BIP39 mnemonic + SLIP-0010 Ed25519 HD derivation
 pub mod recovery;
 
+/// Key Transparency — RFC 6962-style append-only Merkle log for identity key auditing
+pub mod key_transparency;
+
 // ============================================================================
 // Post-Quantum (conditionally compiled)
 // ============================================================================
