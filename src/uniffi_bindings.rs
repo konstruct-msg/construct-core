@@ -2116,6 +2116,14 @@ pub fn format_federated_id(device_id: String, server_hostname: String) -> String
     crate::device_id::format_federated_id(&device_id, &server_hostname)
 }
 
+/// Compute a Safety Number for two Construct devices.
+///
+/// Returns a 60-digit string (12 groups of 5, space-separated) that both parties
+/// can compare verbally or via QR to verify no MITM has occurred.
+pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> String {
+    crate::crypto::recovery::compute_safety_number(&my_device_id, &their_device_id)
+}
+
 // ── Post-Quantum KEM Namespace Functions ─────────────────────────────────────
 
 /// Generate an ML-KEM-768 keypair for registration/upload to key server.

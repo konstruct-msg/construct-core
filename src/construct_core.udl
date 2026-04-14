@@ -2,6 +2,9 @@ namespace construct_core {
     // Device ID functions
     string derive_device_id(sequence<u8> identity_public_key);
     string format_federated_id(string device_id, string server_hostname);
+
+    // Safety Numbers — human-verifiable key fingerprint for two devices
+    string compute_safety_number(string my_device_id, string their_device_id);
     
     // Proof of Work functions
     PowSolution compute_pow(string challenge, u32 difficulty);

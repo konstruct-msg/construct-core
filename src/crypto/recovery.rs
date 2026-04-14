@@ -119,6 +119,52 @@ pub fn compute_key_fingerprint(public_key: &[u8]) -> String {
         .join(" ")
 }
 
+/// Compute a Safety Number for two Construct devices.
+///
+/// Both parties derive the same 60-digit string from their device IDs.
+/// Device IDs are cryptographic commitments to identity keys (HKDF of Ed25519 pubkey),
+/// so substituting a MITM key changes the Safety Number.
+///
+/// Algorithm:
+/// 1. Canonicalize: sort device IDs lexicographically so both sides get the same order.
+/// 2. Iterative SHA-512: 1024 rounds of hash(prev_hash || input) — hardens brute-force.
+/// 3. Format: first 24 bytes → 12 groups of 5 decimal digits (00000–99999).
+///
+/// Display format: "12345 67890 11111 22222 ..."
+pub fn compute_safety_number(my_device_id: &str, their_device_id: &str) -> String {
+    let my_bytes = hex::decode(my_device_id).unwrap_or_default();
+    let their_bytes = hex::decode(their_device_id).unwrap_or_default();
+
+    let (first, second) = if my_device_id < their_device_id {
+        (my_bytes.as_slice(), their_bytes.as_slice())
+    } else {
+        (their_bytes.as_slice(), my_bytes.as_slice())
+    };
+
+    let mut input = Vec::with_capacity(first.len() + second.len());
+    input.extend_from_slice(first);
+    input.extend_from_slice(second);
+
+    let mut hash = Sha512::digest(&input).to_vec();
+    for _ in 1..1024 {
+        let mut h = Sha512::new();
+        h.update(&hash);
+        h.update(&input);
+        hash = h.finalize().to_vec();
+    }
+
+    hash[..24]
+        .chunks(2)
+        .map(|pair| {
+            format!(
+                "{:05}",
+                (u32::from(pair[0]) * 256 + u32::from(pair[1])) % 100_000
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ── SLIP-0010 internals ───────────────────────────────────────────────────────
 
 /// SLIP-0010 master key: HMAC-SHA512(Key="ed25519 seed", Data=seed)
@@ -238,5 +284,42 @@ mod tests {
         // Format: "XXXX XXXX XXXX XXXX" = 4 groups of 4 hex chars separated by spaces
         assert_eq!(fp.len(), 19);
         assert_eq!(fp.chars().filter(|c| *c == ' ').count(), 3);
+    }
+
+    #[test]
+    fn test_safety_number_format() {
+        let id_a = "deadbeefcafe1234deadbeefcafe1234";
+        let id_b = "1234cafe5678abcd1234cafe5678abcd";
+        let sn = compute_safety_number(id_a, id_b);
+        // 12 groups of 5 digits with spaces: "DDDDD DDDDD ..." = 12*5 + 11 spaces = 71 chars
+        assert_eq!(sn.len(), 71);
+        assert_eq!(sn.chars().filter(|c| *c == ' ').count(), 11);
+        // Every group is numeric and ≤ 99999
+        for group in sn.split(' ') {
+            let n: u32 = group.parse().expect("group should be numeric");
+            assert!(n < 100_000);
+        }
+    }
+
+    #[test]
+    fn test_safety_number_symmetric() {
+        let id_a = "deadbeefcafe1234deadbeefcafe1234";
+        let id_b = "1234cafe5678abcd1234cafe5678abcd";
+        // Both orderings must produce the same Safety Number
+        assert_eq!(
+            compute_safety_number(id_a, id_b),
+            compute_safety_number(id_b, id_a)
+        );
+    }
+
+    #[test]
+    fn test_safety_number_different_ids_differ() {
+        let id_a = "deadbeefcafe1234deadbeefcafe1234";
+        let id_b = "1234cafe5678abcd1234cafe5678abcd";
+        let id_c = "ffffffffffffffffffffffffffffffff";
+        assert_ne!(
+            compute_safety_number(id_a, id_b),
+            compute_safety_number(id_a, id_c)
+        );
     }
 }
