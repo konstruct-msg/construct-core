@@ -701,3 +701,34 @@ interface RustPQContributions {
     /// `true` if a deferred contribution exists for `contact_id`.
     boolean has_pending(string contact_id);
 };
+
+// ── ConstructPrivacyPass ──────────────────────────────────────────────────────
+
+namespace construct_core {
+    /// Blind a 32-byte nonce for OPRF token issuance.
+    /// Returns packed 64 bytes: blinded_point[0..32] || blind_factor[32..64].
+    /// blinded_point is sent to server; blind_factor is kept secret until finalize().
+    [Throws=CryptoError]
+    sequence<u8> pp_blind_token(sequence<u8> nonce);
+
+    /// Finalize a blind token after server evaluation.
+    /// evaluated_bytes  — 32-byte Ristretto point returned by server (Z = k * blinded)
+    /// blind_factor     — the second 32 bytes from pp_blind_token output
+    /// nonce            — original 32-byte nonce passed to pp_blind_token
+    /// Returns 32-byte token to store in the wallet.
+    [Throws=CryptoError]
+    sequence<u8> pp_finalize_token(
+        sequence<u8> evaluated_bytes,
+        sequence<u8> blind_factor_bytes,
+        sequence<u8> nonce
+    );
+
+    /// Verify the evaluated point is a valid Ristretto255 curve point.
+    /// server_pubkey_bytes is reserved for future DLEQ batch proof verification.
+    /// Returns false if evaluated_bytes cannot be decompressed.
+    boolean pp_verify_client(
+        sequence<u8> evaluated_bytes,
+        sequence<u8> nonce,
+        sequence<u8> server_pubkey_bytes
+    );
+};

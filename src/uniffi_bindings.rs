@@ -3262,3 +3262,30 @@ impl RustPQContributions {
         map.contains_key(&contact_id)
     }
 }
+
+// ── ConstructPrivacyPass UniFFI bindings ──────────────────────────────────────
+
+pub fn pp_blind_token(nonce: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::privacy_pass::pp_blind_token(nonce).map_err(|e| CryptoError::EncryptionFailed {
+        message: e.to_string(),
+    })
+}
+
+pub fn pp_finalize_token(
+    evaluated_bytes: Vec<u8>,
+    blind_factor_bytes: Vec<u8>,
+    nonce: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::privacy_pass::pp_finalize_token(evaluated_bytes, blind_factor_bytes, nonce)
+        .map_err(|e| CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        })
+}
+
+pub fn pp_verify_client(
+    evaluated_bytes: Vec<u8>,
+    nonce: Vec<u8>,
+    server_pubkey_bytes: Vec<u8>,
+) -> bool {
+    crate::crypto::privacy_pass::pp_verify_client(evaluated_bytes, nonce, server_pubkey_bytes)
+}

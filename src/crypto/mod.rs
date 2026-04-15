@@ -109,6 +109,9 @@ pub mod recovery;
 /// Key Transparency — RFC 6962-style append-only Merkle log for identity key auditing
 pub mod key_transparency;
 
+/// ConstructPrivacyPass — OPRF blind token primitives (Ristretto255)
+pub mod privacy_pass;
+
 // ============================================================================
 // Post-Quantum (conditionally compiled)
 // ============================================================================

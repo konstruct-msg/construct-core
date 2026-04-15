@@ -58,6 +58,7 @@ crc32fast = "1.3"
 # Криптография
 x25519-dalek = { version = "2.0", features = ["reusable_secrets", "static_secrets"] }
 ed25519-dalek = { version = "2.0", features = ["std", "rand_core"] }
+curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
 chacha20poly1305 = { version = "0.10", features = ["std", "getrandom"] }
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
