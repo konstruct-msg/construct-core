@@ -3289,3 +3289,92 @@ pub fn pp_verify_client(
 ) -> bool {
     crate::crypto::privacy_pass::pp_verify_client(evaluated_bytes, nonce, server_pubkey_bytes)
 }
+
+// ── SLIP-39 Social Recovery UniFFI bindings ───────────────────────────────────
+
+/// Mirror of `crypto::social_recovery::RecoveryBundle` with UniFFI-compatible types.
+#[derive(Debug, Clone)]
+pub struct SrRecoveryBundle {
+    pub device_signing_key: Vec<u8>,
+    pub device_identity_key: Vec<u8>,
+    pub device_id: String,
+    pub created_at: i64,
+}
+
+impl From<crate::crypto::social_recovery::RecoveryBundle> for SrRecoveryBundle {
+    fn from(b: crate::crypto::social_recovery::RecoveryBundle) -> Self {
+        Self {
+            device_signing_key: b.device_signing_key,
+            device_identity_key: b.device_identity_key,
+            device_id: b.device_id,
+            created_at: b.created_at,
+        }
+    }
+}
+
+impl From<SrRecoveryBundle> for crate::crypto::social_recovery::RecoveryBundle {
+    fn from(b: SrRecoveryBundle) -> Self {
+        Self {
+            device_signing_key: b.device_signing_key,
+            device_identity_key: b.device_identity_key,
+            device_id: b.device_id,
+            created_at: b.created_at,
+        }
+    }
+}
+
+pub fn sr_generate_vault_key() -> Result<Vec<u8>, CryptoError> {
+    Ok(crate::crypto::social_recovery::generate_vault_key().to_vec())
+}
+
+pub fn sr_create_recovery_shares(
+    vault_key: Vec<u8>,
+    threshold: u8,
+    share_count: u8,
+) -> Result<Vec<String>, CryptoError> {
+    let key: [u8; 32] = vault_key
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    crate::crypto::social_recovery::create_recovery_shares(&key, threshold, share_count).map_err(
+        |e| CryptoError::SessionInitializationFailed {
+            message: e.to_string(),
+        },
+    )
+}
+
+pub fn sr_reconstruct_vault_key(mnemonics: Vec<String>) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::social_recovery::reconstruct_vault_key(mnemonics)
+        .map(|k| k.to_vec())
+        .map_err(|e| CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        })
+}
+
+pub fn sr_seal_recovery_bundle(
+    vault_key: Vec<u8>,
+    bundle: SrRecoveryBundle,
+) -> Result<Vec<u8>, CryptoError> {
+    let key: [u8; 32] = vault_key
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    let inner: crate::crypto::social_recovery::RecoveryBundle = bundle.into();
+    crate::crypto::social_recovery::seal_recovery_bundle(&key, &inner).map_err(|e| {
+        CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        }
+    })
+}
+
+pub fn sr_open_recovery_bundle(
+    vault_key: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> Result<SrRecoveryBundle, CryptoError> {
+    let key: [u8; 32] = vault_key
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    crate::crypto::social_recovery::open_recovery_bundle(&key, &ciphertext)
+        .map(SrRecoveryBundle::from)
+        .map_err(|e| CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        })
+}

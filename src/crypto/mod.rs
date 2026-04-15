@@ -112,6 +112,9 @@ pub mod key_transparency;
 /// ConstructPrivacyPass — OPRF blind token primitives (Ristretto255)
 pub mod privacy_pass;
 
+/// SLIP-39 social recovery — vault key Shamir Secret Sharing + bundle encryption
+pub mod social_recovery;
+
 // ============================================================================
 // Post-Quantum (conditionally compiled)
 // ============================================================================

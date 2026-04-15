@@ -704,6 +704,16 @@ interface RustPQContributions {
 
 // ── ConstructPrivacyPass ──────────────────────────────────────────────────────
 
+// ── SLIP-39 Social Recovery ───────────────────────────────────────────────────
+
+/// Keys and metadata packed into the encrypted recovery bundle.
+dictionary SrRecoveryBundle {
+    bytes device_signing_key;
+    bytes device_identity_key;
+    string device_id;
+    i64 created_at;
+};
+
 namespace construct_core {
     /// Blind a 32-byte nonce for OPRF token issuance.
     /// Returns packed 64 bytes: blinded_point[0..32] || blind_factor[32..64].
@@ -731,4 +741,28 @@ namespace construct_core {
         sequence<u8> nonce,
         sequence<u8> server_pubkey_bytes
     );
+
+    // ── SLIP-39 Social Recovery ───────────────────────────────────────────────
+
+    /// Generate a 32-byte random vault key.
+    [Throws=CryptoError]
+    sequence<u8> sr_generate_vault_key();
+
+    /// Split vault_key into share_count shares, requiring threshold to reconstruct.
+    /// threshold must be <= share_count, both must be 2-10.
+    /// Returns one 28-word mnemonic string per share.
+    [Throws=CryptoError]
+    sequence<string> sr_create_recovery_shares(sequence<u8> vault_key, u8 threshold, u8 share_count);
+
+    /// Reconstruct vault_key from at least threshold share mnemonics.
+    [Throws=CryptoError]
+    sequence<u8> sr_reconstruct_vault_key(sequence<string> mnemonics);
+
+    /// Encrypt a RecoveryBundle to bytes using vault_key.
+    [Throws=CryptoError]
+    sequence<u8> sr_seal_recovery_bundle(sequence<u8> vault_key, SrRecoveryBundle bundle);
+
+    /// Decrypt bytes to RecoveryBundle using vault_key.
+    [Throws=CryptoError]
+    SrRecoveryBundle sr_open_recovery_bundle(sequence<u8> vault_key, sequence<u8> ciphertext);
 };
