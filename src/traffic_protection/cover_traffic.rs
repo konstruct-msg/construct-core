@@ -40,8 +40,9 @@ const DUMMY_MARKER: &[u8] = b"__CONSTRUCT_DUMMY__";
 /// Dummy message payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DummyMessage {
-    /// Marker to identify as dummy
-    marker: String,
+    /// Marker bytes to identify as dummy — stored as raw bytes, never converted to String
+    #[serde(with = "serde_bytes")]
+    marker: Vec<u8>,
 
     /// Random padding
     #[serde(with = "serde_bytes")]
@@ -69,7 +70,7 @@ pub fn generate_dummy_message(size: usize) -> Vec<u8> {
     rng.fill_bytes(&mut padding);
 
     let dummy = DummyMessage {
-        marker: String::from_utf8_lossy(DUMMY_MARKER).to_string(),
+        marker: DUMMY_MARKER.to_vec(),
         padding,
     };
 
@@ -80,12 +81,12 @@ pub fn generate_dummy_message(size: usize) -> Vec<u8> {
 ///
 /// Server should call this and discard dummy messages.
 pub fn is_dummy_message(data: &[u8]) -> bool {
-    // Try to deserialize
+    // Try to deserialize and compare marker bytes directly — no String conversion.
     if let Ok(msg) = rmp_serde::from_slice::<DummyMessage>(data) {
-        return msg.marker == String::from_utf8_lossy(DUMMY_MARKER);
+        return msg.marker == DUMMY_MARKER;
     }
 
-    // Fallback: check raw bytes
+    // Fallback: scan raw bytes for marker pattern.
     if data.len() > DUMMY_MARKER.len() {
         return data.windows(DUMMY_MARKER.len()).any(|w| w == DUMMY_MARKER);
     }

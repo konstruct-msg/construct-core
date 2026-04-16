@@ -242,10 +242,8 @@ impl Orchestrator {
             kyber_one_time_prekey_id: Option<u32>,
         }
 
-        let bundle_str = std::str::from_utf8(recipient_bundle)
-            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
-        let key_bundle: KeyBundle =
-            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
+            .map_err(|_| "invalid key bundle JSON".to_string())?;
 
         let public_bundle = X3DHPublicKeyBundle {
             identity_public: key_bundle.identity_public.clone(),
@@ -342,15 +340,11 @@ impl Orchestrator {
             one_time_prekey_id: u32,
         }
 
-        let bundle_str = std::str::from_utf8(recipient_bundle)
-            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
-        let key_bundle: KeyBundle =
-            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
+            .map_err(|_| "invalid key bundle JSON".to_string())?;
 
-        let msg_str = std::str::from_utf8(first_message)
-            .map_err(|_| "invalid UTF-8 in first message".to_string())?;
-        let first_msg: FirstMsg =
-            serde_json::from_str(msg_str).map_err(|_| "invalid first message JSON".to_string())?;
+        let first_msg: FirstMsg = serde_json::from_slice(first_message)
+            .map_err(|_| "invalid first message JSON".to_string())?;
 
         use base64::Engine as _;
         let sealed_box = base64::engine::general_purpose::STANDARD
@@ -445,10 +439,8 @@ impl Orchestrator {
             suite_id: u16,
         }
 
-        let bundle_str = std::str::from_utf8(recipient_bundle)
-            .map_err(|_| "invalid UTF-8 in bundle".to_string())?;
-        let key_bundle: KeyBundle =
-            serde_json::from_str(bundle_str).map_err(|_| "invalid key bundle JSON".to_string())?;
+        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
+            .map_err(|_| "invalid key bundle JSON".to_string())?;
 
         let decoded = crate::wire_payload::unpack(wire_payload)
             .map_err(|e| format!("wire_payload unpack failed: {e:?}"))?;
@@ -838,7 +830,14 @@ impl Orchestrator {
             data,
             crate::cfe::CfeMessageType::SessionState,
         ) {
-            Ok(s) => String::from_utf8(s.json_bytes.into_vec()).map_err(|e| e.to_string())?,
+            Ok(s) => {
+                // Borrow bytes directly — avoids String allocation before passing to import_session_json
+                let json_str = std::str::from_utf8(&s.json_bytes).map_err(|e| e.to_string())?;
+                return self
+                    .lifecycle
+                    .import_session_json(contact_id, json_str)
+                    .map_err(|e| e.to_string());
+            }
             Err(crate::cfe::CfeError::LegacyJson) => std::str::from_utf8(data)
                 .map_err(|e| e.to_string())?
                 .to_string(),
@@ -1322,7 +1321,7 @@ impl Orchestrator {
             .to_string();
 
         if let Some(bytes) = data {
-            if let Ok(json) = String::from_utf8(bytes) {
+            if let Ok(json) = std::str::from_utf8(&bytes) {
                 self.lifecycle.load_archive_json(&contact_id, json);
             }
         }

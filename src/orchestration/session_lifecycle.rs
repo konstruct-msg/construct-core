@@ -412,20 +412,17 @@ impl SessionLifecycleManager {
     }
 
     /// Feed an archive JSON/envelope loaded from the platform secure store into memory.
-    pub fn load_archive_json(&mut self, contact_id: &str, envelope: String) {
-        // Verify integrity before importing the session; if the envelope is
-        // corrupted we still store it (so restore_latest_archive can return a
-        // meaningful error) but we don't import a broken session into memory.
-        match self.unwrap_archive(&envelope) {
+    pub fn load_archive_json(&mut self, contact_id: &str, envelope: &str) {
+        match self.unwrap_archive(envelope) {
             Ok(json) => {
                 let _ = self.import_session_json(contact_id, json);
             }
             Err(e) => {
-                // Log via debug; will surface as Err from restore_latest_archive.
-                let _ = e; // suppress unused warning; platform will handle via restore error
+                let _ = e;
             }
         }
-        self.archives.insert(contact_id.to_string(), envelope);
+        self.archives
+            .insert(contact_id.to_string(), envelope.to_string());
     }
 
     /// Feed an archive from CFE binary bytes into memory (preferred over `load_archive_json`).
