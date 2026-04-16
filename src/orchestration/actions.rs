@@ -27,11 +27,12 @@ pub enum Action {
     },
 
     /// Emitted when a message has been successfully decrypted.
-    /// Carries the full plaintext so the platform can persist + display it.
+    /// Carries the raw plaintext bytes so the platform can parse them (protobuf,
+    /// plain UTF-8, or chunked-KNST binary frame) without any lossy conversion.
     MessageDecrypted {
         contact_id: String,
         message_id: String,
-        plaintext_utf8: String,
+        plaintext: Vec<u8>,
     },
 
     /// Binary payload decrypted from a CALL_SIGNAL envelope (content_type = 12).
@@ -184,7 +185,7 @@ pub enum IncomingEvent {
         content_type: u8,
     },
     /// Platform-side outgoing regular message.
-    /// Rust orchestrator encrypts `plaintext_utf8` bytes with the Double Ratchet session,
+    /// Rust orchestrator encrypts `plaintext` bytes with the Double Ratchet session,
     /// packs a WirePayload (including PQXDH KEM ciphertext for msgNum=0, sourced
     /// internally from `pq_manager`), and returns `Action::SendEncryptedMessage`.
     OutgoingMessage {
@@ -192,8 +193,8 @@ pub enum IncomingEvent {
         contact_id: String,
         /// Platform-generated message UUID for deduplication / ACK tracking.
         message_id: String,
-        /// Raw UTF-8 text of the plaintext message.
-        plaintext_utf8: String,
+        /// Raw plaintext bytes — may be serialised protobuf, plain UTF-8, or binary.
+        plaintext: Vec<u8>,
         /// Content-type discriminator (matches proto ContentType enum).
         /// 0 = regular E2EE message.
         content_type: u8,

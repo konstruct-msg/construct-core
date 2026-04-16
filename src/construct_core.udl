@@ -469,7 +469,7 @@ interface RustHealingQueue {
 [Enum]
 interface CfeIncomingEvent {
     MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type);
-    OutgoingMessage(string contact_id, string message_id, string plaintext_utf8, u8 content_type);
+    OutgoingMessage(string contact_id, string message_id, bytes plaintext, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
     AckReceived(string message_id);
@@ -495,7 +495,7 @@ interface CfeAction {
     InitSession(string contact_id, string bundle_json);
     ApplyPqContribution(string contact_id, bytes kem_ss);
     ArchiveSession(string contact_id);
-    MessageDecrypted(string contact_id, string message_id, string plaintext_utf8);
+    MessageDecrypted(string contact_id, string message_id, bytes plaintext);
     SessionHealNeeded(string contact_id, string role);
     /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
     HealSuppressed(string contact_id, u64 retry_after_ms);
@@ -618,10 +618,10 @@ interface OrchestratorCore {
     SessionInitResult init_receiving_session(string contact_id, sequence<u8> recipient_bundle, sequence<u8> first_message);
 
     [Throws=CryptoError]
-    EncryptedMessageComponents encrypt_message(string contact_id, string plaintext);
+    EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
 
     [Throws=CryptoError]
-    string decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+    bytes decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
 
     boolean remove_session(string contact_id);
 

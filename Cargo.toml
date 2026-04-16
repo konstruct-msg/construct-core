@@ -20,14 +20,15 @@ name = "construct_core"
 
 [lints.rust]
 unsafe_attr_outside_unsafe = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 # Feature flags
 [features]
 default = []
-ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls"]
+ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-ice TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls"]
+mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",

@@ -111,9 +111,9 @@ impl Orchestrator {
             IncomingEvent::OutgoingMessage {
                 contact_id,
                 message_id,
-                plaintext_utf8,
+                plaintext,
                 content_type,
-            } => self.handle_outgoing_message(contact_id, message_id, plaintext_utf8, content_type),
+            } => self.handle_outgoing_message(contact_id, message_id, plaintext, content_type),
             IncomingEvent::OutgoingCallSignal {
                 contact_id,
                 message_id,
@@ -935,12 +935,12 @@ impl Orchestrator {
     pub fn encrypt_message_for(
         &mut self,
         contact_id: &str,
-        plaintext: &str,
+        plaintext: &[u8],
     ) -> Result<(Vec<u8>, u32, Vec<u8>, u32), String> {
         let encrypted = self
             .lifecycle
             .client
-            .encrypt_message(contact_id, plaintext.as_bytes())
+            .encrypt_message(contact_id, plaintext)
             .map_err(|e| e.to_string())?;
 
         let mut sealed_box = Vec::new();
@@ -1044,7 +1044,7 @@ impl Orchestrator {
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: &[u8],
-    ) -> Result<String, String> {
+    ) -> Result<Vec<u8>, String> {
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 
         let sealed_box = content;
@@ -1068,13 +1068,10 @@ impl Orchestrator {
             suite_id: crate::config::Config::global().classic_suite_id,
         };
 
-        let plaintext = self
-            .lifecycle
+        self.lifecycle
             .client
             .decrypt_message(contact_id, &encrypted_message)
-            .map_err(|e| e.to_string())?;
-
-        String::from_utf8(plaintext).map_err(|e| format!("UTF-8 conversion failed: {}", e))
+            .map_err(|e| e.to_string())
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────
@@ -1137,7 +1134,7 @@ impl Orchestrator {
         &mut self,
         contact_id: String,
         message_id: String,
-        plaintext_utf8: String,
+        plaintext: Vec<u8>,
         content_type: u8,
     ) -> Vec<Action> {
         // For the first message (msgNum=0) after a fresh PQXDH session init, apply the
@@ -1167,7 +1164,7 @@ impl Orchestrator {
         let encrypted = match self
             .lifecycle
             .client
-            .encrypt_message(&contact_id, plaintext_utf8.as_bytes())
+            .encrypt_message(&contact_id, &plaintext)
         {
             Ok(e) => e,
             Err(e) => {
@@ -1497,15 +1494,14 @@ impl Orchestrator {
                         proto_bytes: plaintext,
                     });
                 } else {
-                    let plaintext_str = String::from_utf8_lossy(&plaintext).into_owned();
-                    all.push(Action::MessageDecrypted {
-                        contact_id: cid.clone(),
-                        message_id: mid,
-                        plaintext_utf8: plaintext_str,
-                    });
                     all.push(Action::NotifyNewMessage {
-                        chat_id: cid,
+                        chat_id: cid.clone(),
                         preview: preview(&plaintext),
+                    });
+                    all.push(Action::MessageDecrypted {
+                        contact_id: cid,
+                        message_id: mid,
+                        plaintext,
                     });
                 }
                 all

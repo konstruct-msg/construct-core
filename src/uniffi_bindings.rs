@@ -2564,7 +2564,7 @@ impl OrchestratorCore {
     pub fn encrypt_message(
         &self,
         contact_id: String,
-        plaintext: String,
+        plaintext: Vec<u8>,
     ) -> Result<EncryptedMessageComponents, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (ephemeral_public_key, message_number, content, one_time_prekey_id) = orch
@@ -2584,7 +2584,7 @@ impl OrchestratorCore {
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: Vec<u8>,
-    ) -> Result<String, CryptoError> {
+    ) -> Result<Vec<u8>, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)
             .map_err(|e| CryptoError::DecryptionFailed { message: e })
@@ -2745,7 +2745,7 @@ pub enum CfeIncomingEvent {
     OutgoingMessage {
         contact_id: String,
         message_id: String,
-        plaintext_utf8: String,
+        plaintext: Vec<u8>,
         content_type: u8,
     },
     OutgoingCallSignal {
@@ -2816,12 +2816,12 @@ impl CfeIncomingEvent {
             Self::OutgoingMessage {
                 contact_id,
                 message_id,
-                plaintext_utf8,
+                plaintext,
                 content_type,
             } => OutgoingMessage {
                 contact_id,
                 message_id,
-                plaintext_utf8,
+                plaintext,
                 content_type,
             },
             Self::OutgoingCallSignal {
@@ -2905,7 +2905,7 @@ pub enum CfeAction {
     MessageDecrypted {
         contact_id: String,
         message_id: String,
-        plaintext_utf8: String,
+        plaintext: Vec<u8>,
     },
     SessionHealNeeded {
         contact_id: String,
@@ -3022,11 +3022,11 @@ impl CfeAction {
             MessageDecrypted {
                 contact_id,
                 message_id,
-                plaintext_utf8,
+                plaintext,
             } => Self::MessageDecrypted {
                 contact_id,
                 message_id,
-                plaintext_utf8,
+                plaintext,
             },
             SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
             SaveSessionToSecureStore { key, data } => Self::SaveSessionToSecureStore { key, data },
@@ -3189,10 +3189,10 @@ fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
         Action::MessageDecrypted {
             contact_id,
             message_id,
-            plaintext_utf8,
+            plaintext,
         } => serde_json::json!({
             "type": "MessageDecrypted", "contact_id": contact_id,
-            "message_id": message_id, "plaintext_utf8": plaintext_utf8
+            "message_id": message_id, "plaintext_len": plaintext.len()
         }),
         Action::SessionHealNeeded { contact_id, role } => serde_json::json!({
             "type": "SessionHealNeeded", "contact_id": contact_id, "role": role
