@@ -335,7 +335,7 @@ impl Orchestrator {
         struct FirstMsg {
             ephemeral_public_key: Vec<u8>,
             message_number: u32,
-            content: String,
+            content: Vec<u8>, // raw sealed box bytes (JSON array of numbers)
             #[serde(default)]
             one_time_prekey_id: u32,
         }
@@ -346,10 +346,7 @@ impl Orchestrator {
         let first_msg: FirstMsg = serde_json::from_slice(first_message)
             .map_err(|_| "invalid first message JSON".to_string())?;
 
-        use base64::Engine as _;
-        let sealed_box = base64::engine::general_purpose::STANDARD
-            .decode(&first_msg.content)
-            .map_err(|_| "invalid base64 content".to_string())?;
+        let sealed_box = first_msg.content;
 
         if sealed_box.len() < 12 {
             return Err("sealed_box too short".to_string());
