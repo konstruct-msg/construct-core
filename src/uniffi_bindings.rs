@@ -696,7 +696,7 @@ impl ClassicCryptoCore {
         struct FirstMessage {
             ephemeral_public_key: Vec<u8>,
             message_number: u32,
-            content: String, // Base64
+            content: Vec<u8>,
             #[serde(default)]
             one_time_prekey_id: u32,
         }
@@ -704,10 +704,7 @@ impl ClassicCryptoCore {
         let first_msg: FirstMessage =
             serde_json::from_str(message_str).map_err(|_| CryptoError::InvalidCiphertext)?;
 
-        // Decode base64 content
-        let sealed_box = base64::engine::general_purpose::STANDARD
-            .decode(&first_msg.content)
-            .map_err(|_| CryptoError::InvalidCiphertext)?;
+        let sealed_box = first_msg.content;
 
         tracing::debug!("Parsing sealed_box - total length: {}", sealed_box.len());
 
@@ -1774,7 +1771,7 @@ mod tests {
         let first_msg_json = serde_json::json!({
             "ephemeral_public_key": encrypted.ephemeral_public_key,
             "message_number": encrypted.message_number,
-            "content": base64::engine::general_purpose::STANDARD.encode(&encrypted.content)
+            "content": encrypted.content
         });
         let first_msg_bytes = serde_json::to_vec(&first_msg_json).unwrap();
 
@@ -1874,7 +1871,7 @@ mod tests {
         let first_msg_json = serde_json::json!({
             "ephemeral_public_key": msg1.ephemeral_public_key,
             "message_number": msg1.message_number,
-            "content": base64::engine::general_purpose::STANDARD.encode(&msg1.content)
+            "content": msg1.content
         });
 
         let bob_session_result = bob

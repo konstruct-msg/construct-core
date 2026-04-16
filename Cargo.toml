@@ -89,6 +89,11 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = 
 
 [dev-dependencies]
 hex = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_bench"
+harness = false
 
 [build-dependencies]
 uniffi = { version = "0.30", features = ["build"] }

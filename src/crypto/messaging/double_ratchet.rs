@@ -562,25 +562,24 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             None => true,
         };
 
-        // Snapshot mutable state before any ratchet mutations so we can roll back
+        // Snapshot mutable state before any mutations so we can roll back
         // if AEAD decryption ultimately fails — prevents permanent session corruption.
-        let snapshot = if needs_ratchet {
-            Some(DecryptSnapshot {
-                root_key: self.root_key.clone(),
-                sending_chain_key: self.sending_chain_key.clone(),
-                sending_chain_length: self.sending_chain_length,
-                receiving_chain_key: self.receiving_chain_key.clone(),
-                receiving_chain_length: self.receiving_chain_length,
-                dh_ratchet_private: self.dh_ratchet_private.clone(),
-                dh_ratchet_public: self.dh_ratchet_public.clone(),
-                remote_dh_public: self.remote_dh_public.clone(),
-                previous_sending_length: self.previous_sending_length,
-                skipped_message_keys: self.skipped_message_keys.clone(),
-                skipped_key_timestamps: self.skipped_key_timestamps.clone(),
-            })
-        } else {
-            None
-        };
+        // This covers both DH ratchet steps AND symmetric chain advances:
+        // without this, a tampered message_number (same DH key) permanently
+        // consumes a chain key slot and makes the real message undecryptable.
+        let snapshot = Some(DecryptSnapshot {
+            root_key: self.root_key.clone(),
+            sending_chain_key: self.sending_chain_key.clone(),
+            sending_chain_length: self.sending_chain_length,
+            receiving_chain_key: self.receiving_chain_key.clone(),
+            receiving_chain_length: self.receiving_chain_length,
+            dh_ratchet_private: self.dh_ratchet_private.clone(),
+            dh_ratchet_public: self.dh_ratchet_public.clone(),
+            remote_dh_public: self.remote_dh_public.clone(),
+            previous_sending_length: self.previous_sending_length,
+            skipped_message_keys: self.skipped_message_keys.clone(),
+            skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+        });
 
         if needs_ratchet {
             // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
