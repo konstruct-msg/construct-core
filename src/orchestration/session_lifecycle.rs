@@ -2,7 +2,7 @@
 ///
 /// Owns the `ClassicClient` and orchestrates:
 /// - Encrypt / Decrypt with automatic session restore from archive
-/// - Session archiving (retire → store JSON → GC)
+/// - Session archiving (retire → store binary → GC)
 /// - Prekey change detection (reinstall)
 /// - Integration of AckStore, HealingQueue, PQContributionManager
 ///
@@ -10,9 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
@@ -22,8 +20,6 @@ use crate::orchestration::actions::Action;
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::healing_queue::HealingQueue;
 use crate::orchestration::pq_contribution::PQContributionManager;
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -97,6 +93,7 @@ impl TryFrom<WireMessage> for EncryptedRatchetMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LifecycleState {
     my_user_id: String,
+    /// contactId → hex-encoded CFE binary archive (for JSON compat).
     archives: HashMap<String, String>,
     archive_timestamps: HashMap<String, u64>,
     prekey_tracker: HashMap<String, u32>,
@@ -109,8 +106,8 @@ pub struct SessionLifecycleManager {
     pub ack_store: AckStore,
     pub healing_queue: HealingQueue,
     pub pq_manager: PQContributionManager,
-    /// contactId → archived session JSON (latest archive only).
-    archives: HashMap<String, String>,
+    /// contactId → archived session CFE binary (latest archive only).
+    archives: HashMap<String, Vec<u8>>,
     /// contactId → Unix timestamp of the archive (for GC).
     archive_timestamps: HashMap<String, u64>,
     /// contactId → last seen OTPK ID (used to detect reinstall).
@@ -148,70 +145,6 @@ impl SessionLifecycleManager {
             my_user_id,
             clock,
         }
-    }
-
-    // ── Archive integrity (HMAC-SHA256) ─────────────────────────────────────
-    //
-    // Archives are session-state blobs stored in Keychain. Bit-rot, partial
-    // writes during a crash, or Keychain corruption can silently produce a
-    // malformed JSON that confuses the Double-Ratchet importer and sends the
-    // session into an endless heal loop. We protect against this by wrapping
-    // the JSON in an HMAC envelope using the device identity key.
-    //
-    // Envelope format:  "<hex(hmac32)>:<json>"
-    // The colon is safe as a separator because JSON never starts with `:`.
-
-    /// Returns the device identity secret key bytes used to sign archive envelopes.
-    /// Fails if the key is unavailable (e.g. Keychain locked after reboot).
-    /// Callers must NOT fall back to any public material — an integrity check
-    /// computed with a known value (like user_id) provides no security guarantee.
-    fn identity_key_bytes(&self) -> Result<Vec<u8>, String> {
-        let km = self.client.key_manager();
-        km.identity_secret_key()
-            .map(|secret| <_ as AsRef<[u8]>>::as_ref(secret).to_vec())
-            .map_err(|e| format!("identity key unavailable for HMAC: {e}"))
-    }
-
-    fn hmac_sign(&self, data: &[u8]) -> Result<[u8; 32], String> {
-        let key = self.identity_key_bytes()?;
-        let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
-        mac.update(data);
-        let result = mac.finalize().into_bytes();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
-        Ok(out)
-    }
-
-    fn wrap_archive(&self, json: &str) -> Result<String, String> {
-        let mac = self.hmac_sign(json.as_bytes())?;
-        Ok(format!("{}:{}", hex::encode(mac), json))
-    }
-
-    /// Verify envelope integrity and return the inner JSON.
-    /// Returns `Err` if the identity key is unavailable, the envelope is
-    /// malformed, or the HMAC does not match.
-    fn unwrap_archive<'a>(&self, envelope: &'a str) -> Result<&'a str, String> {
-        // Legacy archives (created before this check was added) have no `:`
-        // prefix with a 64-char hex tag. Accept them as-is to avoid breaking
-        // existing users on upgrade; they will be re-written with a valid MAC
-        // on the next `archive_session` call.
-        let Some(colon_pos) = envelope.find(':') else {
-            return Ok(envelope); // legacy — no MAC prefix
-        };
-        let maybe_hex = &envelope[..colon_pos];
-        if maybe_hex.len() != 64 || !maybe_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(envelope); // legacy JSON that happens to contain a colon
-        }
-        let json = &envelope[colon_pos + 1..];
-        let expected = self.hmac_sign(json.as_bytes())?;
-        let actual =
-            hex::decode(maybe_hex).map_err(|e| format!("archive MAC decode error: {e}"))?;
-        if actual != expected.as_ref() {
-            return Err(
-                "archive integrity check failed — possible Keychain corruption".to_string(),
-            );
-        }
-        Ok(json)
     }
 
     // ── Session queries ───────────────────────────────────────────────────────
@@ -261,10 +194,10 @@ impl SessionLifecycleManager {
             serde_json::to_string(&wire).map_err(|e| format!("serialize: {}", e))?;
 
         // Always save updated session state after encrypt.
-        let session_json = self.export_session_json_for(contact_id)?;
+        let session_bytes = self.export_session_bytes_for(contact_id)?;
         let actions = vec![Action::SaveSessionToSecureStore {
             key: session_key(contact_id),
-            data: session_json.into_bytes(),
+            data: session_bytes,
         }];
 
         Ok(EncryptResult {
@@ -294,10 +227,10 @@ impl SessionLifecycleManager {
         let plaintext = self.client.decrypt_message(contact_id, &msg)?;
 
         // Persist updated session state.
-        let session_json = self.export_session_json_for(contact_id)?;
+        let session_bytes = self.export_session_bytes_for(contact_id)?;
         let actions = vec![Action::SaveSessionToSecureStore {
             key: session_key(contact_id),
-            data: session_json.into_bytes(),
+            data: session_bytes,
         }];
 
         Ok(DecryptResult { plaintext, actions })
@@ -342,10 +275,10 @@ impl SessionLifecycleManager {
 
         let plaintext = self.client.decrypt_message(contact_id, &msg)?;
 
-        let session_json = self.export_session_json_for(contact_id)?;
+        let session_bytes = self.export_session_bytes_for(contact_id)?;
         let actions = vec![Action::SaveSessionToSecureStore {
             key: session_key(contact_id),
-            data: session_json.into_bytes(),
+            data: session_bytes,
         }];
 
         Ok(DecryptResult { plaintext, actions })
@@ -358,17 +291,8 @@ impl SessionLifecycleManager {
     ///
     /// Returns `Action`s to persist the archive and delete the hot session.
     pub fn archive_session(&mut self, contact_id: &str) -> Vec<Action> {
-        let json = match self.export_session_json_for(contact_id) {
-            Ok(j) => j,
-            Err(_) => return vec![],
-        };
-
-        // Wrap with HMAC to detect Keychain corruption on restore.
-        // If the identity key is unavailable (e.g. Keychain locked), we cannot
-        // create an integrity-checked archive — return empty rather than storing
-        // an unprotected blob that would silently pass HMAC verification later.
-        let envelope = match self.wrap_archive(&json) {
-            Ok(e) => e,
+        let cfe_bytes = match self.export_session_bytes_for(contact_id) {
+            Ok(b) => b,
             Err(e) => {
                 tracing::error!("archive_session: {e} — session NOT archived");
                 return vec![];
@@ -376,7 +300,7 @@ impl SessionLifecycleManager {
         };
 
         self.archives
-            .insert(contact_id.to_string(), envelope.clone());
+            .insert(contact_id.to_string(), cfe_bytes.clone());
         self.archive_timestamps
             .insert(contact_id.to_string(), self.clock.now_secs());
         self.client.remove_session(contact_id);
@@ -385,7 +309,7 @@ impl SessionLifecycleManager {
             // Persist archive under a separate key.
             Action::SaveSessionToSecureStore {
                 key: archive_key(contact_id),
-                data: envelope.into_bytes(),
+                data: cfe_bytes,
             },
             // Delete the hot session from secure store.
             Action::SaveSessionToSecureStore {
@@ -397,41 +321,21 @@ impl SessionLifecycleManager {
 
     /// Restore the latest archive for `contact_id` into the active session map.
     ///
-    /// The archive JSON must already be in memory (either via a previous
-    /// `archive_session` call or loaded from the platform store via
-    /// `load_archive_json`).
+    /// The archive bytes must already be in memory (either via a previous
+    /// `archive_session` call or loaded via `load_archive_bytes`).
     pub fn restore_latest_archive(&mut self, contact_id: &str) -> Result<(), String> {
-        let envelope = self
+        let cfe_bytes = self
             .archives
             .get(contact_id)
             .cloned()
             .ok_or_else(|| format!("No archive for {}", contact_id))?;
-        let json = self.unwrap_archive(&envelope)?;
-        self.import_session_json(contact_id, json)?;
-        Ok(())
+        self.import_session_bytes(contact_id, &cfe_bytes)
     }
 
-    /// Feed an archive JSON/envelope loaded from the platform secure store into memory.
-    pub fn load_archive_json(&mut self, contact_id: &str, envelope: &str) {
-        match self.unwrap_archive(envelope) {
-            Ok(json) => {
-                let _ = self.import_session_json(contact_id, json);
-            }
-            Err(e) => {
-                let _ = e;
-            }
-        }
-        self.archives
-            .insert(contact_id.to_string(), envelope.to_string());
-    }
-
-    /// Feed an archive from CFE binary bytes into memory (preferred over `load_archive_json`).
+    /// Feed an archive CFE binary loaded from the platform secure store into memory.
     pub fn load_archive_bytes(&mut self, contact_id: &str, data: Vec<u8>) {
-        // Decode CFE binary → import session (has LegacyJson fallback inside import_session).
-        if let Ok(json_str) = self.import_session_bytes(contact_id, &data) {
-            // Mirror into the JSON archive map so restore_latest_archive still works.
-            self.archives.insert(contact_id.to_string(), json_str);
-        }
+        self.archives.insert(contact_id.to_string(), data.clone());
+        let _ = self.import_session_bytes(contact_id, &data);
     }
 
     /// Garbage-collect archives older than 24 h.
@@ -520,7 +424,11 @@ impl SessionLifecycleManager {
     pub fn export_state_json(&self) -> Result<String, String> {
         let state = LifecycleState {
             my_user_id: self.my_user_id.clone(),
-            archives: self.archives.clone(),
+            archives: self
+                .archives
+                .iter()
+                .map(|(k, v)| (k.clone(), hex::encode(v)))
+                .collect(),
             archive_timestamps: self.archive_timestamps.clone(),
             prekey_tracker: self.prekey_tracker.clone(),
         };
@@ -532,7 +440,11 @@ impl SessionLifecycleManager {
         let state: LifecycleState =
             serde_json::from_str(json).map_err(|e| format!("import_state_json: {}", e))?;
         self.my_user_id = state.my_user_id;
-        self.archives = state.archives;
+        self.archives = state
+            .archives
+            .into_iter()
+            .map(|(k, v)| (k, hex::decode(&v).unwrap_or_default()))
+            .collect();
         self.archive_timestamps = state.archive_timestamps;
         self.prekey_tracker = state.prekey_tracker;
         Ok(())
@@ -567,7 +479,6 @@ impl SessionLifecycleManager {
         use crate::cfe::{
             CfeAckRecordV1, CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1,
         };
-        use base64::Engine as _;
 
         let state = CfeOrchestratorStateV1 {
             ver: 1,
@@ -584,8 +495,7 @@ impl SessionLifecycleManager {
                 .into_iter()
                 .map(|r| CfeHealingRecordV1 {
                     contact_id: r.contact_id.clone(),
-                    message_b64: base64::engine::general_purpose::STANDARD
-                        .encode(&r.message_payload),
+                    message_bytes: r.message_payload.clone(),
                     attempts: r.attempts,
                     incoming_triggers: r.incoming_triggers,
                     created_at: r.created_at,
@@ -595,7 +505,7 @@ impl SessionLifecycleManager {
             archives: self
                 .archives
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), serde_bytes::ByteBuf::from(v.clone())))
                 .collect(),
             archive_timestamps: self
                 .archive_timestamps
@@ -622,7 +532,6 @@ impl SessionLifecycleManager {
     ) -> Result<std::collections::HashSet<String>, String> {
         use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
         use crate::orchestration::healing_queue::HealingRecord;
-        use base64::Engine as _;
 
         let state = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
             data,
@@ -646,9 +555,7 @@ impl SessionLifecycleManager {
                 .into_iter()
                 .map(|r| HealingRecord {
                     contact_id: r.contact_id,
-                    message_payload: base64::engine::general_purpose::STANDARD
-                        .decode(&r.message_b64)
-                        .unwrap_or_default(),
+                    message_payload: r.message_bytes,
                     attempts: r.attempts,
                     incoming_triggers: r.incoming_triggers,
                     created_at: r.created_at,
@@ -657,7 +564,11 @@ impl SessionLifecycleManager {
         );
 
         // Restore archive index and prekey tracker.
-        self.archives = state.archives.into_iter().collect();
+        self.archives = state
+            .archives
+            .into_iter()
+            .map(|(k, v)| (k, v.into_vec()))
+            .collect();
         self.archive_timestamps = state.archive_timestamps.into_iter().collect();
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
 
@@ -676,6 +587,19 @@ impl SessionLifecycleManager {
         serde_json::to_string(&serializable).map_err(|e| format!("serialize session: {}", e))
     }
 
+    /// Export the session as a CFE binary blob (MessagePack, no JSON intermediate).
+    /// Prefer this over `export_session_json_for` wherever bytes are needed.
+    pub fn export_session_bytes_for(&self, contact_id: &str) -> Result<Vec<u8>, String> {
+        let session = self
+            .client
+            .get_session(contact_id)
+            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
+        let serializable = session.messaging_session().to_serializable();
+        let cfe_state = serializable.to_cfe_v1()?;
+        crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &cfe_state)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
@@ -687,13 +611,8 @@ impl SessionLifecycleManager {
         Ok(session_id)
     }
 
-    /// Import a session from CFE binary bytes (preferred over `import_session_json`).
-    /// Returns the JSON-serialised session string for archive mirroring.
-    pub fn import_session_bytes(
-        &mut self,
-        contact_id: &str,
-        data: &[u8],
-    ) -> Result<String, String> {
+    /// Import a session from CFE binary bytes.
+    pub fn import_session_bytes(&mut self, contact_id: &str, data: &[u8]) -> Result<(), String> {
         use crate::cfe::{CfeError, CfeMessageType, decode_as};
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
@@ -708,13 +627,10 @@ impl SessionLifecycleManager {
                 Err(e) => return Err(format!("decode_as: {}", e)),
             };
 
-        // Mirror into JSON archive map for restore_latest_archive compat.
-        let json =
-            serde_json::to_string(&serializable).map_err(|e| format!("re-serialize: {}", e))?;
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
         self.client.import_session(contact_id, ratchet);
-        Ok(json)
+        Ok(())
     }
 }
 
@@ -800,7 +716,8 @@ mod tests {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
         // Inject an archive with a stale timestamp.
-        mgr.archives.insert("bob".to_string(), "{}".to_string());
+        mgr.archives
+            .insert("bob".to_string(), b"placeholder".to_vec());
         mgr.archive_timestamps.insert("bob".to_string(), 0);
 
         let actions = mgr.gc_old_archives();
@@ -812,7 +729,8 @@ mod tests {
     fn test_gc_keeps_fresh_archives() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.archives.insert("bob".to_string(), "{}".to_string());
+        mgr.archives
+            .insert("bob".to_string(), b"placeholder".to_vec());
         mgr.archive_timestamps.insert("bob".to_string(), unix_now());
 
         mgr.gc_old_archives();
@@ -834,7 +752,8 @@ mod tests {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
         mgr.track_prekey("bob", 5);
-        mgr.archives.insert("carol".to_string(), "{}".to_string());
+        mgr.archives
+            .insert("carol".to_string(), b"placeholder".to_vec());
 
         let json = mgr.export_state_json().unwrap();
         assert!(json.contains("alice"));
@@ -880,5 +799,154 @@ mod tests {
         assert_eq!(restored.dh_public_key, original.dh_public_key);
         assert_eq!(restored.message_number, original.message_number);
         assert_eq!(restored.ciphertext, original.ciphertext);
+    }
+
+    /// Establish a real X3DH session between two lifecycle managers.
+    /// Returns (alice_mgr, bob_mgr, alice_device_id, bob_device_id).
+    fn make_session_pair() -> (
+        SessionLifecycleManager,
+        SessionLifecycleManager,
+        String,
+        String,
+    ) {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+        use crate::device_id::derive_device_id;
+
+        let alice_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut alice = SessionLifecycleManager::new(alice_client, "alice".to_string());
+
+        let bob_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut bob = SessionLifecycleManager::new(bob_client, "bob".to_string());
+
+        // Exchange registration bundles.
+        let bob_bundle = bob.client.get_registration_bundle().unwrap();
+        let bob_identity = bob
+            .client
+            .key_manager()
+            .identity_public_key()
+            .unwrap()
+            .clone();
+        let bob_device_id = derive_device_id(&bob_bundle.identity_public);
+
+        let alice_bundle = alice.client.get_registration_bundle().unwrap();
+        let _alice_identity = alice
+            .client
+            .key_manager()
+            .identity_public_key()
+            .unwrap()
+            .clone();
+        let alice_device_id = derive_device_id(&alice_bundle.identity_public);
+
+        alice.client.set_local_user_id(alice_device_id.clone());
+        bob.client.set_local_user_id(bob_device_id.clone());
+
+        // Alice → Bob: X3DH init.
+        let bob_x3dh = X3DHPublicKeyBundle {
+            identity_public: bob_bundle.identity_public.clone(),
+            signed_prekey_public: bob_bundle.signed_prekey_public.clone(),
+            signature: bob_bundle.signature.clone(),
+            verifying_key: bob_bundle.verifying_key.clone(),
+            suite_id: bob_bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+        };
+        alice
+            .client
+            .init_session(&bob_device_id, &bob_x3dh, &bob_identity, 0)
+            .unwrap();
+
+        // Alice encrypts first message.
+        let first_msg = alice
+            .client
+            .encrypt_message(&bob_device_id, b"hello")
+            .unwrap();
+
+        // Bob initialises receiving session.
+        bob.client
+            .init_receiving_session(&alice_device_id, &alice_bundle, &first_msg)
+            .unwrap();
+
+        (alice, bob, alice_device_id, bob_device_id)
+    }
+
+    #[test]
+    fn test_export_session_bytes_for_produces_valid_cfe() {
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+        // Must start with CFE magic.
+        assert_eq!(&bytes[..2], b"CF");
+        // Must be decodable back to CfeSessionStateV1.
+        let state = crate::cfe::decode_as::<crate::cfe::CfeSessionStateV1>(
+            &bytes,
+            crate::cfe::CfeMessageType::SessionState,
+        )
+        .unwrap();
+        assert_eq!(state.ver, 1);
+        assert!(!state.contact_id.is_empty());
+    }
+
+    #[test]
+    fn test_export_bytes_import_bytes_round_trip() {
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+
+        let alice_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(alice_client, "alice".to_string());
+        restored
+            .import_session_bytes(&bob_device_id, &bytes)
+            .unwrap();
+        assert!(restored.has_active_session(&bob_device_id));
+    }
+
+    #[test]
+    fn test_export_bytes_no_json_intermediate() {
+        // Verify the exported bytes are NOT a JSON string wrapped in CFE
+        // (i.e., the old CfeSessionJsonWrapperV1 path is no longer used).
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+        // Successfully decode as CfeSessionStateV1 (new format).
+        assert!(
+            crate::cfe::decode_as::<crate::cfe::CfeSessionStateV1>(
+                &bytes,
+                crate::cfe::CfeMessageType::SessionState,
+            )
+            .is_ok()
+        );
+        // Must NOT decode as CfeSessionJsonWrapperV1 (old format with JSON inside).
+        assert!(
+            crate::cfe::decode_as::<crate::cfe::CfeSessionJsonWrapperV1>(
+                &bytes,
+                crate::cfe::CfeMessageType::SessionState,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_import_session_bytes_handles_old_json_wrapper_format() {
+        use serde_bytes::ByteBuf;
+        // Simulate data produced by the old export_session_cfe (JSON inside CFE wrapper).
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let json = alice.export_session_json_for(&bob_device_id).unwrap();
+        let wrapper = crate::cfe::CfeSessionJsonWrapperV1 {
+            contact_id: bob_device_id.clone(),
+            json_bytes: ByteBuf::from(json.into_bytes()),
+        };
+        let old_bytes =
+            crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &wrapper).unwrap();
+
+        // import_session_bytes handles CfeSessionStateV1 and LegacyJson only.
+        // CfeSessionJsonWrapperV1 (old orchestrator format) is handled by import_session_cfe.
+        let alice_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(alice_client, "alice".to_string());
+        let result = restored.import_session_bytes(&bob_device_id, &old_bytes);
+        assert!(
+            result.is_err(),
+            "import_session_bytes does not handle CfeSessionJsonWrapperV1 — use import_session_cfe"
+        );
     }
 }

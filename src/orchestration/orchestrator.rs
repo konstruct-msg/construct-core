@@ -804,45 +804,56 @@ impl Orchestrator {
 
     /// Export a session as a CFE binary blob (MessagePack + CRC32 header).
     /// Falls back gracefully from JSON if needed by the caller.
+    /// Export a session as a CFE binary blob (MessagePack, no JSON intermediate).
     pub fn export_session_cfe(&self, contact_id: &str) -> Result<Vec<u8>, String> {
-        use serde_bytes::ByteBuf;
-
-        let json = self
-            .lifecycle
-            .export_session_json_for(contact_id)
-            .map_err(|e| e.to_string())?;
-
-        let payload = crate::cfe::CfeSessionJsonWrapperV1 {
-            contact_id: contact_id.to_string(),
-            json_bytes: ByteBuf::from(json.into_bytes()),
-        };
-        crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
-            .map_err(|e| e.to_string())
+        self.lifecycle.export_session_bytes_for(contact_id)
     }
 
-    /// Import a session from a CFE binary blob, or fall back to raw JSON.
-    /// Returns the session ID string on success.
+    /// Import a session from a CFE binary blob.
+    ///
+    /// Tries formats in order:
+    /// 1. `CfeSessionStateV1` — current binary format (new sessions)
+    /// 2. `CfeSessionJsonWrapperV1` — old format (JSON inside CFE, pre-migration sessions)
+    /// 3. Raw JSON bytes — legacy fallback (very old sessions)
     pub fn import_session_cfe(&mut self, contact_id: &str, data: &[u8]) -> Result<String, String> {
-        let json = match crate::cfe::decode_as::<crate::cfe::CfeSessionJsonWrapperV1>(
-            data,
-            crate::cfe::CfeMessageType::SessionState,
-        ) {
-            Ok(s) => {
-                // Borrow bytes directly — avoids String allocation before passing to import_session_json
-                let json_str = std::str::from_utf8(&s.json_bytes).map_err(|e| e.to_string())?;
-                return self
-                    .lifecycle
-                    .import_session_json(contact_id, json_str)
-                    .map_err(|e| e.to_string());
-            }
-            Err(crate::cfe::CfeError::LegacyJson) => std::str::from_utf8(data)
-                .map_err(|e| e.to_string())?
-                .to_string(),
-            Err(e) => return Err(e.to_string()),
-        };
-        self.lifecycle
-            .import_session_json(contact_id, &json)
-            .map_err(|e| e.to_string())
+        use crate::cfe::{CfeError, CfeMessageType, decode_as};
+        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
+
+        let serializable: SerializableSession =
+            match decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState) {
+                Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
+                    .map_err(|e| format!("from_cfe_v1: {}", e))?,
+                Err(CfeError::DeserializeFailed(_)) => {
+                    // Valid CFE but wrong schema — try old JSON-wrapper format.
+                    match decode_as::<crate::cfe::CfeSessionJsonWrapperV1>(
+                        data,
+                        CfeMessageType::SessionState,
+                    ) {
+                        Ok(wrapper) => {
+                            let json_str = std::str::from_utf8(&wrapper.json_bytes)
+                                .map_err(|e| e.to_string())?;
+                            serde_json::from_str(json_str)
+                                .map_err(|e| format!("json wrapper fallback: {}", e))?
+                        }
+                        Err(CfeError::LegacyJson) => {
+                            let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                            serde_json::from_str(s)
+                                .map_err(|e| format!("raw json fallback: {}", e))?
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Err(CfeError::LegacyJson) => {
+                    let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
+                    serde_json::from_str(s).map_err(|e| format!("raw json fallback: {}", e))?
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+
+        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
+            .map_err(|e| format!("from_serializable: {}", e))?;
+        let session_id = self.lifecycle.client.import_session(contact_id, ratchet);
+        Ok(session_id)
     }
     pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
         use base64::Engine as _;
@@ -1278,10 +1289,10 @@ impl Orchestrator {
 
         // Save the session to secure store.
         let mut actions = vec![];
-        if let Ok(json) = self.lifecycle.export_state_json() {
+        if let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
             actions.push(Action::SaveSessionToSecureStore {
                 key: crate::orchestration::session_lifecycle::session_key(&contact_id),
-                data: json.into_bytes(),
+                data: bytes,
             });
         }
 
@@ -1318,8 +1329,8 @@ impl Orchestrator {
             .to_string();
 
         if let Some(bytes) = data {
-            if let Ok(json) = std::str::from_utf8(&bytes) {
-                self.lifecycle.load_archive_json(&contact_id, json);
+            if !bytes.is_empty() {
+                self.lifecycle.load_archive_bytes(&contact_id, bytes);
             }
         }
         vec![]

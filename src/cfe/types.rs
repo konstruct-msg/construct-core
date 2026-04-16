@@ -256,9 +256,9 @@ pub struct CfeHealingRecordV1 {
     /// Contact whose session needs healing.
     #[serde(rename = "cid")]
     pub contact_id: String,
-    /// Base64-encoded binary WirePayload waiting for replay.
-    #[serde(rename = "msg")]
-    pub message_b64: String,
+    /// Binary WirePayload waiting for replay.
+    #[serde(rename = "msg", with = "serde_bytes")]
+    pub message_bytes: Vec<u8>,
     /// Number of healing attempts already made (0-based).
     #[serde(rename = "att")]
     pub attempts: u32,
@@ -301,9 +301,9 @@ pub struct CfeOrchestratorStateV1 {
     /// Contact IDs for which a session-init RPC is currently in flight.
     #[serde(rename = "locks")]
     pub init_locks: Vec<String>,
-    /// contactId → archived session JSON (latest archive per contact).
+    /// contactId → archived session CFE binary (latest archive per contact).
     #[serde(rename = "arcs")]
-    pub archives: Vec<(String, String)>,
+    pub archives: Vec<(String, serde_bytes::ByteBuf)>,
     /// contactId → Unix timestamp of the archive (for GC).
     #[serde(rename = "arc_ts")]
     pub archive_timestamps: Vec<(String, u64)>,
