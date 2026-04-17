@@ -6,8 +6,18 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 pub use crate::orchestration::PlatformBridge;
 use base64::Engine as _;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+
+/// Generate a cryptographically random 32-byte storage key.
+/// Each encrypt/decrypt call gets a unique key stored in MessageKeyStore on the Swift side.
+/// Deleting the key permanently prevents decryption of the corresponding local ciphertext copy.
+fn gen_storage_key() -> Vec<u8> {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    key.to_vec()
+}
 
 // Wrapper for Client to make it work with UniFFI
 // Note: We use UDL definition, not derive macro
@@ -91,6 +101,16 @@ pub struct EncryptedMessageComponents {
     pub message_number: u32,
     pub content: Vec<u8>,        // raw bytes: nonce || ciphertext_with_tag
     pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
+    pub storage_key: Vec<u8>,    // 32-byte random key — caller must store in MessageKeyStore
+}
+
+// Result of decrypting a message: plaintext + per-message storage key.
+// The caller (Swift) must store `storage_key` in MessageKeyStore keyed by message_id.
+// Deleting the key from MessageKeyStore permanently prevents decryption of the local copy.
+#[derive(Debug, Clone)]
+pub struct DecryptedMessageResult {
+    pub plaintext: Vec<u8>,
+    pub storage_key: Vec<u8>, // 32-byte random key — caller must store in MessageKeyStore
 }
 
 // Session initialization result with decrypted first message
@@ -99,6 +119,7 @@ pub struct EncryptedMessageComponents {
 pub struct SessionInitResult {
     pub session_id: String,
     pub decrypted_message: String, // UTF-8 decoded plaintext
+    pub storage_key: Vec<u8>,      // 32-byte random key for the first received message
 }
 
 /// One-time prekey pair for upload to server
@@ -823,6 +844,7 @@ impl ClassicCryptoCore {
         Ok(SessionInitResult {
             session_id: contact_id,
             decrypted_message,
+            storage_key: gen_storage_key(),
         })
     }
 
@@ -882,6 +904,7 @@ impl ClassicCryptoCore {
             message_number: encrypted_message.message_number,
             content: sealed_box,
             one_time_prekey_id,
+            storage_key: gen_storage_key(),
         })
     }
 
@@ -892,7 +915,7 @@ impl ClassicCryptoCore {
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: Vec<u8>,
-    ) -> Result<String, CryptoError> {
+    ) -> Result<DecryptedMessageResult, CryptoError> {
         let sealed_box = content;
 
         // Extract nonce (first 12 bytes) and ciphertext (rest)
@@ -924,7 +947,7 @@ impl ClassicCryptoCore {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let plaintext_bytes = client
+        let plaintext = client
             .decrypt_message(contact_id, &encrypted_message)
             .map_err(|e| {
                 tracing::error!(
@@ -939,8 +962,9 @@ impl ClassicCryptoCore {
                 }
             })?;
 
-        String::from_utf8(plaintext_bytes).map_err(|e| CryptoError::DecryptionFailed {
-            message: format!("UTF-8 conversion failed: {}", e),
+        Ok(DecryptedMessageResult {
+            plaintext,
+            storage_key: gen_storage_key(),
         })
     }
 
@@ -1820,7 +1844,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            decrypted_reply, reply_plaintext,
+            decrypted_reply.plaintext,
+            reply_plaintext.as_bytes(),
             "Alice should decrypt Bob's reply correctly"
         );
     }
@@ -1900,7 +1925,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(decrypted, "Reply");
+        assert_eq!(decrypted.plaintext, b"Reply");
     }
 
     /// Simple test using Client API directly (bypassing UniFFI)
@@ -2555,6 +2580,7 @@ impl OrchestratorCore {
         Ok(SessionInitResult {
             session_id,
             decrypted_message,
+            storage_key: gen_storage_key(),
         })
     }
 
@@ -2572,6 +2598,7 @@ impl OrchestratorCore {
             message_number,
             content,
             one_time_prekey_id,
+            storage_key: gen_storage_key(),
         })
     }
 
@@ -2581,10 +2608,15 @@ impl OrchestratorCore {
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: Vec<u8>,
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<DecryptedMessageResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)
-            .map_err(|e| CryptoError::DecryptionFailed { message: e })
+        let plaintext = orch
+            .decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)
+            .map_err(|e| CryptoError::DecryptionFailed { message: e })?;
+        Ok(DecryptedMessageResult {
+            plaintext,
+            storage_key: gen_storage_key(),
+        })
     }
 
     pub fn remove_session(&self, contact_id: String) -> bool {

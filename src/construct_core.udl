@@ -60,11 +60,18 @@ dictionary EncryptedMessageComponents {
     u32 message_number;
     sequence<u8> content;
     u32 one_time_prekey_id;
+    sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
 dictionary SessionInitResult {
     string session_id;
     string decrypted_message;
+    sequence<u8> storage_key;  // 32-byte random key for the first received message
+};
+
+dictionary DecryptedMessageResult {
+    sequence<u8> plaintext;
+    sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
 dictionary PrivateKeysJson {
@@ -154,7 +161,7 @@ interface ClassicCryptoCore {
     EncryptedMessageComponents encrypt_message(string session_id, string plaintext);
 
     [Throws=CryptoError]
-    string decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+    DecryptedMessageResult decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
 
     boolean remove_session(string contact_id);
 
@@ -621,7 +628,7 @@ interface OrchestratorCore {
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
 
     [Throws=CryptoError]
-    bytes decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+    DecryptedMessageResult decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
 
     boolean remove_session(string contact_id);
 
