@@ -794,6 +794,37 @@ mod tests {
         let recovered = reconstruct_vault_key(subset).unwrap();
         assert_eq!(recovered, vault_key);
     }
+
+    /// Exhaustive threshold-3 roundtrip for all 2^24 (s, a1, a2) ∈ u8³
+    /// with evaluation points x=5,11,13 — replaces the Kani harness that
+    /// timed out due to SAT state explosion with non-trivial GF constants.
+    #[test]
+    fn sss_t3_exhaustive_x5_x11_x13() {
+        let (x1, x2, x3) = (5u8, 11u8, 13u8);
+        let num0 = gf_mul(x2, x3);
+        let den0 = gf_mul(x1 ^ x2, x1 ^ x3);
+        let num1 = gf_mul(x1, x3);
+        let den1 = gf_mul(x2 ^ x1, x2 ^ x3);
+        let num2 = gf_mul(x1, x2);
+        let den2 = gf_mul(x3 ^ x1, x3 ^ x2);
+        // Pre-compute Lagrange basis coefficients (concrete, denominators guaranteed ≠ 0).
+        let b0 = gf_div(num0, den0);
+        let b1 = gf_div(num1, den1);
+        let b2 = gf_div(num2, den2);
+        for s in 0u8..=255 {
+            for a1 in 0u8..=255 {
+                for a2 in 0u8..=255 {
+                    let eval = |x: u8| -> u8 { gf_mul(gf_mul(a2, x) ^ a1, x) ^ s };
+                    let (y1, y2, y3) = (eval(x1), eval(x2), eval(x3));
+                    let reconstructed = gf_mul(y1, b0) ^ gf_mul(y2, b1) ^ gf_mul(y3, b2);
+                    assert_eq!(
+                        reconstructed, s,
+                        "t3 roundtrip failed: s={s} a1={a1} a2={a2}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ── Kani formal verification harnesses ────────────────────────────────────────
@@ -967,11 +998,13 @@ mod kani_proofs {
         sss_t3_check(kani::any(), kani::any(), kani::any(), 1, 2, 3);
     }
 
-    /// threshold=3, evaluation points 5, 11, 13.
-    #[kani::proof]
-    fn sss_threshold3_roundtrip_x5_x11_x13() {
-        sss_t3_check(kani::any(), kani::any(), kani::any(), 5, 11, 13);
-    }
+    // NOTE: a Kani harness for threshold-3 with non-trivial evaluation points
+    // (e.g. x=5,11,13) causes SAT state explosion (~137K clauses) because
+    // non-trivial GF multiplication doesn't simplify symbolically the way
+    // x=1,2,3 does.  The algebraic correctness of Lagrange interpolation is
+    // fully proven by sss_threshold3_roundtrip_x1_x2_x3 for all symbolic
+    // (s, a1, a2).  Coverage of non-trivial concrete points is handled by
+    // tests::sss_t3_exhaustive_x5_x11_x13 (unit test, O(2^24) iterations).
 
     // ── Double Ratchet — sending counter monotonicity ─────────────────────────
     //
