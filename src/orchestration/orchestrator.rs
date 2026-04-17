@@ -1219,10 +1219,10 @@ impl Orchestrator {
             message_id,
             content_type,
         }];
-        if let Ok(session_json) = self.lifecycle.export_session_json_for(&contact_id) {
+        if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
             actions.push(Action::SaveSessionToSecureStore {
                 key: format!("session_{}", contact_id),
-                data: session_json.into_bytes(),
+                data: session_bytes,
             });
         }
         actions
@@ -1247,10 +1247,10 @@ impl Orchestrator {
                     content_type: 12,
                 }];
                 // Persist updated DR session state after encrypt.
-                if let Ok(session_json) = self.lifecycle.export_session_json_for(&contact_id) {
+                if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
                     actions.push(Action::SaveSessionToSecureStore {
                         key: format!("session_{}", contact_id),
-                        data: session_json.into_bytes(),
+                        data: session_bytes,
                     });
                 }
                 actions
@@ -1274,17 +1274,9 @@ impl Orchestrator {
 
         // Import the newly created session from CFE binary (or JSON legacy fallback).
         if !session_data.is_empty() {
-            // Try binary first, fall back to legacy JSON interpretation.
-            if self
+            let _ = self
                 .lifecycle
-                .import_session_bytes(&contact_id, &session_data)
-                .is_err()
-            {
-                // Treat bytes as UTF-8 JSON for backward compat.
-                if let Ok(json) = std::str::from_utf8(&session_data) {
-                    let _ = self.lifecycle.import_session_json(&contact_id, json);
-                }
-            }
+                .import_session_bytes(&contact_id, &session_data);
         }
 
         // Save the session to secure store.

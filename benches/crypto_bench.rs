@@ -190,6 +190,11 @@ fn bench_session_serialize(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("to_json_legacy", |b| {
+        let (alice, _) = setup_sessions();
+        b.iter(|| serde_json::to_string(&alice.to_serializable()).expect("json failed"));
+    });
+
     group.bench_function("from_cfe_v1", |b| {
         let (alice, _) = setup_sessions();
         let cfe = alice
@@ -199,6 +204,17 @@ fn bench_session_serialize(c: &mut Criterion) {
         b.iter(|| {
             use construct_core::crypto::messaging::SerializableSession;
             let snap = SerializableSession::from_cfe_v1(cfe.clone()).expect("from_cfe_v1 failed");
+            DoubleRatchetSession::<Provider>::from_serializable(snap)
+                .expect("from_serializable failed")
+        });
+    });
+
+    group.bench_function("from_json_legacy", |b| {
+        let (alice, _) = setup_sessions();
+        let json = serde_json::to_string(&alice.to_serializable()).expect("json failed");
+        b.iter(|| {
+            use construct_core::crypto::messaging::SerializableSession;
+            let snap: SerializableSession = serde_json::from_str(&json).expect("json parse failed");
             DoubleRatchetSession::<Provider>::from_serializable(snap)
                 .expect("from_serializable failed")
         });

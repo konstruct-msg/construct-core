@@ -949,4 +949,17 @@ mod tests {
             "import_session_bytes does not handle CfeSessionJsonWrapperV1 — use import_session_cfe"
         );
     }
+
+    #[test]
+    fn print_session_payload_sizes() {
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let cfe_bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+        let json_str = alice.export_session_json_for(&bob_device_id).unwrap();
+        eprintln!("CFE bytes: {} bytes", cfe_bytes.len());
+        eprintln!("JSON bytes: {} bytes", json_str.len());
+        eprintln!(
+            "JSON/CFE ratio: {:.1}x",
+            json_str.len() as f64 / cfe_bytes.len() as f64
+        );
+    }
 }
