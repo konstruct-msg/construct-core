@@ -118,8 +118,8 @@ pub struct DecryptedMessageResult {
 #[derive(Debug, Clone)]
 pub struct SessionInitResult {
     pub session_id: String,
-    pub decrypted_message: String, // UTF-8 decoded plaintext
-    pub storage_key: Vec<u8>,      // 32-byte random key for the first received message
+    pub decrypted_message: Vec<u8>, // raw plaintext bytes — may be binary or UTF-8
+    pub storage_key: Vec<u8>,       // 32-byte random key for the first received message
 }
 
 /// One-time prekey pair for upload to server
@@ -829,11 +829,10 @@ impl ClassicCryptoCore {
                 }
             })?;
 
-        // Convert plaintext bytes to UTF-8 string
-        let decrypted_message =
-            String::from_utf8(plaintext_bytes).map_err(|e| CryptoError::DecryptionFailed {
-                message: format!("UTF-8 conversion failed: {}", e),
-            })?;
+        // Keep plaintext as raw bytes — UTF-8 conversion is the caller's responsibility.
+        // Binary content (e.g. old clients sending protobuf as msgNum=0) must NOT prevent
+        // session establishment; the X3DH handshake succeeded regardless of content encoding.
+        let decrypted_message = plaintext_bytes;
 
         tracing::info!(
             "Session initialized, plaintext length: {}",
@@ -1815,7 +1814,8 @@ mod tests {
 
         // First message should be decrypted automatically
         assert_eq!(
-            bob_session_result.decrypted_message, plaintext,
+            bob_session_result.decrypted_message,
+            plaintext.as_bytes(),
             "First message should be decrypted correctly by init_receiving_session"
         );
 
@@ -2573,10 +2573,7 @@ impl OrchestratorCore {
         let (session_id, plaintext) = orch
             .init_receiving_session_with_msg(&contact_id, &recipient_bundle, &first_message)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
-        let decrypted_message =
-            String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptionFailed {
-                message: format!("UTF-8: {}", e),
-            })?;
+        let decrypted_message = plaintext;
         Ok(SessionInitResult {
             session_id,
             decrypted_message,

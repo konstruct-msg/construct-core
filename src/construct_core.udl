@@ -65,7 +65,7 @@ dictionary EncryptedMessageComponents {
 
 dictionary SessionInitResult {
     string session_id;
-    string decrypted_message;
+    sequence<u8> decrypted_message;  // raw plaintext bytes — may be binary or UTF-8
     sequence<u8> storage_key;  // 32-byte random key for the first received message
 };
 
