@@ -79,6 +79,7 @@ pub fn migrate_private_keys_json_str(
         ik_pub: ByteBuf::from(ik_pub),
         vk_pub: ByteBuf::from(vk_pub),
         spk_pub: ByteBuf::from(spk_pub),
+        old_spks: Vec::new(), // legacy JSON doesn't carry old SPKs
     })
 }
 

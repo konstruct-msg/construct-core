@@ -186,6 +186,33 @@ impl<P: CryptoProvider> KeyManager<P> {
         Ok(())
     }
 
+    /// Variant of `initialize_from_keys` that also restores the persisted SPK key id.
+    /// Called by `import_private_keys` so that `next_prekey_id` is consistent with
+    /// the persisted rotation history.
+    pub fn initialize_from_keys_with_id(
+        &mut self,
+        identity_secret_bytes: Vec<u8>,
+        signing_secret_bytes: Vec<u8>,
+        prekey_secret_bytes: Vec<u8>,
+        prekey_signature: Vec<u8>,
+        spk_id: u32,
+    ) -> Result<()> {
+        self.initialize_from_keys(
+            identity_secret_bytes,
+            signing_secret_bytes,
+            prekey_secret_bytes,
+            prekey_signature,
+        )?;
+        if let Some(ref mut store) = self.current_signed_prekey {
+            store.key_id = spk_id;
+        }
+        // Ensure next_prekey_id is ahead of the current key id.
+        if spk_id >= self.next_prekey_id {
+            self.next_prekey_id = spk_id + 1;
+        }
+        Ok(())
+    }
+
     /// Получить identity public key
     pub fn identity_public_key(&self) -> Result<&P::KemPublicKey> {
         self.identity_key.as_ref().map(|k| &k.1).ok_or_else(|| {
@@ -414,6 +441,44 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Количество сохраненных старых prekeys
     pub fn old_prekeys_count(&self) -> usize {
         self.old_prekeys.len()
+    }
+
+    /// Iterate over old prekeys for serialization.
+    pub fn old_prekeys_iter(&self) -> impl Iterator<Item = &PrekeyStore<P>> {
+        self.old_prekeys.values()
+    }
+
+    /// Restore a previously serialized old prekey (called during `import_private_keys`).
+    ///
+    /// Skips entries older than `max_age_seconds` to mirror the in-memory cleanup logic.
+    pub fn add_old_prekey(
+        &mut self,
+        spk_priv_bytes: Vec<u8>,
+        spk_sig: Vec<u8>,
+        key_id: u32,
+        created_at: i64,
+    ) -> Result<()> {
+        let max_age = crate::config::Config::global().prekey_cleanup_period_secs;
+        let now = crate::utils::time::current_timestamp();
+        if now - created_at >= max_age {
+            return Ok(());
+        }
+        let secret = P::kem_private_key_from_bytes(spk_priv_bytes);
+        let public = P::from_private_key_to_public_key(&secret).map_err(ConstructError::Crypto)?;
+        self.old_prekeys.insert(
+            key_id,
+            PrekeyStore {
+                key_pair: (secret, public),
+                signature: spk_sig,
+                created_at,
+                key_id,
+            },
+        );
+        // Advance next_prekey_id so future rotations don't reuse an old id.
+        if key_id >= self.next_prekey_id {
+            self.next_prekey_id = key_id + 1;
+        }
+        Ok(())
     }
 
     // ============================================================================

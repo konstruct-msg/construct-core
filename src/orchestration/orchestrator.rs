@@ -737,6 +737,19 @@ impl Orchestrator {
 
         let spk_id = km.current_signed_prekey_id().unwrap_or(0);
 
+        let old_spks: Vec<crate::cfe::CfeOldSpkV1> = km
+            .old_prekeys_iter()
+            .map(|store| {
+                let priv_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec();
+                crate::cfe::CfeOldSpkV1 {
+                    spk_priv: ByteBuf::from(priv_bytes),
+                    spk_sig: ByteBuf::from(store.signature.clone()),
+                    spk_id: store.key_id,
+                    created_at: store.created_at,
+                }
+            })
+            .collect();
+
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
             ik_priv: ByteBuf::from(ik_priv),
@@ -747,6 +760,7 @@ impl Orchestrator {
             ik_pub: ByteBuf::from(ik_pub),
             vk_pub: ByteBuf::from(vk_pub),
             spk_pub: ByteBuf::from(spk_pub),
+            old_spks,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)

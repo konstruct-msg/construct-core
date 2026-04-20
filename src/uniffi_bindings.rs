@@ -411,6 +411,23 @@ impl ClassicCryptoCore {
 
         let spk_id = client.key_manager().current_signed_prekey_id().unwrap_or(0);
 
+        // Persist old signed-prekeys so that after an app restart the RESPONDER
+        // can still decrypt sessions that the INITIATOR opened using a cached
+        // pre-rotation bundle (the root cause of the AEAD loop).
+        let old_spks: Vec<crate::cfe::CfeOldSpkV1> = client
+            .key_manager()
+            .old_prekeys_iter()
+            .map(|store| {
+                let priv_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec();
+                crate::cfe::CfeOldSpkV1 {
+                    spk_priv: ByteBuf::from(priv_bytes),
+                    spk_sig: ByteBuf::from(store.signature.clone()),
+                    spk_id: store.key_id,
+                    created_at: store.created_at,
+                }
+            })
+            .collect();
+
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
             ik_priv: ByteBuf::from(ik_priv),
@@ -421,6 +438,7 @@ impl ClassicCryptoCore {
             ik_pub: ByteBuf::from(ik_pub),
             vk_pub: ByteBuf::from(vk_pub),
             spk_pub: ByteBuf::from(spk_pub),
+            old_spks,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
@@ -449,11 +467,27 @@ impl ClassicCryptoCore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let local_uid = client.local_user_id().to_string();
-        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+
+        let old_spks_history: Vec<(Vec<u8>, Vec<u8>, u32, i64)> = keys
+            .old_spks
+            .into_iter()
+            .map(|e| {
+                (
+                    e.spk_priv.into_vec(),
+                    e.spk_sig.into_vec(),
+                    e.spk_id,
+                    e.created_at,
+                )
+            })
+            .collect();
+
+        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history(
             keys.ik_priv.into_vec(),
             keys.sk_priv.into_vec(),
             keys.spk_priv.into_vec(),
             keys.spk_sig.into_vec(),
+            keys.spk_id,
+            old_spks_history,
         )
         .map_err(|_| CryptoError::InitializationFailed)?;
 

@@ -214,6 +214,41 @@ where
         })
     }
 
+    /// Variant of `from_keys` that also restores the persisted SPK key id and old SPKs.
+    pub fn from_keys_with_history(
+        identity_secret: Vec<u8>,
+        signing_secret: Vec<u8>,
+        prekey_secret: Vec<u8>,
+        prekey_signature: Vec<u8>,
+        spk_id: u32,
+        old_spks: Vec<(Vec<u8>, Vec<u8>, u32, i64)>, // (priv, sig, id, created_at)
+    ) -> Result<Self, String> {
+        let mut key_manager = KeyManager::<P>::new();
+        key_manager
+            .initialize_from_keys_with_id(
+                identity_secret,
+                signing_secret,
+                prekey_secret,
+                prekey_signature,
+                spk_id,
+            )
+            .map_err(|e| format!("Failed to initialize key manager from keys: {:?}", e))?;
+
+        for (priv_bytes, sig, id, created_at) in old_spks {
+            key_manager
+                .add_old_prekey(priv_bytes, sig, id, created_at)
+                .map_err(|e| format!("Failed to restore old prekey {}: {:?}", id, e))?;
+        }
+
+        Ok(Self {
+            key_manager,
+            sessions: HashMap::new(),
+            pending_otpk_ids: HashMap::new(),
+            local_user_id: String::new(),
+            _phantom: PhantomData,
+        })
+    }
+
     /// Получить registration bundle для отправки на сервер (device-based регистрация)
     ///
     /// Возвращает публичные ключи клиента для регистрации:

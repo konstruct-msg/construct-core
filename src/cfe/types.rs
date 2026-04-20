@@ -71,6 +71,23 @@ impl TryFrom<u8> for CfeMessageType {
 // CFE payload schemas (v1)
 // ============================================================================
 
+/// A previous signed-prekey retained for backward-compatible session init.
+///
+/// Stored in `CfePrivateKeysV1.old_spks` so that after app restart the RESPONDER
+/// can still decrypt sessions that the INITIATOR opened using an older bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeOldSpkV1 {
+    #[serde(rename = "priv")]
+    pub spk_priv: ByteBuf,
+    #[serde(rename = "sig")]
+    pub spk_sig: ByteBuf,
+    #[serde(rename = "id")]
+    pub spk_id: u32,
+    /// Unix timestamp (seconds) when this key was originally created.
+    #[serde(rename = "ts")]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfePrivateKeysV1 {
     #[serde(rename = "suite_id")]
@@ -94,6 +111,11 @@ pub struct CfePrivateKeysV1 {
     pub vk_pub: ByteBuf,
     #[serde(rename = "spk_pub")]
     pub spk_pub: ByteBuf,
+
+    /// Previous signed prekeys retained for cross-restart RESPONDER compatibility.
+    /// Old entries are pruned to `prekey_cleanup_period_secs` on export.
+    #[serde(rename = "old_spks", default, skip_serializing_if = "Vec::is_empty")]
+    pub old_spks: Vec<CfeOldSpkV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
