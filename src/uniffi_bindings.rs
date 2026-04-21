@@ -56,6 +56,11 @@ pub enum CryptoError {
 
     #[error("MessagePack deserialization failed - check format")]
     MessagePackDeserializationFailed,
+
+    /// Peer's Signed Pre-Key is older than the staleness limit (14 days).
+    /// The peer must open their app to trigger SPK rotation before a session can be established.
+    #[error("Peer SPK is stale: age_secs={age_secs}")]
+    PeerSpkStale { age_secs: u64 },
 }
 
 impl From<crate::error::CryptoError> for CryptoError {
@@ -2401,6 +2406,54 @@ pub struct HealingAttemptResult {
 
 // ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
 
+/// Check SPK freshness from raw bundle JSON bytes.
+///
+/// Returns `Err(CryptoError::PeerSpkStale { age_secs })` if the SPK or Kyber SPK is stale
+/// (older than 14 days). Returns `Ok(())` if fresh, absent (legacy server), or unparseable.
+/// Mirrors the logic in `crypto::client_api::validate_bundle_freshness` but runs at the
+/// UniFFI boundary so the error can be surfaced as a typed variant rather than a string.
+fn check_bundle_freshness_raw(bundle: &[u8]) -> Result<(), CryptoError> {
+    #[derive(serde::Deserialize)]
+    struct BundleFreshnessFields {
+        #[serde(default)]
+        spk_uploaded_at: Option<u64>,
+        #[serde(default)]
+        kyber_spk_uploaded_at: Option<u64>,
+    }
+
+    let fields: BundleFreshnessFields = match serde_json::from_slice(bundle) {
+        Ok(f) => f,
+        Err(_) => return Ok(()), // unparseable — let init_session_with_bundle handle it
+    };
+
+    const SPK_MAX_AGE_SECS: u64 = 14 * 24 * 3600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Some(spk_uploaded_at) = fields.spk_uploaded_at {
+        if spk_uploaded_at > 0 {
+            let age = now.saturating_sub(spk_uploaded_at);
+            if age > SPK_MAX_AGE_SECS {
+                return Err(CryptoError::PeerSpkStale { age_secs: age });
+            }
+        }
+    }
+
+    if let Some(kyber_uploaded_at) = fields.kyber_spk_uploaded_at {
+        if kyber_uploaded_at > 0 {
+            let age = now.saturating_sub(kyber_uploaded_at);
+            if age > SPK_MAX_AGE_SECS {
+                // Re-use PeerSpkStale — callers treat both SPK types the same way.
+                return Err(CryptoError::PeerSpkStale { age_secs: age });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub struct OrchestratorCore {
     inner: std::sync::Mutex<crate::orchestration::Orchestrator>,
 }
@@ -2592,6 +2645,11 @@ impl OrchestratorCore {
         contact_id: String,
         recipient_bundle: Vec<u8>,
     ) -> Result<String, CryptoError> {
+        // Check SPK freshness before acquiring the lock.
+        // Surfaces staleness as CryptoError::PeerSpkStale instead of the generic
+        // SessionInitializationFailed, allowing Swift to handle it with a typed catch.
+        check_bundle_freshness_raw(&recipient_bundle)?;
+
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.init_session_with_bundle(&contact_id, &recipient_bundle)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })

@@ -96,6 +96,7 @@ enum CryptoError {
     "InvalidCiphertext",
     "SerializationFailed",
     "MessagePackDeserializationFailed",
+    "PeerSpkStale",
 };
 
 dictionary OtpkPair {
