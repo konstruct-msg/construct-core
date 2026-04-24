@@ -335,7 +335,14 @@ impl SessionLifecycleManager {
     /// Feed an archive CFE binary loaded from the platform secure store into memory.
     pub fn load_archive_bytes(&mut self, contact_id: &str, data: Vec<u8>) {
         self.archives.insert(contact_id.to_string(), data.clone());
-        let _ = self.import_session_bytes(contact_id, &data);
+        if let Err(e) = self.import_session_bytes(contact_id, &data) {
+            tracing::warn!(
+                target: "orchestration::lifecycle",
+                contact_id = %contact_id,
+                error = %e,
+                "load_archive_bytes: import_session_bytes failed — archive stored but session unavailable"
+            );
+        }
     }
 
     /// Garbage-collect archives older than 24 h.
@@ -443,8 +450,12 @@ impl SessionLifecycleManager {
         self.archives = state
             .archives
             .into_iter()
-            .map(|(k, v)| (k, hex::decode(&v).unwrap_or_default()))
-            .collect();
+            .map(|(k, v)| {
+                hex::decode(&v)
+                    .map(|bytes| (k.clone(), bytes))
+                    .map_err(|e| format!("import_state_json: corrupt archive hex for {}: {}", k, e))
+            })
+            .collect::<Result<_, _>>()?;
         self.archive_timestamps = state.archive_timestamps;
         self.prekey_tracker = state.prekey_tracker;
         Ok(())

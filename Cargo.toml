@@ -29,6 +29,8 @@ ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webt
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-ice TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
 mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
+# android = UniFFI JNI bindings (Kotlin) + construct-ice transport
+android = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",

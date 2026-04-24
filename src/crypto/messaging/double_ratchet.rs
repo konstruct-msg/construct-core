@@ -229,7 +229,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step.
         let shared_session_id = derive_shared_session_id::<P>(root_key)
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+            .map_err(|e| format!("INITIATOR: session_id derivation failed: {}", e))?;
 
         tracing::info!(
             target: "crypto::double_ratchet",
@@ -322,7 +322,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step,
         // so both INITIATOR and RESPONDER compute the same value without a round-trip.
         let shared_session_id = derive_shared_session_id::<P>(root_key)
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+            .map_err(|e| format!("RESPONDER: session_id derivation failed: {}", e))?;
 
         tracing::info!(
             target: "crypto::double_ratchet",
@@ -463,10 +463,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         // Associated Data v2: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
         // The session_id is derived from the shared X3DH root key so both sides compute the same value.
-        // For legacy sessions loaded from Keychain (UUID-format session_id), hex::decode will fail
-        // gracefully, falling back to 16 zero bytes — those sessions will fail AEAD and re-negotiate.
-        let session_id_bytes: Vec<u8> =
-            hex::decode(&self.session_id).unwrap_or_else(|_| vec![0u8; 16]);
+        let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
+            format!(
+                "AEAD encrypt: session_id '{}' is not valid hex — session may be corrupt; \
+                 re-initialise the session",
+                &self.session_id
+            )
+        })?;
         let mut associated_data =
             Vec::with_capacity(1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4);
         associated_data.push(2u8); // AD version = 2
@@ -879,8 +882,13 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
         // Reconstruct Associated Data v2: must mirror encrypt() exactly.
         // Decrypt uses contact_id as sender (= local_user_id on encrypt side) and vice versa.
-        let session_id_bytes: Vec<u8> =
-            hex::decode(&self.session_id).unwrap_or_else(|_| vec![0u8; 16]);
+        let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
+            format!(
+                "AEAD decrypt: session_id '{}' is not valid hex — session may be corrupt; \
+                 re-initialise the session",
+                &self.session_id
+            )
+        })?;
         let mut associated_data =
             Vec::with_capacity(1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4);
         associated_data.push(2u8); // AD version = 2

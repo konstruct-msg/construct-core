@@ -1770,6 +1770,8 @@ mod tests {
     fn test_init_session_returns_contact_id() {
         let alice = create_crypto_core().unwrap();
         let bob = create_crypto_core().unwrap();
+        alice.set_local_user_id("alice_user".to_string());
+        bob.set_local_user_id("bob_user_id_123".to_string());
 
         // Get Bob's registration bundle and convert it
         let bob_bundle_json = bob.export_registration_bundle_json().unwrap();
@@ -1794,6 +1796,8 @@ mod tests {
     fn test_full_e2e_encryption_flow() {
         let alice = create_crypto_core().unwrap();
         let bob = create_crypto_core().unwrap();
+        alice.set_local_user_id("alice_user_id".to_string());
+        bob.set_local_user_id("bob_user_id".to_string());
 
         // Get registration bundles and convert them
         let alice_bundle_json = alice.export_registration_bundle_json().unwrap();
@@ -1913,6 +1917,8 @@ mod tests {
     fn test_session_attribute_consistency() {
         let alice = create_crypto_core().unwrap();
         let bob = create_crypto_core().unwrap();
+        alice.set_local_user_id("alice_contact".to_string());
+        bob.set_local_user_id("bob_contact".to_string());
 
         let bob_bundle_json = bob.export_registration_bundle_json().unwrap();
         let alice_bundle_json = alice.export_registration_bundle_json().unwrap();
@@ -1984,6 +1990,8 @@ mod tests {
         // Create Alice and Bob
         let mut alice = TestClient::new().unwrap();
         let mut bob = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
+        bob.set_local_user_id("bob".to_string());
 
         eprintln!("\n[DIRECT TEST] Creating clients...");
 
@@ -2057,6 +2065,8 @@ mod tests {
         // Create Alice and Bob
         let mut alice = TestClient::new().unwrap();
         let mut bob = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
+        bob.set_local_user_id("bob".to_string());
 
         eprintln!("\n[UNIFFI FLOW TEST] Creating clients...");
 

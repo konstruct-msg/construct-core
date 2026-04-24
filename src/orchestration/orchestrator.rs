@@ -1287,10 +1287,24 @@ impl Orchestrator {
         self.init_locks.remove(&contact_id);
 
         // Import the newly created session from CFE binary (or JSON legacy fallback).
+        // If import fails, emit an error action and abort — do not drain the queue
+        // or notify the platform of a session that was never actually created.
         if !session_data.is_empty() {
-            let _ = self
+            if let Err(e) = self
                 .lifecycle
-                .import_session_bytes(&contact_id, &session_data);
+                .import_session_bytes(&contact_id, &session_data)
+            {
+                tracing::error!(
+                    target: "orchestration",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "SessionInitCompleted: import_session_bytes failed — aborting session init"
+                );
+                return vec![Action::NotifyError {
+                    code: "session_import_failed".to_string(),
+                    message: format!("contact={}: {}", contact_id, e),
+                }];
+            }
         }
 
         // Save the session to secure store.

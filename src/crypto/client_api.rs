@@ -323,6 +323,7 @@ where
         one_time_prekey_id: u32,
     ) -> Result<String, String> {
         use tracing::info;
+        self.ensure_local_user_id_set()?;
 
         // Check if session already exists
         if self.sessions.contains_key(contact_id) {
@@ -422,6 +423,7 @@ where
         first_message: &M::EncryptedMessage,
     ) -> Result<(String, Vec<u8>), String> {
         use tracing::info;
+        self.ensure_local_user_id_set()?;
 
         // Check if session already exists
         if self.sessions.contains_key(contact_id) {
@@ -538,6 +540,7 @@ where
         one_time_prekey_id: u32,
     ) -> Result<(String, Vec<u8>), String> {
         use tracing::{info, warn};
+        self.ensure_local_user_id_set()?;
 
         // If a session already exists it was created by the INITIATOR path (we sent
         // first).  Remove it so we can establish the canonical RESPONDER session.
@@ -666,6 +669,7 @@ where
         contact_id: &str,
         plaintext: &[u8],
     ) -> Result<M::EncryptedMessage, String> {
+        self.ensure_local_user_id_set()?;
         let session = self.sessions.get_mut(contact_id).ok_or_else(|| {
             tracing::error!(
                 target: "crypto::client",
@@ -705,6 +709,7 @@ where
         contact_id: &str,
         message: &M::EncryptedMessage,
     ) -> Result<Vec<u8>, String> {
+        self.ensure_local_user_id_set()?;
         let session = self
             .sessions
             .get_mut(contact_id)
@@ -801,9 +806,24 @@ where
         &mut self.key_manager
     }
 
-    /// Установить идентификатор локального пользователя (вызывается после регистрации/логина)
+    /// Установить идентификатор локального пользователя (вызывается после регистрации/логина).
+    /// Must be called before `init_session`, `init_receiving_session`, `encrypt_message`,
+    /// or `decrypt_message` — those methods return `Err` if `local_user_id` is still empty.
     pub fn set_local_user_id(&mut self, user_id: String) {
         self.local_user_id = user_id;
+    }
+
+    /// Guard: returns `Err` with a clear message if `set_local_user_id` was never called.
+    /// Called at the top of every crypto operation that binds user identity to AAD.
+    fn ensure_local_user_id_set(&self) -> Result<(), String> {
+        if self.local_user_id.is_empty() {
+            return Err(
+                "local_user_id is not set — call set_local_user_id() after login/registration \
+                 before invoking init_session, encrypt_message, or decrypt_message"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Получить идентификатор локального пользователя
@@ -975,6 +995,7 @@ mod tests {
     fn test_client_remove_session() {
         let mut alice = TestClient::new().unwrap();
         let bob = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
 
         let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
         let bob_identity_pub =
@@ -1181,6 +1202,7 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        alice.set_local_user_id("alice".to_string());
 
         let mut bob = Client::<
             ClassicSuiteProvider,
@@ -1188,6 +1210,7 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        bob.set_local_user_id("bob".to_string());
 
         let bob_bundle = bob.get_registration_bundle().unwrap();
         let bob_identity = bob.key_manager.identity_public_key().unwrap().clone();
@@ -1241,6 +1264,7 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        alice.set_local_user_id("alice".to_string());
 
         let mut bob = Client::<
             ClassicSuiteProvider,
@@ -1248,6 +1272,7 @@ mod tests {
             DoubleRatchetSession<ClassicSuiteProvider>,
         >::new()
         .unwrap();
+        bob.set_local_user_id("bob".to_string());
 
         let bob_bundle = bob.get_registration_bundle().unwrap();
         let bob_identity = bob.key_manager.identity_public_key().unwrap().clone();
