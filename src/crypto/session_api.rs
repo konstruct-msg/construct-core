@@ -340,6 +340,11 @@ where
             .cleanup_old_skipped_keys(max_age_seconds);
     }
 
+    /// Return a read-only health snapshot of this session's Double Ratchet state.
+    pub fn health_snapshot(&self) -> crate::crypto::messaging::double_ratchet::DrHealthSnapshot {
+        self.messaging_session.health_snapshot()
+    }
+
     /// Получить изменяемую ссылку на messaging session
     ///
     /// Для advanced использования

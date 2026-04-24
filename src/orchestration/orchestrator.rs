@@ -619,6 +619,14 @@ impl Orchestrator {
             .unwrap_or(0)
     }
 
+    /// Return a health snapshot for the session with `contact_id`, or `None` if absent.
+    pub fn get_session_health(
+        &self,
+        contact_id: &str,
+    ) -> Option<crate::crypto::messaging::double_ratchet::DrHealthSnapshot> {
+        self.lifecycle.client.get_session_health(contact_id)
+    }
+
     /// Typed registration bundle fields (no JSON).
     pub fn get_registration_bundle_fields(
         &self,

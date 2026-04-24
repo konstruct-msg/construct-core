@@ -69,6 +69,17 @@ dictionary SessionInitResult {
     sequence<u8> storage_key;  // 32-byte random key for the first received message
 };
 
+/// Read-only health snapshot of a Double Ratchet session.
+/// Returned by get_session_health(). Does not mutate session state.
+dictionary SessionHealthReport {
+    u32 messages_sent;
+    u32 messages_received;
+    u32 skipped_keys_count;
+    boolean is_pq_strengthened;
+    u64 last_ratchet_at;
+    string session_id;
+};
+
 dictionary DecryptedMessageResult {
     sequence<u8> plaintext;
     sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
@@ -151,6 +162,8 @@ interface ClassicCryptoCore {
     string import_session(string contact_id, sequence<u8> data);
 
     sequence<string> get_all_session_contact_ids();
+
+    SessionHealthReport? get_session_health(string contact_id);
 
     [Throws=CryptoError]
     string init_session(string contact_id, sequence<u8> recipient_bundle);
@@ -618,6 +631,8 @@ interface OrchestratorCore {
     sequence<string> get_all_session_contact_ids();
 
     boolean has_session(string contact_id);
+
+    SessionHealthReport? get_session_health(string contact_id);
 
     [Throws=CryptoError]
     string init_session(string contact_id, sequence<u8> recipient_bundle);

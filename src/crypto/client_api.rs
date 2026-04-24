@@ -799,6 +799,17 @@ where
         }
     }
 
+    /// Return a read-only health report for the session with `contact_id`.
+    ///
+    /// Returns `None` if no session exists for that contact.
+    /// Does not mutate any session state.
+    pub fn get_session_health(
+        &self,
+        contact_id: &str,
+    ) -> Option<crate::crypto::messaging::double_ratchet::DrHealthSnapshot> {
+        self.sessions.get(contact_id).map(|s| s.health_snapshot())
+    }
+
     /// Получить изменяемую ссылку на KeyManager
     ///
     /// Для advanced использования

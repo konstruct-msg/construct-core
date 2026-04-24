@@ -79,6 +79,26 @@ impl From<crate::error::CryptoError> for CryptoError {
 // Note: We use UDL definition, not derive macro
 pub use crate::pow::{PowChallenge, PowProgressCallback, PowSolution};
 
+/// Read-only health snapshot of a Double Ratchet session.
+///
+/// Returned by `ClassicCryptoCore::get_session_health` and
+/// `OrchestratorCore::get_session_health`. No session state is mutated.
+#[derive(Debug, Clone)]
+pub struct SessionHealthReport {
+    /// Messages sent in the current sending chain.
+    pub messages_sent: u32,
+    /// Messages received in the current receiving chain.
+    pub messages_received: u32,
+    /// Number of out-of-order message keys currently buffered.
+    pub skipped_keys_count: u32,
+    /// `true` once the Kyber OTPK contribution has been mixed into the root key.
+    pub is_pq_strengthened: bool,
+    /// Unix timestamp of the last DH ratchet step (0 = unknown / legacy session).
+    pub last_ratchet_at: u64,
+    /// Shared session identifier (hex).
+    pub session_id: String,
+}
+
 // Registration bundle as JSON - matches UDL
 // Note: We use UDL definition, not derive macro
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,7 +660,27 @@ impl ClassicCryptoCore {
         client.active_contacts()
     }
 
-    /// Initialize a session with a contact
+    /// Return a read-only health report for the session with `contact_id`.
+    ///
+    /// Returns `None` if no session exists for that contact.
+    /// Does **not** mutate any session state.
+    pub fn get_session_health(&self, contact_id: String) -> Option<SessionHealthReport> {
+        let client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client
+            .get_session_health(&contact_id)
+            .map(|snap| SessionHealthReport {
+                messages_sent: snap.messages_sent,
+                messages_received: snap.messages_received,
+                skipped_keys_count: snap.skipped_keys_count as u32,
+                is_pq_strengthened: snap.is_pq_strengthened,
+                last_ratchet_at: snap.last_ratchet_at,
+                session_id: snap.session_id,
+            })
+    }
+
     pub fn init_session(
         &self,
         contact_id: String,
@@ -2527,6 +2567,23 @@ impl OrchestratorCore {
     pub fn get_session_suite_id(&self, contact_id: String) -> u16 {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.get_session_suite_id(&contact_id)
+    }
+
+    /// Return a read-only health report for the session with `contact_id`.
+    ///
+    /// Returns `None` if no session exists for that contact.
+    /// Does **not** mutate any session state.
+    pub fn get_session_health(&self, contact_id: String) -> Option<SessionHealthReport> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.get_session_health(&contact_id)
+            .map(|snap| SessionHealthReport {
+                messages_sent: snap.messages_sent,
+                messages_received: snap.messages_received,
+                skipped_keys_count: snap.skipped_keys_count as u32,
+                is_pq_strengthened: snap.is_pq_strengthened,
+                last_ratchet_at: snap.last_ratchet_at,
+                session_id: snap.session_id,
+            })
     }
 
     /// Typed registration bundle fields.

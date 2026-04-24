@@ -51,7 +51,36 @@ use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
+
+/// Read-only health snapshot of a `DoubleRatchetSession`.
+///
+/// Returned by [`DoubleRatchetSession::health_snapshot`] and propagated upwards
+/// through [`Session`] / [`Client`] / UniFFI to the Swift layer.
+/// No session state is mutated when producing this value.
+#[derive(Debug, Clone)]
+pub struct DrHealthSnapshot {
+    /// Messages sent in the current sending chain.
+    pub messages_sent: u32,
+    /// Messages received in the current receiving chain.
+    pub messages_received: u32,
+    /// Number of out-of-order message keys currently buffered.
+    pub skipped_keys_count: usize,
+    /// `true` once the Kyber OTPK contribution has been mixed into the root key.
+    pub is_pq_strengthened: bool,
+    /// Unix timestamp of the last DH ratchet step (init counts as first ratchet).
+    pub last_ratchet_at: u64,
+    /// Shared session identifier (hex).
+    pub session_id: String,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Derive a shared session identifier from the X3DH root key.
 ///
@@ -126,6 +155,10 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     session_id: String,
     contact_id: String,
     local_user_id: String,
+
+    /// Unix timestamp of the last DH ratchet step (or session creation).
+    /// Updated by `perform_dh_ratchet` and set in `new_initiator_session` / `new_responder_session`.
+    last_ratchet_at: u64,
 }
 
 /// Snapshot of mutable session fields captured before a DH ratchet in `decrypt()`.
@@ -281,6 +314,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             session_id: shared_session_id,
             contact_id,
             local_user_id,
+            last_ratchet_at: unix_now(),
         })
     }
 
@@ -388,6 +422,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
+            last_ratchet_at: unix_now(),
         };
 
         // КРИТИЧЕСКИ ВАЖНО: Расшифровываем первое сообщение!
@@ -723,6 +758,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
         DoubleRatchetSession::apply_pq_contribution(self, kem_shared_secret)
     }
+
+    fn health_snapshot(&self) -> DrHealthSnapshot {
+        DoubleRatchetSession::health_snapshot(self)
+    }
 }
 
 // Internal implementation details
@@ -730,6 +769,18 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// Cleanup старых skipped message keys с дефолтным периодом (7 дней)
     pub fn cleanup_old_skipped_keys_default(&mut self) {
         self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
+    }
+
+    /// Return a read-only health snapshot of this session. Does not mutate state.
+    pub fn health_snapshot(&self) -> DrHealthSnapshot {
+        DrHealthSnapshot {
+            messages_sent: self.sending_chain_length,
+            messages_received: self.receiving_chain_length,
+            skipped_keys_count: self.skipped_message_keys.len(),
+            is_pq_strengthened: self.pre_pq_root_key.is_none(),
+            last_ratchet_at: self.last_ratchet_at,
+            session_id: self.session_id.clone(),
+        }
     }
 
     /// Mix a post-quantum KEM shared secret into the session root key (PQXDH contribution).
@@ -855,6 +906,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.dh_ratchet_private = Some(new_dh_private);
         self.dh_ratchet_public = new_dh_public;
         self.remote_dh_public = Some(new_remote_dh.clone());
+        self.last_ratchet_at = unix_now();
 
         debug!(
             target: "crypto::double_ratchet",
@@ -979,6 +1031,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             session_id: self.session_id.clone(),
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
+            last_ratchet_at: self.last_ratchet_at,
         }
     }
 
@@ -1041,6 +1094,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
+            last_ratchet_at: data.last_ratchet_at,
         })
     }
 }
@@ -1135,6 +1189,9 @@ pub struct SerializableSession {
     contact_id: String,
     #[serde(default)]
     local_user_id: String,
+    /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
+    #[serde(default)]
+    last_ratchet_at: u64,
 }
 
 impl Drop for SerializableSession {
@@ -1198,6 +1255,7 @@ impl SerializableSession {
                 })
                 .collect(),
             pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
+            last_ratchet_at: self.last_ratchet_at,
         })
     }
 
@@ -1233,6 +1291,7 @@ impl SerializableSession {
             session_id: session_id_hex,
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
+            last_ratchet_at: data.last_ratchet_at,
         })
     }
 }

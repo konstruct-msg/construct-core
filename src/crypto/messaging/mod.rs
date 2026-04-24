@@ -228,6 +228,9 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
     /// - `max_age_seconds`: Максимальный возраст ключа в секундах
     fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64);
 
+    /// Return a read-only health snapshot of this session's ratchet state.
+    fn health_snapshot(&self) -> crate::crypto::messaging::double_ratchet::DrHealthSnapshot;
+
     /// Mix a post-quantum KEM shared secret into the session root key (PQXDH).
     ///
     /// Default implementation is a no-op for non-PQ session types.

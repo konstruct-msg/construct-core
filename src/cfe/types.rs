@@ -196,6 +196,11 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "pq_rk1")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_rk1: Option<ByteBuf>,
+
+    /// Unix timestamp of the last DH ratchet step (zero = unknown / legacy session).
+    #[serde(rename = "lra")]
+    #[serde(default)]
+    pub last_ratchet_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
