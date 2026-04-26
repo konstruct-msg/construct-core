@@ -1529,10 +1529,14 @@ impl Orchestrator {
                         proto_bytes: plaintext,
                     });
                 } else {
-                    all.push(Action::NotifyNewMessage {
-                        chat_id: cid.clone(),
-                        preview: preview(&plaintext),
-                    });
+                    // content_type 13 (HEARTBEAT) and 14 (DELIVERY_RECEIPT) are silent
+                    // control payloads — no push notification, just decrypt and let Swift handle.
+                    if content_type != 13 && content_type != 14 {
+                        all.push(Action::NotifyNewMessage {
+                            chat_id: cid.clone(),
+                            preview: preview(&plaintext),
+                        });
+                    }
                     all.push(Action::MessageDecrypted {
                         contact_id: cid,
                         message_id: mid,
