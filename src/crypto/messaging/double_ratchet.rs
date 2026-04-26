@@ -54,6 +54,11 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
+/// AD (Associated Data) version byte — increment here when the AD format changes.
+/// Both `encrypt` and `decrypt_with_key` must use this constant so a version
+/// mismatch surfaces as an AEAD failure rather than a silent silent format bug.
+const AD_VERSION: u8 = 2;
+
 /// Read-only health snapshot of a `DoubleRatchetSession`.
 ///
 /// Returned by [`DoubleRatchetSession::health_snapshot`] and propagated upwards
@@ -298,7 +303,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .map_err(|e| format!("KDF_RK failed: {}", e))?;
 
         Ok(Self {
-            suite_id: SuiteID::from_u16_unchecked(Config::global().classic_suite_id),
+            suite_id: SuiteID::CLASSIC,
             root_key,
             sending_chain_key: chain_key,
             sending_chain_length: 0,
@@ -484,7 +489,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         self.sending_chain_key = next_chain_key;
 
         let message_number = self.sending_chain_length;
-        self.sending_chain_length += 1;
+        self.sending_chain_length = self
+            .sending_chain_length
+            .checked_add(1)
+            .ok_or("sending_chain_length overflow: session has exceeded u32::MAX messages")?;
 
         // Generate nonce - use configured nonce length for ChaCha20Poly1305
         let nonce = P::generate_nonce(Config::global().chacha_nonce_length)
@@ -507,7 +515,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         })?;
         let mut associated_data =
             Vec::with_capacity(1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4);
-        associated_data.push(2u8); // AD version = 2
+        associated_data.push(AD_VERSION); // AD version (see const AD_VERSION)
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(&session_id_bytes);
@@ -588,6 +596,25 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             "Decrypting message"
         );
 
+        // CPU DoS guard: reject messages whose sequence number would force the chain
+        // to advance by more than max_message_jump steps before hitting the skipped-key
+        // memory limit.  Without this, an attacker can send msg_num = 1_000_000 and
+        // cause O(N) HKDF work in the tight while-loop below.
+        let max_jump = Config::global().max_message_jump;
+        if encrypted.message_number > self.receiving_chain_length.saturating_add(max_jump) {
+            return Err(format!(
+                "Message number jump too large: {} -> {} (limit +{})",
+                self.receiving_chain_length, encrypted.message_number, max_jump
+            ));
+        }
+        // Same bound for the previous-chain skip loop (previous_chain_length).
+        if encrypted.previous_chain_length > self.receiving_chain_length.saturating_add(max_jump) {
+            return Err(format!(
+                "Previous chain length jump too large: {} -> {} (limit +{})",
+                self.receiving_chain_length, encrypted.previous_chain_length, max_jump
+            ));
+        }
+
         // Convert DH public key from message
         let remote_dh_public = Self::bytes_to_kem_public_key(&encrypted.dh_public_key)?;
 
@@ -648,7 +675,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                         timestamp,
                     );
                     self.receiving_chain_key = next_chain;
-                    self.receiving_chain_length += 1;
+                    self.receiving_chain_length = match self.receiving_chain_length.checked_add(1) {
+                        Some(v) => v,
+                        None => {
+                            self.restore_snapshot(snapshot.clone());
+                            return Err("receiving_chain_length overflow".to_string());
+                        }
+                    };
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
@@ -682,7 +715,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
             if self.receiving_chain_length == encrypted.message_number {
                 self.receiving_chain_key = next_chain;
-                self.receiving_chain_length += 1;
+                self.receiving_chain_length = match self.receiving_chain_length.checked_add(1) {
+                    Some(v) => v,
+                    None => {
+                        self.restore_snapshot(snapshot.clone());
+                        return Err("receiving_chain_length overflow".to_string());
+                    }
+                };
                 return self
                     .decrypt_with_key(&msg_key, encrypted)
                     .inspect_err(|_e| {
@@ -699,7 +738,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 self.skipped_key_timestamps
                     .insert((chain_key, self.receiving_chain_length), timestamp);
                 self.receiving_chain_key = next_chain;
-                self.receiving_chain_length += 1;
+                self.receiving_chain_length = match self.receiving_chain_length.checked_add(1) {
+                    Some(v) => v,
+                    None => {
+                        self.restore_snapshot(snapshot.clone());
+                        return Err("receiving_chain_length overflow".to_string());
+                    }
+                };
 
                 // DoS protection: reject if stored skipped key count reaches the configured max.
                 if self.skipped_message_keys.len() >= Config::global().max_skipped_messages as usize
@@ -943,7 +988,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         })?;
         let mut associated_data =
             Vec::with_capacity(1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4);
-        associated_data.push(2u8); // AD version = 2
+        associated_data.push(AD_VERSION); // AD version (see const AD_VERSION)
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(&session_id_bytes);
@@ -1065,7 +1110,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             .map(|entry| ((entry.dh_public.clone(), entry.msg_number), entry.timestamp))
             .collect();
 
-        Ok(Self {
+        let mut session = Self {
             suite_id,
             root_key: Self::bytes_to_aead_key(&data.root_key)?,
             sending_chain_key: Self::bytes_to_aead_key(&data.sending_chain_key)?,
@@ -1095,7 +1140,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
             last_ratchet_at: data.last_ratchet_at,
-        })
+        };
+
+        // Evict any stale skipped-message keys that accumulated while the session was
+        // inactive.  Without this, a session that was dormant for weeks would still
+        // carry expired keys in memory until the next 100-message boundary.
+        session.cleanup_old_skipped_keys_default();
+
+        Ok(session)
     }
 }
 
@@ -1682,5 +1734,177 @@ mod tests {
         // Alice decrypts the REAL reply — should succeed because state was rolled back
         let dec = alice.decrypt(&reply).unwrap();
         assert_eq!(dec, b"Real reply");
+    }
+
+    #[test]
+    fn test_max_message_jump_dos_guard() {
+        // Verify that a message with a forward jump exceeding max_message_jump is
+        // rejected immediately — before any HKDF work is done — preventing CPU DoS.
+        use crate::config::Config;
+        use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
+        use crate::crypto::keys::build_prologue;
+
+        let (alice_priv, alice_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_priv, bob_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_spk_priv, bob_spk_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_sk, bob_vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let sig = {
+            let mut msg = build_prologue(SuiteID::CLASSIC);
+            msg.extend_from_slice(bob_spk_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_sk, &msg).unwrap()
+        };
+        let bundle = X3DHPublicKeyBundle {
+            identity_public: bob_pub.clone(),
+            signed_prekey_public: bob_spk_pub,
+            signature: sig,
+            verifying_key: bob_vk,
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+        };
+
+        let (rk, init_state) =
+            X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle)
+                .unwrap();
+        let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+            &rk,
+            init_state,
+            &bob_pub,
+            "bob".to_string(),
+            "alice".to_string(),
+        )
+        .unwrap();
+
+        let msg0 = alice.encrypt(b"Hi").unwrap();
+        let alice_eph =
+            ClassicSuiteProvider::kem_public_key_from_bytes(msg0.dh_public_key.to_vec());
+        let rk_bob = X3DHProtocol::<ClassicSuiteProvider>::perform_as_responder(
+            &bob_priv,
+            &bob_spk_priv,
+            &alice_pub,
+            &alice_eph,
+            None,
+        )
+        .unwrap();
+        let (mut bob, _) = DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
+            &rk_bob,
+            &bob_priv,
+            &msg0,
+            "alice".to_string(),
+            "bob".to_string(),
+        )
+        .unwrap();
+
+        // Alice sends one message normally so Bob has a receiving chain set up.
+        let legit = alice.encrypt(b"legitimate").unwrap();
+
+        // Craft a message with msg_num strictly beyond receiving_chain_length + max_jump.
+        let max_jump = Config::global().max_message_jump;
+        let mut malicious = legit.clone();
+        // Use max_jump * 2 to ensure we're well beyond the guard threshold
+        // regardless of Bob's current receiving_chain_length.
+        malicious.message_number = max_jump * 2;
+
+        let err = bob.decrypt(&malicious);
+        assert!(err.is_err(), "Expected DoS guard to reject large jump");
+        let msg = err.unwrap_err();
+        assert!(msg.contains("jump"), "Error should mention jump: {}", msg);
+
+        // Bob's state must still be intact — legitimate message decrypts fine.
+        let dec = bob.decrypt(&legit).unwrap();
+        assert_eq!(dec, b"legitimate");
+    }
+
+    #[test]
+    fn test_cleanup_on_deserialize() {
+        // After deserializing a session, stale skipped-message keys must be evicted
+        // before the first real decrypt call, not only after 100 messages.
+        use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
+        use crate::crypto::keys::build_prologue;
+
+        let (alice_priv, alice_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_priv, bob_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_spk_priv, bob_spk_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (bob_sk, bob_vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let sig = {
+            let mut msg = build_prologue(SuiteID::CLASSIC);
+            msg.extend_from_slice(bob_spk_pub.as_ref());
+            ClassicSuiteProvider::sign(&bob_sk, &msg).unwrap()
+        };
+        let bundle = X3DHPublicKeyBundle {
+            identity_public: bob_pub.clone(),
+            signed_prekey_public: bob_spk_pub,
+            signature: sig,
+            verifying_key: bob_vk,
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+        };
+
+        let (rk, init_state) =
+            X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle)
+                .unwrap();
+        let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+            &rk,
+            init_state,
+            &bob_pub,
+            "bob".to_string(),
+            "alice".to_string(),
+        )
+        .unwrap();
+
+        let msg0 = alice.encrypt(b"Hi").unwrap();
+        let alice_eph =
+            ClassicSuiteProvider::kem_public_key_from_bytes(msg0.dh_public_key.to_vec());
+        let rk_bob = X3DHProtocol::<ClassicSuiteProvider>::perform_as_responder(
+            &bob_priv,
+            &bob_spk_priv,
+            &alice_pub,
+            &alice_eph,
+            None,
+        )
+        .unwrap();
+        let (mut bob, _) = DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
+            &rk_bob,
+            &bob_priv,
+            &msg0,
+            "alice".to_string(),
+            "bob".to_string(),
+        )
+        .unwrap();
+
+        // Alice sends 3 messages; Bob only receives the 3rd → 2 skipped keys stored.
+        let _m1 = alice.encrypt(b"skipped 1").unwrap();
+        let _m2 = alice.encrypt(b"skipped 2").unwrap();
+        let m3 = alice.encrypt(b"received 3").unwrap();
+        bob.decrypt(&m3).unwrap();
+
+        let skipped_before = bob.skipped_message_keys.len();
+        assert_eq!(
+            skipped_before, 2,
+            "Expected 2 skipped keys before serialize"
+        );
+
+        // Serialize Bob's session and give skipped keys an ancient timestamp.
+        let mut snap = bob.to_serializable();
+        for entry in &mut snap.skipped_keys {
+            entry.timestamp = 0; // epoch → older than any max_age
+        }
+
+        // Deserialize — cleanup should run automatically on restore.
+        let bob2 = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(snap).unwrap();
+        assert_eq!(
+            bob2.skipped_message_keys.len(),
+            0,
+            "Stale skipped keys must be evicted on from_serializable"
+        );
     }
 }

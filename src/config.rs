@@ -47,6 +47,13 @@ pub struct Config {
     /// Максимальное количество пропущенных сообщений (DoS защита)
     pub max_skipped_messages: u32,
 
+    /// Максимальный допустимый "прыжок" номера сообщения вперёд за один decrypt.
+    /// Предотвращает CPU-exhaustion атаку: без этого лимита сообщение с
+    /// msg_num = 1_000_000 заставляет движок вычислить миллион шагов HKDF-цепочки
+    /// до срабатывания лимита памяти.
+    /// По умолчанию: 2000 (достаточно для любого разумного out-of-order окна)
+    pub max_message_jump: u32,
+
     /// Максимальный возраст пропущенных ключей сообщений (в секундах)
     /// По умолчанию: 7 дней
     pub max_skipped_message_age_seconds: i64,
@@ -119,6 +126,7 @@ impl Default for Config {
 
             // Double Ratchet
             max_skipped_messages: 1000,
+            max_message_jump: 2000,
             max_skipped_message_age_seconds: 7 * 24 * 60 * 60, // 7 days
 
             // Валидация
