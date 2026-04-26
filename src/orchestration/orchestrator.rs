@@ -1140,7 +1140,12 @@ impl Orchestrator {
         let decision = self.router.route_message(&mut self.lifecycle, &incoming);
         let needs_state_save = matches!(
             &decision,
-            RoutingDecision::SessionHealNeeded { .. }
+            // Decrypted: ack_store.mark_processed() mutates the ACK cache — persist it
+            // so the L1 in-memory dedup survives a restart (without this, every
+            // message received since the last orchestrator_state save would hit L2 DB
+            // on restart, creating duplicate-processing risk before the DB check fires).
+            RoutingDecision::Decrypted { .. }
+                | RoutingDecision::SessionHealNeeded { .. }
                 | RoutingDecision::NeedSessionInit { .. }
                 | RoutingDecision::EndSessionNeeded { .. }
         );
@@ -1235,18 +1240,24 @@ impl Orchestrator {
             }
         };
 
-        let mut actions = vec![Action::SendEncryptedMessage {
-            to: contact_id.clone(),
-            payload,
-            message_id,
-            content_type,
-        }];
+        let mut actions = Vec::new();
+        // SAFETY ORDER: persist updated DR state BEFORE sending.
+        // If we sent first and then crashed before saving, the chain would advance on the
+        // remote side (via decryption) while our local state stays stale — breaking the
+        // session.  Saving first means a crash-before-send results in a locally-advanced
+        // but unsent message, which is recoverable (resend).
         if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
             actions.push(Action::SaveSessionToSecureStore {
                 key: format!("session_{}", contact_id),
                 data: session_bytes,
             });
         }
+        actions.push(Action::SendEncryptedMessage {
+            to: contact_id,
+            payload,
+            message_id,
+            content_type,
+        });
         actions
     }
 
@@ -1262,19 +1273,20 @@ impl Orchestrator {
     ) -> Vec<Action> {
         match self.encrypt_bytes_for(&contact_id, &proto_bytes) {
             Ok(payload) => {
-                let mut actions = vec![Action::SendEncryptedMessage {
-                    to: contact_id.clone(),
-                    payload,
-                    message_id,
-                    content_type: 12,
-                }];
-                // Persist updated DR session state after encrypt.
+                let mut actions = Vec::new();
+                // SAFETY ORDER: save before send (same rationale as handle_outgoing_message).
                 if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
                     actions.push(Action::SaveSessionToSecureStore {
                         key: format!("session_{}", contact_id),
                         data: session_bytes,
                     });
                 }
+                actions.push(Action::SendEncryptedMessage {
+                    to: contact_id,
+                    payload,
+                    message_id,
+                    content_type: 12,
+                });
                 actions
             }
             Err(e) => vec![Action::NotifyError {
@@ -1531,6 +1543,12 @@ impl Orchestrator {
                 } else {
                     // content_type 13 (HEARTBEAT) and 14 (DELIVERY_RECEIPT) are silent
                     // control payloads — no push notification, just decrypt and let Swift handle.
+                    //
+                    // Privacy note: decrypting ct=13/14 DOES advance the Double Ratchet chain
+                    // (receiving_chain_length, possibly last_ratchet_at on a DH ratchet step).
+                    // This is intentional — heartbeats must exercise the real DR path so session
+                    // health is accurately reflected.  last_ratchet_at is local-only and is never
+                    // transmitted to the server, so these decrypts do not leak timing metadata.
                     if content_type != 13 && content_type != 14 {
                         all.push(Action::NotifyNewMessage {
                             chat_id: cid.clone(),
