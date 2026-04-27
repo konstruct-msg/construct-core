@@ -188,35 +188,63 @@ impl PQContributionManager {
         persist_action
     }
 
+    /// Peek at the deferred contribution for `contact_id` without removing it.
+    ///
+    /// Returns `None` if no contribution is pending.  The caller should
+    /// apply the contribution and persist the result, then call
+    /// `finalize_consumed` to atomically clear the in-memory entry and
+    /// obtain the delete + CFE export actions.
+    ///
+    /// This two-phase design prevents data loss on a crash between applying
+    /// the PQ shared secret to the Double Ratchet state and persisting it:
+    /// if the process dies before the platform executes the returned
+    /// `SaveSessionToSecureStore` actions, the contribution survives in the
+    /// `kyber_session_state` CFE snapshot and can be replayed on next launch.
+    pub fn peek_deferred(&self, contact_id: &str) -> Option<DeferredContribution> {
+        self.pending.get(contact_id).map(|c| DeferredContribution {
+            shared_secret: c.shared_secret.clone(),
+            otpk_id: c.otpk_id,
+        })
+    }
+
+    /// Remove the deferred contribution after the caller has successfully
+    /// applied and persisted the updated session state.
+    ///
+    /// Returns the `SaveSessionToSecureStore` delete sentinel (empty `data`)
+    /// for the individual `pq_deferred_{contact_id}` Keychain / Keystore entry.
+    /// The caller **must** also export a fresh `kyber_session_state` CFE
+    /// (via `export_cfe`) and include it in the same persist batch so that
+    /// a subsequent restart does not replay the already-applied contribution.
+    ///
+    /// No-op (returns empty Vec) if no pending contribution exists.
+    pub fn finalize_consumed(&mut self, contact_id: &str) -> Vec<Action> {
+        self.pending_ciphertexts.remove(contact_id);
+        match self.pending.remove(contact_id) {
+            None => vec![],
+            Some(_) => vec![Action::SaveSessionToSecureStore {
+                key: format!("pq_deferred_{}", contact_id),
+                data: vec![],
+            }],
+        }
+    }
+
     /// Retrieve and remove the deferred contribution for `contact_id`.
+    ///
+    /// **Prefer using `peek_deferred` + `finalize_consumed`** when you need
+    /// crash-safe transactional semantics (apply, persist, then finalize).
+    /// Use this method only when the caller already holds a separate
+    /// guarantee that the contribution was handled (e.g. Swift-side Keychain
+    /// cleanup has already run before this call).
     ///
     /// Returns `(None, [])` if no deferred contribution exists (caller should
     /// skip `apply_pq_contribution`).
-    ///
-    /// When a contribution IS present, the second element of the tuple contains
-    /// a `SaveSessionToSecureStore` delete sentinel (empty `data`) that the
-    /// platform **must** execute to remove the previously persisted entry.
     pub fn consume_deferred(
         &mut self,
         contact_id: &str,
     ) -> (Option<DeferredContribution>, Vec<Action>) {
-        self.pending_ciphertexts.remove(contact_id);
-        match self.pending.remove(contact_id) {
-            None => (None, vec![]),
-            Some(c) => {
-                let delete_action = Action::SaveSessionToSecureStore {
-                    key: format!("pq_deferred_{}", contact_id),
-                    data: vec![],
-                };
-                (
-                    Some(DeferredContribution {
-                        shared_secret: c.shared_secret,
-                        otpk_id: c.otpk_id,
-                    }),
-                    vec![delete_action],
-                )
-            }
-        }
+        let contribution = self.peek_deferred(contact_id);
+        let delete_actions = self.finalize_consumed(contact_id);
+        (contribution, delete_actions)
     }
 
     /// Consume the pending PQXDH contribution for sending the first message (msgNum=0).

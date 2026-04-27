@@ -389,12 +389,25 @@ impl SessionLifecycleManager {
     /// Apply a deferred PQ contribution for `contact_id` (if one exists).
     ///
     /// Returns `Vec<Action>` — empty if no contribution was pending.
+    ///
+    /// **Crash-safe two-phase design:**
+    /// 1. Peek at the contribution without removing it from the manager.
+    /// 2. Apply it to the session (mutates in-memory DR state).
+    /// 3. Export the updated session JSON.
+    /// 4. Only if both steps succeed: finalize (remove from in-memory pending).
+    /// 5. Include an updated `kyber_session_state` CFE in the same action batch.
+    ///
+    /// The platform must persist all returned actions atomically.  If the
+    /// process crashes before that, the next launch restores the contribution
+    /// from the old CFE snapshot and replays this method safely.
     pub fn maybe_apply_pq_contribution(&mut self, contact_id: &str) -> Vec<Action> {
-        let (contribution, delete_actions) = self.pq_manager.consume_deferred(contact_id);
-        let contribution = match contribution {
+        // Phase 1: peek — do NOT remove yet.
+        let contribution = match self.pq_manager.peek_deferred(contact_id) {
             Some(c) => c,
             None => return vec![],
         };
+
+        // Phase 2: apply to in-memory DR state.
         if let Err(e) = self
             .client
             .apply_pq_contribution_to_session(contact_id, &contribution.shared_secret)
@@ -404,21 +417,39 @@ impl SessionLifecycleManager {
                 message: e,
             }];
         }
-        // Save updated session state and delete the now-consumed deferred entry.
-        match self.export_session_json_for(contact_id) {
-            Ok(json) => {
-                let mut actions = delete_actions;
-                actions.push(Action::SaveSessionToSecureStore {
-                    key: session_key(contact_id),
-                    data: json.into_bytes(),
-                });
-                actions
+
+        // Phase 3: export updated session JSON.
+        let session_json = match self.export_session_json_for(contact_id) {
+            Ok(j) => j,
+            Err(e) => {
+                return vec![Action::NotifyError {
+                    code: "SESSION_EXPORT_FAILED".to_string(),
+                    message: e,
+                }];
             }
-            Err(e) => vec![Action::NotifyError {
-                code: "SESSION_EXPORT_FAILED".to_string(),
-                message: e,
+        };
+
+        // Phase 4: finalize — remove from in-memory pending, get delete sentinel.
+        let delete_actions = self.pq_manager.finalize_consumed(contact_id);
+
+        // Phase 5: export updated CFE snapshot (now without this contact's entry).
+        // Including this in the same batch ensures that a restart after partial
+        // persistence replays from a consistent state (either both applied or neither).
+        let cfe_export_action = match self.pq_manager.export_cfe() {
+            Ok(cfe) => vec![Action::SaveSessionToSecureStore {
+                key: "kyber_session_state".to_string(),
+                data: cfe,
             }],
-        }
+            Err(_) => vec![], // Non-fatal: CFE re-exported on next PQ state change.
+        };
+
+        let mut actions = vec![Action::SaveSessionToSecureStore {
+            key: session_key(contact_id),
+            data: session_json.into_bytes(),
+        }];
+        actions.extend(delete_actions);
+        actions.extend(cfe_export_action);
+        actions
     }
 
     // ── State persistence ─────────────────────────────────────────────────────

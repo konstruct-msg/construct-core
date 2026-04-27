@@ -99,6 +99,10 @@ pub trait SecureStorage {
     /// Используется для pagination при загрузке:
     /// - Загружаем только последние N сессий при старте
     /// - Остальные загружаем lazy on-demand
+    ///
+    /// For LRU-sorted access (most recently used first), platform implementations
+    /// should order results by `StoredSession.last_used DESC`.  The MemoryStorage
+    /// implementation exposes a dedicated `list_recent_sessions(limit)` method.
     fn list_sessions(&self) -> impl Future<Output = Result<Vec<String>>> + MaybeSend;
 
     /// Очистить все сессии (используется при logout или reset)
@@ -274,18 +278,18 @@ pub struct AuthTokens {
 }
 
 impl AuthTokens {
-    /// Проверить, истекает ли токен скоро
+    /// Check whether the token is expiring within `buffer_seconds` from `now`.
     ///
-    /// # Parameters
-    /// - `buffer_seconds`: Буфер в секундах (обычно 300 = 5 минут)
-    pub fn is_expiring_soon(&self, buffer_seconds: i64) -> bool {
-        let now = crate::utils::time::current_timestamp();
+    /// Pass the current Unix timestamp as `now` so this method is fully
+    /// deterministic and testable without wall-clock dependency.
+    pub fn is_expiring_soon(&self, now: i64, buffer_seconds: i64) -> bool {
         self.expires_at - now < buffer_seconds
     }
 
-    /// Проверить, истёк ли токен
-    pub fn is_expired(&self) -> bool {
-        let now = crate::utils::time::current_timestamp();
+    /// Check whether the token has already expired at time `now`.
+    ///
+    /// Pass the current Unix timestamp as `now`.
+    pub fn is_expired(&self, now: i64) -> bool {
         self.expires_at <= now
     }
 }
@@ -324,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_auth_tokens_expiration() {
-        let now = crate::utils::time::current_timestamp();
+        let now = 1_700_000_000i64; // fixed timestamp for determinism
 
         // Токен истекает через 2 минуты
         let tokens = AuthTokens {
@@ -335,13 +339,23 @@ mod tests {
         };
 
         // Не истекает сейчас
-        assert!(!tokens.is_expired());
+        assert!(!tokens.is_expired(now));
 
         // Истекает скоро (буфер 5 минут = 300 сек, токен живёт 120 сек < 300)
-        assert!(tokens.is_expiring_soon(300));
+        assert!(tokens.is_expiring_soon(now, 300));
 
         // Не истекает скоро (буфер 1 минута = 60 сек, токен живёт 120 сек > 60)
-        assert!(!tokens.is_expiring_soon(60));
+        assert!(!tokens.is_expiring_soon(now, 60));
+
+        // Уже истёк
+        let expired = AuthTokens {
+            access_token: "test".to_string(),
+            refresh_token: "test".to_string(),
+            expires_at: now - 1,
+            user_id: "test_user".to_string(),
+        };
+        assert!(expired.is_expired(now));
+        assert!(expired.is_expiring_soon(now, 0));
     }
 
     #[test]

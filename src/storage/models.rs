@@ -1,6 +1,7 @@
 // Модели данных для хранилища
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Статус сообщения
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,7 +36,9 @@ pub struct StoredContact {
 }
 
 /// Приватные ключи в хранилище (ЗАШИФРОВАННЫЕ!)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Implements `Zeroize` so all key material is wiped from memory on drop.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct StoredPrivateKeys {
     pub user_id: String,
     pub encrypted_identity_private: Vec<u8>, // Зашифровано мастер-ключом
@@ -47,7 +50,11 @@ pub struct StoredPrivateKeys {
 }
 
 /// Сессия Double Ratchet в хранилище (СЕРИАЛИЗОВАННАЯ)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Implements `Zeroize` so the session bytes (chain keys, ratchet state) are
+/// wiped from memory on drop — critical because these bytes carry forward
+/// secrecy material.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct StoredSession {
     pub session_id: String,
     pub contact_id: String,

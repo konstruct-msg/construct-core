@@ -1,4 +1,16 @@
 // In-memory storage для тестов и non-WASM платформ
+//
+// # Security note
+// This implementation stores all data in plain heap memory protected only by
+// the process address space.  It is intentionally designed for:
+//   - Unit / integration tests
+//   - Non-sensitive in-process caching layers
+//
+// Do NOT use MemoryStorage as the sole backing store for production key material.
+// `StoredPrivateKeys` and `StoredSession` implement `Zeroize`, so their heap
+// allocations are wiped on drop, but the data remains readable for the lifetime
+// of the `Arc<Mutex<...>>` wrapper.  Platform storage (Keychain, Keystore,
+// IndexedDB with encryption) must be used for all real deployments.
 
 use crate::storage::models::*;
 use crate::storage::traits::{AuthTokens, DataStorage, SecureStorage};
@@ -32,6 +44,21 @@ impl MemoryStorage {
             messages: Arc::new(Mutex::new(Vec::new())),
             conversations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return `limit` contact IDs sorted by `last_used` DESC (most recent first).
+    ///
+    /// Use this for LRU-prefetch at startup instead of loading all sessions.
+    /// Platform storage implementations (Keychain, SQLite, IndexedDB) should
+    /// apply the same ordering natively for efficiency.
+    pub fn list_recent_sessions(&self, limit: usize) -> Vec<String> {
+        let lock = self.sessions.lock().unwrap();
+        let mut entries: Vec<(i64, String)> = lock
+            .values()
+            .map(|s| (s.last_used, s.contact_id.clone()))
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.into_iter().take(limit).map(|(_, id)| id).collect()
     }
 }
 
