@@ -69,6 +69,33 @@ dictionary SessionInitResult {
     sequence<u8> storage_key;  // 32-byte random key for the first received message
 };
 
+/// Binary key bundle passed across the FFI boundary — no JSON encoding.
+/// Replaces the former sequence<u8> JSON payload for init_session / init_receiving_session.
+dictionary BinaryKeyBundle {
+    sequence<u8> identity_public;
+    sequence<u8> signed_prekey_public;
+    sequence<u8> signature;
+    sequence<u8> verifying_key;
+    u16 suite_id;
+    sequence<u8>? one_time_prekey_public;
+    u32? one_time_prekey_id;
+    u64 spk_uploaded_at;
+    u32 spk_rotation_epoch;
+    u64 kyber_spk_uploaded_at;
+    u32 kyber_spk_rotation_epoch;
+    sequence<u8>? kyber_pre_key_public;
+    sequence<u8>? kyber_one_time_prekey_public;
+    u32? kyber_one_time_prekey_id;
+};
+
+/// Binary first-message bundle for init_receiving_session — no JSON encoding.
+dictionary BinaryFirstMessage {
+    sequence<u8> ephemeral_public_key;
+    u32 message_number;
+    sequence<u8> content;
+    u32 one_time_prekey_id;
+};
+
 /// Read-only health snapshot of a Double Ratchet session.
 /// Returned by get_session_health(). Does not mutate session state.
 dictionary SessionHealthReport {
@@ -166,10 +193,10 @@ interface ClassicCryptoCore {
     SessionHealthReport? get_session_health(string contact_id);
 
     [Throws=CryptoError]
-    string init_session(string contact_id, sequence<u8> recipient_bundle);
+    string init_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
     [Throws=CryptoError]
-    SessionInitResult init_receiving_session(string contact_id, sequence<u8> recipient_bundle, sequence<u8> first_message);
+    SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
 
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string session_id, string plaintext);
@@ -635,10 +662,10 @@ interface OrchestratorCore {
     SessionHealthReport? get_session_health(string contact_id);
 
     [Throws=CryptoError]
-    string init_session(string contact_id, sequence<u8> recipient_bundle);
+    string init_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
     [Throws=CryptoError]
-    SessionInitResult init_receiving_session(string contact_id, sequence<u8> recipient_bundle, sequence<u8> first_message);
+    SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
 
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
