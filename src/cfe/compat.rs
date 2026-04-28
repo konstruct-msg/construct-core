@@ -210,3 +210,349 @@ mod tests {
         assert_eq!(migrated.rk.len(), 32);
     }
 }
+
+// ============================================================================
+// Storage Migration: AppSettings (Этап 1)
+// ============================================================================
+
+use crate::cfe::CfeMessageType;
+use crate::cfe::{decode, decode_as, encode};
+use rmp_serde;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyBundleFormat {
+    Json,
+    Postcard,
+    Cfe,
+    Unknown,
+}
+
+pub fn detect_format(data: &[u8]) -> KeyBundleFormat {
+    if data.len() >= 2 && data[0] == 0x43 && data[1] == 0x46 {
+        return KeyBundleFormat::Cfe;
+    }
+    if looks_like_legacy_json(data) {
+        return KeyBundleFormat::Json;
+    }
+    KeyBundleFormat::Postcard
+}
+
+pub fn migrate_app_settings_json_to_cfe(
+    json_data: &[u8],
+) -> Result<crate::cfe::CfeAppSettingsV1, CfeError> {
+    #[derive(serde::Deserialize)]
+    struct LegacyJsonSettings {
+        #[serde(rename = "notificationsEnabled")]
+        notifications_enabled: Option<bool>,
+        #[serde(rename = "theme")]
+        theme: Option<String>,
+        #[serde(rename = "typingIndicator")]
+        typing_indicator: Option<bool>,
+        #[serde(rename = "readReceipts")]
+        read_receipts: Option<bool>,
+        #[serde(rename = "lastSync")]
+        last_sync: Option<i64>,
+    }
+
+    let legacy: LegacyJsonSettings = serde_json::from_slice(json_data)
+        .map_err(|e| CfeError::LegacyJsonParseFailed(e.to_string()))?;
+
+    Ok(crate::cfe::CfeAppSettingsV1 {
+        version: 1,
+        notifications_enabled: legacy.notifications_enabled.unwrap_or(true),
+        theme: legacy.theme.unwrap_or_else(|| "default".to_string()),
+        typing_indicator: legacy.typing_indicator.unwrap_or(true),
+        read_receipts: legacy.read_receipts.unwrap_or(true),
+        last_sync: legacy.last_sync.unwrap_or(0),
+    })
+}
+
+pub fn encode_app_settings_cfe(
+    settings: &crate::cfe::CfeAppSettingsV1,
+) -> Result<Vec<u8>, CfeError> {
+    encode(CfeMessageType::AppSettings, settings)
+}
+
+pub fn decode_app_settings_cfe(data: &[u8]) -> Result<crate::cfe::CfeAppSettingsV1, CfeError> {
+    decode_as(data, CfeMessageType::AppSettings)
+}
+
+pub fn migrate_contact_keys_to_cfe(
+    legacy: &[u8],
+    format: KeyBundleFormat,
+) -> Result<Vec<u8>, CfeError> {
+    let key_bundle_data = match format {
+        KeyBundleFormat::Json => {
+            return Err(CfeError::LegacyJson);
+        }
+        KeyBundleFormat::Postcard => legacy.to_vec(),
+        KeyBundleFormat::Cfe => {
+            let envelope = decode(legacy)?;
+            envelope.payload
+        }
+        KeyBundleFormat::Unknown => {
+            return Err(CfeError::InvalidFormat);
+        }
+    };
+
+    let cfe_bundle = crate::cfe::CfeContactKeyBundleV1 {
+        version: 1,
+        key_bundle: key_bundle_data,
+    };
+
+    encode(CfeMessageType::ContactKeyBundle, &cfe_bundle)
+}
+
+pub fn decode_contact_keys_cfe(data: &[u8]) -> Result<Vec<u8>, CfeError> {
+    let envelope = decode(data)?;
+    if envelope.msg_type != CfeMessageType::ContactKeyBundle {
+        return Err(CfeError::TypeMismatch {
+            expected: CfeMessageType::ContactKeyBundle,
+            got: envelope.msg_type,
+        });
+    }
+    let bundle: crate::cfe::CfeContactKeyBundleV1 = rmp_serde::from_slice(&envelope.payload)
+        .map_err(|e| CfeError::DeserializeFailed(e.to_string()))?;
+    Ok(bundle.key_bundle)
+}
+
+pub fn load_settings_migration(data: &[u8]) -> Result<crate::cfe::CfeAppSettingsV1, CfeError> {
+    if is_cfe_format(data) {
+        decode_app_settings_cfe(data)
+    } else if looks_like_legacy_json(data) {
+        migrate_app_settings_json_to_cfe(data)
+    } else {
+        Err(CfeError::InvalidFormat)
+    }
+}
+
+pub fn save_settings_cfe(settings: &crate::cfe::CfeAppSettingsV1) -> Result<Vec<u8>, CfeError> {
+    encode_app_settings_cfe(settings)
+}
+
+// ============================================================================
+// Storage Migration Tests
+// ============================================================================
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::cfe::CfeAppSettingsV1;
+    use crate::cfe::CfeContactKeyBundleV1;
+    use crate::cfe::CfeMessageType;
+    use crate::cfe::{decode_as, encode};
+
+    #[test]
+    fn test_app_settings_cfe_roundtrip() {
+        let settings = CfeAppSettingsV1 {
+            version: 1,
+            notifications_enabled: true,
+            theme: "dark".to_string(),
+            typing_indicator: false,
+            read_receipts: true,
+            last_sync: 1700000000,
+        };
+
+        let encoded = encode(CfeMessageType::AppSettings, &settings).expect("encode");
+        let decoded: CfeAppSettingsV1 =
+            decode_as(&encoded, CfeMessageType::AppSettings).expect("decode");
+
+        assert_eq!(decoded.version, 1);
+        assert!(decoded.notifications_enabled);
+        assert_eq!(decoded.theme, "dark");
+        assert!(decoded.typing_indicator);
+        assert!(decoded.read_receipts);
+        assert_eq!(decoded.last_sync, 1700000000);
+    }
+
+    #[test]
+    fn test_app_settings_default() {
+        let settings = CfeAppSettingsV1::default();
+
+        assert_eq!(settings.version, 1);
+        assert!(settings.notifications_enabled);
+        assert_eq!(settings.theme, "default");
+        assert!(settings.typing_indicator);
+        assert!(settings.read_receipts);
+        assert_eq!(settings.last_sync, 0);
+    }
+
+    #[test]
+    fn test_app_settings_json_migration() {
+        let json_data = br#"{"notificationsEnabled":false,"theme":"light","typingIndicator":true,"readReceipts":false,"lastSync":1700000000}"#;
+
+        let migrated = migrate_app_settings_json_to_cfe(json_data).expect("migration");
+
+        assert_eq!(migrated.version, 1);
+        assert!(migrated.notifications_enabled);
+        assert_eq!(migrated.theme, "light");
+        assert!(migrated.typing_indicator);
+        assert!(migrated.read_receipts);
+        assert_eq!(migrated.last_sync, 1700000000);
+    }
+
+    #[test]
+    fn test_app_settings_json_migration_defaults() {
+        let json_data = br#"{}"#;
+
+        let migrated = migrate_app_settings_json_to_cfe(json_data).expect("migration");
+
+        assert!(migrated.notifications_enabled);
+        assert_eq!(migrated.theme, "default");
+        assert!(migrated.typing_indicator);
+        assert!(migrated.read_receipts);
+    }
+
+    #[test]
+    fn test_app_settings_json_migration_missing_fields() {
+        let json_data = br#"{"notificationsEnabled":false,"theme":"dark"}"#;
+
+        let migrated = migrate_app_settings_json_to_cfe(json_data).expect("migration");
+
+        assert!(migrated.notifications_enabled);
+        assert_eq!(migrated.theme, "dark");
+        assert!(migrated.typing_indicator);
+        assert!(migrated.read_receipts);
+    }
+
+    #[test]
+    fn test_app_settings_json_migration_invalid() {
+        let json_data = b"not json";
+
+        let result = migrate_app_settings_json_to_cfe(json_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_settings_migration_cfe() {
+        let settings = CfeAppSettingsV1 {
+            version: 1,
+            notifications_enabled: false,
+            theme: "blue".to_string(),
+            typing_indicator: true,
+            read_receipts: false,
+            last_sync: 1700000000,
+        };
+
+        let encoded = encode(CfeMessageType::AppSettings, &settings).expect("encode");
+        let loaded = load_settings_migration(&encoded).expect("load");
+
+        assert_eq!(loaded.theme, "blue");
+    }
+
+    #[test]
+    fn test_load_settings_migration_json() {
+        let json_data = br#"{"theme":"red","lastSync":1700000000}"#;
+
+        let loaded = load_settings_migration(json_data).expect("load");
+
+        assert_eq!(loaded.theme, "red");
+        assert_eq!(loaded.last_sync, 1700000000);
+    }
+
+    #[test]
+    fn test_load_settings_migration_invalid() {
+        let data = b"binary data";
+
+        let result = load_settings_migration(data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_settings_cfe() {
+        let settings = CfeAppSettingsV1 {
+            version: 1,
+            notifications_enabled: true,
+            theme: "system".to_string(),
+            typing_indicator: false,
+            read_receipts: true,
+            last_sync: 1700000000,
+        };
+
+        let saved = save_settings_cfe(&settings).expect("save");
+
+        let decoded: CfeAppSettingsV1 =
+            decode_as(&saved, CfeMessageType::AppSettings).expect("decode");
+        assert_eq!(decoded.theme, "system");
+    }
+
+    #[test]
+    fn test_contact_keys_cfe_roundtrip() {
+        let key_data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let bundle = CfeContactKeyBundleV1 {
+            version: 1,
+            key_bundle: key_data.clone(),
+        };
+
+        let encoded = encode(CfeMessageType::ContactKeyBundle, &bundle).expect("encode");
+        let decoded_keys = decode_contact_keys_cfe(&encoded).expect("decode");
+
+        assert_eq!(decoded_keys, key_data);
+    }
+
+    #[test]
+    fn test_contact_keys_postcard_migration() {
+        let postcard_data = vec![0x00, 0x01, 0x02, 0x03];
+
+        let migrated = migrate_contact_keys_to_cfe(&postcard_data, KeyBundleFormat::Postcard)
+            .expect("migrate");
+
+        assert!(!migrated.is_empty());
+        assert!(is_cfe_format(&migrated));
+
+        let extracted = decode_contact_keys_cfe(&migrated).expect("extract");
+        assert_eq!(extracted, postcard_data);
+    }
+
+    #[test]
+    fn test_detect_format_cfe() {
+        let cfe_data = [0x43, 0x46, 0x01, 0x01];
+        assert_eq!(detect_format(&cfe_data), KeyBundleFormat::Cfe);
+    }
+
+    #[test]
+    fn test_detect_format_json_object() {
+        let json_data = b"{\"key\":\"value\"}";
+        assert_eq!(detect_format(json_data), KeyBundleFormat::Json);
+    }
+
+    #[test]
+    fn test_detect_format_json_array() {
+        let json_data = b"[1,2,3]";
+        assert_eq!(detect_format(json_data), KeyBundleFormat::Json);
+    }
+
+    #[test]
+    fn test_detect_format_postcard() {
+        let postcard_data = vec![0x00, 0x01, 0x02];
+        assert_eq!(detect_format(&postcard_data), KeyBundleFormat::Postcard);
+    }
+
+    #[test]
+    fn test_is_cfe_format() {
+        assert!(is_cfe_format(&[0x43, 0x46, 0x01]));
+        assert!(!is_cfe_format(&[0x42, 0x46, 0x01]));
+        assert!(!is_cfe_format(&[0x43, 0x47, 0x01]));
+        assert!(!is_cfe_format(b"{\"key\":\"value\"}"));
+    }
+
+    #[test]
+    fn test_looks_like_legacy_json() {
+        assert!(looks_like_legacy_json(b"{\"key\":\"value\"}"));
+        assert!(looks_like_legacy_json(b"[1,2,3]"));
+        assert!(looks_like_legacy_json(b"   {\"key\":\"value\"}"));
+        assert!(looks_like_legacy_json(b"\t{\"key\":\"value\"}"));
+        assert!(looks_like_legacy_json(b"\n{\"key\":\"value\"}"));
+        assert!(!looks_like_legacy_json(b"not json"));
+        assert!(!looks_like_legacy_json(&[0x00, 0x01, 0x02]));
+    }
+
+    #[test]
+    fn test_decode_contact_keys_wrong_type() {
+        let settings = CfeAppSettingsV1::default();
+        let encoded = encode(CfeMessageType::AppSettings, &settings).expect("encode");
+
+        let result = decode_contact_keys_cfe(&encoded);
+        assert!(result.is_err());
+    }
+}

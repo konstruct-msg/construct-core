@@ -30,7 +30,9 @@ pub struct StoredMessage {
 pub struct StoredContact {
     pub id: String,
     pub username: String,
-    pub public_key_bundle: Option<Vec<u8>>, // JSON или Postcard
+    pub key_bundle_cfe: Option<Vec<u8>>,
+    pub key_bundle_postcard: Option<Vec<u8>>,
+    pub key_bundle_json: Option<String>,
     pub added_at: i64,
     pub last_message_at: Option<i64>,
 }
@@ -69,7 +71,8 @@ pub struct StoredAppMetadata {
     pub user_id: String,
     pub username: String,
     pub last_sync: i64,
-    pub settings: Vec<u8>, // JSON настроек
+    pub settings_cfe: Option<Vec<u8>>,
+    pub settings_json: Option<Vec<u8>>,
 }
 
 /// Беседа

@@ -12,6 +12,10 @@ pub enum CfeMessageType {
     OrchestratorState = 0x05,
     SpkRotation = 0x06,
 
+    // Storage (App data)
+    AppSettings = 0x07,
+    ContactKeyBundle = 0x08,
+
     // Event/Action protocol (in-memory)
     InboundEvent = 0x10,
     OutboundActions = 0x11,
@@ -43,6 +47,8 @@ impl CfeMessageType {
             0x04 => Self::RegistrationBundle,
             0x05 => Self::OrchestratorState,
             0x06 => Self::SpkRotation,
+            0x07 => Self::AppSettings,
+            0x08 => Self::ContactKeyBundle,
             0x10 => Self::InboundEvent,
             0x11 => Self::OutboundActions,
             0x20 => Self::KyberPrivateKeys,
@@ -65,6 +71,51 @@ impl TryFrom<u8> for CfeMessageType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Self::from_u8(value).ok_or(())
     }
+}
+
+// ============================================================================
+// Storage CFE types (0x07-0x0F range)
+// ============================================================================
+
+/// App settings stored in metadata
+/// msg_type = 0x07
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeAppSettingsV1 {
+    #[serde(rename = "ver")]
+    pub version: u8,
+    #[serde(rename = "notif")]
+    pub notifications_enabled: bool,
+    #[serde(rename = "theme")]
+    pub theme: String,
+    #[serde(rename = "typing")]
+    pub typing_indicator: bool,
+    #[serde(rename = "receipts")]
+    pub read_receipts: bool,
+    #[serde(rename = "sync")]
+    pub last_sync: i64,
+}
+
+impl Default for CfeAppSettingsV1 {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            notifications_enabled: true,
+            theme: "default".to_string(),
+            typing_indicator: true,
+            read_receipts: true,
+            last_sync: 0,
+        }
+    }
+}
+
+/// Contact public key bundle
+/// msg_type = 0x08
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeContactKeyBundleV1 {
+    #[serde(rename = "ver")]
+    pub version: u8,
+    #[serde(rename = "keys", with = "serde_bytes")]
+    pub key_bundle: Vec<u8>,
 }
 
 // ============================================================================

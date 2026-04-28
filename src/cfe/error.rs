@@ -38,6 +38,9 @@ pub enum CfeError {
         got: CfeMessageType,
     },
 
+    #[error("Invalid data format")]
+    InvalidFormat,
+
     #[error("Serialize failed: {0}")]
     SerializeFailed(String),
 
