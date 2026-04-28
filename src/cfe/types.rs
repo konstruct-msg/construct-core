@@ -118,6 +118,37 @@ pub struct CfeContactKeyBundleV1 {
     pub key_bundle: Vec<u8>,
 }
 
+/// Registration bundle for sharing with contacts
+///_msg_type = 0x04
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeRegistrationBundleV1 {
+    #[serde(rename = "ver")]
+    pub version: u8,
+    #[serde(rename = "ik", with = "serde_bytes")]
+    pub identity_public: Vec<u8>,
+    #[serde(rename = "spk", with = "serde_bytes")]
+    pub signed_prekey_public: Vec<u8>,
+    #[serde(rename = "sig", with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    #[serde(rename = "vk", with = "serde_bytes")]
+    pub verifying_key: Vec<u8>,
+    #[serde(rename = "suite")]
+    pub suite_id: u8,
+}
+
+impl Default for CfeRegistrationBundleV1 {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            identity_public: Vec::new(),
+            signed_prekey_public: Vec::new(),
+            signature: Vec::new(),
+            verifying_key: Vec::new(),
+            suite_id: 0,
+        }
+    }
+}
+
 // ============================================================================
 // CFE payload schemas (v1)
 // ============================================================================

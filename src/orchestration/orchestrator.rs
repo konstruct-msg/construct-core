@@ -599,6 +599,28 @@ impl Orchestrator {
         serde_json::to_string(&json).map_err(|e| e.to_string())
     }
 
+    /// Export registration bundle as CFE binary.
+    pub fn export_registration_bundle_cfe(&self) -> Result<Vec<u8>, String> {
+        let bundle = self
+            .lifecycle
+            .client
+            .key_manager()
+            .export_registration_bundle()
+            .map_err(|e| e.to_string())?;
+
+        let cfe_bundle = crate::cfe::CfeRegistrationBundleV1 {
+            version: 1,
+            identity_public: bundle.identity_public,
+            signed_prekey_public: bundle.signed_prekey_public,
+            signature: bundle.signature,
+            verifying_key: bundle.verifying_key,
+            suite_id: bundle.suite_id.as_u16() as u8,
+        };
+
+        crate::cfe::encode(crate::cfe::CfeMessageType::RegistrationBundle, &cfe_bundle)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn sign_bundle_bytes(&self, data: &[u8]) -> Result<String, String> {
         use base64::Engine as _;
         let signature = self

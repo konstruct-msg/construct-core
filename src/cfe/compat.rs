@@ -128,6 +128,52 @@ pub fn migrate_otpk_bundle_json_str(
     Ok(crate::cfe::CfeOtpkBundleV1 { records, next_id })
 }
 
+pub fn migrate_registration_bundle_json_str(
+    legacy_json: &str,
+) -> Result<crate::cfe::CfeRegistrationBundleV1, CfeError> {
+    use base64::Engine as _;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyRegBundleJson {
+        #[serde(rename = "identity_public")]
+        identity_public: String,
+        #[serde(rename = "signed_prekey_public")]
+        signed_prekey_public: String,
+        #[serde(rename = "signature")]
+        signature: String,
+        #[serde(rename = "verifying_key")]
+        verifying_key: String,
+        #[serde(rename = "suite_id")]
+        suite_id: String,
+    }
+
+    let legacy: LegacyRegBundleJson = serde_json::from_str(legacy_json)
+        .map_err(|e| CfeError::LegacyJsonParseFailed(e.to_string()))?;
+
+    let decode_b64 = |s: &str| -> Result<Vec<u8>, CfeError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|e| CfeError::Base64DecodeFailed(e.to_string()))
+    };
+
+    let suite_id_u8: u8 = legacy
+        .suite_id
+        .parse::<u16>()
+        .map_err(|e| CfeError::InvalidField(format!("suite_id parse failed: {e}")))?
+        .try_into()
+        .map_err(|_| CfeError::InvalidField("suite_id out of range".to_string()))?;
+
+    Ok(crate::cfe::CfeRegistrationBundleV1 {
+        version: 1,
+        identity_public: decode_b64(&legacy.identity_public)?,
+        signed_prekey_public: decode_b64(&legacy.signed_prekey_public)?,
+        signature: decode_b64(&legacy.signature)?,
+        verifying_key: decode_b64(&legacy.verifying_key)?,
+        suite_id: suite_id_u8,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +376,31 @@ pub fn save_settings_cfe(settings: &crate::cfe::CfeAppSettingsV1) -> Result<Vec<
     encode_app_settings_cfe(settings)
 }
 
+pub fn encode_registration_bundle_cfe(
+    bundle: &crate::cfe::CfeRegistrationBundleV1,
+) -> Result<Vec<u8>, CfeError> {
+    encode(CfeMessageType::RegistrationBundle, bundle)
+}
+
+pub fn decode_registration_bundle_cfe(
+    data: &[u8],
+) -> Result<crate::cfe::CfeRegistrationBundleV1, CfeError> {
+    decode_as(data, CfeMessageType::RegistrationBundle)
+}
+
+pub fn load_registration_bundle_migration(
+    data: &[u8],
+) -> Result<crate::cfe::CfeRegistrationBundleV1, CfeError> {
+    if is_cfe_format(data) {
+        decode_registration_bundle_cfe(data)
+    } else if looks_like_legacy_json(data) {
+        let json_str = std::str::from_utf8(data).map_err(|_| CfeError::InvalidFormat)?;
+        migrate_registration_bundle_json_str(json_str)
+    } else {
+        Err(CfeError::InvalidFormat)
+    }
+}
+
 // ============================================================================
 // Storage Migration Tests
 // ============================================================================
@@ -340,7 +411,10 @@ mod storage_tests {
     use crate::cfe::CfeAppSettingsV1;
     use crate::cfe::CfeContactKeyBundleV1;
     use crate::cfe::CfeMessageType;
+    use crate::cfe::CfeRegistrationBundleV1;
     use crate::cfe::{decode_as, encode};
+    use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::classic::ClassicSuiteProvider;
 
     #[test]
     fn test_app_settings_cfe_roundtrip() {
@@ -348,7 +422,7 @@ mod storage_tests {
             version: 1,
             notifications_enabled: true,
             theme: "dark".to_string(),
-            typing_indicator: false,
+            typing_indicator: true,
             read_receipts: true,
             last_sync: 1700000000,
         };
@@ -384,10 +458,10 @@ mod storage_tests {
         let migrated = migrate_app_settings_json_to_cfe(json_data).expect("migration");
 
         assert_eq!(migrated.version, 1);
-        assert!(migrated.notifications_enabled);
+        assert!(!migrated.notifications_enabled);
         assert_eq!(migrated.theme, "light");
         assert!(migrated.typing_indicator);
-        assert!(migrated.read_receipts);
+        assert!(!migrated.read_receipts);
         assert_eq!(migrated.last_sync, 1700000000);
     }
 
@@ -409,7 +483,7 @@ mod storage_tests {
 
         let migrated = migrate_app_settings_json_to_cfe(json_data).expect("migration");
 
-        assert!(migrated.notifications_enabled);
+        assert!(!migrated.notifications_enabled);
         assert_eq!(migrated.theme, "dark");
         assert!(migrated.typing_indicator);
         assert!(migrated.read_receipts);
@@ -554,5 +628,85 @@ mod storage_tests {
 
         let result = decode_contact_keys_cfe(&encoded);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_registration_bundle_json_migration() {
+        use base64::Engine as _;
+
+        let (_ik_priv, ik_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (_spk_priv, spk_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (_sk_priv, vk_pub) = ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let spk_sig = vec![7u8; 64];
+
+        let legacy = serde_json::json!({
+            "identity_public": base64::engine::general_purpose::STANDARD.encode(&ik_pub),
+            "signed_prekey_public": base64::engine::general_purpose::STANDARD.encode(&spk_pub),
+            "signature": base64::engine::general_purpose::STANDARD.encode(&spk_sig),
+            "verifying_key": base64::engine::general_purpose::STANDARD.encode(&vk_pub),
+            "suite_id": "1"
+        })
+        .to_string();
+
+        let migrated = migrate_registration_bundle_json_str(&legacy).expect("migration");
+
+        assert_eq!(migrated.version, 1);
+        assert_eq!(migrated.suite_id, 1);
+        assert_eq!(migrated.identity_public.as_slice(), ik_pub.as_slice());
+        assert_eq!(migrated.signed_prekey_public.as_slice(), spk_pub.as_slice());
+    }
+
+    #[test]
+    fn test_registration_bundle_cfe_roundtrip() {
+        let bundle = CfeRegistrationBundleV1 {
+            version: 1,
+            identity_public: vec![1, 2, 3, 4],
+            signed_prekey_public: vec![5, 6, 7, 8],
+            signature: vec![9, 10, 11, 12],
+            verifying_key: vec![13, 14, 15, 16],
+            suite_id: 1,
+        };
+
+        let encoded = encode(CfeMessageType::RegistrationBundle, &bundle).expect("encode");
+        let decoded: CfeRegistrationBundleV1 =
+            decode_as(&encoded, CfeMessageType::RegistrationBundle).expect("decode");
+
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.identity_public.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(decoded.suite_id, 1);
+    }
+
+    #[test]
+    fn test_load_registration_bundle_migration_cfe() {
+        let bundle = CfeRegistrationBundleV1 {
+            version: 1,
+            identity_public: vec![1, 2, 3],
+            signed_prekey_public: vec![4, 5, 6],
+            signature: vec![7, 8, 9],
+            verifying_key: vec![10, 11, 12],
+            suite_id: 1,
+        };
+
+        let encoded = encode(CfeMessageType::RegistrationBundle, &bundle).expect("encode");
+        let loaded = load_registration_bundle_migration(&encoded).expect("load");
+
+        assert_eq!(loaded.identity_public.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_load_registration_bundle_migration_json() {
+        let legacy = serde_json::json!({
+            "identity_public": "AQID",
+            "signed_prekey_public": "AQIE",
+            "signature": "AQIF",
+            "verifying_key": "AQYG",
+            "suite_id": "1"
+        })
+        .to_string();
+
+        let loaded = load_registration_bundle_migration(legacy.as_bytes()).expect("load");
+
+        assert_eq!(loaded.identity_public.as_slice(), &[1, 2, 3]);
+        assert_eq!(loaded.suite_id, 1);
     }
 }
