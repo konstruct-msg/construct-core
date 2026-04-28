@@ -38,6 +38,15 @@ const PREWARM_COOLDOWN_MS: u64 = 30_000;
 
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
+/// Binary first message for RESPONDER path — replaces JSON-encoded `&[u8]`.
+pub struct IncomingFirstMessage {
+    pub ephemeral_public_key: Vec<u8>,
+    pub message_number: u32,
+    /// Raw sealed box: nonce[12] ++ ciphertext
+    pub content: Vec<u8>,
+    pub one_time_prekey_id: u32,
+}
+
 pub struct Orchestrator {
     lifecycle: SessionLifecycleManager,
     router: MessageRouter,
@@ -209,66 +218,20 @@ impl Orchestrator {
     pub fn init_session_with_bundle(
         &mut self,
         contact_id: &str,
-        recipient_bundle: &[u8],
+        public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        kyber_pre_key_public: Option<Vec<u8>>,
+        kyber_one_time_prekey_public: Option<Vec<u8>>,
+        kyber_one_time_prekey_id: Option<u32>,
     ) -> Result<String, String> {
-        use crate::crypto::SuiteID;
-        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-
-        #[derive(serde::Deserialize)]
-        struct KeyBundle {
-            identity_public: Vec<u8>,
-            signed_prekey_public: Vec<u8>,
-            signature: Vec<u8>,
-            verifying_key: Vec<u8>,
-            suite_id: u16,
-            #[serde(default)]
-            one_time_prekey_public: Option<Vec<u8>>,
-            #[serde(default)]
-            one_time_prekey_id: Option<u32>,
-            #[serde(default)]
-            spk_uploaded_at: Option<u64>,
-            #[serde(default)]
-            spk_rotation_epoch: Option<u32>,
-            #[serde(default)]
-            kyber_spk_uploaded_at: Option<u64>,
-            #[serde(default)]
-            kyber_spk_rotation_epoch: Option<u32>,
-            // PQXDH: recipient's ML-KEM-768 public keys
-            #[serde(default)]
-            kyber_pre_key_public: Option<Vec<u8>>,
-            #[serde(default)]
-            kyber_one_time_prekey_public: Option<Vec<u8>>,
-            #[serde(default)]
-            kyber_one_time_prekey_id: Option<u32>,
-        }
-
-        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
-            .map_err(|_| "invalid key bundle JSON".to_string())?;
-
-        let public_bundle = X3DHPublicKeyBundle {
-            identity_public: key_bundle.identity_public.clone(),
-            signed_prekey_public: key_bundle.signed_prekey_public.clone(),
-            signature: key_bundle.signature.clone(),
-            verifying_key: key_bundle.verifying_key.clone(),
-            suite_id: SuiteID::new(key_bundle.suite_id)
-                .map_err(|_| "invalid suite_id".to_string())?,
-            one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
-            one_time_prekey_id: key_bundle.one_time_prekey_id,
-            spk_uploaded_at: key_bundle.spk_uploaded_at.unwrap_or(0),
-            spk_rotation_epoch: key_bundle.spk_rotation_epoch.unwrap_or(0),
-            kyber_spk_uploaded_at: key_bundle.kyber_spk_uploaded_at.unwrap_or(0),
-            kyber_spk_rotation_epoch: key_bundle.kyber_spk_rotation_epoch.unwrap_or(0),
-        };
-
         let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
-        let one_time_prekey_id = key_bundle.one_time_prekey_id.unwrap_or(0);
+            ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
+        let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
 
         tracing::debug!(
             target: "crypto::orchestrator",
             contact_id = %contact_id,
             one_time_prekey_id = one_time_prekey_id,
-            has_otpk_public = key_bundle.one_time_prekey_public.is_some(),
+            has_otpk_public = public_bundle.one_time_prekey_public.is_some(),
             "init_session_with_bundle: storing pending OTPK id"
         );
 
@@ -285,12 +248,11 @@ impl Orchestrator {
         // PQXDH: encapsulate to recipient's Kyber public key and defer SS application.
         // Prefer one-time pre-key (consumed once) over the signed pre-key.
         // `recipient_otpk_id` is 0 when Kyber SPK is used (no OTPK available).
-        let (kyber_public, recipient_otpk_id) =
-            if let Some(pk) = key_bundle.kyber_one_time_prekey_public {
-                (Some(pk), key_bundle.kyber_one_time_prekey_id.unwrap_or(0))
-            } else {
-                (key_bundle.kyber_pre_key_public, 0)
-            };
+        let (kyber_public, recipient_otpk_id) = if let Some(pk) = kyber_one_time_prekey_public {
+            (Some(pk), kyber_one_time_prekey_id.unwrap_or(0))
+        } else {
+            (kyber_pre_key_public, 0)
+        };
         if let Some(kem_pk) = kyber_public {
             if let Ok((_result, _persist_actions)) = self
                 .lifecycle
@@ -303,8 +265,6 @@ impl Orchestrator {
                     kyber_otpk_id = _result.otpk_id,
                     "init_session_with_bundle: PQXDH encapsulated, ciphertext deferred"
                 );
-                // persist_actions (SaveSessionToSecureStore for pq_deferred_<id>) are
-                // handled by the caller via saveOrchestratorStateCFE on the Swift side.
             }
         }
 
@@ -314,47 +274,21 @@ impl Orchestrator {
     pub fn init_receiving_session_with_msg(
         &mut self,
         contact_id: &str,
-        recipient_bundle: &[u8],
-        first_message: &[u8],
+        public_bundle: &crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        first_message: &IncomingFirstMessage,
     ) -> Result<(String, Vec<u8>), String> {
-        use crate::crypto::SuiteID;
         use crate::crypto::keys::build_prologue;
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
         use crate::crypto::provider::CryptoProvider;
 
-        #[derive(serde::Deserialize)]
-        struct KeyBundle {
-            identity_public: Vec<u8>,
-            signed_prekey_public: Vec<u8>,
-            signature: Vec<u8>,
-            verifying_key: Vec<u8>,
-            suite_id: u16,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct FirstMsg {
-            ephemeral_public_key: Vec<u8>,
-            message_number: u32,
-            content: Vec<u8>, // raw sealed box bytes (JSON array of numbers)
-            #[serde(default)]
-            one_time_prekey_id: u32,
-        }
-
-        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
-            .map_err(|_| "invalid key bundle JSON".to_string())?;
-
-        let first_msg: FirstMsg = serde_json::from_slice(first_message)
-            .map_err(|_| "invalid first message JSON".to_string())?;
-
-        let sealed_box = first_msg.content;
-
+        let sealed_box = &first_message.content;
         if sealed_box.len() < 12 {
             return Err("sealed_box too short".to_string());
         }
         let nonce = sealed_box[..12].to_vec();
         let ciphertext = sealed_box[12..].to_vec();
 
-        let dh_public_key: [u8; 32] = first_msg
+        let dh_public_key: [u8; 32] = first_message
             .ephemeral_public_key
             .clone()
             .try_into()
@@ -362,36 +296,31 @@ impl Orchestrator {
 
         let encrypted_first_message = EncryptedRatchetMessage {
             dh_public_key,
-            message_number: first_msg.message_number,
+            message_number: first_message.message_number,
             ciphertext,
             nonce,
             previous_chain_length: 0,
-            suite_id: key_bundle.suite_id,
+            suite_id: public_bundle.suite_id.as_u16(),
         };
 
         // Verify the initiator's signed prekey signature before doing any crypto.
-        // This prevents a malicious or corrupted bundle from being used to establish
-        // a session — the initiator must prove they hold the signing key that signed
-        // their SPK.  We do this here rather than delegating to init_receiving_session()
-        // because that function also checks contact_id == derive_device_id(identity_key),
-        // which is only valid in the device-based test model; in production contact_id
-        // is a user UUID and the check would always fail.
-        let suite_id =
-            SuiteID::new(key_bundle.suite_id).map_err(|_| "invalid suite_id".to_string())?;
-        let verifying_key =
-            ClassicSuiteProvider::signature_public_key_from_bytes(key_bundle.verifying_key.clone());
+        let suite_id = public_bundle.suite_id;
+        let verifying_key = ClassicSuiteProvider::signature_public_key_from_bytes(
+            public_bundle.verifying_key.clone(),
+        );
         let prologue = build_prologue(suite_id);
         let mut spk_msg =
-            Vec::with_capacity(prologue.len() + key_bundle.signed_prekey_public.len());
+            Vec::with_capacity(prologue.len() + public_bundle.signed_prekey_public.len());
         spk_msg.extend_from_slice(&prologue);
-        spk_msg.extend_from_slice(&key_bundle.signed_prekey_public);
-        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &key_bundle.signature)
+        spk_msg.extend_from_slice(&public_bundle.signed_prekey_public);
+        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &public_bundle.signature)
             .map_err(|_| "invalid signed prekey signature from initiator".to_string())?;
 
         let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
-        let remote_ephemeral =
-            ClassicSuiteProvider::kem_public_key_from_bytes(first_msg.ephemeral_public_key.clone());
+            ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
+        let remote_ephemeral = ClassicSuiteProvider::kem_public_key_from_bytes(
+            first_message.ephemeral_public_key.clone(),
+        );
 
         let (_session_id, plaintext) = self
             .lifecycle
@@ -401,7 +330,7 @@ impl Orchestrator {
                 &remote_identity,
                 &remote_ephemeral,
                 &encrypted_first_message,
-                first_msg.one_time_prekey_id,
+                first_message.one_time_prekey_id,
             )
             .map_err(|e| e.to_string())?;
 

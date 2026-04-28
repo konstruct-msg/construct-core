@@ -147,6 +147,37 @@ pub struct SessionInitResult {
     pub storage_key: Vec<u8>,       // 32-byte random key for the first received message
 }
 
+/// Binary key bundle — mirrors the UDL `BinaryKeyBundle` dictionary.
+/// Replaces the JSON-encoded `sequence<u8>` that was previously passed to init_session /
+/// init_receiving_session. All fields are already `Vec<u8>` / scalar — no encoding step needed.
+#[derive(Debug, Clone)]
+pub struct BinaryKeyBundle {
+    pub identity_public: Vec<u8>,
+    pub signed_prekey_public: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub verifying_key: Vec<u8>,
+    pub suite_id: u16,
+    pub one_time_prekey_public: Option<Vec<u8>>,
+    pub one_time_prekey_id: Option<u32>,
+    pub spk_uploaded_at: u64,
+    pub spk_rotation_epoch: u32,
+    pub kyber_spk_uploaded_at: u64,
+    pub kyber_spk_rotation_epoch: u32,
+    pub kyber_pre_key_public: Option<Vec<u8>>,
+    pub kyber_one_time_prekey_public: Option<Vec<u8>>,
+    pub kyber_one_time_prekey_id: Option<u32>,
+}
+
+/// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
+/// Replaces the JSON-encoded first-message bytes in init_receiving_session.
+#[derive(Debug, Clone)]
+pub struct BinaryFirstMessage {
+    pub ephemeral_public_key: Vec<u8>,
+    pub message_number: u32,
+    pub content: Vec<u8>, // raw sealed box: nonce[12] ++ ciphertext
+    pub one_time_prekey_id: u32,
+}
+
 /// One-time prekey pair for upload to server
 #[derive(Debug, Clone)]
 pub struct OtpkPair {
@@ -160,20 +191,6 @@ pub struct OtpkRecord {
     pub key_id: u32,
     pub private_key: Vec<u8>, // Base64-encoded private key bytes
     pub public_key: Vec<u8>,  // Base64-encoded public key bytes
-}
-
-// Key bundle for session initialization
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct KeyBundle {
-    identity_public: Vec<u8>,
-    signed_prekey_public: Vec<u8>,
-    signature: Vec<u8>,
-    verifying_key: Vec<u8>,
-    suite_id: u16,
-    #[serde(default)]
-    one_time_prekey_public: Option<Vec<u8>>,
-    #[serde(default)]
-    one_time_prekey_id: Option<u32>,
 }
 
 // Private keys for persistence (exported via UDL)
@@ -684,39 +701,18 @@ impl ClassicCryptoCore {
     pub fn init_session(
         &self,
         contact_id: String,
-        recipient_bundle: Vec<u8>,
+        recipient_bundle: BinaryKeyBundle,
     ) -> Result<String, CryptoError> {
-        let bundle_str =
-            std::str::from_utf8(&recipient_bundle).map_err(|_| CryptoError::InvalidKeyData)?;
-
-        let key_bundle: KeyBundle =
-            serde_json::from_str(bundle_str).map_err(|_| CryptoError::InvalidKeyData)?;
-
-        // Create X3DHPublicKeyBundle
-        let public_bundle = X3DHPublicKeyBundle {
-            identity_public: key_bundle.identity_public.clone(),
-            signed_prekey_public: key_bundle.signed_prekey_public.clone(),
-            signature: key_bundle.signature.clone(),
-            verifying_key: key_bundle.verifying_key.clone(),
-            suite_id: SuiteID::new(key_bundle.suite_id).map_err(|_| CryptoError::InvalidKeyData)?,
-            one_time_prekey_public: key_bundle.one_time_prekey_public.clone(),
-            one_time_prekey_id: key_bundle.one_time_prekey_id,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        };
-
-        // Extract remote identity public key
-        let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
-
-        let one_time_prekey_id = key_bundle.one_time_prekey_id.unwrap_or(0);
+        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
+        let remote_identity = ClassicSuiteProvider::kem_public_key_from_bytes(
+            recipient_bundle.identity_public.clone(),
+        );
+        let one_time_prekey_id = recipient_bundle.one_time_prekey_id.unwrap_or(0);
 
         tracing::debug!(
             target: "crypto::uniffi",
             contact_id = %contact_id,
-            remote_identity_len = key_bundle.identity_public.len(),
+            remote_identity_len = recipient_bundle.identity_public.len(),
             "Initializing session (sender side)"
         );
 
@@ -725,7 +721,6 @@ impl ClassicCryptoCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Log local keys for debugging (sender side)
         let local_bundle = client
             .key_manager()
             .export_registration_bundle()
@@ -735,15 +730,14 @@ impl ClassicCryptoCore {
             target: "crypto::uniffi",
             contact_id = %contact_id,
             local_identity_len = local_bundle.identity_public.len(),
-            remote_identity_len = key_bundle.identity_public.len(),
-            remote_signed_prekey_len = key_bundle.signed_prekey_public.len(),
-            verifying_key_len = key_bundle.verifying_key.len(),
-            signature_len = key_bundle.signature.len(),
-            suite_id = key_bundle.suite_id,
+            remote_identity_len = recipient_bundle.identity_public.len(),
+            remote_signed_prekey_len = recipient_bundle.signed_prekey_public.len(),
+            verifying_key_len = recipient_bundle.verifying_key.len(),
+            signature_len = recipient_bundle.signature.len(),
+            suite_id = recipient_bundle.suite_id,
             "Initializing session (sender side)"
         );
 
-        // Initialize the session (returns internal session_id which we ignore)
         client
             .init_session(
                 &contact_id,
@@ -763,8 +757,6 @@ impl ClassicCryptoCore {
                 }
             })?;
 
-        // Return contact_id as the session identifier for Swift
-        // Sessions are looked up by contact_id, not by the internal random session_id
         Ok(contact_id)
     }
 
@@ -774,41 +766,16 @@ impl ClassicCryptoCore {
     pub fn init_receiving_session(
         &self,
         contact_id: String,
-        recipient_bundle: Vec<u8>,
-        first_message: Vec<u8>,
+        recipient_bundle: BinaryKeyBundle,
+        first_message: BinaryFirstMessage,
     ) -> Result<SessionInitResult, CryptoError> {
         tracing::debug!("init_receiving_session called for contact: {}", contact_id);
 
-        // Parse recipient bundle JSON
-        let bundle_str =
-            std::str::from_utf8(&recipient_bundle).map_err(|_| CryptoError::InvalidKeyData)?;
+        let _public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
 
-        let key_bundle: KeyBundle =
-            serde_json::from_str(bundle_str).map_err(|_| CryptoError::InvalidKeyData)?;
+        let sealed_box = first_message.content;
+        tracing::debug!("sealed_box length: {}", sealed_box.len());
 
-        tracing::debug!("Parsed key bundle, suite_id: {}", key_bundle.suite_id);
-
-        // Parse first message JSON
-        let message_str =
-            std::str::from_utf8(&first_message).map_err(|_| CryptoError::InvalidCiphertext)?;
-
-        #[derive(Deserialize)]
-        struct FirstMessage {
-            ephemeral_public_key: Vec<u8>,
-            message_number: u32,
-            content: Vec<u8>,
-            #[serde(default)]
-            one_time_prekey_id: u32,
-        }
-
-        let first_msg: FirstMessage =
-            serde_json::from_str(message_str).map_err(|_| CryptoError::InvalidCiphertext)?;
-
-        let sealed_box = first_msg.content;
-
-        tracing::debug!("Parsing sealed_box - total length: {}", sealed_box.len());
-
-        // Extract nonce (first 12 bytes) and ciphertext (rest)
         if sealed_box.len() < 12 {
             return Err(CryptoError::InvalidCiphertext);
         }
@@ -821,35 +788,34 @@ impl ClassicCryptoCore {
             ciphertext.len()
         );
 
-        // Convert ephemeral_public_key to [u8; 32]
-        let dh_public_key: [u8; 32] = first_msg
+        let dh_public_key: [u8; 32] = first_message
             .ephemeral_public_key
             .clone()
             .try_into()
             .map_err(|_| CryptoError::InvalidKeyData)?;
 
-        // Create EncryptedRatchetMessage
         let encrypted_first_message = EncryptedRatchetMessage {
             dh_public_key,
-            message_number: first_msg.message_number,
+            message_number: first_message.message_number,
             ciphertext,
             nonce,
             previous_chain_length: 0,
-            suite_id: key_bundle.suite_id,
+            suite_id: recipient_bundle.suite_id,
         };
 
-        // Extract keys for session initialization
-        let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
+        let remote_identity = ClassicSuiteProvider::kem_public_key_from_bytes(
+            recipient_bundle.identity_public.clone(),
+        );
 
-        let remote_ephemeral =
-            ClassicSuiteProvider::kem_public_key_from_bytes(first_msg.ephemeral_public_key.clone());
+        let remote_ephemeral = ClassicSuiteProvider::kem_public_key_from_bytes(
+            first_message.ephemeral_public_key.clone(),
+        );
 
         tracing::debug!(
             target: "crypto::uniffi",
             contact_id = %contact_id,
-            remote_identity_len = key_bundle.identity_public.len(),
-            remote_ephemeral_len = first_msg.ephemeral_public_key.len(),
+            remote_identity_len = recipient_bundle.identity_public.len(),
+            remote_ephemeral_len = first_message.ephemeral_public_key.len(),
             dh_public_key_len = encrypted_first_message.dh_public_key.len(),
             "Initializing receiving session (receiver side)"
         );
@@ -859,7 +825,6 @@ impl ClassicCryptoCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Log local keys for debugging
         let local_bundle = client
             .key_manager()
             .export_registration_bundle()
@@ -870,18 +835,18 @@ impl ClassicCryptoCore {
             contact_id = %contact_id,
             local_identity_len = local_bundle.identity_public.len(),
             local_signed_prekey_len = local_bundle.signed_prekey_public.len(),
-            remote_identity_len = key_bundle.identity_public.len(),
-            remote_ephemeral_len = first_msg.ephemeral_public_key.len(),
-            message_number = first_msg.message_number,
+            remote_identity_len = recipient_bundle.identity_public.len(),
+            remote_ephemeral_len = first_message.ephemeral_public_key.len(),
+            message_number = first_message.message_number,
             "Initializing receiving session (receiver side)"
         );
         tracing::info!(
             target: "crypto::uniffi",
             local_ik_pub_prefix = %hex::encode(&local_bundle.identity_public[..4.min(local_bundle.identity_public.len())]),
             local_spk_pub_prefix = %hex::encode(&local_bundle.signed_prekey_public[..4.min(local_bundle.signed_prekey_public.len())]),
-            remote_ik_pub_prefix = %hex::encode(&key_bundle.identity_public[..4.min(key_bundle.identity_public.len())]),
-            remote_ek_pub_prefix = %hex::encode(&first_msg.ephemeral_public_key[..4.min(first_msg.ephemeral_public_key.len())]),
-            otpk_id = first_msg.one_time_prekey_id,
+            remote_ik_pub_prefix = %hex::encode(&recipient_bundle.identity_public[..4.min(recipient_bundle.identity_public.len())]),
+            remote_ek_pub_prefix = %hex::encode(&first_message.ephemeral_public_key[..4.min(first_message.ephemeral_public_key.len())]),
+            otpk_id = first_message.one_time_prekey_id,
             "[RESPONDER keys] local_ik_pub, local_spk_pub, remote_ik_pub, remote_ek_pub, otpk_id"
         );
 
@@ -891,16 +856,16 @@ impl ClassicCryptoCore {
                 &remote_identity,
                 &remote_ephemeral,
                 &encrypted_first_message,
-                first_msg.one_time_prekey_id,
+                first_message.one_time_prekey_id,
             )
             .map_err(|e| {
                 tracing::error!(
                     target: "crypto::uniffi",
                     contact_id = %contact_id,
                     error = %e,
-                    remote_identity_len = key_bundle.identity_public.len(),
-                    remote_ephemeral_len = first_msg.ephemeral_public_key.len(),
-                    message_number = first_msg.message_number,
+                    remote_identity_len = recipient_bundle.identity_public.len(),
+                    remote_ephemeral_len = first_message.ephemeral_public_key.len(),
+                    message_number = first_message.message_number,
                     "init_receiving_session_with_ephemeral failed"
                 );
                 CryptoError::SessionInitializationFailed {
@@ -910,7 +875,7 @@ impl ClassicCryptoCore {
 
         // Keep plaintext as raw bytes — UTF-8 conversion is the caller's responsibility.
         // Binary content (e.g. old clients sending protobuf as msgNum=0) must NOT prevent
-        // session establishment; the X3DH handshake succeeded regardless of content encoding.
+        // session establishment; the X3DH handshake completed successfully.
         let decrypted_message = plaintext_bytes;
 
         tracing::info!(
@@ -918,7 +883,6 @@ impl ClassicCryptoCore {
             decrypted_message.len()
         );
 
-        // Return contact_id as session_id for Swift (sessions are looked up by contact_id)
         Ok(SessionInitResult {
             session_id: contact_id,
             decrypted_message,
@@ -1760,8 +1724,8 @@ pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> 
 mod tests {
     use super::*;
 
-    /// Helper to convert RegistrationBundleJson to KeyBundle format
-    fn convert_bundle_for_init(bundle_json: &str) -> Vec<u8> {
+    /// Helper to convert RegistrationBundleJson to BinaryKeyBundle for tests
+    fn convert_bundle_for_init(bundle_json: &str) -> BinaryKeyBundle {
         use base64::Engine;
 
         #[derive(serde::Deserialize)]
@@ -1775,33 +1739,30 @@ mod tests {
 
         let bundle: RegBundle = serde_json::from_str(bundle_json).unwrap();
 
-        // Convert base64 to bytes
-        let identity_pub = base64::engine::general_purpose::STANDARD
-            .decode(&bundle.identity_public)
-            .unwrap();
-        let signed_prekey = base64::engine::general_purpose::STANDARD
-            .decode(&bundle.signed_prekey_public)
-            .unwrap();
-        let signature = base64::engine::general_purpose::STANDARD
-            .decode(&bundle.signature)
-            .unwrap();
-        let verifying_key = base64::engine::general_purpose::STANDARD
-            .decode(&bundle.verifying_key)
-            .unwrap();
-        let suite_id: u16 = bundle.suite_id.parse().unwrap();
-
-        // Create KeyBundle and serialize it properly
-        let key_bundle = KeyBundle {
-            identity_public: identity_pub,
-            signed_prekey_public: signed_prekey,
-            signature,
-            verifying_key,
-            suite_id,
+        BinaryKeyBundle {
+            identity_public: base64::engine::general_purpose::STANDARD
+                .decode(&bundle.identity_public)
+                .unwrap(),
+            signed_prekey_public: base64::engine::general_purpose::STANDARD
+                .decode(&bundle.signed_prekey_public)
+                .unwrap(),
+            signature: base64::engine::general_purpose::STANDARD
+                .decode(&bundle.signature)
+                .unwrap(),
+            verifying_key: base64::engine::general_purpose::STANDARD
+                .decode(&bundle.verifying_key)
+                .unwrap(),
+            suite_id: bundle.suite_id.parse().unwrap(),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
-        };
-
-        serde_json::to_vec(&key_bundle).unwrap()
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            kyber_pre_key_public: None,
+            kyber_one_time_prekey_public: None,
+            kyber_one_time_prekey_id: None,
+        }
     }
 
     /// Test that verifies session_id returned from init_session is the contact_id
@@ -1874,19 +1835,15 @@ mod tests {
         );
 
         // Bob initializes receiving session with Alice's first message
-        let first_msg_json = serde_json::json!({
-            "ephemeral_public_key": encrypted.ephemeral_public_key,
-            "message_number": encrypted.message_number,
-            "content": encrypted.content
-        });
-        let first_msg_bytes = serde_json::to_vec(&first_msg_json).unwrap();
+        let first_msg = BinaryFirstMessage {
+            ephemeral_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            content: encrypted.content,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+        };
 
         let bob_session_result = bob
-            .init_receiving_session(
-                "alice_user_id".to_string(),
-                alice_bundle_bytes,
-                first_msg_bytes,
-            )
+            .init_receiving_session("alice_user_id".to_string(), alice_bundle_bytes, first_msg)
             .unwrap();
 
         // CRITICAL: Bob's session_id should be alice_user_id
@@ -1978,18 +1935,15 @@ mod tests {
             .unwrap();
 
         // Bob initializes receiving session
-        let first_msg_json = serde_json::json!({
-            "ephemeral_public_key": msg1.ephemeral_public_key,
-            "message_number": msg1.message_number,
-            "content": msg1.content
-        });
+        let first_msg = BinaryFirstMessage {
+            ephemeral_public_key: msg1.ephemeral_public_key,
+            message_number: msg1.message_number,
+            content: msg1.content,
+            one_time_prekey_id: msg1.one_time_prekey_id,
+        };
 
         let bob_session_result = bob
-            .init_receiving_session(
-                "alice_contact".to_string(),
-                alice_bundle_bytes,
-                serde_json::to_vec(&first_msg_json).unwrap(),
-            )
+            .init_receiving_session("alice_contact".to_string(), alice_bundle_bytes, first_msg)
             .unwrap();
 
         // Verify session IDs are the contact IDs
@@ -2456,48 +2410,49 @@ pub struct HealingAttemptResult {
 
 // ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
 
+/// Convert a `BinaryKeyBundle` (received from Swift via UniFFI) into the internal
+/// `X3DHPublicKeyBundle` used by the crypto layer. This is a zero-copy conversion
+/// — all fields are moved from the dictionary struct into the internal type.
+fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, CryptoError> {
+    Ok(X3DHPublicKeyBundle {
+        identity_public: b.identity_public.clone(),
+        signed_prekey_public: b.signed_prekey_public.clone(),
+        signature: b.signature.clone(),
+        verifying_key: b.verifying_key.clone(),
+        suite_id: SuiteID::new(b.suite_id).map_err(|_| CryptoError::InvalidKeyData)?,
+        one_time_prekey_public: b.one_time_prekey_public.clone(),
+        one_time_prekey_id: b.one_time_prekey_id,
+        spk_uploaded_at: b.spk_uploaded_at,
+        spk_rotation_epoch: b.spk_rotation_epoch,
+        kyber_spk_uploaded_at: b.kyber_spk_uploaded_at,
+        kyber_spk_rotation_epoch: b.kyber_spk_rotation_epoch,
+    })
+}
+
 /// Check SPK freshness from raw bundle JSON bytes.
 ///
 /// Returns `Err(CryptoError::PeerSpkStale { age_secs })` if the SPK or Kyber SPK is stale
 /// (older than 14 days). Returns `Ok(())` if fresh, absent (legacy server), or unparseable.
 /// Mirrors the logic in `crypto::client_api::validate_bundle_freshness` but runs at the
 /// UniFFI boundary so the error can be surfaced as a typed variant rather than a string.
-fn check_bundle_freshness_raw(bundle: &[u8]) -> Result<(), CryptoError> {
-    #[derive(serde::Deserialize)]
-    struct BundleFreshnessFields {
-        #[serde(default)]
-        spk_uploaded_at: Option<u64>,
-        #[serde(default)]
-        kyber_spk_uploaded_at: Option<u64>,
-    }
-
-    let fields: BundleFreshnessFields = match serde_json::from_slice(bundle) {
-        Ok(f) => f,
-        Err(_) => return Ok(()), // unparseable — let init_session_with_bundle handle it
-    };
-
+fn check_bundle_freshness(bundle: &BinaryKeyBundle) -> Result<(), CryptoError> {
     const SPK_MAX_AGE_SECS: u64 = 14 * 24 * 3600;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    if let Some(spk_uploaded_at) = fields.spk_uploaded_at {
-        if spk_uploaded_at > 0 {
-            let age = now.saturating_sub(spk_uploaded_at);
-            if age > SPK_MAX_AGE_SECS {
-                return Err(CryptoError::PeerSpkStale { age_secs: age });
-            }
+    if bundle.spk_uploaded_at > 0 {
+        let age = now.saturating_sub(bundle.spk_uploaded_at);
+        if age > SPK_MAX_AGE_SECS {
+            return Err(CryptoError::PeerSpkStale { age_secs: age });
         }
     }
 
-    if let Some(kyber_uploaded_at) = fields.kyber_spk_uploaded_at {
-        if kyber_uploaded_at > 0 {
-            let age = now.saturating_sub(kyber_uploaded_at);
-            if age > SPK_MAX_AGE_SECS {
-                // Re-use PeerSpkStale — callers treat both SPK types the same way.
-                return Err(CryptoError::PeerSpkStale { age_secs: age });
-            }
+    if bundle.kyber_spk_uploaded_at > 0 {
+        let age = now.saturating_sub(bundle.kyber_spk_uploaded_at);
+        if age > SPK_MAX_AGE_SECS {
+            return Err(CryptoError::PeerSpkStale { age_secs: age });
         }
     }
 
@@ -2710,32 +2665,43 @@ impl OrchestratorCore {
     pub fn init_session(
         &self,
         contact_id: String,
-        recipient_bundle: Vec<u8>,
+        recipient_bundle: BinaryKeyBundle,
     ) -> Result<String, CryptoError> {
-        // Check SPK freshness before acquiring the lock.
-        // Surfaces staleness as CryptoError::PeerSpkStale instead of the generic
-        // SessionInitializationFailed, allowing Swift to handle it with a typed catch.
-        check_bundle_freshness_raw(&recipient_bundle)?;
+        check_bundle_freshness(&recipient_bundle)?;
 
+        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.init_session_with_bundle(&contact_id, &recipient_bundle)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+        orch.init_session_with_bundle(
+            &contact_id,
+            public_bundle,
+            recipient_bundle.kyber_pre_key_public,
+            recipient_bundle.kyber_one_time_prekey_public,
+            recipient_bundle.kyber_one_time_prekey_id,
+        )
+        .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 
     pub fn init_receiving_session(
         &self,
         contact_id: String,
-        recipient_bundle: Vec<u8>,
-        first_message: Vec<u8>,
+        recipient_bundle: BinaryKeyBundle,
+        first_message: BinaryFirstMessage,
     ) -> Result<SessionInitResult, CryptoError> {
+        use crate::orchestration::orchestrator::IncomingFirstMessage;
+        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
+        let first_msg = IncomingFirstMessage {
+            ephemeral_public_key: first_message.ephemeral_public_key,
+            message_number: first_message.message_number,
+            content: first_message.content,
+            one_time_prekey_id: first_message.one_time_prekey_id,
+        };
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
-            .init_receiving_session_with_msg(&contact_id, &recipient_bundle, &first_message)
+            .init_receiving_session_with_msg(&contact_id, &public_bundle, &first_msg)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
-        let decrypted_message = plaintext;
         Ok(SessionInitResult {
             session_id,
-            decrypted_message,
+            decrypted_message: plaintext,
             storage_key: gen_storage_key(),
         })
     }
