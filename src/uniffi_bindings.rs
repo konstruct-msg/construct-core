@@ -5,7 +5,6 @@ use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 pub use crate::orchestration::PlatformBridge;
-use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -2299,16 +2298,14 @@ impl RustAckStore {
         }
     }
 
-    pub fn mark_processed(&self, message_id: String) -> String {
+    pub fn mark_processed(&self, message_id: String) {
         let mut store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = store.mark_processed(&message_id);
-        actions_to_json(&actions)
+        let _ = store.mark_processed(&message_id);
     }
 
-    pub fn prune_expired(&self) -> String {
+    pub fn prune_expired(&self) {
         let store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = store.prune_expired();
-        actions_to_json(&actions)
+        let _ = store.prune_expired();
     }
 
     pub fn cache_len(&self) -> u64 {
@@ -2464,53 +2461,6 @@ pub struct OrchestratorCore {
 }
 
 impl OrchestratorCore {
-    pub fn new(keys_json: String, my_user_id: String) -> Result<Self, CryptoError> {
-        let _ = crate::config::Config::init();
-
-        let private_keys: PrivateKeysJson =
-            serde_json::from_str(&keys_json).map_err(|_| CryptoError::SerializationFailed)?;
-
-        // Verify key integrity before using (catches Keychain corruption).
-        verify_private_keys_integrity(&private_keys)?;
-
-        let identity_secret = base64::engine::general_purpose::STANDARD
-            .decode(&private_keys.identity_secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let signing_secret = base64::engine::general_purpose::STANDARD
-            .decode(&private_keys.signing_secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let prekey_secret = base64::engine::general_purpose::STANDARD
-            .decode(&private_keys.signed_prekey_secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let prekey_signature = base64::engine::general_purpose::STANDARD
-            .decode(&private_keys.prekey_signature)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
-            identity_secret,
-            signing_secret,
-            prekey_secret,
-            prekey_signature,
-        )
-        .map_err(|_| CryptoError::InitializationFailed)?;
-
-        let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
-        Ok(Self {
-            inner: std::sync::Mutex::new(orchestrator),
-        })
-    }
-
-    pub fn handle_event_json(&self, event_json: String) -> Result<Vec<String>, CryptoError> {
-        let event = serde_json::from_str::<crate::orchestration::IncomingEvent>(&event_json)
-            .map_err(|e| CryptoError::SessionInitializationFailed {
-                message: format!("invalid event JSON: {}", e),
-            })?;
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = orch.handle_event(event);
-        Ok(actions.iter().map(action_to_json).collect())
-    }
-
-    /// Typed event handler — zero JSON overhead on the Swift↔Rust boundary.
     pub fn handle_event(&self, event: CfeIncomingEvent) -> Result<Vec<CfeAction>, CryptoError> {
         let incoming = event.into_incoming_event();
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -2582,40 +2532,21 @@ impl OrchestratorCore {
         }
     }
 
-    pub fn ack_mark_processed(&self, message_id: String) -> String {
+    pub fn ack_mark_processed(&self, message_id: String) {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = orch.ack_mark_processed(&message_id);
-        actions_to_json(&actions)
+        let _ = orch.ack_mark_processed(&message_id);
     }
 
     pub fn healing_can_heal(&self, msg_number: u32) -> bool {
         crate::orchestration::HealingQueue::can_heal(msg_number)
     }
 
-    pub fn export_state_json(&self) -> Result<String, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_state_json()
-            .map_err(|_| CryptoError::SerializationFailed)
-    }
-
     // ── Session crypto delegates ──────────────────────────────────────────────
-
-    pub fn export_private_keys_json(&self) -> Result<String, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_private_keys_json_str()
-            .map_err(|_| CryptoError::SerializationFailed)
-    }
 
     pub fn export_private_keys(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_private_keys_cfe()
             .map_err(|_| CryptoError::SerializationFailed)
-    }
-
-    pub fn export_registration_bundle_json(&self) -> Result<String, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_registration_bundle_json_str()
-            .map_err(|_| CryptoError::InitializationFailed)
     }
 
     pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String, CryptoError> {
@@ -2624,26 +2555,10 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::InitializationFailed)
     }
 
-    pub fn export_session_json(&self, contact_id: String) -> Result<String, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_session_json_for(&contact_id)
-            .map_err(|_| CryptoError::SessionNotFound)
-    }
-
     pub fn export_session(&self, contact_id: String) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_session_cfe(&contact_id)
             .map_err(|_| CryptoError::SessionNotFound)
-    }
-
-    pub fn import_session_json(
-        &self,
-        contact_id: String,
-        session_json: String,
-    ) -> Result<String, CryptoError> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.import_session_json(&contact_id, &session_json)
-            .map_err(|_| CryptoError::SerializationFailed)
     }
 
     pub fn import_session(&self, contact_id: String, data: Vec<u8>) -> Result<String, CryptoError> {
@@ -2767,21 +2682,9 @@ impl OrchestratorCore {
         orch.otpk_count()
     }
 
-    pub fn export_one_time_prekeys_json(&self) -> Result<String, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_otpks_json()
-            .map_err(|_| CryptoError::SerializationFailed)
-    }
-
     pub fn export_one_time_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_otpks_cfe()
-            .map_err(|_| CryptoError::SerializationFailed)
-    }
-
-    pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.import_otpks_json(&json)
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
@@ -2813,16 +2716,9 @@ impl OrchestratorCore {
     /// Call after ML-KEM encapsulation (INITIATOR) or decapsulation (RESPONDER).
     /// Follow up with `exportKyberSessionState` + save to persist the new snapshot.
     ///
-    /// Returns JSON action string with `SaveSessionToSecureStore` for crash-safety backup.
-    pub fn register_pq_deferred(
-        &self,
-        contact_id: String,
-        otpk_id: u32,
-        shared_secret: Vec<u8>,
-    ) -> String {
+    pub fn register_pq_deferred(&self, contact_id: String, otpk_id: u32, shared_secret: Vec<u8>) {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let actions = orch.register_pq_deferred(&contact_id, otpk_id, &shared_secret);
-        actions_to_json(&actions)
+        let _ = orch.register_pq_deferred(&contact_id, otpk_id, &shared_secret);
     }
 
     pub fn apply_pq_contribution(
@@ -3242,135 +3138,6 @@ impl CfeAction {
                 Self::NotifyLinkedDevicesOfSessionReset { contact_id }
             }
         }
-    }
-}
-
-// ── JSON serialization helpers ────────────────────────────────────────────────
-
-fn actions_to_json(actions: &[crate::orchestration::Action]) -> String {
-    let values: Vec<serde_json::Value> = actions.iter().map(action_value).collect();
-    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn action_to_json(action: &crate::orchestration::Action) -> String {
-    serde_json::to_string(&action_value(action)).unwrap_or_else(|_| "{}".to_string())
-}
-
-fn action_value(action: &crate::orchestration::Action) -> serde_json::Value {
-    use crate::orchestration::Action;
-    match action {
-        Action::SaveSessionToSecureStore { key, data } => serde_json::json!({
-            "type": "SaveSessionToSecureStore", "key": key, "data": data
-        }),
-        Action::LoadSessionFromSecureStore { key } => serde_json::json!({
-            "type": "LoadSessionFromSecureStore", "key": key
-        }),
-        Action::PersistMessage { message_json } => serde_json::json!({
-            "type": "PersistMessage", "message_json": message_json
-        }),
-        Action::PersistAck {
-            message_id,
-            timestamp,
-        } => serde_json::json!({
-            "type": "PersistAck", "message_id": message_id, "timestamp": timestamp
-        }),
-        Action::PruneAckStore { cutoff_ts } => serde_json::json!({
-            "type": "PruneAckStore", "cutoff_ts": cutoff_ts
-        }),
-        Action::MarkMessageDelivered { message_id } => serde_json::json!({
-            "type": "MarkMessageDelivered", "message_id": message_id
-        }),
-        Action::FetchPublicKeyBundle { user_id } => serde_json::json!({
-            "type": "FetchPublicKeyBundle", "user_id": user_id
-        }),
-        Action::SendEncryptedMessage {
-            to,
-            payload,
-            message_id,
-            content_type,
-        } => serde_json::json!({
-            "type": "SendEncryptedMessage", "to": to, "payload": payload,
-            "message_id": message_id, "content_type": content_type
-        }),
-        Action::SendReceipt { message_id, status } => serde_json::json!({
-            "type": "SendReceipt", "message_id": message_id, "status": format!("{:?}", status)
-        }),
-        Action::SendEndSession { contact_id } => serde_json::json!({
-            "type": "SendEndSession", "contact_id": contact_id
-        }),
-        Action::NotifyNewMessage { chat_id, preview } => serde_json::json!({
-            "type": "NotifyNewMessage", "chat_id": chat_id, "preview": preview
-        }),
-        Action::NotifySessionCreated { contact_id } => serde_json::json!({
-            "type": "NotifySessionCreated", "contact_id": contact_id
-        }),
-        Action::NotifyError { code, message } => serde_json::json!({
-            "type": "NotifyError", "code": code, "message": message
-        }),
-        Action::ScheduleTimer { timer_id, delay_ms } => serde_json::json!({
-            "type": "ScheduleTimer", "timer_id": timer_id, "delay_ms": delay_ms
-        }),
-        Action::CancelTimer { timer_id } => serde_json::json!({
-            "type": "CancelTimer", "timer_id": timer_id
-        }),
-        Action::DecryptMessage {
-            contact_id,
-            ciphertext,
-        } => serde_json::json!({
-            "type": "DecryptMessage", "contact_id": contact_id, "ciphertext": ciphertext
-        }),
-        Action::EncryptMessage {
-            contact_id,
-            plaintext,
-        } => serde_json::json!({
-            "type": "EncryptMessage", "contact_id": contact_id, "plaintext": plaintext
-        }),
-        Action::InitSession {
-            contact_id,
-            bundle_json,
-        } => serde_json::json!({
-            "type": "InitSession", "contact_id": contact_id, "bundle_json": bundle_json
-        }),
-        Action::ApplyPQContribution { contact_id, kem_ss } => serde_json::json!({
-            "type": "ApplyPQContribution", "contact_id": contact_id, "kem_ss": kem_ss
-        }),
-        Action::ArchiveSession { contact_id } => serde_json::json!({
-            "type": "ArchiveSession", "contact_id": contact_id
-        }),
-        Action::MessageDecrypted {
-            contact_id,
-            message_id,
-            plaintext,
-        } => serde_json::json!({
-            "type": "MessageDecrypted", "contact_id": contact_id,
-            "message_id": message_id, "plaintext_len": plaintext.len()
-        }),
-        Action::SessionHealNeeded { contact_id, role } => serde_json::json!({
-            "type": "SessionHealNeeded", "contact_id": contact_id, "role": role
-        }),
-        Action::CallSignalDecrypted {
-            contact_id,
-            message_id,
-            proto_bytes,
-        } => serde_json::json!({
-            "type": "CallSignalDecrypted", "contact_id": contact_id,
-            "message_id": message_id, "proto_bytes": proto_bytes
-        }),
-        Action::CheckAckInDb { message_id } => serde_json::json!({
-            "type": "CheckAckInDb", "message_id": message_id
-        }),
-        Action::HealSuppressed {
-            contact_id,
-            retry_after_ms,
-        } => serde_json::json!({
-            "type": "HealSuppressed", "contact_id": contact_id, "retry_after_ms": retry_after_ms
-        }),
-        Action::SendHeartbeat { contact_id } => serde_json::json!({
-            "type": "SendHeartbeat", "contact_id": contact_id
-        }),
-        Action::NotifyLinkedDevicesOfSessionReset { contact_id } => serde_json::json!({
-            "type": "NotifyLinkedDevicesOfSessionReset", "contact_id": contact_id
-        }),
     }
 }
 

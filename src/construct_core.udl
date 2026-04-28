@@ -149,10 +149,7 @@ dictionary OtpkRecord {
 };
 
 interface ClassicCryptoCore {
-    [Throws=CryptoError]
-    string export_registration_bundle_json();
-
-    /// Typed registration bundle fields — replaces JSON parsing.
+    /// Typed registration bundle fields.
     [Throws=CryptoError]
     RegistrationBundleJson get_registration_bundle_fields();
 
@@ -168,22 +165,13 @@ interface ClassicCryptoCore {
     string sign_bundle_data(sequence<u8> bundle_data_json);
 
     [Throws=CryptoError]
-    string export_private_keys_json();
-
-    [Throws=CryptoError]
     sequence<u8> export_private_keys();
 
     [Throws=CryptoError]
     void import_private_keys(sequence<u8> data);
 
     [Throws=CryptoError]
-    string export_session_json(string contact_id);
-
-    [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);
-
-    [Throws=CryptoError]
-    string import_session_json(string contact_id, string session_json);
 
     [Throws=CryptoError]
     string import_session(string contact_id, sequence<u8> data);
@@ -214,13 +202,7 @@ interface ClassicCryptoCore {
     u32 one_time_prekey_count();
 
     [Throws=CryptoError]
-    string export_one_time_prekeys_json();
-
-    [Throws=CryptoError]
     sequence<u8> export_one_time_prekeys();
-
-    [Throws=CryptoError]
-    void import_one_time_prekeys_json(string json);
 
     [Throws=CryptoError]
     void import_one_time_prekeys(sequence<u8> data);
@@ -452,19 +434,18 @@ enum AckCheckResult {
 /// Thread-safe ACK deduplication store.
 ///
 /// Replaces Swift `PersistentACKStore`. The in-memory `HashSet` lives here;
-/// CoreData / Room persistence is requested via returned `Action` JSON strings.
+/// CoreData / Room persistence is handled by the orchestrator CFE state.
 interface RustAckStore {
     constructor();
 
     /// Returns `InCache` if the hot-path cache contains `message_id`, else `NeedDbCheck`.
     AckCheckResult is_processed(string message_id);
 
-    /// Mark `message_id` as processed.  Returns a JSON-encoded `Action` array
-    /// (typically a single `PersistMessage` action) that the platform must execute.
-    string mark_processed(string message_id);
+    /// Mark `message_id` as processed in the in-memory cache.
+    void mark_processed(string message_id);
 
-    /// Returns a JSON-encoded `Action` requesting the platform to delete expired records.
-    string prune_expired();
+    /// Evict expired entries from the in-memory cache.
+    void prune_expired();
 
     /// Current in-memory cache size (diagnostic).
     u64 cache_len();
@@ -581,22 +562,9 @@ interface CfeAction {
 /// Replaces: CryptoManager + MessageRouter + SessionCoordinator + SessionHealingService
 ///           + PersistentACKStore + PQCKeyManager + SessionInitializationService.
 interface OrchestratorCore {
-    /// Construct from an existing `ClassicCryptoCore` key JSON export and a
-    /// `PlatformBridge` implementation.
-    [Throws=CryptoError]
-    constructor(string keys_json, string my_user_id);
-
-    /// Typed event handler — replaces `handle_event_json`.
-    /// Accepts a typed `CfeIncomingEvent` and returns typed `CfeAction` list.
+    /// Typed event handler — accepts a typed `CfeIncomingEvent` and returns typed `CfeAction` list.
     [Throws=CryptoError]
     sequence<CfeAction> handle_event(CfeIncomingEvent event);
-
-    /// Unified event handler (legacy JSON interface — kept for fallback).
-    ///
-    /// `event_json` — JSON-encoded `IncomingEvent` (see Rust `orchestration::actions`).
-    /// Returns a JSON array of `Action` objects for the platform to execute.
-    [Throws=CryptoError]
-    sequence<string> handle_event_json(string event_json);
 
     /// Suite ID for the active session with `contact_id`.
     /// Returns 0 if no session exists.
@@ -614,43 +582,25 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     bytes get_identity_key_bytes();
 
-    // ── Direct query helpers (used during incremental migration) ──────────────
-
     /// Check if a message ID is in the in-memory ACK cache.
     AckCheckResult ack_is_processed(string message_id);
 
-    /// Mark a message as processed in the ACK cache. Returns action JSON.
-    string ack_mark_processed(string message_id);
+    /// Mark a message as processed in the ACK cache.
+    void ack_mark_processed(string message_id);
 
     /// `true` iff `msg_number == 0` (healing-eligible message).
     boolean healing_can_heal(u32 msg_number);
 
-    /// Export non-crypto orchestration state to JSON.
-    [Throws=CryptoError]
-    string export_state_json();
-
     // ── Session crypto (delegation from ClassicCryptoCore) ───────────────────
-
-    [Throws=CryptoError]
-    string export_private_keys_json();
 
     [Throws=CryptoError]
     sequence<u8> export_private_keys();
 
     [Throws=CryptoError]
-    string export_registration_bundle_json();
-
-    [Throws=CryptoError]
     string sign_bundle_data(sequence<u8> bundle_data_json);
 
     [Throws=CryptoError]
-    string export_session_json(string contact_id);
-
-    [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);
-
-    [Throws=CryptoError]
-    string import_session_json(string contact_id, string session_json);
 
     [Throws=CryptoError]
     string import_session(string contact_id, sequence<u8> data);
@@ -683,13 +633,7 @@ interface OrchestratorCore {
     u32 one_time_prekey_count();
 
     [Throws=CryptoError]
-    string export_one_time_prekeys_json();
-
-    [Throws=CryptoError]
     sequence<u8> export_one_time_prekeys();
-
-    [Throws=CryptoError]
-    void import_one_time_prekeys_json(string json);
 
     [Throws=CryptoError]
     void import_one_time_prekeys(sequence<u8> data);
@@ -723,8 +667,7 @@ interface OrchestratorCore {
     void import_orchestrator_state(sequence<u8> data);
 
     /// Register a KEM shared secret as a deferred contribution.
-    /// Returns JSON action string (SaveSessionToSecureStore for per-entry backup).
-    string register_pq_deferred(string contact_id, u32 otpk_id, sequence<u8> shared_secret);
+    void register_pq_deferred(string contact_id, u32 otpk_id, sequence<u8> shared_secret);
 };
 
 // ── RustPQContributions ───────────────────────────────────────────────────────
