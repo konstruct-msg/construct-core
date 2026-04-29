@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.8.1"
+version = "0.8.2"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.85"
@@ -75,7 +75,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1.0", features = ["zeroize_derive"] }
 
 # Post-Quantum (optional) - ML-KEM and ML-DSA (NIST standardized names)
-ml-kem = { version = "0.3.0-rc.1", optional = true }
+ml-kem = { version = "0.3.0", optional = true }
 getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"], optional = true }
 pqcrypto-mldsa = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
