@@ -153,6 +153,20 @@ pub enum Action {
     NotifyLinkedDevicesOfSessionReset {
         contact_id: String,
     },
+
+    /// Rust has archived and removed the session for `contact_id`.
+    ///
+    /// Platform MUST:
+    ///   1. Store `archive_bytes` in the archive store (keyed by `contact_id`).
+    ///   2. Delete the hot session Keychain/Keystore entry for `contact_id`.
+    ///
+    /// Replaces the two-action pattern of `SaveSessionToSecureStore("archive_<id>", bytes)`
+    /// + `SaveSessionToSecureStore("session_<id>", [])` with a single semantic action.
+    ///   Android can implement the identical behaviour against Android Keystore.
+    SessionTerminated {
+        contact_id: String,
+        archive_bytes: Vec<u8>,
+    },
 }
 
 /// Delivery / read receipt status.

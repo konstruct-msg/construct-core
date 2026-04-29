@@ -305,18 +305,10 @@ impl SessionLifecycleManager {
             .insert(contact_id.to_string(), self.clock.now_secs());
         self.client.remove_session(contact_id);
 
-        vec![
-            // Persist archive under a separate key.
-            Action::SaveSessionToSecureStore {
-                key: archive_key(contact_id),
-                data: cfe_bytes,
-            },
-            // Delete the hot session from secure store.
-            Action::SaveSessionToSecureStore {
-                key: session_key(contact_id),
-                data: vec![], // empty = delete sentinel
-            },
-        ]
+        vec![Action::SessionTerminated {
+            contact_id: contact_id.to_string(),
+            archive_bytes: cfe_bytes,
+        }]
     }
 
     /// Restore the latest archive for `contact_id` into the active session map.

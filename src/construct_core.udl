@@ -551,6 +551,10 @@ interface CfeAction {
     SendHeartbeat(string contact_id);
     /// Broadcast to all linked devices that the session with `contact_id` was reset.
     NotifyLinkedDevicesOfSessionReset(string contact_id);
+    /// Rust archived and removed the session for `contact_id`.
+    /// Platform MUST: (1) store `archive_bytes` in the archive store, (2) delete the
+    /// hot session Keychain/Keystore entry for `contact_id`.
+    SessionTerminated(string contact_id, bytes archive_bytes);
 };
 
 /// Top-level orchestration facade.

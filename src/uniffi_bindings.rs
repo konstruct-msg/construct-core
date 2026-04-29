@@ -3034,6 +3034,13 @@ pub enum CfeAction {
     NotifyLinkedDevicesOfSessionReset {
         contact_id: String,
     },
+    /// Rust archived and removed the session for `contact_id`.
+    /// Platform MUST: (1) store `archive_bytes` in the archive store, (2) delete the
+    /// hot session Keychain/Keystore entry for `contact_id`.
+    SessionTerminated {
+        contact_id: String,
+        archive_bytes: Vec<u8>,
+    },
 }
 
 impl CfeAction {
@@ -3137,6 +3144,13 @@ impl CfeAction {
             NotifyLinkedDevicesOfSessionReset { contact_id } => {
                 Self::NotifyLinkedDevicesOfSessionReset { contact_id }
             }
+            SessionTerminated {
+                contact_id,
+                archive_bytes,
+            } => Self::SessionTerminated {
+                contact_id,
+                archive_bytes,
+            },
         }
     }
 }

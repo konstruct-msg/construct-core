@@ -128,6 +128,15 @@ impl MessageRouter {
         lifecycle: &mut SessionLifecycleManager,
         msg: &IncomingMessage,
     ) -> RoutingDecision {
+        // Control messages (END_SESSION) bypass ACK deduplication entirely.
+        // They are synthetic — generated with a unique-per-invocation ID — so
+        // they will always be cache-miss in post_restart_mode, which would cause
+        // `archive_session()` to never be called and leave the Rust in-memory
+        // session alive, recreating a desync loop on the next incoming message.
+        if msg.is_control {
+            return self.route_after_ack_check(lifecycle, msg);
+        }
+
         // ── 1. ACK deduplication ──────────────────────────────────────────────
         use crate::orchestration::ack_store::AckCheckResult;
         match lifecycle.ack_store.is_processed(&msg.message_id) {
