@@ -2,6 +2,7 @@
 /target/
 /target_host/
 /fuzz/
+/benches
 **/*.rs.bk
 Cargo.lock
 
