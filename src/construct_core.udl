@@ -308,9 +308,6 @@ namespace construct_core {
     ClassicCryptoCore create_crypto_core();
 
     [Throws=CryptoError]
-    ClassicCryptoCore create_crypto_core_from_keys_json(string keys_json);
-
-    [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core_from_keys(sequence<u8> keys);
 
     // Invite Crypto Functions

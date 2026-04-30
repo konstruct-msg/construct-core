@@ -238,60 +238,6 @@ pub struct MLKEMEncapsulation {
 
 // UniFFI interface implementation (exported via UDL, not proc-macros)
 impl ClassicCryptoCore {
-    /// Export registration bundle as JSON string
-    pub fn export_registration_bundle_json(&self) -> Result<String, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // TODO(ARCHITECTURE): Обходной путь для экспорта существующих ключей
-        // См. подробное описание: packages/core/ARCHITECTURE_TODOS.md
-        //
-        // ПРОБЛЕМА:
-        // - Client::get_registration_bundle() вызывает H::generate_registration_bundle()
-        // - Это статический метод, который генерирует НОВЫЕ ключи каждый раз
-        // - Нам нужны СУЩЕСТВУЮЩИЕ ключи из KeyManager
-        // - KeyManager::export_registration_bundle() возвращает конкретный тип X3DHPublicKeyBundle
-        // - Client::get_registration_bundle() возвращает generic H::RegistrationBundle
-        //
-        // ТЕКУЩЕЕ РЕШЕНИЕ (временное):
-        // - Обходим Client::get_registration_bundle()
-        // - Напрямую вызываем key_manager().export_registration_bundle()
-        //
-        // ПРАВИЛЬНОЕ РЕШЕНИЕ:
-        // Вариант 1: Сделать KeyManager generic по протоколу handshake
-        //   - KeyManager<P, H: KeyAgreement<P>>
-        //   - export_registration_bundle() -> Result<H::RegistrationBundle>
-        //
-        // Вариант 2: Добавить метод в trait KeyAgreement
-        //   - fn export_from_key_manager(km: &KeyManager<P>) -> Result<Self::RegistrationBundle>
-        //
-        // Вариант 3: Сделать Client::get_registration_bundle() не-generic
-        //   - pub fn export_registration_bundle() -> Result<конкретный тип>
-        //   - Но это нарушает generic design
-        //
-        // РЕКОМЕНДАЦИЯ: Вариант 1 - наиболее type-safe и правильный архитектурно
-        let bundle = client
-            .key_manager()
-            .export_registration_bundle()
-            .map_err(|_| CryptoError::InitializationFailed)?;
-
-        // Convert to base64 strings
-        use base64::Engine;
-        let json_bundle = RegistrationBundleJson {
-            identity_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.identity_public),
-            signed_prekey_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.signed_prekey_public),
-            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
-            verifying_key: base64::engine::general_purpose::STANDARD.encode(&bundle.verifying_key),
-            suite_id: bundle.suite_id.as_u16().to_string(),
-        };
-
-        serde_json::to_string(&json_bundle).map_err(|_| CryptoError::SerializationFailed)
-    }
-
     /// Typed registration bundle fields — no JSON parsing needed on Swift side.
     pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleJson, CryptoError> {
         let client = self
@@ -350,64 +296,6 @@ impl ClassicCryptoCore {
             .key_manager()
             .sign(&bundle_data_json)
             .map_err(|_| CryptoError::InitializationFailed)
-    }
-
-    /// Export private keys as JSON string for persistence
-    /// SECURITY: Only call this method to store keys in secure storage (Keychain)
-    pub fn export_private_keys_json(&self) -> Result<String, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Get private keys from key manager
-        let identity_secret = client
-            .key_manager()
-            .identity_secret_key()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let signing_secret = client
-            .key_manager()
-            .signing_secret_key()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let prekey = client
-            .key_manager()
-            .current_signed_prekey()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        // Convert to bytes - use AsRef<[u8]> trait bound
-        let identity_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
-        let signing_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
-        let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
-
-        // Re-derive public keys from private keys for integrity checking on next load.
-        use base64::Engine;
-        let identity_pub_check =
-            ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
-                .ok()
-                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
-        let signing_pub_check =
-            ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
-                .ok()
-                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
-        let spk_pub_check =
-            ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
-                .ok()
-                .map(|pub_bytes| base64::engine::general_purpose::STANDARD.encode(&pub_bytes));
-
-        // Encode to base64
-        let private_keys_json = PrivateKeysJson {
-            identity_secret: base64::engine::general_purpose::STANDARD.encode(&identity_bytes),
-            signing_secret: base64::engine::general_purpose::STANDARD.encode(&signing_bytes),
-            signed_prekey_secret: base64::engine::general_purpose::STANDARD
-                .encode(&prekey_secret_bytes),
-            prekey_signature: base64::engine::general_purpose::STANDARD.encode(&prekey.signature),
-            suite_id: "1".to_string(),
-            identity_public_check: identity_pub_check,
-            verifying_key_check: signing_pub_check,
-            signed_prekey_public_check: spk_pub_check,
-        };
-
-        serde_json::to_string(&private_keys_json).map_err(|_| CryptoError::SerializationFailed)
     }
 
     /// Export private keys in CFE binary format (MessagePack + header).
@@ -534,43 +422,6 @@ impl ClassicCryptoCore {
         Ok(())
     }
 
-    /// Export session to JSON for persistence in Keychain
-    ///
-    /// # Parameters
-    /// - `contact_id`: Contact ID to export session for
-    ///
-    /// # Returns
-    /// JSON string containing serialized session state
-    ///
-    /// # Security - CRITICAL
-    ///
-    /// ⚠️ **UNENCRYPTED cryptographic material**: root key, chain keys, DH private key.
-    ///
-    /// **MUST** store in: iOS Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`) or IndexedDB.
-    /// **NEVER** use: UserDefaults, localStorage, or unencrypted files.
-    ///
-    /// Ref: SECURITY_AUDIT.md #13 - Sessions rely on platform storage encryption
-    pub fn export_session_json(&self, contact_id: String) -> Result<String, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Get session from HashMap
-        let session = client
-            .get_session(&contact_id)
-            .ok_or(CryptoError::SessionNotFound)?;
-
-        // Get Double Ratchet session
-        let ratchet_session = session.messaging_session();
-
-        // Serialize using existing method
-        let serializable = ratchet_session.to_serializable();
-
-        // Convert to JSON
-        serde_json::to_string(&serializable).map_err(|_| CryptoError::SerializationFailed)
-    }
-
     /// Export session in CFE binary format (MessagePack + header).
     pub fn export_session(&self, contact_id: String) -> Result<Vec<u8>, CryptoError> {
         let client = self
@@ -588,45 +439,6 @@ impl ClassicCryptoCore {
 
         crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
             .map_err(|_| CryptoError::SerializationFailed)
-    }
-
-    /// Import session from JSON (restore from Keychain)
-    ///
-    /// # Parameters
-    /// - `contact_id`: Contact ID to restore session for
-    /// - `session_json`: JSON string from export_session_json()
-    ///
-    /// # Returns
-    /// Session ID of the restored session
-    ///
-    /// # Errors
-    /// - `SerializationFailed`: Invalid JSON or unsupported version
-    /// - Other crypto errors during deserialization
-    pub fn import_session_json(
-        &self,
-        contact_id: String,
-        session_json: String,
-    ) -> Result<String, CryptoError> {
-        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
-
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Parse JSON
-        let serializable: SerializableSession =
-            serde_json::from_str(&session_json).map_err(|_| CryptoError::SerializationFailed)?;
-
-        // Deserialize using existing method (also validates version)
-        let ratchet_session =
-            DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
-                .map_err(|_| CryptoError::SerializationFailed)?;
-
-        // Import into Client
-        let session_id = client.import_session(&contact_id, ratchet_session);
-
-        Ok(session_id)
     }
 
     /// Import session from CFE bytes (with legacy JSON fallback).
@@ -1054,25 +866,6 @@ impl ClassicCryptoCore {
         client.one_time_prekey_count() as u32
     }
 
-    /// Export all locally stored OTPKs as a JSON string for Keychain persistence.
-    /// Call this after generating and uploading OTPKs to keep Keychain in sync.
-    pub fn export_one_time_prekeys_json(&self) -> Result<String, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let records: Vec<OtpkRecord> = client
-            .export_one_time_prekeys()
-            .into_iter()
-            .map(|(key_id, private_key, public_key)| OtpkRecord {
-                key_id,
-                private_key,
-                public_key,
-            })
-            .collect();
-        serde_json::to_string(&records).map_err(|_| CryptoError::SerializationFailed)
-    }
-
     /// Export all locally stored OTPKs in CFE binary format.
     pub fn export_one_time_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
         use serde_bytes::ByteBuf;
@@ -1097,23 +890,6 @@ impl ClassicCryptoCore {
 
         crate::cfe::encode(crate::cfe::CfeMessageType::OtpkBundle, &payload)
             .map_err(|_| CryptoError::SerializationFailed)
-    }
-
-    /// Import previously persisted OTPKs from a JSON string back into the core.
-    /// Call this after restoring the core from Keychain to ensure OTPK continuity.
-    pub fn import_one_time_prekeys_json(&self, json: String) -> Result<(), CryptoError> {
-        let records: Vec<OtpkRecord> =
-            serde_json::from_str(&json).map_err(|_| CryptoError::SerializationFailed)?;
-        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = records
-            .into_iter()
-            .map(|r| (r.key_id, r.private_key, r.public_key))
-            .collect();
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client.import_one_time_prekeys(keys);
-        Ok(())
     }
 
     /// Import OTPKs from CFE bytes (with legacy JSON fallback).
@@ -1218,109 +994,6 @@ pub fn create_crypto_core() -> Result<Arc<ClassicCryptoCore>, CryptoError> {
 
     let client = ClassicClient::<ClassicSuiteProvider>::new()
         .map_err(|_| CryptoError::InitializationFailed)?;
-
-    Ok(Arc::new(ClassicCryptoCore {
-        inner: Mutex::new(client),
-    }))
-}
-
-/// Verify that private keys in `PrivateKeysJson` are internally consistent.
-/// Re-derives each public key from its corresponding private key and compares to the
-/// stored `*_check` field. If a check field is absent (old export), verification is skipped.
-/// Returns `Err` only if a check field IS present but does NOT match — indicating corruption.
-fn verify_private_keys_integrity(keys: &PrivateKeysJson) -> Result<(), CryptoError> {
-    use base64::Engine;
-
-    let decode = |b64: &str| -> Option<Vec<u8>> {
-        base64::engine::general_purpose::STANDARD.decode(b64).ok()
-    };
-
-    if let Some(expected_b64) = &keys.identity_public_check {
-        let secret = decode(&keys.identity_secret).ok_or(CryptoError::InvalidKeyData)?;
-        let derived = ClassicSuiteProvider::from_private_key_to_public_key(&secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
-        if derived != expected {
-            tracing::error!(
-                target: "crypto::uniffi",
-                "Key integrity check FAILED: identity key mismatch — Keychain data may be corrupted"
-            );
-            return Err(CryptoError::InvalidKeyData);
-        }
-    }
-
-    if let Some(expected_b64) = &keys.verifying_key_check {
-        let secret = decode(&keys.signing_secret).ok_or(CryptoError::InvalidKeyData)?;
-        let derived = ClassicSuiteProvider::from_signature_private_to_public(&secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
-        if derived != expected {
-            tracing::error!(
-                target: "crypto::uniffi",
-                "Key integrity check FAILED: signing key mismatch — Keychain data may be corrupted"
-            );
-            return Err(CryptoError::InvalidKeyData);
-        }
-    }
-
-    if let Some(expected_b64) = &keys.signed_prekey_public_check {
-        let secret = decode(&keys.signed_prekey_secret).ok_or(CryptoError::InvalidKeyData)?;
-        let derived = ClassicSuiteProvider::from_private_key_to_public_key(&secret)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let expected = decode(expected_b64).ok_or(CryptoError::InvalidKeyData)?;
-        if derived != expected {
-            tracing::error!(
-                target: "crypto::uniffi",
-                "Key integrity check FAILED: signed prekey mismatch — Keychain data may be corrupted"
-            );
-            return Err(CryptoError::InvalidKeyData);
-        }
-    }
-
-    tracing::debug!(target: "crypto::uniffi", "Key integrity checks passed");
-    Ok(())
-}
-
-/// Create a CryptoCore instance from existing private keys (exported via UDL)
-/// Used to restore cryptographic state from secure storage (e.g., iOS Keychain)
-pub fn create_crypto_core_from_keys_json(
-    keys_json: String,
-) -> Result<Arc<ClassicCryptoCore>, CryptoError> {
-    // Инициализировать конфигурацию при первом вызове
-    let _ = crate::config::Config::init();
-
-    // Parse JSON
-    let private_keys: PrivateKeysJson =
-        serde_json::from_str(&keys_json).map_err(|_| CryptoError::SerializationFailed)?;
-
-    // Verify key integrity before using (catches Keychain corruption).
-    verify_private_keys_integrity(&private_keys)?;
-
-    // Decode base64 to bytes
-    use base64::Engine;
-    let identity_secret = base64::engine::general_purpose::STANDARD
-        .decode(&private_keys.identity_secret)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let signing_secret = base64::engine::general_purpose::STANDARD
-        .decode(&private_keys.signing_secret)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let prekey_secret = base64::engine::general_purpose::STANDARD
-        .decode(&private_keys.signed_prekey_secret)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let prekey_signature = base64::engine::general_purpose::STANDARD
-        .decode(&private_keys.prekey_signature)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-
-    // Create client from keys
-    let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
-        identity_secret,
-        signing_secret,
-        prekey_secret,
-        prekey_signature,
-    )
-    .map_err(|_| CryptoError::InitializationFailed)?;
-
-    tracing::debug!(target: "crypto::uniffi", "CryptoCore restored from saved keys");
 
     Ok(Arc::new(ClassicCryptoCore {
         inner: Mutex::new(client),
@@ -1713,35 +1386,22 @@ pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> 
 mod tests {
     use super::*;
 
-    /// Helper to convert RegistrationBundleJson to BinaryKeyBundle for tests
-    fn convert_bundle_for_init(bundle_json: &str) -> BinaryKeyBundle {
+    fn bundle_fields_to_binary(fields: RegistrationBundleJson) -> BinaryKeyBundle {
         use base64::Engine;
-
-        #[derive(serde::Deserialize)]
-        struct RegBundle {
-            identity_public: String,
-            signed_prekey_public: String,
-            signature: String,
-            verifying_key: String,
-            suite_id: String,
-        }
-
-        let bundle: RegBundle = serde_json::from_str(bundle_json).unwrap();
-
         BinaryKeyBundle {
             identity_public: base64::engine::general_purpose::STANDARD
-                .decode(&bundle.identity_public)
+                .decode(&fields.identity_public)
                 .unwrap(),
             signed_prekey_public: base64::engine::general_purpose::STANDARD
-                .decode(&bundle.signed_prekey_public)
+                .decode(&fields.signed_prekey_public)
                 .unwrap(),
             signature: base64::engine::general_purpose::STANDARD
-                .decode(&bundle.signature)
+                .decode(&fields.signature)
                 .unwrap(),
             verifying_key: base64::engine::general_purpose::STANDARD
-                .decode(&bundle.verifying_key)
+                .decode(&fields.verifying_key)
                 .unwrap(),
-            suite_id: bundle.suite_id.parse().unwrap(),
+            suite_id: fields.suite_id.parse().unwrap(),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
             spk_uploaded_at: 0,
@@ -1764,8 +1424,8 @@ mod tests {
         bob.set_local_user_id("bob_user_id_123".to_string());
 
         // Get Bob's registration bundle and convert it
-        let bob_bundle_json = bob.export_registration_bundle_json().unwrap();
-        let bob_bundle_bytes = convert_bundle_for_init(&bob_bundle_json);
+        let bob_bundle_bytes =
+            bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
 
         // Alice initializes session with Bob
         let contact_id = "bob_user_id_123".to_string();
@@ -1790,11 +1450,11 @@ mod tests {
         bob.set_local_user_id("bob_user_id".to_string());
 
         // Get registration bundles and convert them
-        let alice_bundle_json = alice.export_registration_bundle_json().unwrap();
-        let alice_bundle_bytes = convert_bundle_for_init(&alice_bundle_json);
+        let alice_bundle_bytes =
+            bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
 
-        let bob_bundle_json = bob.export_registration_bundle_json().unwrap();
-        let bob_bundle_bytes = convert_bundle_for_init(&bob_bundle_json);
+        let bob_bundle_bytes =
+            bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
 
         // Alice initializes session with Bob
         let alice_to_bob_session = alice
@@ -1906,12 +1566,12 @@ mod tests {
         alice.set_local_user_id("alice_contact".to_string());
         bob.set_local_user_id("bob_contact".to_string());
 
-        let bob_bundle_json = bob.export_registration_bundle_json().unwrap();
-        let alice_bundle_json = alice.export_registration_bundle_json().unwrap();
+        let bob_bundle_bytes =
+            bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        let alice_bundle_bytes =
+            bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
 
         // Convert bundles to KeyBundle format
-        let bob_bundle_bytes = convert_bundle_for_init(&bob_bundle_json);
-        let alice_bundle_bytes = convert_bundle_for_init(&alice_bundle_json);
 
         // Alice initializes session
         let alice_session_id = alice
