@@ -1332,3 +1332,67 @@ fn test_cross_session_message_rejected_by_ad() {
         "session-1 ciphertext must be rejected by session-2 (session_id in AD differs)"
     );
 }
+
+/// desync-test-skipped-keys-limit: DoS protection.
+///
+/// Alice encrypts `limit + 2` messages but only delivers the last one to Bob.
+/// Bob must receive `Err("Too many skipped messages")` — no panic — when trying
+/// to skip `limit + 1` keys to reach the delivered message.
+///
+/// After the failed decrypt the session state must be rolled back to the
+/// snapshot (restore_snapshot path), so a normally-delivered follow-up message
+/// still decrypts successfully.
+#[test]
+fn test_skipped_keys_dos_limit_returns_error_and_session_survives() {
+    let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000011";
+    let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000012";
+
+    let (mut alice, mut bob) = make_session_pair(alice_uuid, bob_uuid);
+
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+
+    // Alice encrypts `limit + 2` messages (indices 0 … limit+1).
+    // We keep only the very last one to present a gap of limit+1 to Bob.
+    let mut overflow_msg = None;
+    for i in 0..=(limit + 1) {
+        let ct = alice.encrypt(format!("msg-{i}").as_bytes()).unwrap();
+        if i == limit + 1 {
+            overflow_msg = Some(ct);
+        }
+    }
+    let overflow_msg = overflow_msg.unwrap();
+
+    // Bob tries to decrypt a message that requires skipping limit+1 keys.
+    // This must return an error, not panic.
+    let result = bob.decrypt(&overflow_msg);
+    assert!(
+        result.is_err(),
+        "decrypt must return Err when the gap exceeds MAX_SKIPPED_MESSAGES"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("Too many skipped"),
+        "error message should mention skipped messages, got: {err}"
+    );
+
+    // Session must be rolled back to the pre-decrypt snapshot — Bob's
+    // skipped_message_keys must be empty (no partial state leaked).
+    let bob_snap = bob.to_serializable();
+    assert!(
+        bob_snap.skipped_keys.is_empty(),
+        "snapshot restore must leave skipped_keys empty after overflow error"
+    );
+
+    // Bob's SENDING chain is independent of his receiving chain and must still
+    // be usable — the overflow only affects Alice→Bob decryption.
+    // (Alice→Bob requires END_SESSION + re-init once the gap exceeds the limit;
+    //  that is correct, intentional DR behaviour — not a bug to fix here.)
+    let bob_msg = bob.encrypt(b"bob send after overflow").unwrap();
+    let alice_received = alice.decrypt(&bob_msg);
+    assert!(
+        alice_received.is_ok(),
+        "Bob must still be able to send after the overflow; Alice decrypt failed: {:?}",
+        alice_received.err()
+    );
+    assert_eq!(alice_received.unwrap(), b"bob send after overflow");
+}
