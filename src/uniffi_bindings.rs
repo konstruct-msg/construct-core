@@ -369,21 +369,13 @@ impl ClassicCryptoCore {
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
-    /// Import private keys from CFE bytes (with legacy JSON fallback).
+    /// Import private keys from CFE bytes.
     pub fn import_private_keys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
         let keys = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
             &data,
             crate::cfe::CfeMessageType::PrivateKeys,
         )
-        .or_else(|e| {
-            if matches!(e, crate::cfe::CfeError::LegacyJson) {
-                let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
-                crate::cfe::migrate_private_keys_json_str(s)
-                    .map_err(|_| CryptoError::InvalidKeyData)
-            } else {
-                Err(CryptoError::SerializationFailed)
-            }
-        })?;
+        .map_err(|_| CryptoError::SerializationFailed)?;
 
         let mut client = self
             .inner
@@ -892,21 +884,13 @@ impl ClassicCryptoCore {
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
-    /// Import OTPKs from CFE bytes (with legacy JSON fallback).
+    /// Import OTPKs from CFE bytes.
     pub fn import_one_time_prekeys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
         let bundle = crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
             &data,
             crate::cfe::CfeMessageType::OtpkBundle,
         )
-        .or_else(|e| {
-            if matches!(e, crate::cfe::CfeError::LegacyJson) {
-                let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
-                crate::cfe::migrate_otpk_bundle_json_str(s)
-                    .map_err(|_| CryptoError::SerializationFailed)
-            } else {
-                Err(CryptoError::SerializationFailed)
-            }
-        })?;
+        .map_err(|_| CryptoError::SerializationFailed)?;
 
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
@@ -1000,8 +984,7 @@ pub fn create_crypto_core() -> Result<Arc<ClassicCryptoCore>, CryptoError> {
     }))
 }
 
-/// Create a CryptoCore instance from existing private keys in CFE binary format
-/// (with legacy JSON fallback).
+/// Create a CryptoCore instance from existing private keys in CFE binary format.
 pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCore>, CryptoError> {
     let _ = crate::config::Config::init();
 
@@ -1009,14 +992,7 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
         &keys,
         crate::cfe::CfeMessageType::PrivateKeys,
     )
-    .or_else(|e| {
-        if matches!(e, crate::cfe::CfeError::LegacyJson) {
-            let s = std::str::from_utf8(&keys).map_err(|_| CryptoError::InvalidKeyData)?;
-            crate::cfe::migrate_private_keys_json_str(s).map_err(|_| CryptoError::InvalidKeyData)
-        } else {
-            Err(CryptoError::SerializationFailed)
-        }
-    })?;
+    .map_err(|_| CryptoError::SerializationFailed)?;
 
     let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
         decoded.ik_priv.into_vec(),
@@ -1031,8 +1007,7 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
     }))
 }
 
-/// Create an OrchestratorCore from CFE binary or legacy JSON key bytes.
-/// Accepts both formats — format is detected automatically.
+/// Create an OrchestratorCore from CFE binary key bytes.
 pub fn create_orchestrator_core_from_keys(
     keys_data: Vec<u8>,
     my_user_id: String,
@@ -1043,14 +1018,7 @@ pub fn create_orchestrator_core_from_keys(
         &keys_data,
         crate::cfe::CfeMessageType::PrivateKeys,
     )
-    .or_else(|e| {
-        if matches!(e, crate::cfe::CfeError::LegacyJson) {
-            let s = std::str::from_utf8(&keys_data).map_err(|_| CryptoError::InvalidKeyData)?;
-            crate::cfe::migrate_private_keys_json_str(s).map_err(|_| CryptoError::InvalidKeyData)
-        } else {
-            Err(CryptoError::SerializationFailed)
-        }
-    })?;
+    .map_err(|_| CryptoError::SerializationFailed)?;
 
     let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
         decoded.ik_priv.into_vec(),

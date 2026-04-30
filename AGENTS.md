@@ -1,8 +1,8 @@
-# 🔐 Construct Core - Project Context
+# Construct Core - Project Context
 
 `construct-core` is the central cryptographic and orchestration engine for **Construct Messenger**. It provides end-to-end encryption (E2EE), session management, and traffic protection for cross-platform clients (iOS, macOS, Desktop).
 
-## 🏗️ Architecture & Core Concepts
+## Architecture & Core Concepts
 
 - **I/O-Free Core**: The library is designed to be pure and deterministic. All side effects (storage, networking, logging) are delegated to the host platform via the `PlatformBridge` callback interface and the `Action` system.
 - **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
@@ -10,7 +10,7 @@
 - **CFE (Construct Format Envelope)**: A custom binary format (using Postcard) used for state persistence and migration from legacy JSON formats.
 - **UniFFI Bindings**: Cross-platform bindings are defined in `src/construct_core.udl` and implemented in `src/uniffi_bindings.rs`.
 
-## 🛠️ Building and Running
+## Building and Running
 
 ### Key Commands
 - **Build**: `cargo build`
@@ -23,7 +23,7 @@
 - `post-quantum`: Enables ML-KEM-768 and ML-DSA support.
 - `desktop`: Enables `tokio` runtime for desktop-specific use cases.
 
-## 📜 Development Conventions
+## Development Conventions
 
 ### 1. Architectural Integrity
 - **Logic vs. I/O**: Keep business logic in the `Orchestrator`. Never perform direct I/O (filesystem, network) inside the core. Use `Action`s to request these operations from the platform.
@@ -43,7 +43,7 @@
 - Use **Serde JSON** only for legacy compatibility or human-readable exports.
 - All persistent state should be versioned.
 
-## 📂 Key Files
+## Key Files
 - `src/construct_core.udl`: UniFFI interface definition (The "Source of Truth" for the cross-platform API).
 - `src/orchestration/orchestrator.rs`: Implementation of the main event loop.
 - `src/crypto/mod.rs`: Entry point for cryptographic primitives.

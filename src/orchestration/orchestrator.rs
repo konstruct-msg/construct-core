@@ -678,17 +678,11 @@ impl Orchestrator {
     }
 
     pub fn import_otpks_cfe(&mut self, data: &[u8]) -> Result<(), String> {
-        let bundle = match crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
+        let bundle = crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
             data,
             crate::cfe::CfeMessageType::OtpkBundle,
-        ) {
-            Ok(b) => b,
-            Err(crate::cfe::CfeError::LegacyJson) => {
-                let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                crate::cfe::migrate_otpk_bundle_json_str(s).map_err(|e| e.to_string())?
-            }
-            Err(e) => return Err(e.to_string()),
-        };
+        )
+        .map_err(|e| e.to_string())?;
 
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
@@ -705,53 +699,20 @@ impl Orchestrator {
     }
 
     /// Export a session as a CFE binary blob (MessagePack + CRC32 header).
-    /// Falls back gracefully from JSON if needed by the caller.
-    /// Export a session as a CFE binary blob (MessagePack, no JSON intermediate).
     pub fn export_session_cfe(&self, contact_id: &str) -> Result<Vec<u8>, String> {
         self.lifecycle.export_session_bytes_for(contact_id)
     }
 
-    /// Import a session from a CFE binary blob.
-    ///
-    /// Tries formats in order:
-    /// 1. `CfeSessionStateV1` — current binary format (new sessions)
-    /// 2. `CfeSessionJsonWrapperV1` — old format (JSON inside CFE, pre-migration sessions)
-    /// 3. Raw JSON bytes — legacy fallback (very old sessions)
+    /// Import a session from a `CfeSessionStateV1` binary blob.
     pub fn import_session_cfe(&mut self, contact_id: &str, data: &[u8]) -> Result<String, String> {
-        use crate::cfe::{CfeError, CfeMessageType, decode_as};
+        use crate::cfe::{CfeMessageType, decode_as};
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
-        let serializable: SerializableSession =
-            match decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState) {
-                Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
-                    .map_err(|e| format!("from_cfe_v1: {}", e))?,
-                Err(CfeError::DeserializeFailed(_)) => {
-                    // Valid CFE but wrong schema — try old JSON-wrapper format.
-                    match decode_as::<crate::cfe::CfeSessionJsonWrapperV1>(
-                        data,
-                        CfeMessageType::SessionState,
-                    ) {
-                        Ok(wrapper) => {
-                            let json_str = std::str::from_utf8(&wrapper.json_bytes)
-                                .map_err(|e| e.to_string())?;
-                            serde_json::from_str(json_str)
-                                .map_err(|e| format!("json wrapper fallback: {}", e))?
-                        }
-                        Err(CfeError::LegacyJson) => {
-                            let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                            serde_json::from_str(s)
-                                .map_err(|e| format!("raw json fallback: {}", e))?
-                        }
-                        Err(e) => return Err(e.to_string()),
-                    }
-                }
-                Err(CfeError::LegacyJson) => {
-                    let s = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-                    serde_json::from_str(s).map_err(|e| format!("raw json fallback: {}", e))?
-                }
-                Err(e) => return Err(e.to_string()),
-            };
-
+        let cfe_state =
+            decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState)
+                .map_err(|e| e.to_string())?;
+        let serializable = SerializableSession::from_cfe_v1(cfe_state)
+            .map_err(|e| format!("from_cfe_v1: {}", e))?;
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
         let session_id = self.lifecycle.client.import_session(contact_id, ratchet);
