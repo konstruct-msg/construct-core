@@ -863,12 +863,6 @@ mod tests {
         let bob_device_id = derive_device_id(&bob_bundle.identity_public);
 
         let alice_bundle = alice.client.get_registration_bundle().unwrap();
-        let _alice_identity = alice
-            .client
-            .key_manager()
-            .identity_public_key()
-            .unwrap()
-            .clone();
         let alice_device_id = derive_device_id(&alice_bundle.identity_public);
 
         alice.client.set_local_user_id(alice_device_id.clone());

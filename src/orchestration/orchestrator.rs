@@ -460,74 +460,6 @@ impl Orchestrator {
             .map(|r| r.message_payload.clone())
     }
 
-    pub fn export_private_keys_json_str(&self) -> Result<String, String> {
-        use base64::Engine as _;
-        let km = self.lifecycle.client.key_manager();
-        let identity_secret = km.identity_secret_key().map_err(|e| e.to_string())?;
-        let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
-        let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
-
-        let identity_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
-        let signing_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
-        let prekey_secret_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
-
-        use crate::crypto::provider::CryptoProvider as _;
-        use crate::crypto::suites::classic::ClassicSuiteProvider;
-        use base64::engine::general_purpose::STANDARD;
-
-        // Re-derive public keys for integrity verification on next load.
-        let identity_pub_check =
-            ClassicSuiteProvider::from_private_key_to_public_key(&identity_bytes)
-                .ok()
-                .map(|b| STANDARD.encode(&b));
-        let verifying_key_check =
-            ClassicSuiteProvider::from_signature_private_to_public(&signing_bytes)
-                .ok()
-                .map(|b| STANDARD.encode(&b));
-        let spk_pub_check =
-            ClassicSuiteProvider::from_private_key_to_public_key(&prekey_secret_bytes)
-                .ok()
-                .map(|b| STANDARD.encode(&b));
-
-        let mut json = serde_json::json!({
-            "identity_secret": STANDARD.encode(&identity_bytes),
-            "signing_secret": STANDARD.encode(&signing_bytes),
-            "signed_prekey_secret": STANDARD.encode(&prekey_secret_bytes),
-            "prekey_signature": STANDARD.encode(&prekey.signature),
-            "suite_id": "1"
-        });
-        if let Some(v) = identity_pub_check {
-            json["identity_public_check"] = serde_json::Value::String(v);
-        }
-        if let Some(v) = verifying_key_check {
-            json["verifying_key_check"] = serde_json::Value::String(v);
-        }
-        if let Some(v) = spk_pub_check {
-            json["signed_prekey_public_check"] = serde_json::Value::String(v);
-        }
-        serde_json::to_string(&json).map_err(|e| e.to_string())
-    }
-
-    pub fn export_registration_bundle_json_str(&self) -> Result<String, String> {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::STANDARD;
-        let bundle = self
-            .lifecycle
-            .client
-            .key_manager()
-            .export_registration_bundle()
-            .map_err(|e| e.to_string())?;
-
-        let json = serde_json::json!({
-            "identity_public": STANDARD.encode(&bundle.identity_public),
-            "signed_prekey_public": STANDARD.encode(&bundle.signed_prekey_public),
-            "signature": STANDARD.encode(&bundle.signature),
-            "verifying_key": STANDARD.encode(&bundle.verifying_key),
-            "suite_id": bundle.suite_id.as_u16().to_string()
-        });
-        serde_json::to_string(&json).map_err(|e| e.to_string())
-    }
-
     /// Export registration bundle as CFE binary.
     pub fn export_registration_bundle_cfe(&self) -> Result<Vec<u8>, String> {
         let bundle = self
@@ -550,15 +482,12 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
-    pub fn sign_bundle_bytes(&self, data: &[u8]) -> Result<String, String> {
-        use base64::Engine as _;
-        let signature = self
-            .lifecycle
+    pub fn sign_bundle_bytes(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.lifecycle
             .client
             .key_manager()
             .sign(data)
-            .map_err(|e| e.to_string())?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(&signature))
+            .map_err(|e| e.to_string())
     }
 
     /// Suite ID for the active session with `contact_id`. Returns 0 if no session.
@@ -828,9 +757,7 @@ impl Orchestrator {
         let session_id = self.lifecycle.client.import_session(contact_id, ratchet);
         Ok(session_id)
     }
-    pub fn rotate_spk(&mut self) -> Result<(u32, String, String), String> {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::STANDARD;
+    pub fn rotate_spk(&mut self) -> Result<(u32, Vec<u8>, Vec<u8>), String> {
         self.lifecycle
             .client
             .key_manager_mut()
@@ -851,11 +778,7 @@ impl Orchestrator {
             .current_signed_prekey_id()
             .unwrap_or(1);
 
-        Ok((
-            key_id,
-            STANDARD.encode(&bundle.signed_prekey_public),
-            STANDARD.encode(&bundle.signature),
-        ))
+        Ok((key_id, bundle.signed_prekey_public, bundle.signature))
     }
 
     pub fn apply_pq_contribution_delegate(

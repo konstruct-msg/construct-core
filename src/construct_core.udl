@@ -48,11 +48,10 @@ dictionary RegistrationBundleJson {
 };
 
 /// Result of a signed pre-key rotation.
-/// All byte fields are base64-encoded for cross-language compatibility.
 dictionary RotatedSpkBundle {
     u32 key_id;
-    string public_key;    // base64 X25519 public key (32 bytes)
-    string signature;     // base64 Ed25519 signature over prologue || public_key (64 bytes)
+    sequence<u8> public_key;  // raw X25519 public key bytes (32 bytes)
+    sequence<u8> signature;   // raw Ed25519 signature bytes (64 bytes)
 };
 
 dictionary EncryptedMessageComponents {
@@ -162,7 +161,7 @@ interface ClassicCryptoCore {
     bytes get_identity_key_bytes();
 
     [Throws=CryptoError]
-    string sign_bundle_data(sequence<u8> bundle_data_json);
+    sequence<u8> sign_bundle_data(sequence<u8> bundle_data_json);
 
     [Throws=CryptoError]
     sequence<u8> export_private_keys();
@@ -601,7 +600,7 @@ interface OrchestratorCore {
     sequence<u8> export_private_keys();
 
     [Throws=CryptoError]
-    string sign_bundle_data(sequence<u8> bundle_data_json);
+    sequence<u8> sign_bundle_data(sequence<u8> bundle_data_json);
 
     [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);

@@ -111,12 +111,8 @@ where
 
     /// Подписать BundleData JSON с помощью Ed25519 signing key
     /// Используется для создания signature в UploadableKeyBundle
-    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String> {
-        use base64::Engine;
-
-        // Получить подпись от KeyManager
-        let signature = self
-            .client
+    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<Vec<u8>> {
+        self.client
             .key_manager()
             .sign(&bundle_data_json)
             .map_err(|e| {
@@ -124,10 +120,7 @@ where
                     "Failed to sign BundleData: {:?}",
                     e
                 )))
-            })?;
-
-        // Base64-encode подпись
-        Ok(base64::engine::general_purpose::STANDARD.encode(&signature))
+            })
     }
 
     pub fn export_public_bundle(&self) -> Result<KeyBundle> {
@@ -298,18 +291,6 @@ pub fn deserialize_key_bundle(json: &str) -> Result<KeyBundle> {
     serde_json::from_str(json).map_err(|e| ConstructError::SerializationError(e.to_string()))
 }
 
-pub fn bytes_to_base64(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-pub fn base64_to_bytes(base64_str: &str) -> Result<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(base64_str)
-        .map_err(|e| ConstructError::SerializationError(format!("Invalid base64: {}", e)))
-}
-
 pub fn generate_random_bytes(len: usize) -> Vec<u8> {
     use rand::RngCore;
     let mut bytes = vec![0u8; len];
@@ -329,14 +310,6 @@ mod tests {
 
         let manager = manager.unwrap();
         assert_eq!(manager.active_sessions_count(), 0);
-    }
-
-    #[test]
-    fn test_base64_conversion() {
-        let data = b"hello world";
-        let b64 = bytes_to_base64(data);
-        let decoded = base64_to_bytes(&b64).unwrap();
-        assert_eq!(data, decoded.as_slice());
     }
 
     #[test]

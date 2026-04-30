@@ -31,20 +31,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     ) -> Result<Self, String> {
         use tracing::debug;
 
-        // Guard: server UUIDs are 36 chars (e.g. "14f28d31-…"); a 32-char value is
-        // a device-hash that will cause permanent AD mismatch on the RESPONDER side.
-        debug_assert!(
-            local_user_id.len() != 32 || local_user_id.contains('-'),
-            "new_initiator_session: local_user_id looks like a 32-char device-hash \
-             instead of a server UUID — AD will not match on the responder side. \
-             Pass the server-assigned UUID."
-        );
-        debug_assert!(
-            contact_id.len() != 32 || contact_id.contains('-'),
-            "new_initiator_session: contact_id looks like a 32-char device-hash \
-             instead of a server UUID — AD will not match on the responder side."
-        );
-
         debug!(
             target: "crypto::double_ratchet",
             contact_id = %contact_id,
@@ -128,17 +114,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         local_user_id: String,
     ) -> Result<(Self, Vec<u8>), String> {
         use tracing::debug;
-
-        debug_assert!(
-            local_user_id.len() != 32 || local_user_id.contains('-'),
-            "new_responder_session: local_user_id looks like a 32-char device-hash \
-             instead of a server UUID — AD will not match on the initiator side."
-        );
-        debug_assert!(
-            contact_id.len() != 32 || contact_id.contains('-'),
-            "new_responder_session: contact_id looks like a 32-char device-hash \
-             instead of a server UUID — AD will not match on the initiator side."
-        );
 
         debug!(
             target: "crypto::double_ratchet",

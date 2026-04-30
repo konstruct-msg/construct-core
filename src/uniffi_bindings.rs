@@ -113,8 +113,8 @@ pub struct RegistrationBundleJson {
 #[derive(Debug, Clone)]
 pub struct RotatedSpkBundle {
     pub key_id: u32,
-    pub public_key: String, // base64 X25519 public key (32 bytes)
-    pub signature: String,  // base64 Ed25519 signature over prologue || public_key (64 bytes)
+    pub public_key: Vec<u8>, // raw X25519 public key bytes (32 bytes)
+    pub signature: Vec<u8>,  // raw Ed25519 signature bytes (64 bytes)
 }
 
 // Encrypted message components for wire format (matches server ChatMessage)
@@ -340,21 +340,16 @@ impl ClassicCryptoCore {
 
     /// Sign BundleData JSON string with Ed25519 signing key
     /// This is used for creating the signature in UploadableKeyBundle
-    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String, CryptoError> {
+    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
         let client = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Sign the BundleData JSON bytes
-        let signature = client
+        client
             .key_manager()
             .sign(&bundle_data_json)
-            .map_err(|_| CryptoError::InitializationFailed)?;
-
-        // Encode signature to base64
-        use base64::Engine;
-        Ok(base64::engine::general_purpose::STANDARD.encode(&signature))
+            .map_err(|_| CryptoError::InitializationFailed)
     }
 
     /// Export private keys as JSON string for persistence
@@ -1187,11 +1182,7 @@ impl ClassicCryptoCore {
     /// updates internal KeyManager state (old SPK kept for grace period decryption),
     /// and returns the new public key + signature ready for upload to the key server.
     ///
-    /// MUST be called before the client sends the RotateSignedPreKeyRequest RPC.
-    /// The server response confirms the rotation; the Keychain is updated by the
-    /// caller (Swift) after confirmation so the on-disk state stays in sync.
     pub fn rotate_signed_prekey(&self) -> Result<RotatedSpkBundle, CryptoError> {
-        use base64::Engine;
         let mut client = self
             .inner
             .lock()
@@ -1213,9 +1204,8 @@ impl ClassicCryptoCore {
 
         Ok(RotatedSpkBundle {
             key_id,
-            public_key: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.signed_prekey_public),
-            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
+            public_key: bundle.signed_prekey_public,
+            signature: bundle.signature,
         })
     }
 }
@@ -2549,7 +2539,7 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::SerializationFailed)
     }
 
-    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<String, CryptoError> {
+    pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.sign_bundle_bytes(&bundle_data_json)
             .map_err(|_| CryptoError::InitializationFailed)
