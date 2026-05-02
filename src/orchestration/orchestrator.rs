@@ -435,6 +435,17 @@ impl Orchestrator {
         self.router.peek_first_pending_wire_payload(contact_id)
     }
 
+    /// Consume the first pending wire payload for a contact without processing it.
+    ///
+    /// Call this after a successful RESPONDER `init_receiving_session_from_wire_payload`
+    /// so that `drain_pending` does not attempt to re-decrypt the init message (msg_num=0),
+    /// which would fail because the Double-Ratchet key was already consumed during X3DH.
+    ///
+    /// Returns `Some(message_id)` of the removed message, or `None` if the queue was empty.
+    pub fn pop_first_pending(&mut self, contact_id: &str) -> Option<String> {
+        self.router.pop_first_pending(contact_id)
+    }
+
     pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
         self.lifecycle.export_session_json_for(contact_id)
     }
@@ -458,6 +469,30 @@ impl Orchestrator {
             .healing_queue
             .get(contact_id)
             .map(|r| r.message_payload.clone())
+    }
+
+    /// Store a failed msgNum=0 wire payload in the healing queue for later retry.
+    /// Idempotent — calling with the same `contact_id` again does not overwrite
+    /// the existing record (first failure wins).
+    pub fn enqueue_heal(&mut self, contact_id: &str, payload: Vec<u8>) {
+        use crate::orchestration::healing_queue::HealDirection;
+        self.lifecycle
+            .healing_queue
+            .enqueue(contact_id, payload, HealDirection::Incoming);
+    }
+
+    /// Record one healing attempt for `contact_id` and return whether another
+    /// retry is allowed or the maximum has been reached.
+    pub fn record_heal_attempt(
+        &mut self,
+        contact_id: &str,
+    ) -> crate::orchestration::healing_queue::HealingDecision {
+        self.lifecycle.healing_queue.record_attempt(contact_id)
+    }
+
+    /// Remove the healing record for `contact_id` (called on success or give-up).
+    pub fn clear_heal_record(&mut self, contact_id: &str) {
+        self.lifecycle.healing_queue.remove(contact_id);
     }
 
     /// Export registration bundle as CFE binary.

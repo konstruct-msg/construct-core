@@ -111,6 +111,24 @@ dictionary DecryptedMessageResult {
     sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
+/// Input slot for decrypt_offline_batch.
+dictionary OfflineBatchMessage {
+    string id;                          // server message ID (for dedup correlation)
+    string contact_id;                  // DR session key (userId or userId:deviceId)
+    sequence<u8> ephemeral_public_key;  // 32 bytes
+    u32 message_number;
+    sequence<u8> content;               // raw ciphertext (already unpadded by Swift caller)
+};
+
+/// Per-message result from decrypt_offline_batch.
+/// Exactly one of plaintext / error is populated.
+dictionary OfflineBatchResult {
+    string id;                      // mirrors OfflineBatchMessage.id
+    sequence<u8>? plaintext;        // Some(_) on success
+    string? error;                  // Some(_) on failure; session is NOT archived
+    sequence<u8> storage_key;       // 32-byte key (empty when error is Some)
+};
+
 dictionary PrivateKeysJson {
     string identity_secret;
     string signing_secret;
@@ -622,6 +640,10 @@ interface OrchestratorCore {
 
     [Throws=CryptoError]
     DecryptedMessageResult decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+
+    /// Batch offline decrypt — single mutex acquisition for the whole batch.
+    /// Session is never archived on per-message failure.
+    sequence<OfflineBatchResult> decrypt_offline_batch(sequence<OfflineBatchMessage> messages);
 
     boolean remove_session(string contact_id);
 

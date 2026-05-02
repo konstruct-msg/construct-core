@@ -137,6 +137,26 @@ pub struct DecryptedMessageResult {
     pub storage_key: Vec<u8>, // 32-byte random key — caller must store in MessageKeyStore
 }
 
+// Input message for decrypt_offline_batch — one slot per message.
+#[derive(Debug, Clone)]
+pub struct OfflineBatchMessage {
+    pub id: String,                    // server message ID (for dedup correlation)
+    pub contact_id: String,            // DR session key (userId or userId:deviceId)
+    pub ephemeral_public_key: Vec<u8>, // 32 bytes
+    pub message_number: u32,
+    pub content: Vec<u8>, // raw ciphertext (already unpadded by Swift caller)
+}
+
+// Per-message result from decrypt_offline_batch.
+// Exactly one of `plaintext` / `error` is populated.
+#[derive(Debug, Clone)]
+pub struct OfflineBatchResult {
+    pub id: String,                 // mirrors OfflineBatchMessage.id
+    pub plaintext: Option<Vec<u8>>, // Some(_) on success
+    pub error: Option<String>,      // Some(_) on failure; session is NOT archived
+    pub storage_key: Vec<u8>,       // 32-byte key (empty when error is Some)
+}
+
 // Session initialization result with decrypted first message
 // Note: We use UDL definition for UniFFI
 #[derive(Debug, Clone)]
@@ -2272,6 +2292,43 @@ impl OrchestratorCore {
             plaintext,
             storage_key: gen_storage_key(),
         })
+    }
+
+    /// Batch offline decrypt — one mutex acquisition for the entire batch.
+    ///
+    /// Designed for `BackgroundFetchManager`: decrypts N messages in a single lock
+    /// acquisition, returning a per-message result without aborting on individual
+    /// failures.  Session is never archived on decrypt failure — the foreground
+    /// stream owns all recovery logic (END_SESSION, re-init, healing).
+    pub fn decrypt_offline_batch(
+        &self,
+        messages: Vec<OfflineBatchMessage>,
+    ) -> Vec<OfflineBatchResult> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        messages
+            .into_iter()
+            .map(|msg| {
+                match orch.decrypt_message_for(
+                    &msg.contact_id,
+                    msg.ephemeral_public_key,
+                    msg.message_number,
+                    &msg.content,
+                ) {
+                    Ok(plaintext) => OfflineBatchResult {
+                        id: msg.id,
+                        plaintext: Some(plaintext),
+                        error: None,
+                        storage_key: gen_storage_key(),
+                    },
+                    Err(e) => OfflineBatchResult {
+                        id: msg.id,
+                        plaintext: None,
+                        error: Some(e),
+                        storage_key: Vec::new(),
+                    },
+                }
+            })
+            .collect()
     }
 
     pub fn remove_session(&self, contact_id: String) -> bool {

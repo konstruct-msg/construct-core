@@ -226,6 +226,20 @@ impl MessageRouter {
             .map(|msg| msg.wire_payload.clone())
     }
 
+    /// Remove the first (oldest) queued message for `contact_id` and return its message_id.
+    ///
+    /// Called after a successful RESPONDER session init so that `drain_pending`
+    /// does not attempt to re-decrypt the session-initiating message (which was
+    /// already consumed during X3DH + Double Ratchet init).
+    ///
+    /// Returns `Some(message_id)` if a message was removed, `None` if the queue was empty.
+    pub fn pop_first_pending(&mut self, contact_id: &str) -> Option<String> {
+        self.pending_queues
+            .get_mut(contact_id)
+            .and_then(|q| q.pop_front())
+            .map(|msg| msg.message_id)
+    }
+
     /// All contact IDs that currently have at least one queued message.
     pub fn contacts_with_pending(&self) -> Vec<String> {
         self.pending_queues
