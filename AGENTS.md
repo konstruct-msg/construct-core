@@ -49,3 +49,45 @@
 - `src/crypto/mod.rs`: Entry point for cryptographic primitives.
 - `src/cfe/mod.rs`: Definition of the Construct Format Envelope for state persistence.
 - `Cargo.toml`: Workspace configuration and feature flag definitions.
+
+---
+
+## Shared Construct Docs Workflow
+
+These instructions apply to GitHub Copilot, Codex, OpenCode, and similar coding agents.
+
+### Division of labour — read this first
+
+| Role | Tool | Responsibility |
+|------|------|----------------|
+| **Coding agent** (you) | Copilot / Codex | Write code + drop raw session notes into `wiki/sessions/` and `wiki/decisions/`. That is all. |
+| **Wiki pipeline** | `obsidian-llm-wiki-local` (olw) | Reads `raw/`, synthesizes concepts, creates/updates wiki articles, generates cross-links. |
+| **Developer** | Human + Obsidian | Reviews wiki draft articles, approves/rejects. Curates `raw/`. |
+
+**Your job is code.** olw handles article synthesis. Write plain-markdown session notes; let the pipeline do the rest.
+
+### Shared knowledge base
+
+- Vault: `/Users/maximeliseyev/Code/constrcut-docs`
+- `raw/` — source corpus. Do **not** rewrite or reorganize.
+- `wiki/` — canonical curated knowledge base. **Read** from here before architectural work.
+- `wiki/.drafts/` — **reserved for olw**. Never write here manually.
+- `wiki/sessions/` — where coding agents write session notes.
+- `wiki/decisions/` — where coding agents write long-lived decision records.
+
+### Where to save durable reasoning
+
+After any session involving architectural changes, design decisions, API changes, or non-obvious implementation choices:
+
+1. **Always** create or update `wiki/sessions/YYYY-MM-DD-<topic>.md`.
+2. **Always** fill in `# Why` — reasoning, alternatives considered, why rejected. Most important section.
+3. If the decision constrains future work, also create `wiki/decisions/<topic>.md`.
+4. Session notes: plain markdown, **no YAML frontmatter, no `[[wikilinks]]`** — olw adds those.
+
+Required note sections: `# Context`, `# What Changed`, `# Why`, `# Intended Outcome`, `# Decisions`, `# Open Questions`
+
+### Operational logging
+
+Append a one-line entry to `wiki/log.md` after writing a note.
+Format: `[YYYY-MM-DD HH:MM] note | <topic>`
+
