@@ -68,7 +68,7 @@ These instructions apply to GitHub Copilot, Codex, OpenCode, and similar coding 
 
 ### Shared knowledge base
 
-- Vault: `/Users/maximeliseyev/Code/constrcut-docs`
+- Vault: `/Users/maximeliseyev/Code/construct-docs`
 - `raw/` — source corpus. Do **not** rewrite or reorganize.
 - `wiki/` — canonical curated knowledge base. **Read** from here before architectural work.
 - `wiki/.drafts/` — **reserved for olw**. Never write here manually.
