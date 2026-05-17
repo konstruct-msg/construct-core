@@ -2091,6 +2091,13 @@ fn check_bundle_freshness(bundle: &BinaryKeyBundle) -> Result<(), CryptoError> {
         }
     }
 
+    // PQ_HYBRID bundles (suite_id == 2) require a non-zero Kyber SPK rotation epoch.
+    // epoch == 0 means the Kyber SPK was never uploaded — refuse to use such a bundle
+    // rather than silently falling back to classical-only key agreement.
+    if bundle.suite_id == 2 && bundle.kyber_spk_rotation_epoch == 0 {
+        return Err(CryptoError::InvalidKeyData);
+    }
+
     Ok(())
 }
 
