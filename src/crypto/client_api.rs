@@ -59,10 +59,10 @@ use std::marker::PhantomData;
 
 // ---- SPK freshness constants ----
 /// Maximum age of a Signed Pre-Key bundle before the client rejects it.
-/// 14 days = 7-day rotation period × 2 (two missed rotations as grace buffer).
-/// Clients rotate every 7 days, so a bundle should never be older than 14 days
-/// under normal operation. The 2× buffer covers users who are offline for a week.
-const SPK_MAX_AGE_SECS: u64 = 14 * 24 * 3600;
+/// 10 days = 7-day rotation period + 3-day grace for clients that miss one rotation.
+/// Tighter than the old 14-day limit: clients that are offline for more than a week
+/// should not block sessions for others.
+const SPK_MAX_AGE_SECS: u64 = 10 * 24 * 3600;
 
 /// Validate that a received `X3DHPublicKeyBundle` is not stale.
 ///
