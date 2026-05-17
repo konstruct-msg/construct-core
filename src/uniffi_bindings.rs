@@ -56,7 +56,7 @@ pub enum CryptoError {
     #[error("MessagePack deserialization failed - check format")]
     MessagePackDeserializationFailed,
 
-    /// Peer's Signed Pre-Key is older than the staleness limit (14 days).
+    /// Peer's Signed Pre-Key is older than the staleness limit (10 days).
     /// The peer must open their app to trigger SPK rotation before a session can be established.
     #[error("Peer SPK is stale: age_secs={age_secs}")]
     PeerSpkStale { age_secs: u64 },
