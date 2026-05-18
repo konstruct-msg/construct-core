@@ -278,7 +278,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .try_into()
             .map_err(|_| "Invalid public key length")?;
 
-        // Associated Data v2: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
+        // Associated Data v3: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
+        // v3 marks the era after session_id derivation v2 (HKDF info includes sorted user IDs).
         // The session_id is derived from the shared X3DH root key so both sides compute the same value.
         let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
             format!(

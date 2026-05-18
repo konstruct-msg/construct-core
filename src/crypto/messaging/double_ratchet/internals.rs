@@ -158,13 +158,17 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         Ok(())
     }
 
-    /// Расшифровать с заданным message key
+    /// Расшифровать с заданным message key.
+    ///
+    /// Tries the current `AD_VERSION` first. If AEAD fails, retries with `AD_VERSION_PREV`
+    /// to handle in-flight messages from peers that encrypted before the AD version bump.
+    /// Returns the error from the current-version attempt if both attempts fail.
     pub(super) fn decrypt_with_key(
         &self,
         message_key: &P::AeadKey,
         encrypted: &EncryptedRatchetMessage,
     ) -> Result<Vec<u8>, String> {
-        use tracing::{debug, trace};
+        use tracing::trace;
 
         trace!(
             target: "crypto::double_ratchet",
@@ -174,7 +178,40 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             "Decrypting with message key"
         );
 
-        // Reconstruct Associated Data v2: must mirror encrypt() exactly.
+        // Try current AD version first.
+        match self.try_aead_decrypt(message_key, encrypted, AD_VERSION) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(primary_err) => {
+                // Graceful migration: retry with the previous AD version for in-flight
+                // messages from peers that haven't upgraded yet. Once all clients are on
+                // AD_VERSION, remove this fallback.
+                tracing::warn!(
+                    target: "crypto::double_ratchet",
+                    msg_num = %encrypted.message_number,
+                    ad_version = AD_VERSION,
+                    fallback_version = AD_VERSION_PREV,
+                    "AEAD failed with current AD version; retrying with previous version \
+                     (migration fallback — peer may not have upgraded yet)"
+                );
+                self.try_aead_decrypt(message_key, encrypted, AD_VERSION_PREV)
+                    .map_err(|_| primary_err)
+            }
+        }
+    }
+
+    /// Attempt AEAD decryption with a specific `ad_version` byte.
+    ///
+    /// `decrypt_with_key` calls this twice during a rolling upgrade: first with
+    /// `AD_VERSION`, then (on failure) with `AD_VERSION_PREV`.
+    pub(super) fn try_aead_decrypt(
+        &self,
+        message_key: &P::AeadKey,
+        encrypted: &EncryptedRatchetMessage,
+        ad_version: u8,
+    ) -> Result<Vec<u8>, String> {
+        use tracing::debug;
+
+        // Reconstruct Associated Data: must mirror encrypt() exactly.
         // Decrypt uses contact_id as sender (= local_user_id on encrypt side) and vice versa.
         let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
             format!(
@@ -185,7 +222,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         })?;
         let mut associated_data =
             Vec::with_capacity(1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4);
-        associated_data.push(AD_VERSION); // AD version (see const AD_VERSION)
+        associated_data.push(ad_version);
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(&session_id_bytes);
@@ -198,6 +235,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id = %self.contact_id,
             session_id = %self.session_id,
             msg_num = %encrypted.message_number,
+            ad_version = %ad_version,
             dh_pub_prefix = %hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
             ad_len = %associated_data.len(),
             "DECRYPT AD built"
@@ -218,6 +256,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 local_user_id_len = %self.local_user_id.len(),
                 contact_id_len = %self.contact_id.len(),
                 ad_total_len = %associated_data.len(),
+                ad_version = %ad_version,
                 msg_num = %encrypted.message_number,
                 "AEAD decryption failed — check that local_user_id and contact_id \
                  are both server UUIDs (36 chars); a 32-char device-hash on either \
@@ -226,7 +265,11 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             format!("Decryption failed: {}", e)
         })?;
 
-        debug!(target: "crypto::double_ratchet", "Decryption successful");
+        debug!(
+            target: "crypto::double_ratchet",
+            ad_version = %ad_version,
+            "Decryption successful"
+        );
 
         // Remove padding to recover original plaintext (traffic analysis protection)
         use crate::traffic_protection::padding::unpad_message;

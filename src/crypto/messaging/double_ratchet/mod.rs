@@ -61,8 +61,20 @@ pub use storage::{SerializableSession, SkippedKeyEntry};
 
 /// AD (Associated Data) version byte — increment here when the AD format changes.
 /// Both `encrypt` and `decrypt_with_key` must use this constant so a version
-/// mismatch surfaces as an AEAD failure rather than a silent silent format bug.
-const AD_VERSION: u8 = 2;
+/// mismatch surfaces as an AEAD failure rather than a silent format bug.
+///
+/// History:
+///   v1 — original format (before the AD identity bug fix)
+///   v2 — after AD bug fix: local_user_id/contact_id are both server UUIDs (36-char)
+///   v3 — after session_id derivation v2: HKDF info includes sorted user IDs
+const AD_VERSION: u8 = 3;
+
+/// Previous AD version used as a fallback during rolling upgrades.
+///
+/// `decrypt_with_key` tries v3 first; if AEAD fails it retries with v2 to handle
+/// in-flight messages encrypted by peers that haven't yet upgraded.
+/// Once all clients are on v3, this constant can be removed.
+const AD_VERSION_PREV: u8 = 2;
 
 /// Read-only health snapshot of a `DoubleRatchetSession`.
 ///

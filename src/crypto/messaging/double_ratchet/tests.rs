@@ -1,4 +1,4 @@
-use super::{DoubleRatchetSession, SuiteID};
+use super::{DoubleRatchetSession, EncryptedRatchetMessage, SuiteID};
 use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
@@ -1395,4 +1395,97 @@ fn test_skipped_keys_dos_limit_returns_error_and_session_survives() {
         alice_received.err()
     );
     assert_eq!(alice_received.unwrap(), b"bob send after overflow");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// AD v2 → v3 graceful migration tests
+//
+// When AD_VERSION was bumped from 2 to 3 (marking the session_id v2 era),
+// in-flight messages from old clients (still using AD v2) must be decryptable
+// by new clients via the fallback in `decrypt_with_key`.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Core assertion: `decrypt_with_key` retries with the previous AD version
+/// when the current version fails, so "old-client" messages don't cause
+/// a session rupture during a rolling upgrade.
+#[test]
+fn test_ad_v2_fallback_decrypts_legacy_messages() {
+    use crate::traffic_protection::padding::pad_message_default;
+
+    let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000031";
+    let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000032";
+    let (_alice, bob) = make_session_pair(alice_uuid, bob_uuid);
+
+    // Bob is the receiver. His decrypt-side AD is:
+    //   ad_version || contact_id (alice) || local_user_id (bob) || session_id || dh_pub || msg_num
+    let session_id_bytes = hex::decode(bob.session_id()).unwrap();
+
+    // Synthetic message key and wire fields (not derived from the real ratchet chain).
+    let message_key = ClassicSuiteProvider::aead_key_from_bytes(vec![0x42u8; 32]);
+    let dh_public_key = [0xABu8; 32];
+    let nonce = vec![0u8; 12]; // 12-byte ChaCha20Poly1305 nonce
+    let message_number: u32 = 7;
+
+    let plaintext = b"hello from old client";
+    let padded = pad_message_default(plaintext).unwrap();
+
+    // Build v2 AD (AD_VERSION_PREV = 2).
+    let mut ad_v2: Vec<u8> = Vec::new();
+    ad_v2.push(2u8); // AD_VERSION_PREV
+    ad_v2.extend_from_slice(alice_uuid.as_bytes()); // contact_id
+    ad_v2.extend_from_slice(bob_uuid.as_bytes()); // local_user_id
+    ad_v2.extend_from_slice(&session_id_bytes);
+    ad_v2.extend_from_slice(&dh_public_key);
+    ad_v2.extend_from_slice(&message_number.to_be_bytes());
+
+    let ciphertext =
+        ClassicSuiteProvider::aead_encrypt(&message_key, &nonce, &padded, Some(&ad_v2))
+            .expect("test AEAD encrypt with v2 AD failed");
+
+    let old_msg = EncryptedRatchetMessage {
+        dh_public_key,
+        message_number,
+        ciphertext,
+        nonce,
+        previous_chain_length: 0,
+        suite_id: SuiteID::CLASSIC.as_u16(),
+    };
+
+    // Current AD version (v3) must NOT decrypt a v2-encrypted message.
+    assert!(
+        bob.try_aead_decrypt(&message_key, &old_msg, 3u8).is_err(),
+        "v3 AD must not decrypt a v2-encrypted message — these are different AD bytes"
+    );
+
+    // Previous AD version (v2) must succeed (direct call).
+    let result_v2 = bob.try_aead_decrypt(&message_key, &old_msg, 2u8);
+    assert!(
+        result_v2.is_ok(),
+        "v2 AD fallback must succeed: {:?}",
+        result_v2.err()
+    );
+    assert_eq!(result_v2.unwrap(), plaintext);
+
+    // `decrypt_with_key` (tries v3, falls back to v2) must also succeed.
+    let fallback_result = bob.decrypt_with_key(&message_key, &old_msg);
+    assert!(
+        fallback_result.is_ok(),
+        "decrypt_with_key must succeed via AD v2 fallback: {:?}",
+        fallback_result.err()
+    );
+    assert_eq!(fallback_result.unwrap(), plaintext);
+}
+
+/// Current AD version (v3) messages must still decrypt normally (no regression).
+#[test]
+fn test_ad_v3_normal_path_unaffected() {
+    let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000033";
+    let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000034";
+    let (mut alice, mut bob) = make_session_pair(alice_uuid, bob_uuid);
+
+    let msg = alice.encrypt(b"v3 normal message").unwrap();
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"v3 normal message");
+
+    let reply = bob.encrypt(b"v3 reply").unwrap();
+    assert_eq!(alice.decrypt(&reply).unwrap(), b"v3 reply");
 }
