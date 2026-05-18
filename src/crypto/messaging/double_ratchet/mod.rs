@@ -92,7 +92,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Derive a shared session identifier from the X3DH root key.
+/// Derive a shared session identifier from the X3DH root key and the two user IDs.
 ///
 /// Both INITIATOR and RESPONDER hold the same `root_key_x3dh` after the X3DH
 /// handshake. Running the same HKDF on that shared secret yields an identical
@@ -103,15 +103,39 @@ fn unix_now() -> u64 {
 ///
 /// Used as additional context in Associated Data (AD) of every AEAD message,
 /// binding ciphertexts to the specific session they were created in.
-fn derive_shared_session_id<P: CryptoProvider>(root_key_x3dh: &[u8]) -> Result<String, String> {
-    // HKDF(salt=root_key_x3dh, ikm=static-label, info=domain-string, len=16)
-    let bytes = P::hkdf_derive_key(
-        root_key_x3dh,
-        b"construct-session-id",
-        b"Construct-SessionID-v1",
-        16,
-    )
-    .map_err(|e| format!("Failed to derive shared session_id: {e}"))?;
+///
+/// ## Cross-user collision defence (v2)
+///
+/// Including the sorted user IDs in the HKDF `info` field ensures that even
+/// if two different user pairs accidentally derived the same X3DH root key
+/// (statistically negligible but theoretically possible), their session IDs
+/// would still differ.  The IDs are sorted lexicographically so that
+/// INITIATOR (`local=A, contact=B`) and RESPONDER (`local=B, contact=A`)
+/// produce identical info bytes without a round-trip.
+///
+/// Format: `"Construct-SessionID-v2\x00" || min_id || "\x00" || max_id`
+/// (null bytes are safe delimiters; server UUIDs never contain them)
+fn derive_shared_session_id<P: CryptoProvider>(
+    root_key_x3dh: &[u8],
+    local_user_id: &str,
+    contact_id: &str,
+) -> Result<String, String> {
+    // Sort IDs so INITIATOR (local=A,contact=B) and RESPONDER (local=B,contact=A)
+    // produce the same info bytes.
+    let (first, second) = if local_user_id <= contact_id {
+        (local_user_id, contact_id)
+    } else {
+        (contact_id, local_user_id)
+    };
+    // info = domain || \0 || id_a || \0 || id_b
+    let mut info = b"Construct-SessionID-v2\x00".to_vec();
+    info.extend_from_slice(first.as_bytes());
+    info.push(0x00);
+    info.extend_from_slice(second.as_bytes());
+
+    // HKDF(salt=root_key_x3dh, ikm=static-label, info=domain+ids, len=16)
+    let bytes = P::hkdf_derive_key(root_key_x3dh, b"construct-session-id", &info, 16)
+        .map_err(|e| format!("Failed to derive shared session_id: {e}"))?;
     Ok(hex::encode(&bytes))
 }
 

@@ -38,8 +38,9 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         );
 
         // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step.
-        let shared_session_id = derive_shared_session_id::<P>(root_key)
-            .map_err(|e| format!("INITIATOR: session_id derivation failed: {}", e))?;
+        let shared_session_id =
+            derive_shared_session_id::<P>(root_key, &local_user_id, &contact_id)
+                .map_err(|e| format!("INITIATOR: session_id derivation failed: {}", e))?;
 
         tracing::info!(
             target: "crypto::double_ratchet",
@@ -132,8 +133,9 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         // Derive shared session_id from the raw X3DH root key BEFORE the DR HKDF step,
         // so both INITIATOR and RESPONDER compute the same value without a round-trip.
-        let shared_session_id = derive_shared_session_id::<P>(root_key)
-            .map_err(|e| format!("RESPONDER: session_id derivation failed: {}", e))?;
+        let shared_session_id =
+            derive_shared_session_id::<P>(root_key, &local_user_id, &contact_id)
+                .map_err(|e| format!("RESPONDER: session_id derivation failed: {}", e))?;
 
         tracing::info!(
             target: "crypto::double_ratchet",

@@ -536,9 +536,15 @@ mod tests {
         let decrypted3 = bob_session.decrypt(&encrypted3).unwrap();
         assert_eq!(decrypted3, plaintext3);
 
-        // Verify session IDs are set
+        // Verify session IDs are set and SYMMETRIC:
+        // both sides derive the same session_id from the shared X3DH root key.
         assert!(!alice_session.session_id().is_empty());
         assert!(!bob_session.session_id().is_empty());
+        assert_eq!(
+            alice_session.session_id(),
+            bob_session.session_id(),
+            "session_id must be identical on INITIATOR and RESPONDER"
+        );
         assert_eq!(alice_session.contact_id(), "bob");
         assert_eq!(bob_session.contact_id(), "alice");
     }
