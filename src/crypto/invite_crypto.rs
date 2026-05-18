@@ -247,6 +247,104 @@ mod tests {
         assert!(!is_valid, "Signature should be invalid with wrong key");
     }
 
+    // ─── Deterministic interop vector tests ───────────────────────────────────
+    //
+    // Vectors generated with Python `cryptography` library (RFC 8032 Ed25519).
+    // Cross-verified against ed25519_dalek 2.2.0 — both produce identical output.
+    //
+    // These tests verify:
+    //   1. `derive_verifying_key_from_secret` produces the correct public key.
+    //   2. Ed25519 signing is deterministic: same key + message always → same sig.
+    //   3. `verify_invite_signature` accepts exactly these known-good signatures.
+    //   4. Interoperability: any correct Ed25519 implementation must match.
+    //
+    // If any of these fail after a crate update, the Ed25519 implementation has
+    // changed in a way that breaks wire compatibility — DO NOT ignore the failure.
+
+    // Vector 1 — seed = 0x00..0x1f, empty message
+    const V1_SEED: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const V1_PK: &str = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+    const V1_SIG: &str = "9ca53579530654d5c3df77089ef45eda613e2fedf670e96bedac4639504e5845ef4b95d5793077233dd16817b2532e9c5525872a73a4ad74b759369a9e05c102";
+
+    // Vector 2 — seed = 0x01..0x20, message = "hello"
+    const V2_SEED: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const V2_PK: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+    const V2_SIG: &str = "6970dad564d940df9017a22431bc2d52fae0b56ce07b860fbe3819fe7128653ccb4ce6c05aef0141e84b1428cc6289fd6e1d5a0941e2005f4dfe534cdbb1990e";
+
+    /// Vector 1 — derive public key from seed.
+    #[test]
+    fn test_vector1_derive_pubkey() {
+        let sk = hex::decode(V1_SEED).unwrap();
+        let pk = derive_verifying_key_from_secret(&sk).expect("derivation failed");
+        assert_eq!(hex::encode(&pk), V1_PK);
+    }
+
+    /// Vector 1 — sign empty message, verify deterministic signature.
+    #[test]
+    fn test_vector1_sign_empty_message() {
+        let sk = hex::decode(V1_SEED).unwrap();
+        let sig = sign_invite_data("", &sk).expect("sign failed");
+        assert_eq!(hex::encode(&sig.signature), V1_SIG);
+    }
+
+    /// Vector 1 — verify with correct pk/sig passes.
+    #[test]
+    fn test_vector1_verify() {
+        let pk = hex::decode(V1_PK).unwrap();
+        let sig = hex::decode(V1_SIG).unwrap();
+        let ok = verify_invite_signature("", &sig, &pk).expect("verify error");
+        assert!(ok, "vector 1 should verify successfully");
+    }
+
+    /// Vector 1 — tampered signature must fail.
+    #[test]
+    fn test_vector1_verify_rejects_tampered_sig() {
+        let pk = hex::decode(V1_PK).unwrap();
+        let mut sig = hex::decode(V1_SIG).unwrap();
+        sig[0] ^= 0xff; // flip first byte
+        let ok = verify_invite_signature("", &sig, &pk).expect("verify error");
+        assert!(!ok, "tampered signature must not verify");
+    }
+
+    /// Vector 2 — derive pubkey + sign "hello".
+    #[test]
+    fn test_vector2_derive_and_sign() {
+        let sk = hex::decode(V2_SEED).unwrap();
+        // verify pubkey derivation
+        let pk = derive_verifying_key_from_secret(&sk).expect("derivation failed");
+        assert_eq!(hex::encode(&pk), V2_PK);
+        // verify deterministic signature
+        let sig = sign_invite_data("hello", &sk).expect("sign failed");
+        assert_eq!(hex::encode(&sig.signature), V2_SIG);
+        // verify roundtrip
+        let ok = verify_invite_signature("hello", &sig.signature, &pk).expect("verify error");
+        assert!(ok, "vector 2 must verify");
+    }
+
+    /// Cross-vector: signature from vector 1 key must not verify with vector 2 key.
+    #[test]
+    fn test_cross_vector_wrong_key_rejected() {
+        let wrong_pk = hex::decode(V2_PK).unwrap();
+        let sig = hex::decode(V1_SIG).unwrap();
+        let ok = verify_invite_signature("", &sig, &wrong_pk).expect("verify error");
+        assert!(
+            !ok,
+            "sig from vector 1 key must not verify with vector 2 key"
+        );
+    }
+
+    /// Signature from vector 2 must not verify against vector 1's message.
+    #[test]
+    fn test_cross_vector_wrong_message_rejected() {
+        let pk = hex::decode(V2_PK).unwrap();
+        let sig = hex::decode(V2_SIG).unwrap();
+        let ok = verify_invite_signature("", &sig, &pk).expect("verify error"); // wrong msg
+        assert!(
+            !ok,
+            "sig over 'hello' must not verify against empty message"
+        );
+    }
+
     #[test]
     fn test_invalid_key_lengths() {
         let data = "test data";

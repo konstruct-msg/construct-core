@@ -144,7 +144,7 @@ pub struct OfflineBatchMessage {
     pub contact_id: String,            // DR session key (userId or userId:deviceId)
     pub ephemeral_public_key: Vec<u8>, // 32 bytes
     pub message_number: u32,
-    pub content: Vec<u8>, // raw ciphertext (already unpadded by Swift caller)
+    pub content: Vec<u8>, // raw sealed box from wire: nonce[12] || ciphertext || tag (unpadding happens in Rust after decrypt)
 }
 
 // Per-message result from decrypt_offline_batch.
