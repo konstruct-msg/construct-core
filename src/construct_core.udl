@@ -501,6 +501,14 @@ interface RustHealingQueue {
 
     /// Number of pending healing records.
     u64 len();
+
+    /// Serialise the queue state to a CFE blob for Keychain persistence.
+    /// Returns an empty sequence on serialisation failure.
+    sequence<u8> export_state();
+
+    /// Restore queue state from a CFE blob produced by `export_state`.
+    /// Silently no-ops on decode failure.
+    void import_state(sequence<u8> data);
 };
 
 // ── OrchestratorCore ──────────────────────────────────────────────────────────

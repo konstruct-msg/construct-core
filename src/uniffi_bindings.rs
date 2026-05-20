@@ -2034,6 +2034,63 @@ impl RustHealingQueue {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Serialize the queue state to a CFE blob for Keychain persistence.
+    /// Reuses `CfeOrchestratorStateV1` format (only `healing_records` is populated).
+    /// Returns an empty `Vec` on serialisation failure — callers should treat this
+    /// as a non-fatal error and skip the save.
+    pub fn export_state(&self) -> Vec<u8> {
+        use crate::cfe::{CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1};
+        let queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let state = CfeOrchestratorStateV1 {
+            ver: 1,
+            my_user_id: String::new(),
+            processed_ids: Vec::new(),
+            healing_records: queue
+                .snapshot_records()
+                .into_iter()
+                .map(|r| CfeHealingRecordV1 {
+                    contact_id: r.contact_id.clone(),
+                    message_bytes: r.message_payload.clone(),
+                    attempts: r.attempts,
+                    incoming_triggers: r.incoming_triggers,
+                    created_at: r.created_at,
+                })
+                .collect(),
+            init_locks: Vec::new(),
+            archives: Vec::new(),
+            archive_timestamps: Vec::new(),
+            prekey_tracker: Vec::new(),
+        };
+        crate::cfe::encode(CfeMessageType::OrchestratorState, &state).unwrap_or_default()
+    }
+
+    /// Restore queue state from a CFE blob previously produced by `export_state`.
+    /// Silently no-ops on decode failure (e.g., corrupted blob or format mismatch).
+    pub fn import_state(&self, data: Vec<u8>) {
+        use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
+        use crate::orchestration::healing_queue::HealingRecord;
+        let Ok(state) = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
+            &data,
+            CfeMessageType::OrchestratorState,
+        ) else {
+            return;
+        };
+        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        queue.restore_records(
+            state
+                .healing_records
+                .into_iter()
+                .map(|r| HealingRecord {
+                    contact_id: r.contact_id,
+                    message_payload: r.message_bytes,
+                    attempts: r.attempts,
+                    incoming_triggers: r.incoming_triggers,
+                    created_at: r.created_at,
+                })
+                .collect(),
+        );
+    }
 }
 
 /// Mirror of UDL `HealingAttemptResult` dictionary.
