@@ -19,6 +19,10 @@ pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;
 
+// MLS group chat (RFC 9420) — feature-gated, pulls in openmls
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+pub mod group;
+
 // UniFFI bindings module (types and implementations)
 #[cfg(any(feature = "ios", feature = "mac"))]
 mod uniffi_bindings;
