@@ -25,12 +25,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 # Feature flags
 [features]
 default = []
-ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
+ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto"]
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-ice TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
+mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto"]
 # android = UniFFI JNI bindings (Kotlin) + construct-ice transport
-android = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel"]
+android = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",
@@ -79,6 +79,11 @@ ml-kem = { version = "0.3.0", optional = true }
 getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"], optional = true }
 pqcrypto-mldsa = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
+
+# MLS (Messaging Layer Security) — group chat protocol (RFC 9420)
+# Feature-gated: mls + group-conversation. Pulls in ~15 additional crates.
+openmls = { version = "0.8", optional = true }
+openmls_rust_crypto = { version = "0.3", optional = true }
 
 # iOS bindings (optional)
 uniffi = { version = "0.30", features = ["build"], optional = true }
