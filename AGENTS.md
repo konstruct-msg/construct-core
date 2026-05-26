@@ -68,7 +68,7 @@ These instructions apply to GitHub Copilot, Codex, OpenCode, and similar coding 
 
 ### Shared knowledge base
 
-- Vault: `/Users/maximeliseyev/Code/construct-docs`
+- Vault: `~/Code/construct-docs`
 - `raw/` — source corpus. Do **not** rewrite or reorganize.
 - `wiki/` — canonical curated knowledge base. **Read** from here before architectural work.
 - `wiki/.drafts/` — **reserved for olw**. Never write here manually.
@@ -90,4 +90,3 @@ Required note sections: `# Context`, `# What Changed`, `# Why`, `# Intended Outc
 
 Append a one-line entry to `wiki/log.md` after writing a note.
 Format: `[YYYY-MM-DD HH:MM] note | <topic>`
-

@@ -40,14 +40,7 @@ construct-core/
 
 ```toml
 [dependencies]
-construct-core = { git = "https://github.com/maximeliseyev/construct-core", features = ["ios"] }
-```
-
-### For Web (WASM)
-
-```toml
-[dependencies]
-construct-core = { git = "https://github.com/maximeliseyev/construct-core", features = ["wasm"] }
+construct-core = { git = "https://github.com/construct-msg/construct-core", features = ["ios"] }
 ```
 
 ## 🔐 Cryptography

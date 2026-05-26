@@ -4,12 +4,12 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.8.5"
+version = "0.9.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/maximeliseyev/construct-core"
+repository = "https://github.com/construct-msg/construct-core"
 description = "Core cryptographic engine for Construct Messenger with E2EE"
 keywords = ["crypto", "e2ee", "messaging", "x3dh", "double-ratchet"]
 categories = ["cryptography"]
@@ -82,7 +82,7 @@ pqcrypto-traits = { version = "0.3", optional = true }
 
 # MLS (Messaging Layer Security) — group chat protocol (RFC 9420)
 # Feature-gated: mls + group-conversation. Pulls in ~15 additional crates.
-openmls = { version = "0.8", optional = true }
+openmls = { version = "0.8", optional = true, features = ["test-utils"] }
 openmls_rust_crypto = { version = "0.5", optional = true }
 openmls_basic_credential = { version = "0.5", optional = true }
 
