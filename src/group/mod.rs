@@ -14,5 +14,5 @@
 pub mod mls_group;
 pub mod mls_error;
 
-pub use mls_group::MlsGroup;
+pub use mls_group::{MlsGroup, GroupConfig, MemberAddition};
 pub use mls_error::MlsError;

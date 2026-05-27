@@ -789,3 +789,46 @@ namespace construct_core {
     [Throws=CryptoError]
     SrRecoveryBundle sr_open_recovery_bundle(sequence<u8> vault_key, sequence<u8> ciphertext);
 };
+
+// ============================================================================
+// MLS Group Chat (RFC 9420) — Messaging Layer Security
+// ============================================================================
+
+/// Configuration for creating or joining an MLS group.
+dictionary GroupConfig {
+    sequence<u8> signer_private_key;
+    sequence<u8> signer_public_key;
+    sequence<u8> encrypted_group_context;
+};
+
+/// Result of adding a member to an MLS group.
+dictionary MemberAddition {
+    sequence<u8> commit;
+    sequence<u8> welcome;
+    u32 leaf_index;
+};
+
+/// Errors that can occur during MLS group operations.
+[Error]
+enum MlsError {
+    "CryptoError",
+    "EpochMismatch",
+    "NotAMember",
+    "SerializationError",
+    "WelcomeError",
+    "CommitError",
+    "EncryptionError",
+};
+
+/// MLS group — stateful wrapper around openmls::MlsGroup.
+interface MlsGroup {
+    /// Create a new MLS group with the caller as the sole initial member.
+    [Throws=MlsError]
+    constructor(GroupConfig config);
+
+    /// Current number of members in the group.
+    u32 member_count();
+
+    /// Current MLS epoch. Increments on every commit.
+    u64 epoch();
+};

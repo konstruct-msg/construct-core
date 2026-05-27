@@ -23,6 +23,9 @@ pub mod wire_payload;
 #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 pub mod group;
 
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+pub use group::{MlsGroup, MlsError, GroupConfig, MemberAddition};
+
 // UniFFI bindings module (types and implementations)
 #[cfg(any(feature = "ios", feature = "mac"))]
 mod uniffi_bindings;
