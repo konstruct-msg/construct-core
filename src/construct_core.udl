@@ -39,11 +39,11 @@ callback interface PowProgressCallback {
 // Registration & Key Bundles
 // ============================================================================
 
-dictionary RegistrationBundleJson {
-    string identity_public;
-    string signed_prekey_public;
-    string signature;
-    string verifying_key;
+dictionary RegistrationBundleFields {
+    sequence<u8> identity_public;
+    sequence<u8> signed_prekey_public;
+    sequence<u8> signature;
+    sequence<u8> verifying_key;
     string suite_id;
 };
 
@@ -168,7 +168,7 @@ dictionary OtpkRecord {
 interface ClassicCryptoCore {
     /// Typed registration bundle fields.
     [Throws=CryptoError]
-    RegistrationBundleJson get_registration_bundle_fields();
+    RegistrationBundleFields get_registration_bundle_fields();
 
     /// Raw Ed25519 signing secret key bytes (64 bytes).
     [Throws=CryptoError]
@@ -598,7 +598,7 @@ interface OrchestratorCore {
 
     /// Typed registration bundle — replaces `export_registration_bundle_json()` parsing.
     [Throws=CryptoError]
-    RegistrationBundleJson get_registration_bundle_fields();
+    RegistrationBundleFields get_registration_bundle_fields();
 
     /// Raw Ed25519 signing secret key bytes (64 bytes).
     [Throws=CryptoError]

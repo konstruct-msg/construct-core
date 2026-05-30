@@ -98,14 +98,15 @@ pub struct SessionHealthReport {
     pub session_id: String,
 }
 
-// Registration bundle as JSON - matches UDL
-// Note: We use UDL definition, not derive macro
+// Registration bundle fields exposed across the UniFFI boundary as raw bytes.
+// Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
+// `suite_id` remains a String for now; callers parse it into UInt16 at the use site.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistrationBundleJson {
-    pub identity_public: String,
-    pub signed_prekey_public: String,
-    pub signature: String,
-    pub verifying_key: String,
+pub struct RegistrationBundleFields {
+    pub identity_public: Vec<u8>,
+    pub signed_prekey_public: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub verifying_key: Vec<u8>,
     pub suite_id: String,
 }
 
@@ -258,8 +259,8 @@ pub struct MLKEMEncapsulation {
 
 // UniFFI interface implementation (exported via UDL, not proc-macros)
 impl ClassicCryptoCore {
-    /// Typed registration bundle fields — no JSON parsing needed on Swift side.
-    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleJson, CryptoError> {
+    /// Typed registration bundle fields — raw bytes across the FFI boundary.
+    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleFields, CryptoError> {
         let client = self
             .inner
             .lock()
@@ -268,14 +269,11 @@ impl ClassicCryptoCore {
             .key_manager()
             .export_registration_bundle()
             .map_err(|_| CryptoError::InitializationFailed)?;
-        use base64::Engine;
-        Ok(RegistrationBundleJson {
-            identity_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.identity_public),
-            signed_prekey_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.signed_prekey_public),
-            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
-            verifying_key: base64::engine::general_purpose::STANDARD.encode(&bundle.verifying_key),
+        Ok(RegistrationBundleFields {
+            identity_public: bundle.identity_public,
+            signed_prekey_public: bundle.signed_prekey_public,
+            signature: bundle.signature,
+            verifying_key: bundle.verifying_key,
             suite_id: bundle.suite_id.as_u16().to_string(),
         })
     }
@@ -1374,21 +1372,12 @@ pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> 
 mod tests {
     use super::*;
 
-    fn bundle_fields_to_binary(fields: RegistrationBundleJson) -> BinaryKeyBundle {
-        use base64::Engine;
+    fn bundle_fields_to_binary(fields: RegistrationBundleFields) -> BinaryKeyBundle {
         BinaryKeyBundle {
-            identity_public: base64::engine::general_purpose::STANDARD
-                .decode(&fields.identity_public)
-                .unwrap(),
-            signed_prekey_public: base64::engine::general_purpose::STANDARD
-                .decode(&fields.signed_prekey_public)
-                .unwrap(),
-            signature: base64::engine::general_purpose::STANDARD
-                .decode(&fields.signature)
-                .unwrap(),
-            verifying_key: base64::engine::general_purpose::STANDARD
-                .decode(&fields.verifying_key)
-                .unwrap(),
+            identity_public: fields.identity_public,
+            signed_prekey_public: fields.signed_prekey_public,
+            signature: fields.signature,
+            verifying_key: fields.verifying_key,
             suite_id: fields.suite_id.parse().unwrap(),
             one_time_prekey_public: None,
             one_time_prekey_id: None,
@@ -2193,20 +2182,17 @@ impl OrchestratorCore {
             })
     }
 
-    /// Typed registration bundle fields.
-    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleJson, CryptoError> {
+    /// Typed registration bundle fields — raw bytes across the FFI boundary.
+    pub fn get_registration_bundle_fields(&self) -> Result<RegistrationBundleFields, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let bundle = orch
             .get_registration_bundle_fields()
             .map_err(|_| CryptoError::InitializationFailed)?;
-        use base64::Engine as _;
-        Ok(RegistrationBundleJson {
-            identity_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.identity_public),
-            signed_prekey_public: base64::engine::general_purpose::STANDARD
-                .encode(&bundle.signed_prekey_public),
-            signature: base64::engine::general_purpose::STANDARD.encode(&bundle.signature),
-            verifying_key: base64::engine::general_purpose::STANDARD.encode(&bundle.verifying_key),
+        Ok(RegistrationBundleFields {
+            identity_public: bundle.identity_public,
+            signed_prekey_public: bundle.signed_prekey_public,
+            signature: bundle.signature,
+            verifying_key: bundle.verifying_key,
             suite_id: bundle.suite_id.as_u16().to_string(),
         })
     }

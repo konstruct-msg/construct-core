@@ -410,9 +410,9 @@ impl SessionLifecycleManager {
             }];
         }
 
-        // Phase 3: export updated session JSON.
-        let session_json = match self.export_session_json_for(contact_id) {
-            Ok(j) => j,
+        // Phase 3: export updated session as CFE binary (MessagePack, no JSON).
+        let session_bytes = match self.export_session_bytes_for(contact_id) {
+            Ok(b) => b,
             Err(e) => {
                 return vec![Action::NotifyError {
                     code: "SESSION_EXPORT_FAILED".to_string(),
@@ -437,7 +437,7 @@ impl SessionLifecycleManager {
 
         let mut actions = vec![Action::SaveSessionToSecureStore {
             key: session_key(contact_id),
-            data: session_json.into_bytes(),
+            data: session_bytes,
         }];
         actions.extend(delete_actions);
         actions.extend(cfe_export_action);
