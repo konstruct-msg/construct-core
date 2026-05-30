@@ -25,12 +25,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 # Feature flags
 [features]
 default = []
-ios = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
-# mac = same capabilities as ios — UniFFI Swift bindings + construct-ice TLS proxy
+ios = ["uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+# mac = same capabilities as ios — UniFFI Swift bindings + construct-veil TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
-# android = UniFFI JNI bindings (Kotlin) + construct-ice transport
-android = ["uniffi", "dep:construct-ice", "construct-ice?/tls", "construct-ice?/webtunnel", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+mac = ["uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+# android = UniFFI JNI bindings (Kotlin) + construct-veil transport
+android = ["uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",
@@ -89,8 +89,8 @@ openmls_basic_credential = { version = "0.5", optional = true }
 # iOS bindings (optional)
 uniffi = { version = "0.30", features = ["build"], optional = true }
 
-# Traffic obfuscation — ICE (obfs4 pluggable transport)
-construct-ice = { path = "../construct-ice", features = ["ffi"], optional = true }
+# Traffic obfuscation — VEIL (obfs4 + WebTunnel pluggable transports)
+construct-veil = { path = "../construct-veil", features = ["ffi"], optional = true }
 
 # Async runtime (optional, для desktop)
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
