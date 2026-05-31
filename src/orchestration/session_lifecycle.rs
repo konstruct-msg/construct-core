@@ -88,17 +88,6 @@ impl TryFrom<WireMessage> for EncryptedRatchetMessage {
     }
 }
 
-// ── Serializable state (export / import) ─────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LifecycleState {
-    my_user_id: String,
-    /// contactId → hex-encoded CFE binary archive (for JSON compat).
-    archives: HashMap<String, String>,
-    archive_timestamps: HashMap<String, u64>,
-    prekey_tracker: HashMap<String, u32>,
-}
-
 // ── SessionLifecycleManager ───────────────────────────────────────────────────
 
 pub struct SessionLifecycleManager {
@@ -446,44 +435,6 @@ impl SessionLifecycleManager {
 
     // ── State persistence ─────────────────────────────────────────────────────
 
-    /// Export non-crypto orchestration state to JSON.
-    ///
-    /// This does NOT include session keys (those are persisted separately via
-    /// `Action::SaveSessionToSecureStore`). Use this to snapshot coordinator
-    /// metadata (archives index, prekey tracker, user ID).
-    pub fn export_state_json(&self) -> Result<String, String> {
-        let state = LifecycleState {
-            my_user_id: self.my_user_id.clone(),
-            archives: self
-                .archives
-                .iter()
-                .map(|(k, v)| (k.clone(), hex::encode(v)))
-                .collect(),
-            archive_timestamps: self.archive_timestamps.clone(),
-            prekey_tracker: self.prekey_tracker.clone(),
-        };
-        serde_json::to_string(&state).map_err(|e| format!("export_state_json: {}", e))
-    }
-
-    /// Restore orchestration metadata from a previously exported JSON snapshot.
-    pub fn import_state_json(&mut self, json: &str) -> Result<(), String> {
-        let state: LifecycleState =
-            serde_json::from_str(json).map_err(|e| format!("import_state_json: {}", e))?;
-        self.my_user_id = state.my_user_id;
-        self.archives = state
-            .archives
-            .into_iter()
-            .map(|(k, v)| {
-                hex::decode(&v)
-                    .map(|bytes| (k.clone(), bytes))
-                    .map_err(|e| format!("import_state_json: corrupt archive hex for {}: {}", k, e))
-            })
-            .collect::<Result<_, _>>()?;
-        self.archive_timestamps = state.archive_timestamps;
-        self.prekey_tracker = state.prekey_tracker;
-        Ok(())
-    }
-
     /// Export the Kyber `PQContributionManager` state as a CFE binary blob.
     ///
     /// The caller should persist the returned bytes under the well-known key
@@ -781,28 +732,7 @@ mod tests {
         assert!(mgr.is_reinstall("bob", 99)); // different → reinstall
     }
 
-    #[test]
-    fn test_export_import_state_json() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.track_prekey("bob", 5);
-        mgr.archives
-            .insert("carol".to_string(), b"placeholder".to_vec());
-
-        let json = mgr.export_state_json().unwrap();
-        assert!(json.contains("alice"));
-        assert!(json.contains("carol"));
-
-        let client2 = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr2 = SessionLifecycleManager::new(client2, "initial".to_string());
-        mgr2.import_state_json(&json).unwrap();
-        assert_eq!(mgr2.my_user_id(), "alice");
-        assert!(mgr2.has_archive("carol"));
-        assert!(!mgr2.is_reinstall("bob", 5)); // prekey tracker restored
-        assert!(mgr2.is_reinstall("bob", 99));
-    }
-
-    #[test]
+#[test]
     fn test_session_and_archive_keys() {
         assert_eq!(session_key("alice"), "session_alice");
         assert_eq!(archive_key("alice"), "archive_alice");

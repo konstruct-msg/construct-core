@@ -100,14 +100,13 @@ pub struct SessionHealthReport {
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
-// `suite_id` remains a String for now; callers parse it into UInt16 at the use site.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrationBundleFields {
     pub identity_public: Vec<u8>,
     pub signed_prekey_public: Vec<u8>,
     pub signature: Vec<u8>,
     pub verifying_key: Vec<u8>,
-    pub suite_id: String,
+    pub suite_id: u16,
 }
 
 /// Returned by rotate_signed_prekey() — new SPK data ready for server upload.
@@ -274,7 +273,7 @@ impl ClassicCryptoCore {
             signed_prekey_public: bundle.signed_prekey_public,
             signature: bundle.signature,
             verifying_key: bundle.verifying_key,
-            suite_id: bundle.suite_id.as_u16().to_string(),
+            suite_id: bundle.suite_id.as_u16(),
         })
     }
 
@@ -1378,7 +1377,7 @@ mod tests {
             signed_prekey_public: fields.signed_prekey_public,
             signature: fields.signature,
             verifying_key: fields.verifying_key,
-            suite_id: fields.suite_id.parse().unwrap(),
+            suite_id: fields.suite_id,
             one_time_prekey_public: None,
             one_time_prekey_id: None,
             spk_uploaded_at: 0,
@@ -2193,7 +2192,7 @@ impl OrchestratorCore {
             signed_prekey_public: bundle.signed_prekey_public,
             signature: bundle.signature,
             verifying_key: bundle.verifying_key,
-            suite_id: bundle.suite_id.as_u16().to_string(),
+            suite_id: bundle.suite_id.as_u16(),
         })
     }
 

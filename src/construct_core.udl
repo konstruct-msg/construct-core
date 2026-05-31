@@ -44,7 +44,7 @@ dictionary RegistrationBundleFields {
     sequence<u8> signed_prekey_public;
     sequence<u8> signature;
     sequence<u8> verifying_key;
-    string suite_id;
+    u16 suite_id;
 };
 
 /// Result of a signed pre-key rotation.
