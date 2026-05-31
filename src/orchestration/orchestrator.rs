@@ -446,10 +446,6 @@ impl Orchestrator {
         self.lifecycle.export_session_json_for(contact_id)
     }
 
-    pub fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
-        self.lifecycle.import_session_json(contact_id, json)
-    }
-
     pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
         self.lifecycle.client.remove_session(contact_id)
     }

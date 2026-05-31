@@ -585,17 +585,6 @@ impl SessionLifecycleManager {
             .map_err(|e| e.to_string())
     }
 
-    pub fn import_session_json(&mut self, contact_id: &str, json: &str) -> Result<String, String> {
-        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
-
-        let serializable: SerializableSession =
-            serde_json::from_str(json).map_err(|e| format!("deserialize session: {}", e))?;
-        let ratchet =
-            DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)?;
-        let session_id = self.client.import_session(contact_id, ratchet);
-        Ok(session_id)
-    }
-
     /// Import a session from CFE binary bytes.
     pub fn import_session_bytes(&mut self, contact_id: &str, data: &[u8]) -> Result<(), String> {
         use crate::cfe::{CfeError, CfeMessageType, decode_as};
