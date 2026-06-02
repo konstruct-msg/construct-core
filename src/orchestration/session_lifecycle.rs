@@ -721,7 +721,7 @@ mod tests {
         assert!(mgr.is_reinstall("bob", 99)); // different → reinstall
     }
 
-#[test]
+    #[test]
     fn test_session_and_archive_keys() {
         assert_eq!(session_key("alice"), "session_alice");
         assert_eq!(archive_key("alice"), "archive_alice");

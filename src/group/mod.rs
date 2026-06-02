@@ -11,8 +11,8 @@
 //! Ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
 //! Credential:  BasicCredential with Ed25519 device identity key
 
-pub mod mls_group;
 pub mod mls_error;
+pub mod mls_group;
 
-pub use mls_group::{MlsGroup, GroupConfig, MemberAddition};
 pub use mls_error::MlsError;
+pub use mls_group::{GroupConfig, MemberAddition, MlsGroup};

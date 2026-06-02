@@ -3,13 +3,13 @@
 //! Ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519.
 //! Credential: BasicCredential with Ed25519 keypair from `openmls_basic_credential`.
 
-use openmls::prelude::{
-    Ciphersuite, CredentialWithKey, MlsGroup as OpenMlsGroup,
-    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageIn, ProtocolMessage,
-};
-use openmls::prelude::tls_codec::Deserialize;
 use openmls::credentials::BasicCredential;
 use openmls::group::StagedWelcome;
+use openmls::prelude::tls_codec::Deserialize;
+use openmls::prelude::{
+    Ciphersuite, CredentialWithKey, MlsGroup as OpenMlsGroup, MlsGroupCreateConfig,
+    MlsGroupJoinConfig, MlsMessageIn, ProtocolMessage,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 
@@ -60,7 +60,11 @@ impl MlsGroup {
         let inner = OpenMlsGroup::new(&provider, &signer, &mls_config, cwk)
             .map_err(|e| MlsError::CryptoError(format!("create group: {e}")))?;
 
-        Ok(Self { inner, signer, provider })
+        Ok(Self {
+            inner,
+            signer,
+            provider,
+        })
     }
 
     /// Join a group from a Welcome message.
@@ -84,10 +88,15 @@ impl MlsGroup {
         let staged = StagedWelcome::new_from_welcome(&provider, &mls_config, welcome, None)
             .map_err(|e| MlsError::WelcomeError(format!("stage join: {e}")))?;
 
-        let inner = staged.into_group(&provider)
+        let inner = staged
+            .into_group(&provider)
             .map_err(|e| MlsError::WelcomeError(format!("join group: {e}")))?;
 
-        Ok(Self { inner, signer, provider })
+        Ok(Self {
+            inner,
+            signer,
+            provider,
+        })
     }
 
     // ── Messages ───────────────────────────────────────────────────────
@@ -107,7 +116,8 @@ impl MlsGroup {
             .try_into_protocol_message()
             .map_err(|e| MlsError::EncryptionError(format!("protocol: {e}")))?;
 
-        let processed = self.inner
+        let processed = self
+            .inner
             .process_message(&self.provider, proto)
             .map_err(|e| MlsError::EncryptionError(format!("process: {e}")))?;
 
@@ -125,10 +135,12 @@ impl MlsGroup {
         let kp_msg = MlsMessageIn::tls_deserialize_exact(key_package_bytes)
             .map_err(|e| MlsError::CryptoError(format!("kp deserialize: {e}")))?;
 
-        let key_package = kp_msg.into_keypackage()
+        let key_package = kp_msg
+            .into_keypackage()
             .ok_or_else(|| MlsError::CryptoError("not a KeyPackage".into()))?;
 
-        let (commit, welcome, _group_info) = self.inner
+        let (commit, welcome, _group_info) = self
+            .inner
             .add_members(&self.provider, &self.signer, &[key_package])
             .map_err(|e| MlsError::CryptoError(format!("add member: {e}")))?;
 
@@ -141,25 +153,33 @@ impl MlsGroup {
 
     pub fn remove_member(&mut self, leaf_index: u32) -> Result<Vec<u8>, MlsError> {
         let leaf = openmls::prelude::LeafNodeIndex::new(leaf_index);
-        let (commit, _, _) = self.inner
+        let (commit, _, _) = self
+            .inner
             .remove_members(&self.provider, &self.signer, &[leaf])
             .map_err(|e| MlsError::CryptoError(format!("remove: {e}")))?;
 
-        commit.to_bytes()
+        commit
+            .to_bytes()
             .map_err(|e| MlsError::SerializationError(format!("remove commit: {e}")))
     }
 
     pub fn leave_group(&mut self) -> Result<Vec<u8>, MlsError> {
-        let commit = self.inner
+        let commit = self
+            .inner
             .leave_group(&self.provider, &self.signer)
             .map_err(|e| MlsError::CryptoError(format!("leave: {e}")))?;
 
-        commit.to_bytes()
+        commit
+            .to_bytes()
             .map_err(|e| MlsError::SerializationError(format!("leave commit: {e}")))
     }
 
-    pub fn member_count(&self) -> u32 { self.inner.members().count() as u32 }
-    pub fn epoch(&self) -> u64 { self.inner.epoch().as_u64() }
+    pub fn member_count(&self) -> u32 {
+        self.inner.members().count() as u32
+    }
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch().as_u64()
+    }
 
     // ── Commits ────────────────────────────────────────────────────────
 
@@ -171,10 +191,12 @@ impl MlsGroup {
             .try_into_protocol_message()
             .map_err(|e| MlsError::CommitError(format!("protocol: {e}")))?;
 
-        self.inner.process_message(&self.provider, proto)
+        self.inner
+            .process_message(&self.provider, proto)
             .map_err(|e| MlsError::CommitError(format!("process: {e}")))?;
 
-        self.inner.merge_pending_commit(&self.provider)
+        self.inner
+            .merge_pending_commit(&self.provider)
             .map_err(|e| MlsError::CommitError(format!("merge: {e}")))?;
 
         Ok(())
@@ -183,11 +205,15 @@ impl MlsGroup {
     // ── Persistence (TODO: implement via StorageProvider) ──────────────
 
     pub fn serialize(&self) -> Result<Vec<u8>, MlsError> {
-        Err(MlsError::SerializationError("TODO: openmls persistence".into()))
+        Err(MlsError::SerializationError(
+            "TODO: openmls persistence".into(),
+        ))
     }
 
     pub fn deserialize(_data: &[u8]) -> Result<Self, MlsError> {
-        Err(MlsError::SerializationError("TODO: openmls persistence".into()))
+        Err(MlsError::SerializationError(
+            "TODO: openmls persistence".into(),
+        ))
     }
 }
 

@@ -180,7 +180,7 @@ impl Orchestrator {
         self.lifecycle.ack_store.mark_processed(message_id)
     }
 
-/// Export the full orchestrator coordination state as a CFE binary blob.
+    /// Export the full orchestrator coordination state as a CFE binary blob.
     ///
     /// Captures ACK dedup cache, healing queue, init locks, archive index, and
     /// prekey tracker.  Persist under `"orchestrator_state"` in Keychain.
