@@ -199,8 +199,11 @@ jobs:
 
       # Ubuntu GitHub runners ship the Android NDK pre-installed; cargo-ndk
       # autodetects it via $ANDROID_NDK_LATEST_HOME.
+      # `--force` because the Cargo cache (~/.cargo/bin) restored from the
+      # previous run already contains cargo-ndk binaries — without it cargo
+      # install errors out with "binary already exists in destination".
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked --quiet
+        run: cargo install cargo-ndk --force --locked --quiet
 
       - name: Install uniffi-bindgen v${{ env.UNIFFI_VERSION }}
         run: |
