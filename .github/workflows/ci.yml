@@ -53,19 +53,24 @@ jobs:
       - name: Run tests (post-quantum)
         run: cargo test --features post-quantum
 
-  # ── 2. iOS cross-compilation + UniFFI bindings (macOS) ───────────────────
+  # ── 2. iOS cross-compilation + Swift bindings (macOS) ────────────────────
   build-ios:
-    name: iOS Cross-compile + UniFFI
+    name: iOS Cross-compile + Swift bindings
     runs-on: macos-14   # Apple Silicon runner — faster Rust compilation
     needs: test
     steps:
-      - name: Checkout construct-ice (path dependency)
+      # construct-core's `ios`/`mac` features depend on construct-veil via a
+      # path = "../construct-veil" dependency, so we check it out as a sibling.
+      - name: Checkout construct-veil (path dependency)
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/construct-ice
-          path: ../construct-ice
+          repository: ${{ github.repository_owner }}/construct-veil
+          path: construct-veil
 
-      - uses: actions/checkout@v4
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          path: construct-core
 
       - name: Install Rust + iOS targets
         uses: dtolnay/rust-toolchain@stable
@@ -80,34 +85,42 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: macos-cargo-ios-${{ hashFiles('**/Cargo.lock') }}
+            construct-core/target/
+          key: macos-cargo-ios-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
           restore-keys: macos-cargo-ios-
 
-      - name: Install uniffi-bindgen-cli v${{ env.UNIFFI_VERSION }}
+      # The `uniffi-bindgen` binary ships with the `uniffi` crate behind its
+      # `cli` feature. The standalone `uniffi-bindgen-cli` crate referenced by
+      # the previous workflow does not exist on crates.io.
+      - name: Install uniffi-bindgen v${{ env.UNIFFI_VERSION }}
         run: |
-          cargo install uniffi-bindgen-cli \
+          cargo install uniffi \
             --version ${{ env.UNIFFI_VERSION }} \
+            --features cli \
             --locked \
             --quiet
 
       # cargo check validates the full dependency graph without linking —
       # much faster than cargo build for a cross-compilation sanity check.
       - name: Check iOS device target (aarch64-apple-ios)
+        working-directory: construct-core
         run: cargo check --features ios --target aarch64-apple-ios
 
       - name: Check iOS simulator target (aarch64-apple-ios-sim)
+        working-directory: construct-core
         run: cargo check --features ios --target aarch64-apple-ios-sim
 
       - name: Check mac target (aarch64-apple-darwin)
+        working-directory: construct-core
         run: cargo check --features mac
 
       # UDL gate: generate Swift bindings and detect drift.
       # If this diff is non-empty, a developer changed the UDL without
-      # regenerating construct_core.swift in construct-ice clients.
+      # regenerating construct_core.swift in construct-veil clients.
       - name: Generate Swift bindings
+        working-directory: construct-core
         run: |
-          uniffi-bindgen-cli generate \
+          uniffi-bindgen generate \
             src/construct_core.udl \
             --language swift \
             --out-dir /tmp/bindings
@@ -119,11 +132,123 @@ jobs:
           path: /tmp/bindings/
           retention-days: 7
 
-  # ── 3. Release ────────────────────────────────────────────────────────────
+  # ── 3. Android cross-compilation + Kotlin bindings (Linux) ───────────────
+  # Produces .so binaries for the three NDK ABIs Android Studio expects
+  # under app/src/main/jniLibs/ plus auto-generated Kotlin UniFFI bindings.
+  # Android developers consume the released archive instead of running
+  # NDK + Rust + uniffi-bindgen locally.
+  build-android:
+    name: Android Cross-compile + Kotlin bindings
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout construct-veil (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/construct-veil
+          path: construct-veil
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          path: construct-core
+
+      - name: Install Rust + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            construct-core/target/
+          key: linux-cargo-android-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
+          restore-keys: linux-cargo-android-
+
+      # Ubuntu GitHub runners ship the Android NDK pre-installed; cargo-ndk
+      # autodetects it via $ANDROID_NDK_LATEST_HOME.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --quiet
+
+      - name: Install uniffi-bindgen v${{ env.UNIFFI_VERSION }}
+        run: |
+          cargo install uniffi \
+            --version ${{ env.UNIFFI_VERSION }} \
+            --features cli \
+            --locked \
+            --quiet
+
+      # Build all three ABIs in one cargo-ndk invocation. `-o jniLibs/` lays the
+      # output out exactly as Android Studio expects under
+      # app/src/main/jniLibs/<abi>/libconstruct_core.so.
+      - name: Build .so for arm64-v8a, armeabi-v7a, x86_64
+        working-directory: construct-core
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -t x86_64 \
+            -o ../android-out/jniLibs \
+            build --release --features "android,post-quantum"
+
+      # UniFFI library-mode binding generation — the arm64 .so is the
+      # canonical artifact (all ABIs share one UDL, so bindings are identical).
+      - name: Generate Kotlin bindings
+        working-directory: construct-core
+        run: |
+          mkdir -p ../android-out/kotlin
+          uniffi-bindgen generate \
+            --library ../android-out/jniLibs/arm64-v8a/libconstruct_core.so \
+            --language kotlin \
+            --out-dir ../android-out/kotlin
+
+      - name: Write README for Android devs
+        run: |
+          cat > android-out/README.md <<'EOF'
+          # construct-core for Android
+
+          Drop-in artifact for Android Studio projects.
+
+          ## Install
+
+          1. Copy `jniLibs/` into `app/src/main/`:
+             ```
+             app/src/main/jniLibs/
+                ├── arm64-v8a/libconstruct_core.so
+                ├── armeabi-v7a/libconstruct_core.so
+                └── x86_64/libconstruct_core.so
+             ```
+          2. Copy `kotlin/uniffi/construct_core/construct_core.kt` (and any
+             sibling files generated under `kotlin/uniffi/`) into your Kotlin
+             crypto package (e.g. `app/src/main/java/.../crypto/`).
+          3. Build the app — no other Gradle changes required.
+
+          ## Features compiled in
+          - `android` (UniFFI Kotlin bindings, construct-veil transport)
+          - `post-quantum` (Kyber-768 OTPK, ML-DSA signing)
+
+          ## Versioning
+          The archive name includes the construct-core commit SHA.
+          Verify by running `strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION`.
+          EOF
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ github.sha }}
+          path: android-out/
+          retention-days: 7
+
+  # ── 4. Release ────────────────────────────────────────────────────────────
   release:
     name: Upload Release Assets
     runs-on: ubuntu-latest
-    needs: build-ios
+    needs: [ build-ios, build-android ]
     if: github.event_name == 'release'
     steps:
       - uses: actions/download-artifact@v4
@@ -131,21 +256,33 @@ jobs:
           name: swift-bindings-${{ github.sha }}
           path: release/ios/
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-${{ github.sha }}
+          path: release/android/
+
       - name: Create archives
         run: |
           cd release
           tar -czf construct-core-ios-bindings.tar.gz ios/
+          tar -czf construct-core-android.tar.gz android/
 
       - name: Write release notes
         run: |
           cat > release/notes.md <<EOF
           ## Construct Core
 
-          Latest iOS download:
-          - [iOS bindings](https://github.com/${{ github.repository }}/releases/latest/download/construct-core-ios-bindings.tar.gz)
+          Latest downloads:
+          - [iOS Swift bindings](https://github.com/${{ github.repository }}/releases/latest/download/construct-core-ios-bindings.tar.gz)
+          - [Android (jniLibs + Kotlin bindings)](https://github.com/${{ github.repository }}/releases/latest/download/construct-core-android.tar.gz)
+
+          The Android archive contains \`libconstruct_core.so\` for
+          \`arm64-v8a\`, \`armeabi-v7a\`, and \`x86_64\` plus auto-generated
+          Kotlin UniFFI bindings — see the README inside the archive for
+          drop-in instructions.
 
           Related repository:
-          - [construct-ice](https://github.com/${{ github.repository_owner }}/construct-ice)
+          - [construct-veil](https://github.com/${{ github.repository_owner }}/construct-veil)
           EOF
 
       - name: Upload to release
@@ -154,5 +291,6 @@ jobs:
           body_path: release/notes.md
           files: |
             release/construct-core-ios-bindings.tar.gz
+            release/construct-core-android.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
