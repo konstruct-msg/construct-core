@@ -36,10 +36,11 @@ jobs:
         with:
           path: construct-core
 
-      - name: Install Rust (stable + fmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Honors construct-core/rust-toolchain.toml — installs the pinned channel,
+      # all listed cross-compile targets, and rustfmt/clippy components.
+      - name: Install pinned Rust toolchain
+        working-directory: construct-core
+        run: rustup show
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -92,10 +93,12 @@ jobs:
         with:
           path: construct-core
 
-      - name: Install Rust + iOS targets
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      # Honors construct-core/rust-toolchain.toml — installs the pinned channel
+      # and all cross-compile targets (iOS + macOS + Android — `rustup show`
+      # is single-toolchain-file-driven, no per-job target list needed).
+      - name: Install pinned Rust toolchain
+        working-directory: construct-core
+        run: rustup show
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -173,10 +176,9 @@ jobs:
         with:
           path: construct-core
 
-      - name: Install Rust + Android targets
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - name: Install pinned Rust toolchain
+        working-directory: construct-core
+        run: rustup show
 
       - name: Cache Cargo
         uses: actions/cache@v4
