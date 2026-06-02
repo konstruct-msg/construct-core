@@ -19,7 +19,22 @@ jobs:
     name: Lint + Tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # construct-core has a path dependency on construct-veil
+      # (`construct-veil = { path = "../construct-veil", optional = true }`).
+      # Even when the `ios`/`mac`/`android` features are off, `cargo metadata`
+      # (used by `cargo fmt`, `cargo clippy`, etc.) still reads
+      # `../construct-veil/Cargo.toml` to validate the dependency graph.
+      # Without this sibling checkout, the very first lint step fails.
+      - name: Checkout construct-veil (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/construct-veil
+          path: construct-veil
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          path: construct-core
 
       - name: Install Rust (stable + fmt + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -34,23 +49,28 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+            construct-core/target/
+          key: linux-cargo-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
           restore-keys: linux-cargo-
 
       - name: Check formatting
+        working-directory: construct-core
         run: cargo fmt --all -- --check
 
       - name: Clippy (default features)
+        working-directory: construct-core
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (post-quantum)
+        working-directory: construct-core
         run: cargo clippy --all-targets --features post-quantum -- -D warnings
 
       - name: Run tests (default)
+        working-directory: construct-core
         run: cargo test
 
       - name: Run tests (post-quantum)
+        working-directory: construct-core
         run: cargo test --features post-quantum
 
   # ── 2. iOS cross-compilation + Swift bindings (macOS) ────────────────────
