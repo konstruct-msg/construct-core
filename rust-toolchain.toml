@@ -1,0 +1,12 @@
+# Pinned toolchain. Bumping in lockstep with construct-veil's
+# rust-toolchain.toml keeps `cargo metadata` resolution deterministic across
+# the workspace (construct-core depends on construct-veil via `path = "../construct-veil"`).
+# CI's `dtolnay/rust-toolchain@stable` step is overridden by this file —
+# whatever channel is named here is what actually runs.
+#
+# When bumping: run `cargo clippy --all-targets -- -D warnings` and
+# `cargo clippy --all-targets --features post-quantum -- -D warnings`
+# locally first to catch new-default lints before CI fails on them.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

@@ -585,7 +585,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         }
         // Sort old prekeys newest-first (highest key_id = most recent rotation)
         let mut old: Vec<_> = self.old_prekeys.values().collect();
-        old.sort_by(|a, b| b.key_id.cmp(&a.key_id));
+        old.sort_by_key(|p| std::cmp::Reverse(p.key_id));
         for prekey in old {
             keys.push(prekey.key_pair.0.clone());
         }
