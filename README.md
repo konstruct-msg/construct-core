@@ -43,6 +43,45 @@ construct-core/
 construct-core = { git = "https://github.com/construct-msg/construct-core", features = ["ios"] }
 ```
 
+### For Android — download a pre-built artifact
+
+You don't need Rust, the NDK, or `uniffi-bindgen` locally. CI builds the
+artifact on every push to `main` and republishes a rolling pre-release tagged
+`latest`. **Stable URL** (never changes):
+
+```
+https://github.com/construct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
+```
+
+One-liner to grab + extract:
+
+```bash
+curl -L -o construct-core-android.tar.gz \
+  https://github.com/construct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
+tar -xzf construct-core-android.tar.gz
+```
+
+What's inside:
+
+```
+jniLibs/
+├── arm64-v8a/libconstruct_core.so       # 64-bit modern phones
+├── armeabi-v7a/libconstruct_core.so     # 32-bit legacy devices
+└── x86_64/libconstruct_core.so          # emulator
+kotlin/
+└── uniffi/construct_core/...            # auto-generated Kotlin bindings
+README.md                                # drop-in instructions
+```
+
+How to wire it into an Android Studio project — see `README.md` inside the
+archive. (Short version: drop `jniLibs/` into `app/src/main/`, copy the
+Kotlin files into your crypto package, build.)
+
+For a **versioned** build (e.g. for a production release pin), find it on
+the [Releases page](https://github.com/construct-msg/construct-core/releases)
+under the relevant `vX.Y.Z` tag. The `latest` tag is rolling and always
+points at the freshest `main`.
+
 ## 🔐 Cryptography
 
 ### Classic Suite (v1)

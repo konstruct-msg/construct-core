@@ -7,6 +7,10 @@ on:
     branches: [ main, develop ]
   release:
     types: [ created ]
+  # Manual trigger from the Actions tab — produces the same artifacts as a
+  # push to main and republishes the rolling `latest` release. Useful when
+  # the Android team needs a fresh build without waiting for a new commit.
+  workflow_dispatch:
 
 # Единый Cargo cache key для всех jobs.
 env:
@@ -267,11 +271,23 @@ jobs:
           retention-days: 7
 
   # ── 4. Release ────────────────────────────────────────────────────────────
+  # Publishes two kinds of releases:
+  #   * Tagged release (`release` event)   — versioned (e.g. `v0.9.1`), full release.
+  #   * Rolling pre-release (`push` to main or `workflow_dispatch`) — single fixed
+  #     tag `latest`, force-updated on every run. Gives integrators a stable URL:
+  #       https://github.com/<owner>/construct-core/releases/download/latest/construct-core-android.tar.gz
+  #     so Android & iOS devs don't have to navigate the Actions tab.
   release:
     name: Upload Release Assets
     runs-on: ubuntu-latest
     needs: [ build-ios, build-android ]
-    if: github.event_name == 'release'
+    if: |
+      github.event_name == 'release' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+    # Required so softprops/action-gh-release can create/update releases.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -289,28 +305,63 @@ jobs:
           tar -czf construct-core-ios-bindings.tar.gz ios/
           tar -czf construct-core-android.tar.gz android/
 
+      # Compute release params depending on trigger.
+      #   * release event   → use the human-supplied tag, full release.
+      #   * push / dispatch → fixed `latest` tag, marked prerelease (rolling).
+      - name: Resolve release tag and type
+        id: relinfo
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag_name=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ github.event.release.name || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=latest" >> "$GITHUB_OUTPUT"
+            echo "release_name=Latest rolling build" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Write release notes
         run: |
           cat > release/notes.md <<EOF
-          ## Construct Core
+          ## Construct Core — \`${{ steps.relinfo.outputs.tag_name }}\`
 
-          Latest downloads:
-          - [iOS Swift bindings](https://github.com/${{ github.repository }}/releases/latest/download/construct-core-ios-bindings.tar.gz)
-          - [Android (jniLibs + Kotlin bindings)](https://github.com/${{ github.repository }}/releases/latest/download/construct-core-android.tar.gz)
+          Built from commit [\`${GITHUB_SHA::7}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}).
+
+          ### Downloads
+
+          | Platform | File | Stable URL |
+          |---|---|---|
+          | iOS | \`construct-core-ios-bindings.tar.gz\` | <https://github.com/${{ github.repository }}/releases/download/${{ steps.relinfo.outputs.tag_name }}/construct-core-ios-bindings.tar.gz> |
+          | Android | \`construct-core-android.tar.gz\` | <https://github.com/${{ github.repository }}/releases/download/${{ steps.relinfo.outputs.tag_name }}/construct-core-android.tar.gz> |
+
+          ### Android drop-in
+
+          \`\`\`bash
+          curl -L -o construct-core-android.tar.gz \\
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.relinfo.outputs.tag_name }}/construct-core-android.tar.gz
+          tar -xzf construct-core-android.tar.gz
+          # then follow README.md inside the extracted directory
+          \`\`\`
 
           The Android archive contains \`libconstruct_core.so\` for
           \`arm64-v8a\`, \`armeabi-v7a\`, and \`x86_64\` plus auto-generated
-          Kotlin UniFFI bindings — see the README inside the archive for
-          drop-in instructions.
+          Kotlin UniFFI bindings.
 
-          Related repository:
-          - [construct-veil](https://github.com/${{ github.repository_owner }}/construct-veil)
+          Related repository: [construct-veil](https://github.com/${{ github.repository_owner }}/construct-veil)
           EOF
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v1
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.relinfo.outputs.tag_name }}
+          name: ${{ steps.relinfo.outputs.release_name }}
           body_path: release/notes.md
+          prerelease: ${{ steps.relinfo.outputs.prerelease == 'true' }}
+          # Rolling release overwrites the same tag every time.
+          # softprops/action-gh-release@v2 supports this via `files:` replacement
+          # when the release already exists; combined with the fixed tag, this
+          # gives integrators a never-changing download URL for the latest build.
           files: |
             release/construct-core-ios-bindings.tar.gz
             release/construct-core-android.tar.gz
