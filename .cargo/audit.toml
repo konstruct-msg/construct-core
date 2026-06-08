@@ -1,9 +1,15 @@
 # cargo-audit configuration
 #
-# Security policy for dependency auditing
+# Security policy for dependency auditing.
+#
+# NOTE on the ignores below: cargo-audit is NOT feature-aware — it scans
+# Cargo.lock literally, which pins every *optional* transitive dependency edge
+# even when no enabled feature ever compiles it. Several advisories here are for
+# optional deps that are present in the lock but absent from our resolved build
+# graph (verified with `cargo tree`). Each ignore documents that verification
+# and the upstream condition under which it should be removed.
 
 [advisories]
-# Accepted warnings (non-blocking)
 ignore = [
     # RUSTSEC-2024-0436: paste crate unmaintained
     # Transitive dependency through pqcrypto-mldsa (post-quantum crypto)
@@ -11,8 +17,32 @@ ignore = [
     # Risk: Low - paste is a proc-macro for code generation, not runtime
     # Alternative: Wait for pqcrypto-mldsa to migrate away from paste
     "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2026-0124: libcrux-chacha20poly1305 0.0.7 — panic on overlong
+    # ciphertext buffer (HIGH 8.2). NOT COMPILED into our library: openmls_rust_crypto
+    # uses the rust-crypto HPKE backend (hpke-rs-rust-crypto), not the libcrux backend.
+    # hpke-rs-libcrux / libcrux-aead / libcrux-chacha20poly1305 are optional edges
+    # pinned in Cargo.lock but never enabled by any feature we build.
+    # Verified: `cargo tree -i libcrux-chacha20poly1305 --all-features --target all`
+    #           → no path; `cargo tree --features ios` shows hpke-rs-rust-crypto only.
+    # REMOVE THIS IGNORE when: openmls/hpke-rs upstream stops pinning the libcrux
+    # backend in the lock, or we move to an openmls release whose lock no longer
+    # carries hpke-rs-libcrux (then prefer upgrading to libcrux >=0.0.8).
+    # Tracking: wiki/decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0124",
+
+    # RUSTSEC-2023-0071: rsa 0.9.10 — Marvin timing sidechannel (MEDIUM, no fixed
+    # upgrade available). NOT COMPILED into our library: it arrives only via
+    # sqlx-mysql, an optional sqlx driver. construct-veil enables sqlx with the
+    # `sqlite` driver only (features = ["runtime-tokio","sqlite","macros",...]);
+    # the mysql driver is never selected.
+    # Verified: `cargo tree -i sqlx-mysql --features ios --target all` → no path.
+    # REMOVE THIS IGNORE when: sqlx no longer pins sqlx-mysql in the lock for a
+    # sqlite-only consumer (sqlx feature-resolution fix), or rsa ships a constant
+    # -time fix.
+    # Tracking: wiki/decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2023-0071",
 ]
 
 # Allow informational warnings (unmaintained crates)
 informational_warnings = ["unmaintained"]
-
