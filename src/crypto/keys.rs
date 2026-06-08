@@ -299,11 +299,10 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Получить prekey по ID
     pub fn get_prekey(&self, key_id: u32) -> Option<&PrekeyStore<P>> {
-        if let Some(current) = &self.current_signed_prekey {
-            if current.key_id == key_id {
+        if let Some(current) = &self.current_signed_prekey
+            && current.key_id == key_id {
                 return Some(current);
             }
-        }
         self.old_prekeys.get(&key_id)
     }
 

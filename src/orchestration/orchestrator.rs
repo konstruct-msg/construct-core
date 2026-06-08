@@ -249,8 +249,8 @@ impl Orchestrator {
         } else {
             (kyber_pre_key_public, 0)
         };
-        if let Some(kem_pk) = kyber_public {
-            if let Ok((_result, _persist_actions)) = self
+        if let Some(kem_pk) = kyber_public
+            && let Ok((_result, _persist_actions)) = self
                 .lifecycle
                 .pq_manager
                 .encapsulate_and_defer(contact_id, &kem_pk, recipient_otpk_id)
@@ -262,7 +262,6 @@ impl Orchestrator {
                     "init_session_with_bundle: PQXDH encapsulated, ciphertext deferred"
                 );
             }
-        }
 
         Ok(contact_id.to_string())
     }
@@ -1014,11 +1013,10 @@ impl Orchestrator {
         actions.extend(self.decision_to_actions(decision, &from));
         // Persist coordination state (healing queue, ACK cache, init_locks) for
         // paths that don't already trigger a session-keyed save on the Swift side.
-        if needs_state_save {
-            if let Some(save_action) = self.orchestrator_state_action() {
+        if needs_state_save
+            && let Some(save_action) = self.orchestrator_state_action() {
                 actions.push(save_action);
             }
-        }
         actions
     }
 
@@ -1042,8 +1040,8 @@ impl Orchestrator {
                 .lifecycle
                 .pq_manager
                 .take_contribution_for_first_message(&contact_id);
-            if let Some(shared_secret) = ss {
-                if let Err(e) = self
+            if let Some(shared_secret) = ss
+                && let Err(e) = self
                     .lifecycle
                     .client
                     .apply_pq_contribution_to_session(&contact_id, &shared_secret)
@@ -1053,7 +1051,6 @@ impl Orchestrator {
                         message: e.to_string(),
                     }];
                 }
-            }
             (kem_ct, otpk_id)
         };
 
@@ -1171,8 +1168,8 @@ impl Orchestrator {
         // Import the newly created session from CFE binary (or JSON legacy fallback).
         // If import fails, emit an error action and abort — do not drain the queue
         // or notify the platform of a session that was never actually created.
-        if !session_data.is_empty() {
-            if let Err(e) = self
+        if !session_data.is_empty()
+            && let Err(e) = self
                 .lifecycle
                 .import_session_bytes(&contact_id, &session_data)
             {
@@ -1187,7 +1184,6 @@ impl Orchestrator {
                     message: format!("contact={}: {}", contact_id, e),
                 }];
             }
-        }
 
         // Save the session to secure store.
         let mut actions = vec![];
@@ -1230,11 +1226,10 @@ impl Orchestrator {
             .unwrap_or(&key)
             .to_string();
 
-        if let Some(bytes) = data {
-            if !bytes.is_empty() {
+        if let Some(bytes) = data
+            && !bytes.is_empty() {
                 self.lifecycle.load_archive_bytes(&contact_id, bytes);
             }
-        }
         vec![]
     }
 

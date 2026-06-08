@@ -106,12 +106,11 @@ pub fn compute_pow_with_progress(
         let attempts = nonce + 1;
 
         // Periodic progress update
-        if attempts % PROGRESS_INTERVAL_ATTEMPTS == 0 {
-            if let Some(ref callback) = progress_callback {
+        if attempts.is_multiple_of(PROGRESS_INTERVAL_ATTEMPTS)
+            && let Some(ref callback) = progress_callback {
                 let progress = estimate_progress(attempts, estimated_max_attempts);
                 callback.on_progress(nonce, attempts, progress);
             }
-        }
 
         // Check if solution meets difficulty requirement
         if leading_zeros >= difficulty {
@@ -127,7 +126,7 @@ pub fn compute_pow_with_progress(
         nonce += 1;
 
         // Yield to prevent UI freeze every 100 attempts (~2.5 minutes)
-        if nonce % 100 == 0 {
+        if nonce.is_multiple_of(100) {
             std::thread::yield_now();
         }
     }

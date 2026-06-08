@@ -217,15 +217,14 @@ impl CoverTrafficManager {
         let now = Instant::now();
 
         // Check coalescing: skip if real message sent recently
-        if self.config.coalesce_with_real_messages {
-            if let Some(last_real) = self.last_real_message {
+        if self.config.coalesce_with_real_messages
+            && let Some(last_real) = self.last_real_message {
                 let elapsed = now.duration_since(last_real).as_millis() as u64;
                 if elapsed < self.config.coalesce_window_ms {
                     self.metrics.coalesced_count += 1;
                     return false;
                 }
             }
-        }
 
         // Check interval: has enough time passed since last dummy?
         if let Some(last_dummy) = self.last_dummy_message {
@@ -261,7 +260,7 @@ impl CoverTrafficManager {
     /// If many consecutive dummies are sent, increase the interval to save battery.
     fn adapt_interval(&mut self) {
         // Increase interval every 5 consecutive dummies
-        if self.consecutive_dummies % 5 == 0 && self.consecutive_dummies > 0 {
+        if self.consecutive_dummies.is_multiple_of(5) && self.consecutive_dummies > 0 {
             self.current_interval_ms =
                 (self.current_interval_ms * 3 / 2).min(self.config.max_interval_ms);
         }

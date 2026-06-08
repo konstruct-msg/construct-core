@@ -164,8 +164,8 @@ impl Config {
         // Ref: SECURITY_AUDIT.md #9 - env vars can weaken security
 
         // Переопределяем значения из env, если они заданы
-        if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGES") {
-            if let Ok(parsed) = val.parse::<u32>() {
+        if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGES")
+            && let Ok(parsed) = val.parse::<u32>() {
                 // ✅ Enforce maximum to prevent memory exhaustion DoS
                 const MIN_SKIPPED: u32 = 10;
                 const MAX_SKIPPED: u32 = 10_000;
@@ -180,10 +180,9 @@ impl Config {
                     );
                 }
             }
-        }
 
-        if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGE_AGE_SECONDS") {
-            if let Ok(parsed) = val.parse::<i64>() {
+        if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGE_AGE_SECONDS")
+            && let Ok(parsed) = val.parse::<i64>() {
                 // ✅ Enforce minimum to prevent premature key deletion
                 const MIN_AGE: i64 = 60; // At least 1 minute
                 const MAX_AGE: i64 = 2_592_000; // Max 30 days
@@ -198,10 +197,9 @@ impl Config {
                     );
                 }
             }
-        }
 
-        if let Ok(val) = std::env::var("PBKDF2_ITERATIONS") {
-            if let Ok(parsed) = val.parse::<u32>() {
+        if let Ok(val) = std::env::var("PBKDF2_ITERATIONS")
+            && let Ok(parsed) = val.parse::<u32>() {
                 // ✅ Enforce minimum to prevent brute-force attacks
                 const MIN_ITERATIONS: u32 = 10_000;
                 const MAX_ITERATIONS: u32 = 1_000_000; // Prevent DoS via excessive iterations
@@ -216,10 +214,9 @@ impl Config {
                     );
                 }
             }
-        }
 
-        if let Ok(val) = std::env::var("WEBSOCKET_RETRY_MAX_MS") {
-            if let Ok(parsed) = val.parse::<u64>() {
+        if let Ok(val) = std::env::var("WEBSOCKET_RETRY_MAX_MS")
+            && let Ok(parsed) = val.parse::<u64>() {
                 // ✅ Enforce minimum to prevent infinite retry loops
                 const MIN_RETRY: u64 = 100; // At least 100ms
                 const MAX_RETRY: u64 = 300_000; // Max 5 minutes
@@ -234,7 +231,6 @@ impl Config {
                     );
                 }
             }
-        }
 
         config
     }
