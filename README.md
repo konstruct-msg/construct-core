@@ -1,49 +1,72 @@
-# 🔐 Construct Core
+# construct-core
 
-**Core cryptographic engine for Construct Messenger with end-to-end encryption**
+**The cryptographic core of [Konstruct](https://github.com/construct-msg) — a privacy-first,
+end-to-end encrypted messenger.**
 
-[![Rust](https://img.shields.io/badge/Rust-1.93-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.92+-orange.svg)](https://www.rust-lang.org/)
+[![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## 🎯 About
+## About
 
-Construct Core is the cryptographic engine powering Construct Messenger. It provides:
+`construct-core` is the Rust crypto engine shared verbatim by every Konstruct client. iOS,
+macOS, and Android run the *same* audited code via UniFFI rather than reimplementing crypto
+per platform. It provides:
 
-- ✅ **Double Ratchet Protocol** (Signal Protocol) for forward secrecy
-- ✅ **X3DH** for asynchronous key agreement
-- ✅ **Crypto-Agility** to support various cryptographic algorithms
-- ✅ **Post-Quantum Ready** architecture for hybrid schemes
-- ✅ **Multi-Platform** support (iOS via UniFFI, Web via WASM)
+- **X3DH + PQXDH** asynchronous key agreement (classical and post-quantum hybrid)
+- **Double Ratchet** for forward secrecy & post-compromise security
+- **Crypto-agility** — pluggable cipher suites negotiated per session (`suite_id`)
+- **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204)
+- **MLS (RFC 9420)** group primitives via `openmls`
+- **Account recovery** — BIP39 mnemonic + SLIP-39 social (Shamir) recovery
+- **Key transparency** — RFC 6962-style append-only Merkle log for identity-key auditing
+- **Privacy Pass** — OPRF blind-token primitives (Ristretto255)
+- **Binary session state** — CFE envelopes (no JSON/base64 in the crypto path)
 
-## 🏗️ Architecture
+Platforms: **iOS / macOS** (UniFFI Swift) and **Android** (UniFFI Kotlin). No WASM/Web
+target — a cryptographically secure messenger can't be done as a PWA, so that path was
+dropped long ago.
+
+## Architecture
 
 ```
 construct-core/
 ├── src/
-│   ├── crypto/              # Cryptographic primitives
-│   │   ├── handshake/        # X3DH key agreement
-│   │   ├── messaging/        # Double Ratchet
-│   │   ├── suites/           # Crypto suites (Classic, PQ-Hybrid)
-│   │   └── provider.rs       # CryptoProvider trait
-│   ├── api/                  # High-level API
-│   ├── protocol/             # Protocol structures
-│   ├── error.rs              # Error types
-│   └── platforms/            # Platform-specific code
-│       ├── ios/               # iOS bindings (UniFFI)
-│       └── wasm/              # WASM bindings
+│   ├── crypto/                 # cryptographic primitives
+│   │   ├── handshake/          # X3DH key agreement
+│   │   ├── messaging/          # Double Ratchet
+│   │   ├── suites/             # cipher suites (classic, PQ-hybrid) + provider trait
+│   │   ├── privacy_pass/       # OPRF blind tokens (Ristretto255)
+│   │   ├── pq_x3dh.rs          # ML-KEM-768 post-quantum key agreement
+│   │   ├── recovery.rs         # BIP39 account recovery
+│   │   ├── social_recovery.rs  # SLIP-39 Shamir social recovery
+│   │   ├── key_transparency.rs # RFC 6962 Merkle log
+│   │   └── provider.rs         # CryptoProvider trait (crypto-agility)
+│   ├── group/                  # MLS (RFC 9420) group messaging
+│   ├── orchestration/          # session orchestration (OrchestratorCore)
+│   ├── cfe/                    # CFE binary session-state envelopes
+│   ├── traffic_protection/     # cover traffic, message padding, timing obfuscation
+│   ├── storage/                # storage traits + in-memory store
+│   ├── uniffi_bindings.rs      # UniFFI FFI surface (iOS/Android)
+│   ├── construct_core.udl      # UniFFI interface definition
+│   ├── pow.rs                  # Argon2id proof-of-work
+│   └── device_id.rs            # device-id derivation
 └── Cargo.toml
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
-### For iOS
+### iOS / macOS
 
 ```toml
 [dependencies]
 construct-core = { git = "https://github.com/construct-msg/construct-core", features = ["ios"] }
 ```
 
-### For Android — download a pre-built artifact
+Swift bindings are generated with UniFFI. In the `construct-messenger` app repo,
+`./generate_swift_bindings.sh` builds the library and regenerates `construct_core.swift`.
+
+### Android — download a pre-built artifact
 
 You don't need Rust, the NDK, or `uniffi-bindgen` locally. CI builds the
 artifact on every push to `main` and republishes a rolling pre-release tagged
@@ -69,8 +92,8 @@ jniLibs/
 ├── armeabi-v7a/libconstruct_core.so     # 32-bit legacy devices
 └── x86_64/libconstruct_core.so          # emulator
 kotlin/
-└── uniffi/construct_core/...            # auto-generated Kotlin bindings
-README.md                                # drop-in instructions
+└── uniffi/construct_core/...             # auto-generated Kotlin bindings
+README.md                                 # drop-in instructions
 ```
 
 How to wire it into an Android Studio project — see `README.md` inside the
@@ -82,38 +105,58 @@ the [Releases page](https://github.com/construct-msg/construct-core/releases)
 under the relevant `vX.Y.Z` tag. The `latest` tag is rolling and always
 points at the freshest `main`.
 
-## 🔐 Cryptography
+## Cryptography
 
-### Classic Suite (v1)
+Names follow NIST FIPS; informal names in parens.
+
+### Classic suite (`suite_id = 1`) — production
 
 | Component     | Algorithm             |
 |---------------|-----------------------|
-| Key Agreement | X25519 (ECDH)        |
-| Signatures    | Ed25519              |
-| AEAD          | ChaCha20-Poly1305    |
-| KDF           | HKDF-SHA256          |
+| Key agreement | **X25519** (ECDH)     |
+| Signatures    | **Ed25519**           |
+| AEAD          | **ChaCha20-Poly1305** |
+| KDF           | **HKDF-SHA256**       |
 
-### Post-Quantum Hybrid Suite (v2) - In Development
+### Post-quantum (`suite_id = 2`) — hybrid
 
-| Component     | Algorithm                |
-|---------------|--------------------------|
-| Key Agreement | X25519 ⊕ Kyber768        |
-| Signatures    | Ed25519 + Dilithium3     |
-| AEAD          | ChaCha20-Poly1305        |
+| Component     | Algorithm                                       | Status |
+|---------------|-------------------------------------------------|--------|
+| Key agreement | **X25519 ⊕ ML-KEM-768** (FIPS 203, Kyber-768)   | ✅ Implemented — PQXDH mixes a Kyber OTPK into the root key |
+| Signatures    | **Ed25519 + ML-DSA-65** (FIPS 204, Dilithium-3) | 🚧 Implemented (RustCrypto `ml-dsa`, seed-based), **not yet activated on the wire** |
+| AEAD / KDF    | ChaCha20-Poly1305 / HKDF-SHA256                 | unchanged |
 
-## 📦 Features
+> **Hybrid = classical AND post-quantum** — both must verify, and an attacker must break
+> both to forge. The ML-DSA-65 path uses RustCrypto `ml-dsa` (seed-based), identical to the
+> Konstruct server, so hybrid signatures cross-verify byte-for-byte (pinned by an interop
+> test). Older docs claiming "Kyber-1024" or "Dilithium deployed" are wrong.
 
-- `ios` - iOS/macOS bindings via UniFFI
-- `wasm` - WebAssembly bindings via wasm-bindgen
-- `post-quantum` - Post-quantum cryptography support
-- `desktop` - Desktop testing support (Tokio runtime)
+## Features
 
-## 🧪 Testing
+| Feature         | Purpose                                                        |
+|-----------------|----------------------------------------------------------------|
+| `ios`           | iOS/macOS bindings via UniFFI (+ VEIL transport, MLS)          |
+| `mac`           | Native macOS build (same surface as `ios`)                     |
+| `android`       | Android JNI/Kotlin bindings via UniFFI                         |
+| `post-quantum`  | ML-KEM-768 + ML-DSA-65 post-quantum cryptography               |
+| `desktop`       | Desktop testing support (Tokio runtime)                        |
+
+`default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
+features pull in `construct-veil` (path dependency) and `openmls`.
+
+## Testing
 
 ```bash
-cargo test --all-features
+# Core crypto, including the PQ suites
+cargo test --features post-quantum
+
+# Security audit (advisory policy in .cargo/audit.toml)
+cargo audit
 ```
 
-## 📄 License
+> `--all-features` requires the sibling `construct-veil` crate checked out at `../construct-veil`
+> (pulled in by `ios`/`mac`/`android`).
 
-MIT License - see [LICENSE](LICENSE) for details
+## License
+
+MIT — see [LICENSE](LICENSE).
