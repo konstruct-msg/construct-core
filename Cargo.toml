@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.9.3"
+version = "0.9.4"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.92"
@@ -34,8 +34,7 @@ android = ["uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-vei
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",
-    "dep:pqcrypto-mldsa",
-    "dep:pqcrypto-traits",
+    "dep:ml-dsa",
 ]
 desktop = ["tokio/rt"]
 
@@ -77,8 +76,10 @@ zeroize = { version = "1.0", features = ["zeroize_derive"] }
 # Post-Quantum (optional) - ML-KEM and ML-DSA (NIST standardized names)
 ml-kem = { version = "0.3.0", optional = true }
 getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"], optional = true }
-pqcrypto-mldsa = { version = "0.1", optional = true }
-pqcrypto-traits = { version = "0.3", optional = true }
+# RustCrypto `ml-dsa` (maintained) — replaced the archived PQClean-based
+# pqcrypto-mldsa/pqcrypto-traits (RUSTSEC-2026-0162/0166). Seed-based secret-key
+# storage; pins the SAME impl as construct-server for byte-level signature interop.
+ml-dsa = { version = "0.1.1", optional = true }
 
 # MLS (Messaging Layer Security) — group chat protocol (RFC 9420)
 # Feature-gated: mls + group-conversation. Pulls in ~15 additional crates.

@@ -325,7 +325,7 @@ dictionary MLKEMEncapsulation {
 
 /// Generated ML-DSA-65 keypair for post-quantum identity signatures.
 dictionary MLDSAKeyPair {
-    /// Secret key: 4032 bytes (PQClean expanded form)
+    /// Secret key: 32-byte signing seed (RustCrypto ml-dsa; expanded key re-derived on sign)
     sequence<u8> secret_key;
     /// Public key: 1952 bytes
     sequence<u8> public_key;
@@ -334,8 +334,8 @@ dictionary MLDSAKeyPair {
 /// Hybrid signature keypair (Ed25519 + ML-DSA-65).
 /// Used for post-quantum identity key bundles.
 dictionary HybridSignatureKeyPair {
-    /// Hybrid private key: 6016 bytes
-    /// [ed25519_seed (32)] [mldsa65_sk (4032)] [mldsa65_pk (1952)]
+    /// Hybrid private key: 2016 bytes
+    /// [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
     sequence<u8> private_key;
     /// Hybrid public key: 1984 bytes
     /// [ed25519_pk (32)] [mldsa65_pk (1952)]

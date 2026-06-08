@@ -1882,7 +1882,7 @@ pub fn mlkem768_decapsulate(
 /// ML-DSA-65 keypair exposed across the FFI boundary.
 #[derive(Debug, Clone)]
 pub struct MLDSAKeyPair {
-    /// Secret key: 4032 bytes (PQClean expanded form)
+    /// Secret key: 32-byte signing seed (RustCrypto ml-dsa; expanded key re-derived on sign)
     pub secret_key: Vec<u8>,
     /// Public key: 1952 bytes
     pub public_key: Vec<u8>,
@@ -1891,21 +1891,27 @@ pub struct MLDSAKeyPair {
 /// Hybrid (Ed25519 + ML-DSA-65) signature keypair.
 #[derive(Debug, Clone)]
 pub struct HybridSignatureKeyPair {
-    /// Hybrid private key: 6016 bytes
+    /// Hybrid private key: 2016 bytes
+    /// [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
     pub private_key: Vec<u8>,
     /// Hybrid public key: 1984 bytes
     pub public_key: Vec<u8>,
 }
 
-/// Generate an ML-DSA-65 keypair.
+/// Generate an ML-DSA-65 keypair (RustCrypto ml-dsa, seed-based).
 #[cfg(feature = "post-quantum")]
 pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::keypair;
-    use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
-    let (pk, sk) = keypair();
+    use ml_dsa::{B32, Keypair as _, MlDsa65, SigningKey as MlDsaSigningKey};
+    use rand_core::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let sk = MlDsaSigningKey::<MlDsa65>::from_seed(&B32::from(seed));
+    let pk_enc = sk.verifying_key().encode(); // 1952 bytes
     Ok(MLDSAKeyPair {
-        secret_key: sk.as_bytes().to_vec(),
-        public_key: pk.as_bytes().to_vec(),
+        // Store the 32-byte signing seed (the expanded 4032-byte key is re-derived
+        // on demand at sign time). Matches the hybrid suite + construct-server.
+        secret_key: seed.to_vec(),
+        public_key: pk_enc.as_slice().to_vec(),
     })
 }
 
@@ -1914,14 +1920,19 @@ pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
     Err(CryptoError::InitializationFailed)
 }
 
-/// Sign a message with an ML-DSA-65 secret key (detached signature).
+/// Sign a message with an ML-DSA-65 signing seed (detached signature).
 #[cfg(feature = "post-quantum")]
 pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::{SecretKey, detached_sign};
-    use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
-    let sk = SecretKey::from_bytes(&secret_key).map_err(|_| CryptoError::InvalidKeyData)?;
-    let sig = detached_sign(&message, &sk);
-    Ok(sig.as_bytes().to_vec())
+    use ml_dsa::{B32, MlDsa65, Signer as _, SigningKey as MlDsaSigningKey};
+    let seed: [u8; 32] = secret_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    let sk = MlDsaSigningKey::<MlDsa65>::from_seed(&B32::from(seed));
+    let sig = sk
+        .try_sign(&message)
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    Ok(sig.encode().as_slice().to_vec())
 }
 
 #[cfg(not(feature = "post-quantum"))]
@@ -1936,14 +1947,19 @@ pub fn mldsa65_verify(
     message: Vec<u8>,
     signature: Vec<u8>,
 ) -> Result<bool, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::{DetachedSignature, PublicKey, verify_detached_signature};
-    use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
-    let pk = PublicKey::from_bytes(&public_key).map_err(|_| CryptoError::InvalidKeyData)?;
-    let sig = DetachedSignature::from_bytes(&signature).map_err(|_| CryptoError::InvalidKeyData)?;
-    match verify_detached_signature(&sig, &message, &pk) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    use ml_dsa::{
+        EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature as MlDsaSignature, Verifier as _,
+        VerifyingKey as MlDsaVerifyingKey,
+    };
+    let pk_enc = EncodedVerifyingKey::<MlDsa65>::try_from(public_key.as_slice())
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    let pk = MlDsaVerifyingKey::<MlDsa65>::decode(&pk_enc);
+    let sig_enc = EncodedSignature::<MlDsa65>::try_from(signature.as_slice())
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    let Some(sig) = MlDsaSignature::<MlDsa65>::decode(&sig_enc) else {
+        return Ok(false);
+    };
+    Ok(pk.verify(&message, &sig).is_ok())
 }
 
 #[cfg(not(feature = "post-quantum"))]
