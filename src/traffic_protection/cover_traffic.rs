@@ -218,13 +218,14 @@ impl CoverTrafficManager {
 
         // Check coalescing: skip if real message sent recently
         if self.config.coalesce_with_real_messages
-            && let Some(last_real) = self.last_real_message {
-                let elapsed = now.duration_since(last_real).as_millis() as u64;
-                if elapsed < self.config.coalesce_window_ms {
-                    self.metrics.coalesced_count += 1;
-                    return false;
-                }
+            && let Some(last_real) = self.last_real_message
+        {
+            let elapsed = now.duration_since(last_real).as_millis() as u64;
+            if elapsed < self.config.coalesce_window_ms {
+                self.metrics.coalesced_count += 1;
+                return false;
             }
+        }
 
         // Check interval: has enough time passed since last dummy?
         if let Some(last_dummy) = self.last_dummy_message {

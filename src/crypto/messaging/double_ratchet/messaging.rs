@@ -359,7 +359,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         // Periodically evict stale skipped-message keys to bound memory usage.
         // Running every 100 received messages is cheap and avoids a 7-day accumulation.
-        if self.receiving_chain_length.is_multiple_of(100) && !self.skipped_message_keys.is_empty() {
+        if self.receiving_chain_length.is_multiple_of(100) && !self.skipped_message_keys.is_empty()
+        {
             self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
         }
 

@@ -107,10 +107,11 @@ pub fn compute_pow_with_progress(
 
         // Periodic progress update
         if attempts.is_multiple_of(PROGRESS_INTERVAL_ATTEMPTS)
-            && let Some(ref callback) = progress_callback {
-                let progress = estimate_progress(attempts, estimated_max_attempts);
-                callback.on_progress(nonce, attempts, progress);
-            }
+            && let Some(ref callback) = progress_callback
+        {
+            let progress = estimate_progress(attempts, estimated_max_attempts);
+            callback.on_progress(nonce, attempts, progress);
+        }
 
         // Check if solution meets difficulty requirement
         if leading_zeros >= difficulty {

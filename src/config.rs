@@ -165,72 +165,76 @@ impl Config {
 
         // Переопределяем значения из env, если они заданы
         if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGES")
-            && let Ok(parsed) = val.parse::<u32>() {
-                // ✅ Enforce maximum to prevent memory exhaustion DoS
-                const MIN_SKIPPED: u32 = 10;
-                const MAX_SKIPPED: u32 = 10_000;
-                config.max_skipped_messages = parsed.clamp(MIN_SKIPPED, MAX_SKIPPED);
-                if !(MIN_SKIPPED..=MAX_SKIPPED).contains(&parsed) {
-                    tracing::warn!(
-                        parsed,
-                        clamped = config.max_skipped_messages,
-                        "MAX_SKIPPED_MESSAGES out of safe range [{}-{}], clamped",
-                        MIN_SKIPPED,
-                        MAX_SKIPPED
-                    );
-                }
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            // ✅ Enforce maximum to prevent memory exhaustion DoS
+            const MIN_SKIPPED: u32 = 10;
+            const MAX_SKIPPED: u32 = 10_000;
+            config.max_skipped_messages = parsed.clamp(MIN_SKIPPED, MAX_SKIPPED);
+            if !(MIN_SKIPPED..=MAX_SKIPPED).contains(&parsed) {
+                tracing::warn!(
+                    parsed,
+                    clamped = config.max_skipped_messages,
+                    "MAX_SKIPPED_MESSAGES out of safe range [{}-{}], clamped",
+                    MIN_SKIPPED,
+                    MAX_SKIPPED
+                );
             }
+        }
 
         if let Ok(val) = std::env::var("MAX_SKIPPED_MESSAGE_AGE_SECONDS")
-            && let Ok(parsed) = val.parse::<i64>() {
-                // ✅ Enforce minimum to prevent premature key deletion
-                const MIN_AGE: i64 = 60; // At least 1 minute
-                const MAX_AGE: i64 = 2_592_000; // Max 30 days
-                config.max_skipped_message_age_seconds = parsed.clamp(MIN_AGE, MAX_AGE);
-                if !(MIN_AGE..=MAX_AGE).contains(&parsed) {
-                    tracing::warn!(
-                        parsed,
-                        clamped = config.max_skipped_message_age_seconds,
-                        "MAX_SKIPPED_MESSAGE_AGE_SECONDS out of safe range [{}-{}], clamped",
-                        MIN_AGE,
-                        MAX_AGE
-                    );
-                }
+            && let Ok(parsed) = val.parse::<i64>()
+        {
+            // ✅ Enforce minimum to prevent premature key deletion
+            const MIN_AGE: i64 = 60; // At least 1 minute
+            const MAX_AGE: i64 = 2_592_000; // Max 30 days
+            config.max_skipped_message_age_seconds = parsed.clamp(MIN_AGE, MAX_AGE);
+            if !(MIN_AGE..=MAX_AGE).contains(&parsed) {
+                tracing::warn!(
+                    parsed,
+                    clamped = config.max_skipped_message_age_seconds,
+                    "MAX_SKIPPED_MESSAGE_AGE_SECONDS out of safe range [{}-{}], clamped",
+                    MIN_AGE,
+                    MAX_AGE
+                );
             }
+        }
 
         if let Ok(val) = std::env::var("PBKDF2_ITERATIONS")
-            && let Ok(parsed) = val.parse::<u32>() {
-                // ✅ Enforce minimum to prevent brute-force attacks
-                const MIN_ITERATIONS: u32 = 10_000;
-                const MAX_ITERATIONS: u32 = 1_000_000; // Prevent DoS via excessive iterations
-                config.pbkdf2_iterations = parsed.clamp(MIN_ITERATIONS, MAX_ITERATIONS);
-                if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&parsed) {
-                    tracing::warn!(
-                        parsed,
-                        clamped = config.pbkdf2_iterations,
-                        "PBKDF2_ITERATIONS out of safe range [{}-{}], clamped",
-                        MIN_ITERATIONS,
-                        MAX_ITERATIONS
-                    );
-                }
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            // ✅ Enforce minimum to prevent brute-force attacks
+            const MIN_ITERATIONS: u32 = 10_000;
+            const MAX_ITERATIONS: u32 = 1_000_000; // Prevent DoS via excessive iterations
+            config.pbkdf2_iterations = parsed.clamp(MIN_ITERATIONS, MAX_ITERATIONS);
+            if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&parsed) {
+                tracing::warn!(
+                    parsed,
+                    clamped = config.pbkdf2_iterations,
+                    "PBKDF2_ITERATIONS out of safe range [{}-{}], clamped",
+                    MIN_ITERATIONS,
+                    MAX_ITERATIONS
+                );
             }
+        }
 
         if let Ok(val) = std::env::var("WEBSOCKET_RETRY_MAX_MS")
-            && let Ok(parsed) = val.parse::<u64>() {
-                // ✅ Enforce minimum to prevent infinite retry loops
-                const MIN_RETRY: u64 = 100; // At least 100ms
-                const MAX_RETRY: u64 = 300_000; // Max 5 minutes
-                config.websocket_retry_max_ms = parsed.clamp(MIN_RETRY, MAX_RETRY);
-                if !(MIN_RETRY..=MAX_RETRY).contains(&parsed) {
-                    tracing::warn!(
-                        parsed,
-                        clamped = config.websocket_retry_max_ms,
-                        "WEBSOCKET_RETRY_MAX_MS out of safe range [{}-{}], clamped",
-                        MIN_RETRY,
-                        MAX_RETRY
-                    );
-                }
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            // ✅ Enforce minimum to prevent infinite retry loops
+            const MIN_RETRY: u64 = 100; // At least 100ms
+            const MAX_RETRY: u64 = 300_000; // Max 5 minutes
+            config.websocket_retry_max_ms = parsed.clamp(MIN_RETRY, MAX_RETRY);
+            if !(MIN_RETRY..=MAX_RETRY).contains(&parsed) {
+                tracing::warn!(
+                    parsed,
+                    clamped = config.websocket_retry_max_ms,
+                    "WEBSOCKET_RETRY_MAX_MS out of safe range [{}-{}], clamped",
+                    MIN_RETRY,
+                    MAX_RETRY
+                );
             }
+        }
 
         config
     }
