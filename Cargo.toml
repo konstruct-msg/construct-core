@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.9.2"
+version = "0.9.3"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.92"
