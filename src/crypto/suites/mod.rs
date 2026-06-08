@@ -25,6 +25,7 @@
 //! type MySuite = ClassicSuiteProvider;
 //!
 //! let (private_key, public_key) = MySuite::generate_kem_keys()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 pub mod classic;
