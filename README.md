@@ -60,7 +60,7 @@ construct-core/
 
 ```toml
 [dependencies]
-construct-core = { git = "https://github.com/construct-msg/construct-core", features = ["ios"] }
+construct-core = { git = "https://github.com/konstruct-msg/construct-core", features = ["ios"] }
 ```
 
 Swift bindings are generated with UniFFI. In the `construct-messenger` app repo,
@@ -73,14 +73,14 @@ artifact on every push to `main` and republishes a rolling pre-release tagged
 `latest`. **Stable URL** (never changes):
 
 ```
-https://github.com/construct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
+https://github.com/konstruct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
 ```
 
 One-liner to grab + extract:
 
 ```bash
 curl -L -o construct-core-android.tar.gz \
-  https://github.com/construct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
+  https://github.com/konstruct-msg/construct-core/releases/download/latest/construct-core-android.tar.gz
 tar -xzf construct-core-android.tar.gz
 ```
 
