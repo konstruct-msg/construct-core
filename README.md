@@ -1,6 +1,6 @@
 # construct-core
 
-**The cryptographic core of [Konstruct](https://github.com/construct-msg) — a privacy-first,
+**The cryptographic core of [Konstruct](https://github.com/konstruct-msg) — a privacy-first,
 end-to-end encrypted messenger.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.92+-orange.svg)](https://www.rust-lang.org/)
@@ -101,7 +101,7 @@ archive. (Short version: drop `jniLibs/` into `app/src/main/`, copy the
 Kotlin files into your crypto package, build.)
 
 For a **versioned** build (e.g. for a production release pin), find it on
-the [Releases page](https://github.com/construct-msg/construct-core/releases)
+the [Releases page](https://github.com/konstruct-msg/construct-core/releases)
 under the relevant `vX.Y.Z` tag. The `latest` tag is rolling and always
 points at the freshest `main`.
 
