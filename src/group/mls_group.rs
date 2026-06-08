@@ -71,7 +71,7 @@ impl MlsGroup {
     pub fn from_welcome(welcome_bytes: &[u8], config: GroupConfig) -> Result<Self, MlsError> {
         let provider = OpenMlsRustCrypto::default();
         let signer = make_signer(&config);
-        let cwk = make_credential(&signer);
+        let _cwk = make_credential(&signer);
 
         let mls_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)

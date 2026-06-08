@@ -90,17 +90,17 @@ pub const HYBRID_SIGNATURE_SIZE: usize = ED25519_SIGNATURE_SIZE + ML_DSA_65_SIGN
 
 // ── Helpers: split hybrid private key ─────────────────────────────────────────
 
-/// Split hybrid private key into (ed25519_seed, mldsa_sk, mldsa_pk).
-fn split_hybrid_private_key(
-    hybrid_sk: &[u8],
-) -> Result<
-    (
-        &[u8; ED25519_SECRET_KEY_SIZE],
-        &[u8; ML_DSA_65_SECRET_KEY_SIZE],
-        &[u8; ML_DSA_65_PUBLIC_KEY_SIZE],
-    ),
-    CryptoError,
-> {
+// ── Helpers: split hybrid private key ─────────────────────────────────────────
+
+/// Decomposed parts of a hybrid private key.
+struct HybridKeyParts<'a> {
+    ed25519_seed: &'a [u8; ED25519_SECRET_KEY_SIZE],
+    mldsa_sk: &'a [u8; ML_DSA_65_SECRET_KEY_SIZE],
+    mldsa_pk: &'a [u8; ML_DSA_65_PUBLIC_KEY_SIZE],
+}
+
+/// Split hybrid private key into its constituent parts.
+fn split_hybrid_private_key(hybrid_sk: &[u8]) -> Result<HybridKeyParts<'_>, CryptoError> {
     if hybrid_sk.len() != HYBRID_SIG_SECRET_KEY_SIZE {
         return Err(CryptoError::InvalidInputError(format!(
             "Hybrid private key size mismatch: expected {HYBRID_SIG_SECRET_KEY_SIZE}, got {}",
@@ -122,9 +122,12 @@ fn split_hybrid_private_key(
         .map_err(|_| {
             CryptoError::InvalidInputError("Failed to extract ML-DSA public key".into())
         })?;
-    Ok((ed25519_seed, mldsa_sk, mldsa_pk))
+    Ok(HybridKeyParts {
+        ed25519_seed,
+        mldsa_sk,
+        mldsa_pk,
+    })
 }
-
 // ── Helpers: split hybrid public key ──────────────────────────────────────────
 
 fn split_hybrid_public_key(
@@ -268,14 +271,14 @@ impl CryptoProvider for HybridSuiteProvider {
     fn from_signature_private_to_public(
         private_key: &Self::SignaturePrivateKey,
     ) -> Result<Self::SignaturePublicKey, CryptoError> {
-        let (ed25519_seed, _mldsa_sk, mldsa_pk) = split_hybrid_private_key(private_key.as_ref())?;
+        let parts = split_hybrid_private_key(private_key.as_ref())?;
 
-        let ed25519_signing_key = SigningKey::from_bytes(ed25519_seed);
+        let ed25519_signing_key = SigningKey::from_bytes(parts.ed25519_seed);
         let ed25519_pk = ed25519_signing_key.verifying_key();
 
         let mut hybrid_pk = Vec::with_capacity(HYBRID_SIG_PUBLIC_KEY_SIZE);
         hybrid_pk.extend_from_slice(&ed25519_pk.to_bytes());
-        hybrid_pk.extend_from_slice(mldsa_pk);
+        hybrid_pk.extend_from_slice(parts.mldsa_pk);
         Ok(hybrid_pk)
     }
 
@@ -290,15 +293,14 @@ impl CryptoProvider for HybridSuiteProvider {
             )));
         }
 
-        let (ed25519_seed, mldsa_sk_bytes, _mldsa_pk) =
-            split_hybrid_private_key(private_key.as_ref())?;
+        let parts = split_hybrid_private_key(private_key.as_ref())?;
 
         // Ed25519 signature
-        let ed25519_signing_key = SigningKey::from_bytes(ed25519_seed);
+        let ed25519_signing_key = SigningKey::from_bytes(parts.ed25519_seed);
         let ed25519_sig = ed25519_signing_key.sign(message);
 
         // ML-DSA-65 detached signature
-        let mldsa_sk = MlDsaSecretKey::from_bytes(mldsa_sk_bytes).map_err(|e| {
+        let mldsa_sk = MlDsaSecretKey::from_bytes(parts.mldsa_sk).map_err(|e| {
             CryptoError::SigningError(format!("ML-DSA-65 secret key parse error: {e:?}"))
         })?;
         let mldsa_sig = detached_sign(message, &mldsa_sk);

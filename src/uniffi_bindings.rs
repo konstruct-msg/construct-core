@@ -1900,7 +1900,7 @@ pub struct HybridSignatureKeyPair {
 /// Generate an ML-DSA-65 keypair.
 #[cfg(feature = "post-quantum")]
 pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::{keypair, PublicKey, SecretKey};
+    use pqcrypto_mldsa::mldsa65::keypair;
     use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
     let (pk, sk) = keypair();
     Ok(MLDSAKeyPair {
@@ -1917,19 +1917,15 @@ pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
 /// Sign a message with an ML-DSA-65 secret key (detached signature).
 #[cfg(feature = "post-quantum")]
 pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::{detached_sign, SecretKey};
-    use pqcrypto_traits::sign::SecretKey as _;
-    let sk = SecretKey::from_bytes(&secret_key)
-        .map_err(|e| CryptoError::InvalidKeyData)?;
+    use pqcrypto_mldsa::mldsa65::{SecretKey, detached_sign};
+    use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
+    let sk = SecretKey::from_bytes(&secret_key).map_err(|_| CryptoError::InvalidKeyData)?;
     let sig = detached_sign(&message, &sk);
     Ok(sig.as_bytes().to_vec())
 }
 
 #[cfg(not(feature = "post-quantum"))]
-pub fn mldsa65_sign(
-    _secret_key: Vec<u8>,
-    _message: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
+pub fn mldsa65_sign(_secret_key: Vec<u8>, _message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     Err(CryptoError::InitializationFailed)
 }
 
@@ -1940,12 +1936,10 @@ pub fn mldsa65_verify(
     message: Vec<u8>,
     signature: Vec<u8>,
 ) -> Result<bool, CryptoError> {
-    use pqcrypto_mldsa::mldsa65::{verify_detached_signature, PublicKey, DetachedSignature};
-    use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
-    let pk = PublicKey::from_bytes(&public_key)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let sig = DetachedSignature::from_bytes(&signature)
-        .map_err(|_| CryptoError::InvalidKeyData)?;
+    use pqcrypto_mldsa::mldsa65::{DetachedSignature, PublicKey, verify_detached_signature};
+    use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+    let pk = PublicKey::from_bytes(&public_key).map_err(|_| CryptoError::InvalidKeyData)?;
+    let sig = DetachedSignature::from_bytes(&signature).map_err(|_| CryptoError::InvalidKeyData)?;
     match verify_detached_signature(&sig, &message, &pk) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
@@ -1964,10 +1958,10 @@ pub fn mldsa65_verify(
 /// Generate a hybrid (Ed25519 + ML-DSA-65) signature keypair.
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> {
-    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     let (sk, pk) = HybridSuiteProvider::generate_signature_keys()
-        .map_err(|_| CryptoError::KeyGenerationError("Hybrid keygen failed".into()))?;
+        .map_err(|_| CryptoError::InitializationFailed)?;
     Ok(HybridSignatureKeyPair {
         private_key: sk,
         public_key: pk,
@@ -1982,17 +1976,15 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
 /// Sign a message with a hybrid private key (Ed25519 + ML-DSA-65).
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     use crate::crypto::provider::CryptoProvider;
-    HybridSuiteProvider::sign(&private_key, &message)
-        .map_err(|e| CryptoError::SigningError(format!("Hybrid sign failed: {e}")))
+    use crate::crypto::suites::hybrid::HybridSuiteProvider;
+    HybridSuiteProvider::sign(&private_key, &message).map_err(|e| CryptoError::EncryptionFailed {
+        message: format!("Hybrid sign failed: {e}"),
+    })
 }
 
 #[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_sign(
-    _private_key: Vec<u8>,
-    _message: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
+pub fn hybrid_sign(_private_key: Vec<u8>, _message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     Err(CryptoError::InitializationFailed)
 }
 
@@ -2003,8 +1995,8 @@ pub fn hybrid_verify(
     message: Vec<u8>,
     signature: Vec<u8>,
 ) -> Result<bool, CryptoError> {
-    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     match HybridSuiteProvider::verify(&public_key, &message, &signature) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
@@ -2023,16 +2015,14 @@ pub fn hybrid_verify(
 /// Derive the hybrid public key from a hybrid private key.
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::hybrid::HybridSuiteProvider;
     HybridSuiteProvider::from_signature_private_to_public(&private_key)
-        .map_err(|e| CryptoError::InvalidKeyData)
+        .map_err(|_e| CryptoError::InvalidKeyData)
 }
 
 #[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_public_key_from_private(
-    _private_key: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
+pub fn hybrid_public_key_from_private(_private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     Err(CryptoError::InitializationFailed)
 }
 
