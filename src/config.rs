@@ -41,6 +41,9 @@ pub struct Config {
     /// ID классического криптографического набора (Classic Suite)
     pub classic_suite_id: u16,
 
+    /// ID постквантового гибридного набора (PQ Hybrid Suite)
+    pub hybrid_suite_id: u16,
+
     // ============================================
     // DOUBLE RATCHET ПАРАМЕТРЫ
     // ============================================
@@ -123,6 +126,7 @@ impl Default for Config {
             public_key_size: 32,
             signature_size: 64,
             classic_suite_id: 1,
+            hybrid_suite_id: 2,
 
             // Double Ratchet
             max_skipped_messages: 1000,

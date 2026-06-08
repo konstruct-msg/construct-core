@@ -321,6 +321,27 @@ dictionary MLKEMEncapsulation {
     sequence<u8> shared_secret;
 };
 
+// ── Post-Quantum Signatures (ML-DSA-65) ─────────────────────────────────────
+
+/// Generated ML-DSA-65 keypair for post-quantum identity signatures.
+dictionary MLDSAKeyPair {
+    /// Secret key: 4032 bytes (PQClean expanded form)
+    sequence<u8> secret_key;
+    /// Public key: 1952 bytes
+    sequence<u8> public_key;
+};
+
+/// Hybrid signature keypair (Ed25519 + ML-DSA-65).
+/// Used for post-quantum identity key bundles.
+dictionary HybridSignatureKeyPair {
+    /// Hybrid private key: 6016 bytes
+    /// [ed25519_seed (32)] [mldsa65_sk (4032)] [mldsa65_pk (1952)]
+    sequence<u8> private_key;
+    /// Hybrid public key: 1984 bytes
+    /// [ed25519_pk (32)] [mldsa65_pk (1952)]
+    sequence<u8> public_key;
+};
+
 namespace construct_core {
     [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core();
@@ -386,6 +407,38 @@ namespace construct_core {
     /// Returns shared_secret to pass to ClassicCryptoCore.apply_pq_contribution.
     [Throws=CryptoError]
     sequence<u8> mlkem768_decapsulate(sequence<u8> secret_key, sequence<u8> ciphertext);
+
+    // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────
+
+    /// Generate an ML-DSA-65 keypair (post-quantum signature scheme, NIST FIPS 204).
+    [Throws=CryptoError]
+    MLDSAKeyPair mldsa65_keygen();
+
+    /// Sign a message with an ML-DSA-65 secret key. Returns a detached signature (3309 bytes).
+    [Throws=CryptoError]
+    sequence<u8> mldsa65_sign(sequence<u8> secret_key, sequence<u8> message);
+
+    /// Verify an ML-DSA-65 detached signature. Returns true if valid.
+    [Throws=CryptoError]
+    boolean mldsa65_verify(sequence<u8> public_key, sequence<u8> message, sequence<u8> signature);
+
+    /// Generate a hybrid signature keypair (Ed25519 + ML-DSA-65).
+    /// Both signatures must verify for the hybrid signature to be valid.
+    [Throws=CryptoError]
+    HybridSignatureKeyPair hybrid_signature_keygen();
+
+    /// Sign a message with a hybrid private key (Ed25519 + ML-DSA-65).
+    /// Returns a hybrid signature: [ed25519_sig (64)] [mldsa65_sig (3309)] = 3373 bytes.
+    [Throws=CryptoError]
+    sequence<u8> hybrid_sign(sequence<u8> private_key, sequence<u8> message);
+
+    /// Verify a hybrid signature. Both Ed25519 and ML-DSA-65 signatures must be valid.
+    [Throws=CryptoError]
+    boolean hybrid_verify(sequence<u8> public_key, sequence<u8> message, sequence<u8> signature);
+
+    /// Derive the hybrid public key from a hybrid private key.
+    [Throws=CryptoError]
+    sequence<u8> hybrid_public_key_from_private(sequence<u8> private_key);
 
     // ── Orchestration (Phase 0) ───────────────────────────────────────────────
 
