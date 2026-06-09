@@ -54,39 +54,47 @@
 
 ## Shared Construct Docs Workflow
 
-These instructions apply to GitHub Copilot, Codex, OpenCode, and similar coding agents.
+The vault's own `~/Code/construct-docs/AGENTS.md` is **authoritative** for how to contribute docs —
+read it. The summary below is the operational subset for coding agents.
 
-### Division of labour — read this first
+> **There is no pipeline anymore.** The old `raw/` → olw → `wiki/` three-way synthesis workflow is
+> gone. Agents patch docs **directly** and write session/decision notes by hand. No olw, no
+> `wiki/.drafts/`, no "let the pipeline cross-link it". `raw/` and `wiki/` no longer exist — the
+> corpus is the flat domain folders (`architecture/`, `backend/`, `client/`, `cryptocore/`,
+> `security/`, …) listed under *Documentation* above.
 
-| Role | Tool | Responsibility |
-|------|------|----------------|
-| **Coding agent** (you) | Copilot / Codex | Write code + drop raw session notes into `wiki/sessions/` and `wiki/decisions/`. That is all. |
-| **Wiki pipeline** | `obsidian-llm-wiki-local` (olw) | Reads `raw/`, synthesizes concepts, creates/updates wiki articles, generates cross-links. |
-| **Developer** | Human + Obsidian | Reviews wiki draft articles, approves/rejects. Curates `raw/`. |
+### Where durable reasoning goes
 
-**Your job is code.** olw handles article synthesis. Write plain-markdown session notes; let the pipeline do the rest.
+Any reasoning that informed a code change must survive beyond the chat session — conclusions,
+trade-offs, and "why we didn't do X". After any session involving architectural changes, design
+decisions, API/data-format changes, bug root-cause analysis, or non-obvious implementation choices:
 
-### Shared knowledge base
+1. **Always** write a session note at `~/Code/construct-docs/sessions/YYYY-MM-DD-<topic>.md`.
+2. **Always** fill in `## Why` — the reasoning, considered alternatives, and why they were rejected.
+   This is the most important section.
+3. If the decision will constrain future work or the same question is likely to recur, also create
+   or update `~/Code/construct-docs/decisions/<slug>.md`.
+4. Patch the affected spec in its domain folder in the **same** session — keep specs current.
+5. Before creating a new note, search for an existing one and extend it rather than duplicating.
 
-- Vault: `~/Code/construct-docs`
-- `raw/` — source corpus. Do **not** rewrite or reorganize.
-- `wiki/` — canonical curated knowledge base. **Read** from here before architectural work.
-- `wiki/.drafts/` — **reserved for olw**. Never write here manually.
-- `wiki/sessions/` — where coding agents write session notes.
-- `wiki/decisions/` — where coding agents write long-lived decision records.
+Do not skip session notes for "small" changes — if non-trivial reasoning was involved, write it down.
 
-### Where to save durable reasoning
+### Session note format
 
-After any session involving architectural changes, design decisions, API changes, or non-obvious implementation choices:
+Plain markdown, no YAML frontmatter. `[[wikilinks]]` to other sessions/decisions/specs are welcome
+(Obsidian graph). Sections:
 
-1. **Always** create or update `wiki/sessions/YYYY-MM-DD-<topic>.md`.
-2. **Always** fill in `# Why` — reasoning, alternatives considered, why rejected. Most important section.
-3. If the decision constrains future work, also create `wiki/decisions/<topic>.md`.
-4. Session notes: plain markdown, **no YAML frontmatter, no `[[wikilinks]]`** — olw adds those.
+1. `## Context` — what problem prompted this work
+2. `## What Changed` — concrete file/API/behaviour changes
+3. `## Why` — the reasoning: alternatives considered and why rejected
+4. `## Decisions` — discrete decisions, each as a one-liner
+5. `## Open Questions` — known unknowns, deferred work
 
-Required note sections: `# Context`, `# What Changed`, `# Why`, `# Intended Outcome`, `# Decisions`, `# Open Questions`
+Decision records (`decisions/<slug>.md`) use: `## Context`, `## Decision`, `## Rationale`,
+`## Consequences`, plus a **Status** (accepted | superseded | deferred) and **Date** header.
 
 ### Operational logging
 
-Append a one-line entry to `wiki/log.md` after writing a note.
-Format: `[YYYY-MM-DD HH:MM] note | <topic>`
+- Append a one-line entry to `~/Code/construct-docs/log.md` after creating/updating a session or
+  decision note. Format: `[YYYY-MM-DD HH:MM] note | <topic>`
+- Keep detailed rationale out of `log.md` — it belongs in the session/decision note.
