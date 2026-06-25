@@ -693,6 +693,14 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     string init_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
+    // Degraded INITIATOR init: identical to init_session but skips ONLY the SPK
+    // age-staleness reject (PeerSpkStale). Signature verification, the X3DH agreement,
+    // and the kyber-epoch requirement are all still enforced. Used to reach a peer who
+    // has been offline too long to rotate their SPK (see stale-peer-reachability decision).
+    // The caller is responsible for flagging the resulting session as "at-risk".
+    [Throws=CryptoError]
+    string init_session_allowing_stale(string contact_id, BinaryKeyBundle recipient_bundle);
+
     [Throws=CryptoError]
     SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
 

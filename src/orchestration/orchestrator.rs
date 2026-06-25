@@ -218,6 +218,7 @@ impl Orchestrator {
         kyber_pre_key_public: Option<Vec<u8>>,
         kyber_one_time_prekey_public: Option<Vec<u8>>,
         kyber_one_time_prekey_id: Option<u32>,
+        allow_stale: bool,
     ) -> Result<String, String> {
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
@@ -231,15 +232,27 @@ impl Orchestrator {
             "init_session_with_bundle: storing pending OTPK id"
         );
 
-        self.lifecycle
-            .client
-            .init_session(
-                contact_id,
-                &public_bundle,
-                &remote_identity,
-                one_time_prekey_id,
-            )
-            .map_err(|e| e.to_string())?;
+        if allow_stale {
+            self.lifecycle
+                .client
+                .init_session_allowing_stale(
+                    contact_id,
+                    &public_bundle,
+                    &remote_identity,
+                    one_time_prekey_id,
+                )
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.lifecycle
+                .client
+                .init_session(
+                    contact_id,
+                    &public_bundle,
+                    &remote_identity,
+                    one_time_prekey_id,
+                )
+                .map_err(|e| e.to_string())?;
+        }
 
         // PQXDH: encapsulate to recipient's Kyber public key and defer SS application.
         // Prefer one-time pre-key (consumed once) over the signed pre-key.

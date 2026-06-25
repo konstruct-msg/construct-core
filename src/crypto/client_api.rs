@@ -322,6 +322,43 @@ where
         remote_identity: &P::KemPublicKey,
         one_time_prekey_id: u32,
     ) -> Result<String, String> {
+        self.init_session_inner(
+            contact_id,
+            remote_bundle,
+            remote_identity,
+            one_time_prekey_id,
+            false,
+        )
+    }
+
+    /// Degraded initiator init: skips ONLY the SPK age-staleness validation. Used to reach a
+    /// peer who has been offline too long to rotate their SPK. The bundle signature is still
+    /// verified inside the X3DH agreement; only freshness is relaxed. The caller flags the
+    /// resulting session at-risk. See the `stale-peer-reachability` decision record.
+    pub fn init_session_allowing_stale(
+        &mut self,
+        contact_id: &str,
+        remote_bundle: &H::PublicKeyBundle,
+        remote_identity: &P::KemPublicKey,
+        one_time_prekey_id: u32,
+    ) -> Result<String, String> {
+        self.init_session_inner(
+            contact_id,
+            remote_bundle,
+            remote_identity,
+            one_time_prekey_id,
+            true,
+        )
+    }
+
+    fn init_session_inner(
+        &mut self,
+        contact_id: &str,
+        remote_bundle: &H::PublicKeyBundle,
+        remote_identity: &P::KemPublicKey,
+        one_time_prekey_id: u32,
+        allow_stale: bool,
+    ) -> Result<String, String> {
         use tracing::info;
         self.ensure_local_user_id_set()?;
 
@@ -333,8 +370,11 @@ where
             ));
         }
 
-        // Validate SPK bundle freshness before doing any crypto work.
-        validate_bundle_freshness::<P, H>(remote_bundle)?;
+        // Validate SPK bundle freshness before doing any crypto work — unless the caller
+        // explicitly opted into a degraded (stale-tolerant) init.
+        if !allow_stale {
+            validate_bundle_freshness::<P, H>(remote_bundle)?;
+        }
 
         info!(
             target: "crypto::client",

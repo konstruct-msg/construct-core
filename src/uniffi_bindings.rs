@@ -1416,6 +1416,118 @@ mod tests {
         );
     }
 
+    /// Unix seconds for a timestamp `days` in the past (used to fake a stale SPK).
+    fn unix_secs_days_ago(days: u64) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(days * 24 * 3600)
+    }
+
+    /// Build an `OrchestratorCore` (the core the iOS app actually uses) for a given user id.
+    /// Keys are generated via the classic core and re-imported as CFE bytes, matching the
+    /// production `create_orchestrator_core_from_keys` path.
+    fn make_orchestrator(user_id: &str) -> std::sync::Arc<OrchestratorCore> {
+        let classic = create_crypto_core().unwrap();
+        let keys = classic.export_private_keys().unwrap();
+        create_orchestrator_core_from_keys(keys, user_id.to_string()).unwrap()
+    }
+
+    /// Strict `init_session` must REJECT a bundle whose SPK is past the 10-day staleness limit.
+    /// This is the gate that makes a long-offline peer unreachable — guarded so the degraded
+    /// path (below) remains the only way through. See the stale-peer-reachability decision.
+    #[test]
+    fn test_init_session_rejects_stale_spk() {
+        let alice = make_orchestrator("alice_user");
+        let bob = make_orchestrator("bob_user");
+
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(11); // > 10d limit
+
+        let err = alice
+            .init_session("bob_user".to_string(), bob_bundle)
+            .expect_err("init_session must reject a stale SPK bundle");
+        assert!(
+            matches!(err, CryptoError::PeerSpkStale { .. }),
+            "expected PeerSpkStale, got {err:?}"
+        );
+    }
+
+    /// Degraded `init_session_allowing_stale` must ACCEPT the same stale bundle the strict path
+    /// rejects — this is the reachability fix for long-offline peers.
+    #[test]
+    fn test_init_session_allowing_stale_accepts_stale_spk() {
+        let alice = make_orchestrator("alice_user");
+        let bob = make_orchestrator("bob_user");
+
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(40); // well past the limit
+
+        let session_id = alice
+            .init_session_allowing_stale("bob_user".to_string(), bob_bundle)
+            .expect("degraded init must accept a stale SPK bundle");
+        assert_eq!(session_id, "bob_user");
+    }
+
+    /// Degraded init relaxes ONLY the age check. A PQ bundle (suite_id == 2) that never uploaded a
+    /// Kyber SPK (kyber_spk_rotation_epoch == 0) is a correctness failure, not a freshness one, and
+    /// must still be refused so we never silently downgrade to classical-only key agreement.
+    #[test]
+    fn test_init_session_allowing_stale_still_rejects_pq_without_kyber_epoch() {
+        let alice = make_orchestrator("alice_user");
+        let bob = make_orchestrator("bob_user");
+
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(11);
+        bob_bundle.suite_id = 2; // PQ_HYBRID
+        bob_bundle.kyber_spk_rotation_epoch = 0; // never uploaded a Kyber SPK
+
+        let err = alice
+            .init_session_allowing_stale("bob_user".to_string(), bob_bundle)
+            .expect_err("degraded init must still reject a PQ bundle with no Kyber SPK");
+        assert!(
+            matches!(err, CryptoError::InvalidKeyData),
+            "expected InvalidKeyData, got {err:?}"
+        );
+    }
+
+    /// A session established via the degraded path must be fully functional when the peer still
+    /// holds the matching SPK private key: Alice degraded-inits against Bob's (faked-stale) bundle,
+    /// encrypts, and Bob decrypts via init_receiving_session. (The lost-SPK case is exercised by
+    /// the iOS healing integration tests.)
+    #[test]
+    fn test_degraded_session_encrypts_and_decrypts() {
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+
+        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(30); // stale → only degraded init works
+
+        let session = alice
+            .init_session_allowing_stale("bob_user_id".to_string(), bob_bundle)
+            .expect("degraded init should succeed");
+
+        let plaintext = b"reachable while offline".to_vec();
+        let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
+
+        let first_msg = BinaryFirstMessage {
+            ephemeral_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            content: encrypted.content,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+        };
+        let bob_result = bob
+            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .expect("Bob should establish receiving session from a degraded-init first message");
+
+        assert_eq!(
+            bob_result.decrypted_message, plaintext,
+            "degraded-init first message must decrypt when the peer still holds its SPK key"
+        );
+    }
+
     /// Test full end-to-end encryption/decryption flow
     /// Verifies that sessions are created consistently and messages can be exchanged
     #[test]
@@ -2435,7 +2547,32 @@ impl OrchestratorCore {
         recipient_bundle: BinaryKeyBundle,
     ) -> Result<String, CryptoError> {
         check_bundle_freshness(&recipient_bundle)?;
+        self.init_session_inner(contact_id, recipient_bundle, false)
+    }
 
+    /// Degraded INITIATOR init: skips ONLY the SPK age-staleness reject. All other
+    /// validation (`check_bundle_freshness`'s kyber-epoch requirement, the bundle
+    /// signature verified inside the X3DH agreement) still applies. See the
+    /// `stale-peer-reachability` decision record. The caller flags the session at-risk.
+    pub fn init_session_allowing_stale(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+    ) -> Result<String, CryptoError> {
+        // Still refuse a PQ bundle with no Kyber SPK — that is a correctness failure
+        // (silent downgrade to classical-only), not a freshness concern.
+        if recipient_bundle.suite_id == 2 && recipient_bundle.kyber_spk_rotation_epoch == 0 {
+            return Err(CryptoError::InvalidKeyData);
+        }
+        self.init_session_inner(contact_id, recipient_bundle, true)
+    }
+
+    fn init_session_inner(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+        allow_stale: bool,
+    ) -> Result<String, CryptoError> {
         let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.init_session_with_bundle(
@@ -2444,6 +2581,7 @@ impl OrchestratorCore {
             recipient_bundle.kyber_pre_key_public,
             recipient_bundle.kyber_one_time_prekey_public,
             recipient_bundle.kyber_one_time_prekey_id,
+            allow_stale,
         )
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
