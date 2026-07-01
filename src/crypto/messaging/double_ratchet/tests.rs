@@ -1,4 +1,6 @@
-use super::{DoubleRatchetSession, EncryptedRatchetMessage, SuiteID};
+use super::{
+    DoubleRatchetSession, EncryptedRatchetMessage, PqRatchetKeyPair, PqRatchetWireField, SuiteID,
+};
 use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
@@ -1488,4 +1490,220 @@ fn test_ad_v3_normal_path_unaffected() {
 
     let reply = bob.encrypt(b"v3 reply").unwrap();
     assert_eq!(alice.decrypt(&reply).unwrap(), b"v3 reply");
+}
+
+// ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ─────────────────────
+//
+// Milestone 1 scope: the protocol/KDF state machine, tested in isolation by
+// driving `maybe_advance_pq_ratchet`/`ingest_incoming_pq_field`/
+// `take_outgoing_pq_field` directly and by manually setting `suite_id`. Not
+// yet wired into `encrypt()`/`decrypt()` — that lands with the wire-format
+// milestone (see the plan doc), so there is no on-the-wire round trip to test
+// yet. Tests that exercise real ML-KEM-768 (via `maybe_advance_pq_ratchet` or
+// a full ingest→encapsulate/decapsulate cycle) require the `post-quantum`
+// Cargo feature, per `AGENTS.md` ("cargo test --all-features ... required for
+// full coverage including PQ schemes").
+
+/// Existing `CLASSIC`/`PQ_HYBRID` sessions must see zero behavior change: the
+/// sparse ratchet is strictly opt-in via `suite_id == PQ_RATCHET`.
+#[test]
+fn test_pq_ratchet_noop_on_non_pq_ratchet_suite() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000a1",
+        "bbbbbbbb-0000-4000-8000-0000000000a2",
+    );
+    assert_eq!(alice.suite_id, SuiteID::CLASSIC);
+
+    for _ in 0..100 {
+        alice.maybe_advance_pq_ratchet().unwrap();
+    }
+
+    assert_eq!(
+        alice.pq_turns_since_mix, 0,
+        "counter must never advance off PQ_RATCHET"
+    );
+    assert!(alice.pending_pq_ratchet_keypair.is_none());
+    assert!(alice.pending_pq_ciphertext_to_send.is_none());
+}
+
+/// `ingest_incoming_pq_field(Ciphertext)` with no exchange in flight is a
+/// caller bug (or a stray/duplicate field) — must return `Err`, never panic.
+/// Exercises the early-return branch only, so this doesn't need real ML-KEM
+/// and runs without the `post-quantum` feature.
+#[test]
+fn test_pq_ratchet_ciphertext_without_pending_keypair_errors() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000b1",
+        "bbbbbbbb-0000-4000-8000-0000000000b2",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+
+    let result = alice.ingest_incoming_pq_field(&PqRatchetWireField::Ciphertext(vec![0u8; 1088]));
+    assert!(result.is_err());
+}
+
+/// A malformed/wrong-size public key must surface as `Err`, never panic —
+/// this is the "corrupted field" path that the future `decrypt()` wiring will
+/// log-and-skip without failing the surrounding message (see plan doc §6).
+/// Returns `Err` regardless of the `post-quantum` feature (either a real
+/// size-validation error, or the feature-disabled error) so this runs in the
+/// default `cargo test` too.
+#[test]
+fn test_pq_ratchet_malformed_public_key_errors_not_panics() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000c1",
+        "bbbbbbbb-0000-4000-8000-0000000000c2",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+
+    let result = alice.ingest_incoming_pq_field(&PqRatchetWireField::PublicKey(vec![0u8; 10]));
+    assert!(result.is_err());
+    // The surrounding message-decrypt path never sees this: callers are
+    // expected to log-and-continue rather than propagate it (plan doc §6).
+}
+
+/// `take_outgoing_pq_field` must prefer completing a peer-initiated exchange
+/// (ciphertext) over advertising our own pending keypair when both are
+/// in flight simultaneously (each side started its own exchange independently).
+#[test]
+fn test_pq_ratchet_outgoing_field_prioritizes_ciphertext() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000d1",
+        "bbbbbbbb-0000-4000-8000-0000000000d2",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+    alice.pending_pq_ratchet_keypair = Some(PqRatchetKeyPair {
+        public: vec![0xAA; 1184],
+        secret: vec![0xBB; 2400],
+    });
+    alice.pending_pq_ciphertext_to_send = Some(vec![0xCC; 1088]);
+
+    match alice.take_outgoing_pq_field() {
+        Some(PqRatchetWireField::Ciphertext(ct)) => assert_eq!(ct, vec![0xCC; 1088]),
+        other => panic!("expected Ciphertext to take priority, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_cadence_fires_after_default_interval() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000e1",
+        "bbbbbbbb-0000-4000-8000-0000000000e2",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+
+    let interval = crate::config::Config::global().pq_ratchet_interval;
+    for turn in 1..interval {
+        alice.maybe_advance_pq_ratchet().unwrap();
+        assert!(
+            alice.pending_pq_ratchet_keypair.is_none(),
+            "must not start an exchange before turn {interval} (currently turn {turn})"
+        );
+    }
+
+    alice.maybe_advance_pq_ratchet().unwrap();
+    assert!(
+        alice.pending_pq_ratchet_keypair.is_some(),
+        "must start an exchange exactly on the {interval}th turn"
+    );
+    assert_eq!(
+        alice.pq_turns_since_mix, 0,
+        "counter resets once an exchange starts"
+    );
+}
+
+/// Full mutual exchange, mechanical correctness only (root-key mixing is not
+/// implemented yet — see `maybe_advance_pq_ratchet`'s doc and the plan's
+/// "Open protocol-design risk" section): Alice's cadence fires and she
+/// generates a keypair; Bob receives it, encapsulates, and queues the
+/// ciphertext; Alice receives the ciphertext and decapsulates. This verifies
+/// (a) both sides derive the *same* ML-KEM-768 shared secret (proves the KEM
+/// wiring itself is correct) and (b) the state machine correctly resolves
+/// (Alice's pending keypair is consumed) and (c) none of this accidentally
+/// disturbs ordinary classical messaging, since nothing here touches
+/// `root_key`/chain keys yet.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_full_exchange_mechanics_and_shared_secret_agree() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000f1",
+        "bbbbbbbb-0000-4000-8000-0000000000f2",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+    bob.suite_id = SuiteID::PQ_RATCHET;
+
+    // Force Alice's cadence to fire immediately instead of waiting 16 turns.
+    let interval = crate::config::Config::global().pq_ratchet_interval;
+    alice.pq_turns_since_mix = interval - 1;
+    alice.maybe_advance_pq_ratchet().unwrap();
+    let alice_public = match alice.take_outgoing_pq_field() {
+        Some(PqRatchetWireField::PublicKey(pk)) => pk,
+        other => panic!("expected Alice to advertise a fresh public key, got {other:?}"),
+    };
+
+    // Bob receives it: encapsulates, queues the ciphertext for his reply.
+    let bob_shared_secret = bob
+        .ingest_incoming_pq_field(&PqRatchetWireField::PublicKey(alice_public))
+        .unwrap();
+    let bob_ciphertext = match bob.take_outgoing_pq_field() {
+        Some(PqRatchetWireField::Ciphertext(ct)) => ct,
+        other => panic!("expected Bob to queue a ciphertext reply, got {other:?}"),
+    };
+
+    // Alice receives the ciphertext: decapsulates, exchange complete.
+    let alice_shared_secret = alice
+        .ingest_incoming_pq_field(&PqRatchetWireField::Ciphertext(bob_ciphertext))
+        .unwrap();
+
+    assert_eq!(
+        alice_shared_secret, bob_shared_secret,
+        "both sides must derive the identical ML-KEM-768 shared secret"
+    );
+    assert!(
+        alice.pending_pq_ratchet_keypair.is_none(),
+        "Alice's pending keypair must be consumed once the ciphertext arrives"
+    );
+
+    // Ordinary messaging must be completely unaffected (nothing above touched
+    // root_key or chain keys).
+    let reply = bob.encrypt(b"unrelated reply").unwrap();
+    assert_eq!(alice.decrypt(&reply).unwrap(), b"unrelated reply");
+    let msg = alice.encrypt(b"alice again").unwrap();
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"alice again");
+}
+
+/// A pending exchange nobody replied to for longer than
+/// `max_skipped_message_age_seconds` is abandoned (zeroized) so a fresh one
+/// can start — bandwidth hygiene for an unresponsive peer, never a
+/// correctness/security concern (see plan doc §6).
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_stale_pending_exchange_is_abandoned() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000f3",
+        "bbbbbbbb-0000-4000-8000-0000000000f4",
+    );
+    alice.suite_id = SuiteID::PQ_RATCHET;
+
+    let stale_public = vec![0x11u8; 1184];
+    alice.pending_pq_ratchet_keypair = Some(PqRatchetKeyPair {
+        public: stale_public.clone(),
+        secret: vec![0x22u8; 2400],
+    });
+    let max_age = crate::config::Config::global().max_skipped_message_age_seconds as u64;
+    alice.pq_pending_since = super::unix_now().saturating_sub(max_age + 3600);
+
+    // Drive the counter to the cadence trigger so a fresh exchange is attempted.
+    let interval = crate::config::Config::global().pq_ratchet_interval;
+    alice.pq_turns_since_mix = interval - 1;
+    alice.maybe_advance_pq_ratchet().unwrap();
+
+    match &alice.pending_pq_ratchet_keypair {
+        Some(kp) => assert_ne!(
+            kp.public, stale_public,
+            "the stale keypair must be replaced with a freshly generated one"
+        ),
+        None => panic!("expected a fresh exchange to have started after abandoning the stale one"),
+    }
 }

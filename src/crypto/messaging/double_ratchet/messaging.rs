@@ -89,6 +89,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: None,
+            pq_turns_since_mix: 0,
+            pending_pq_ratchet_keypair: None,
+            pending_pq_ciphertext_to_send: None,
+            pq_pending_since: 0,
             session_id: shared_session_id,
             contact_id,
             local_user_id,
@@ -198,6 +202,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: Some(pre_pq_root_key),
+            pq_turns_since_mix: 0,
+            pending_pq_ratchet_keypair: None,
+            pending_pq_ciphertext_to_send: None,
+            pq_pending_since: 0,
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
@@ -420,6 +428,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: self.previous_sending_length,
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            pq_turns_since_mix: self.pq_turns_since_mix,
+            pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
+            pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
+            pq_pending_since: self.pq_pending_since,
         });
 
         if needs_ratchet {

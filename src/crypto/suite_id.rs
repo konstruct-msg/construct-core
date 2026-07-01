@@ -13,7 +13,7 @@ pub struct SuiteID(u16);
 
 /// Error for invalid suite ID
 #[derive(Error, Debug)]
-#[error("Invalid suite ID: {suite_id}. Supported: 1 (CLASSIC), 2 (PQ_HYBRID)")]
+#[error("Invalid suite ID: {suite_id}. Supported: 1 (CLASSIC), 2 (PQ_HYBRID), 3 (PQ_RATCHET)")]
 pub struct InvalidSuiteId {
     pub suite_id: u16,
 }
@@ -25,6 +25,13 @@ impl SuiteID {
     /// Post-Quantum Hybrid suite: X25519+ML-KEM-768 + Ed25519+ML-DSA-65 + ChaCha20-Poly1305 + HKDF-SHA256
     pub const PQ_HYBRID: Self = Self(2);
 
+    /// Classic X25519 Double Ratchet + sparse continuous ML-KEM-768 ratchet (see
+    /// `DoubleRatchetSession::perform_pq_ratchet_step`). Independent of `PQ_HYBRID` —
+    /// this is a ratchet-level add-on, not a `CryptoProvider` capability, so it can be
+    /// adopted on its own rollout timeline. Only ever chosen when both peers have
+    /// already advertised support out of band (prekey bundle capability field).
+    pub const PQ_RATCHET: Self = Self(3);
+
     /// Create a new SuiteID with validation
     ///
     /// # Errors
@@ -33,6 +40,7 @@ impl SuiteID {
         match suite_id {
             1 => Ok(Self::CLASSIC),
             2 => Ok(Self::PQ_HYBRID),
+            3 => Ok(Self::PQ_RATCHET),
             _ => Err(InvalidSuiteId { suite_id }),
         }
     }
@@ -61,9 +69,14 @@ impl SuiteID {
         self.0 == 2
     }
 
+    /// Check if this session uses the sparse continuous PQ ratchet
+    pub const fn is_pq_ratchet(self) -> bool {
+        self.0 == 3
+    }
+
     /// Check if the suite ID is supported
     pub const fn is_supported(suite_id: u16) -> bool {
-        matches!(suite_id, 1 | 2)
+        matches!(suite_id, 1..=3)
     }
 
     /// Get suite name for logging/debugging
@@ -71,6 +84,7 @@ impl SuiteID {
         match self.0 {
             1 => "CLASSIC",
             2 => "PQ_HYBRID",
+            3 => "PQ_RATCHET",
             _ => "UNKNOWN",
         }
     }
@@ -127,9 +141,20 @@ mod tests {
     fn test_suite_id_new() {
         assert_eq!(SuiteID::new(1).unwrap(), SuiteID::CLASSIC);
         assert_eq!(SuiteID::new(2).unwrap(), SuiteID::PQ_HYBRID);
+        assert_eq!(SuiteID::new(3).unwrap(), SuiteID::PQ_RATCHET);
         assert!(SuiteID::new(0).is_err());
-        assert!(SuiteID::new(3).is_err());
+        assert!(SuiteID::new(4).is_err());
         assert!(SuiteID::new(999).is_err());
+    }
+
+    #[test]
+    fn test_suite_id_pq_ratchet_variant() {
+        let suite = SuiteID::new(3).unwrap();
+        assert!(suite.is_pq_ratchet());
+        assert!(!suite.is_classic());
+        assert!(!suite.is_pq_hybrid());
+        assert_eq!(suite.name(), "PQ_RATCHET");
+        assert!(SuiteID::is_supported(3));
     }
 
     #[test]
@@ -165,7 +190,8 @@ mod tests {
     fn test_suite_id_is_supported() {
         assert!(SuiteID::is_supported(1));
         assert!(SuiteID::is_supported(2));
+        assert!(SuiteID::is_supported(3));
         assert!(!SuiteID::is_supported(0));
-        assert!(!SuiteID::is_supported(3));
+        assert!(!SuiteID::is_supported(4));
     }
 }

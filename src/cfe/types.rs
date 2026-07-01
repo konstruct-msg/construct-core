@@ -290,6 +290,34 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "lra")]
     #[serde(default)]
     pub last_ratchet_at: u64,
+
+    // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
+    // Additive/optional: absent on session blobs written before this feature,
+    // which deserialize with `pq_turns_since_mix == 0` and no pending exchange.
+    /// DH-ratchet turns since the last ML-KEM-768 mix-in.
+    #[serde(rename = "pqt")]
+    #[serde(default)]
+    pub pq_turns_since_mix: u32,
+    /// Our locally-generated ML-KEM-768 public key (1184 bytes), awaiting the
+    /// peer's ciphertext reply. Absent when no exchange is in flight.
+    #[serde(rename = "pq_pend_pk")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_pending_public: Option<ByteBuf>,
+    /// The matching secret key (2400 bytes). Zeroized on drop.
+    #[serde(rename = "pq_pend_sk")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_pending_secret: Option<ByteBuf>,
+    /// A ciphertext we derived (as the encapsulating peer) that we keep
+    /// re-attaching to outgoing messages until the peer's next DH-ratchet turn
+    /// proves receipt.
+    #[serde(rename = "pq_pend_ct")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_pending_ciphertext: Option<ByteBuf>,
+    /// Unix timestamp when the pending exchange above was first started — bounds
+    /// how long we keep resending before giving up on an unresponsive peer.
+    #[serde(rename = "pq_pend_ts")]
+    #[serde(default)]
+    pub pq_pending_since: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

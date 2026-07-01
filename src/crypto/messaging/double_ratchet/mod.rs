@@ -97,6 +97,37 @@ pub struct DrHealthSnapshot {
     pub session_id: String,
 }
 
+/// A locally-generated ML-KEM-768 keypair pending completion of a sparse
+/// PQ-ratchet exchange (see `DoubleRatchetSession::perform_pq_ratchet_step`).
+/// The public half rides on outgoing messages until the peer replies with a
+/// ciphertext; the secret half is zeroized on drop or on successful decapsulation.
+#[derive(Debug, Clone)]
+pub(super) struct PqRatchetKeyPair {
+    pub(super) public: Vec<u8>,
+    pub(super) secret: Vec<u8>,
+}
+
+impl Zeroize for PqRatchetKeyPair {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// Wire-level representation of the optional sparse PQ-ratchet field carried on a
+/// post-handshake message. Not yet threaded through `EncryptedRatchetMessage` /
+/// `wire_payload.rs` (see rollout plan) — for now this is the boundary type
+/// between `internals.rs`'s protocol logic and that future wire integration.
+#[allow(dead_code)] // constructed/matched by internals.rs, exercised by unit tests today
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PqRatchetWireField {
+    /// Sender generated a fresh ML-KEM-768 keypair (1184-byte public key) and is
+    /// initiating a new PQ-ratchet exchange.
+    PublicKey(Vec<u8>),
+    /// Sender is completing an exchange the recipient previously initiated
+    /// (1088-byte ML-KEM-768 ciphertext).
+    Ciphertext(Vec<u8>),
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -198,6 +229,25 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// Consumed (set to None) after PQ is applied.
     pre_pq_root_key: Option<P::AeadKey>,
 
+    /// Sparse continuous PQ ratchet (suite_id = `PQ_RATCHET`) — see
+    /// `internals::perform_pq_ratchet_step`. Number of DH-ratchet turns since the
+    /// last ML-KEM-768 mix-in. Only consulted when `suite_id.is_pq_ratchet()`.
+    pq_turns_since_mix: u32,
+
+    /// Our locally-generated ML-KEM-768 keypair, `Some` while we're waiting for the
+    /// peer's ciphertext reply to complete a PQ-ratchet exchange we initiated.
+    pending_pq_ratchet_keypair: Option<PqRatchetKeyPair>,
+
+    /// A ciphertext we derived (as the encapsulating peer) that we keep re-attaching
+    /// to outgoing messages until the peer's next DH-ratchet turn implicitly
+    /// acknowledges receipt (see `perform_pq_ratchet_step`).
+    pending_pq_ciphertext_to_send: Option<Vec<u8>>,
+
+    /// Unix timestamp when `pending_pq_ratchet_keypair`/`pending_pq_ciphertext_to_send`
+    /// was first set — bounds how long we keep resending before giving up on a peer
+    /// that's gone silent (reuses `max_skipped_message_age_seconds` as the cutoff).
+    pq_pending_since: u64,
+
     session_id: String,
     contact_id: String,
     local_user_id: String,
@@ -221,6 +271,10 @@ struct DecryptSnapshot<P: CryptoProvider> {
     previous_sending_length: u32,
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
+    pq_turns_since_mix: u32,
+    pending_pq_ratchet_keypair: Option<PqRatchetKeyPair>,
+    pending_pq_ciphertext_to_send: Option<Vec<u8>>,
+    pq_pending_since: u64,
 }
 
 impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
@@ -237,6 +291,10 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             previous_sending_length: self.previous_sending_length,
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            pq_turns_since_mix: self.pq_turns_since_mix,
+            pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
+            pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
+            pq_pending_since: self.pq_pending_since,
         }
     }
 }
@@ -268,6 +326,9 @@ impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
         }
         if let Some(k) = self.pre_pq_root_key.as_mut() {
             k.zeroize();
+        }
+        if let Some(kp) = self.pending_pq_ratchet_keypair.as_mut() {
+            kp.zeroize();
         }
         for key in self.skipped_message_keys.values_mut() {
             key.zeroize();

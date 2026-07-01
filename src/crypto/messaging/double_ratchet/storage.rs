@@ -45,6 +45,17 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
+            pq_turns_since_mix: self.pq_turns_since_mix,
+            pq_pending_public: self
+                .pending_pq_ratchet_keypair
+                .as_ref()
+                .map(|kp| kp.public.clone()),
+            pq_pending_secret: self
+                .pending_pq_ratchet_keypair
+                .as_ref()
+                .map(|kp| kp.secret.clone()),
+            pq_pending_ciphertext: self.pending_pq_ciphertext_to_send.clone(),
+            pq_pending_since: self.pq_pending_since,
         }
     }
 
@@ -104,6 +115,16 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .as_deref()
                 .map(|bytes| Self::bytes_to_aead_key(bytes))
                 .transpose()?,
+            pq_turns_since_mix: data.pq_turns_since_mix,
+            pending_pq_ratchet_keypair: match (&data.pq_pending_public, &data.pq_pending_secret) {
+                (Some(public), Some(secret)) => Some(PqRatchetKeyPair {
+                    public: public.clone(),
+                    secret: secret.clone(),
+                }),
+                _ => None,
+            },
+            pending_pq_ciphertext_to_send: data.pq_pending_ciphertext.clone(),
+            pq_pending_since: data.pq_pending_since,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
@@ -212,6 +233,18 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
+    /// Sparse continuous PQ ratchet (suite_id = PQ_RATCHET). See `CfeSessionStateV1`
+    /// for field-level docs — this mirrors it 1:1. Absent/zero on pre-feature sessions.
+    #[serde(default)]
+    pq_turns_since_mix: u32,
+    #[serde(default)]
+    pq_pending_public: Option<Vec<u8>>,
+    #[serde(default)]
+    pq_pending_secret: Option<Vec<u8>>,
+    #[serde(default)]
+    pq_pending_ciphertext: Option<Vec<u8>>,
+    #[serde(default)]
+    pq_pending_since: u64,
 }
 
 impl Drop for SerializableSession {
@@ -223,6 +256,9 @@ impl Drop for SerializableSession {
             k.zeroize();
         }
         if let Some(ref mut k) = self.pre_pq_root_key {
+            k.zeroize();
+        }
+        if let Some(ref mut k) = self.pq_pending_secret {
             k.zeroize();
         }
         for entry in &mut self.skipped_keys {
@@ -276,6 +312,11 @@ impl SerializableSession {
                 .collect(),
             pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
             last_ratchet_at: self.last_ratchet_at,
+            pq_turns_since_mix: self.pq_turns_since_mix,
+            pq_pending_public: self.pq_pending_public.clone().map(ByteBuf::from),
+            pq_pending_secret: self.pq_pending_secret.clone().map(ByteBuf::from),
+            pq_pending_ciphertext: self.pq_pending_ciphertext.clone().map(ByteBuf::from),
+            pq_pending_since: self.pq_pending_since,
         })
     }
 
@@ -312,6 +353,11 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
+            pq_turns_since_mix: data.pq_turns_since_mix,
+            pq_pending_public: data.pq_pending_public.map(|b| b.into_vec()),
+            pq_pending_secret: data.pq_pending_secret.map(|b| b.into_vec()),
+            pq_pending_ciphertext: data.pq_pending_ciphertext.map(|b| b.into_vec()),
+            pq_pending_since: data.pq_pending_since,
         })
     }
 }

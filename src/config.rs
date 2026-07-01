@@ -61,6 +61,12 @@ pub struct Config {
     /// По умолчанию: 7 дней
     pub max_skipped_message_age_seconds: i64,
 
+    /// Интервал (в DH-ratchet-поворотах) между подмешиваниями свежего
+    /// ML-KEM-768 материала в sparse continuous PQ ratchet (suite_id=3, `PQ_RATCHET`).
+    /// По умолчанию: 16 поворотов — тот же порядок величины, что и у публично
+    /// описанного Signal SPQR (2025).
+    pub pq_ratchet_interval: u32,
+
     // ============================================
     // ВАЛИДАЦИЯ
     // ============================================
@@ -132,6 +138,7 @@ impl Default for Config {
             max_skipped_messages: 1000,
             max_message_jump: 2000,
             max_skipped_message_age_seconds: 7 * 24 * 60 * 60, // 7 days
+            pq_ratchet_interval: 16,
 
             // Валидация
             username_min_length: 3,
@@ -196,6 +203,26 @@ impl Config {
                     "MAX_SKIPPED_MESSAGE_AGE_SECONDS out of safe range [{}-{}], clamped",
                     MIN_AGE,
                     MAX_AGE
+                );
+            }
+        }
+
+        if let Ok(val) = std::env::var("PQ_RATCHET_INTERVAL")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            // ✅ Keep the cadence in a sane range: too low bloats every reply with
+            // ~2.3KB of ML-KEM-768 material, too high leaves a stale root key exposed
+            // for too many ratchet turns between PQ refreshes.
+            const MIN_INTERVAL: u32 = 4;
+            const MAX_INTERVAL: u32 = 64;
+            config.pq_ratchet_interval = parsed.clamp(MIN_INTERVAL, MAX_INTERVAL);
+            if !(MIN_INTERVAL..=MAX_INTERVAL).contains(&parsed) {
+                tracing::warn!(
+                    parsed,
+                    clamped = config.pq_ratchet_interval,
+                    "PQ_RATCHET_INTERVAL out of safe range [{}-{}], clamped",
+                    MIN_INTERVAL,
+                    MAX_INTERVAL
                 );
             }
         }
@@ -295,6 +322,21 @@ mod tests {
         assert_eq!(config.pbkdf2_iterations, 100_000);
         assert_eq!(config.max_skipped_messages, 1000);
         assert_eq!(config.username_min_length, 3);
+        assert_eq!(config.pq_ratchet_interval, 16);
+    }
+
+    #[test]
+    fn test_pq_ratchet_interval_env_override_clamped() {
+        // SAFETY: single-threaded test process env mutation is fine here; no
+        // other test reads PQ_RATCHET_INTERVAL concurrently.
+        unsafe {
+            std::env::set_var("PQ_RATCHET_INTERVAL", "1000");
+        }
+        let config = Config::from_env();
+        assert_eq!(config.pq_ratchet_interval, 64); // clamped to MAX_INTERVAL
+        unsafe {
+            std::env::remove_var("PQ_RATCHET_INTERVAL");
+        }
     }
 
     #[test]
