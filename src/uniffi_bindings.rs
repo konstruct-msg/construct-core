@@ -369,6 +369,11 @@ impl ClassicCryptoCore {
             })
             .collect();
 
+        let hybrid_sig_priv = client
+            .key_manager()
+            .hybrid_signature_private_bytes()
+            .map(ByteBuf::from);
+
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
             ik_priv: ByteBuf::from(ik_priv),
@@ -380,6 +385,7 @@ impl ClassicCryptoCore {
             vk_pub: ByteBuf::from(vk_pub),
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
+            hybrid_sig_priv,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
@@ -414,13 +420,16 @@ impl ClassicCryptoCore {
             })
             .collect();
 
-        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history(
+        let hybrid_priv: Option<Vec<u8>> = keys.hybrid_sig_priv.map(|b| b.into_vec());
+
+        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
             keys.ik_priv.into_vec(),
             keys.sk_priv.into_vec(),
             keys.spk_priv.into_vec(),
             keys.spk_sig.into_vec(),
             keys.spk_id,
             old_spks_history,
+            hybrid_priv,
         )
         .map_err(|_| CryptoError::InitializationFailed)?;
 
@@ -1011,11 +1020,15 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
     )
     .map_err(|_| CryptoError::SerializationFailed)?;
 
-    let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+    let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
+    let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
         decoded.ik_priv.into_vec(),
         decoded.sk_priv.into_vec(),
         decoded.spk_priv.into_vec(),
         decoded.spk_sig.into_vec(),
+        decoded.spk_id,
+        vec![],
+        hybrid,
     )
     .map_err(|_| CryptoError::InitializationFailed)?;
 
@@ -1037,11 +1050,15 @@ pub fn create_orchestrator_core_from_keys(
     )
     .map_err(|_| CryptoError::SerializationFailed)?;
 
-    let client = ClassicClient::<ClassicSuiteProvider>::from_keys(
+    let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
+    let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
         decoded.ik_priv.into_vec(),
         decoded.sk_priv.into_vec(),
         decoded.spk_priv.into_vec(),
         decoded.spk_sig.into_vec(),
+        decoded.spk_id,
+        vec![],
+        hybrid,
     )
     .map_err(|_| CryptoError::InitializationFailed)?;
 
@@ -2516,6 +2533,27 @@ impl OrchestratorCore {
     pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.sign_bundle_bytes(&bundle_data_json)
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    // ── Hybrid PQ identity signature (owned by core) ──────────────────────────
+    /// Ensure (generate if needed) the hybrid sig key. Returns the 1984 B public key.
+    pub fn ensure_hybrid_signature_key(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.ensure_hybrid_signature_key()
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    /// Current hybrid public (if ensured), 1984 B.
+    pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.hybrid_signature_public_key()
+    }
+
+    /// Sign with the hybrid identity key (must have been ensured). 3373 B sig.
+    pub fn sign_hybrid(&self, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.sign_hybrid(&message)
             .map_err(|_| CryptoError::InitializationFailed)
     }
 

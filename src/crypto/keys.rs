@@ -126,6 +126,12 @@ pub struct KeyManager<P: CryptoProvider> {
     /// Счетчик для OTPK key_id (separate range: starts at 1_000_000 to avoid collisions)
     next_otpk_id: u32,
 
+    #[cfg(feature = "post-quantum")]
+    /// Independent hybrid PQ signature private key (Ed25519+ML-DSA-65, 2016 bytes raw).
+    /// Owned here for centralization: all long-term crypto keys live inside the core.
+    /// Lazily initialized on first ensure_hybrid; not part of the main suite signing_key.
+    hybrid_sig_priv: Option<Vec<u8>>,
+
     _phantom: PhantomData<P>,
 }
 
@@ -140,6 +146,8 @@ impl<P: CryptoProvider> KeyManager<P> {
             one_time_prekeys: HashMap::new(),
             next_prekey_id: 1,
             next_otpk_id: 1_000_000,
+            #[cfg(feature = "post-quantum")]
+            hybrid_sig_priv: None,
             _phantom: PhantomData,
         }
     }
@@ -209,6 +217,29 @@ impl<P: CryptoProvider> KeyManager<P> {
         // Ensure next_prekey_id is ahead of the current key id.
         if spk_id >= self.next_prekey_id {
             self.next_prekey_id = spk_id + 1;
+        }
+        Ok(())
+    }
+
+    /// Extended restore that also imports optional hybrid sig private key.
+    pub fn initialize_from_keys_with_id_and_hybrid(
+        &mut self,
+        identity_secret_bytes: Vec<u8>,
+        signing_secret_bytes: Vec<u8>,
+        prekey_secret_bytes: Vec<u8>,
+        prekey_signature: Vec<u8>,
+        spk_id: u32,
+        hybrid_sig_priv: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.initialize_from_keys_with_id(
+            identity_secret_bytes,
+            signing_secret_bytes,
+            prekey_secret_bytes,
+            prekey_signature,
+            spk_id,
+        )?;
+        if let Some(h) = hybrid_sig_priv {
+            self.set_hybrid_signature_private(h)?;
         }
         Ok(())
     }
@@ -436,6 +467,103 @@ impl<P: CryptoProvider> KeyManager<P> {
         })?;
 
         P::sign(signing_key, data).map_err(ConstructError::Crypto)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Hybrid PQ signature key (Ed25519 + ML-DSA-65) — centralized ownership
+    // The key is independent of the main (classic) signing_key. It is lazily
+    // created on first use and persisted as part of CFE private keys.
+    // All hybrid signing now goes through the core (no external keychain blobs).
+    // Gated behind post-quantum feature (same as the hybrid module).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[cfg(feature = "post-quantum")]
+    /// Ensure a hybrid signature keypair exists. If absent, generate using the
+    /// fixed hybrid suite (same as the free hybridSignatureKeygen primitive) and
+    /// store. Returns the public key (1984 B).
+    pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>> {
+        if self.hybrid_sig_priv.is_none() {
+            // Use the same generation as the stateless hybrid provider.
+            let (priv_key, pub_key) =
+                crate::crypto::suites::hybrid::HybridSuiteProvider::generate_signature_keys()
+                    .map_err(ConstructError::Crypto)?;
+            self.hybrid_sig_priv = Some(priv_key);
+            return Ok(pub_key);
+        }
+        // Derive pub from stored priv (embedded pk or re-derive).
+        let priv_key = self.hybrid_sig_priv.as_ref().unwrap();
+        crate::crypto::suites::hybrid::HybridSuiteProvider::from_signature_private_to_public(priv_key)
+            .map_err(ConstructError::Crypto)
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Return the hybrid public key if one has been ensured/generated, else None.
+    pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
+        self.hybrid_sig_priv.as_ref().and_then(|p| {
+            crate::crypto::suites::hybrid::HybridSuiteProvider::from_signature_private_to_public(p).ok()
+        })
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Sign with the hybrid key (if present). Returns 3373 B hybrid signature.
+    /// The caller must have called ensure first (or this returns error).
+    pub fn sign_hybrid(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let priv_key = self.hybrid_sig_priv.as_ref().ok_or_else(|| {
+            ConstructError::Crypto(crate::error::CryptoError::Other(
+                "Hybrid signature key not initialized (call ensure first)".to_string(),
+            ))
+        })?;
+        crate::crypto::suites::hybrid::HybridSuiteProvider::sign(priv_key, message)
+            .map_err(ConstructError::Crypto)
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Import a previously generated hybrid sig private key (from CFE restore).
+    pub fn set_hybrid_signature_private(&mut self, priv_bytes: Vec<u8>) -> Result<()> {
+        // Validate size early.
+        if priv_bytes.len() != crate::crypto::suites::hybrid::HYBRID_SIG_SECRET_KEY_SIZE {
+            return Err(ConstructError::Crypto(
+                crate::error::CryptoError::InvalidInputError(format!(
+                    "hybrid sig priv size {} != {}",
+                    priv_bytes.len(),
+                    crate::crypto::suites::hybrid::HYBRID_SIG_SECRET_KEY_SIZE
+                )),
+            ));
+        }
+        self.hybrid_sig_priv = Some(priv_bytes);
+        Ok(())
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Export the hybrid sig private (if any) for CFE persistence.
+    pub fn hybrid_signature_private_bytes(&self) -> Option<Vec<u8>> {
+        self.hybrid_sig_priv.clone()
+    }
+
+    // Non-pq stubs (no-op / None) so call sites in export/import don't need per-cfg.
+    #[cfg(not(feature = "post-quantum"))]
+    pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>> {
+        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
+            "hybrid signatures require post-quantum feature".into(),
+        )))
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
+        None
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    pub fn sign_hybrid(&self, _message: &[u8]) -> Result<Vec<u8>> {
+        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
+            "hybrid signatures require post-quantum feature".into(),
+        )))
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    pub fn set_hybrid_signature_private(&mut self, _priv_bytes: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    pub fn hybrid_signature_private_bytes(&self) -> Option<Vec<u8>> {
+        None
     }
 
     /// Количество сохраненных старых prekeys

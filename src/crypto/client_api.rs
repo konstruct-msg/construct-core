@@ -201,23 +201,15 @@ where
         prekey_secret: Vec<u8>,
         prekey_signature: Vec<u8>,
     ) -> Result<Self, String> {
-        let mut key_manager = KeyManager::<P>::new();
-        key_manager
-            .initialize_from_keys(
-                identity_secret,
-                signing_secret,
-                prekey_secret,
-                prekey_signature,
-            )
-            .map_err(|e| format!("Failed to initialize key manager from keys: {:?}", e))?;
-
-        Ok(Self {
-            key_manager,
-            sessions: HashMap::new(),
-            pending_otpk_ids: HashMap::new(),
-            local_user_id: String::new(),
-            _phantom: PhantomData,
-        })
+        Self::from_keys_with_history_and_hybrid(
+            identity_secret,
+            signing_secret,
+            prekey_secret,
+            prekey_signature,
+            1,
+            vec![],
+            None,
+        )
     }
 
     /// Variant of `from_keys` that also restores the persisted SPK key id and old SPKs.
@@ -229,14 +221,36 @@ where
         spk_id: u32,
         old_spks: Vec<(Vec<u8>, Vec<u8>, u32, i64)>, // (priv, sig, id, created_at)
     ) -> Result<Self, String> {
+        Self::from_keys_with_history_and_hybrid(
+            identity_secret,
+            signing_secret,
+            prekey_secret,
+            prekey_signature,
+            spk_id,
+            old_spks,
+            None,
+        )
+    }
+
+    /// Extended restore including optional hybrid signature private key (centralized in core).
+    pub fn from_keys_with_history_and_hybrid(
+        identity_secret: Vec<u8>,
+        signing_secret: Vec<u8>,
+        prekey_secret: Vec<u8>,
+        prekey_signature: Vec<u8>,
+        spk_id: u32,
+        old_spks: Vec<(Vec<u8>, Vec<u8>, u32, i64)>,
+        hybrid_sig_priv: Option<Vec<u8>>,
+    ) -> Result<Self, String> {
         let mut key_manager = KeyManager::<P>::new();
         key_manager
-            .initialize_from_keys_with_id(
+            .initialize_from_keys_with_id_and_hybrid(
                 identity_secret,
                 signing_secret,
                 prekey_secret,
                 prekey_signature,
                 spk_id,
+                hybrid_sig_priv,
             )
             .map_err(|e| format!("Failed to initialize key manager from keys: {:?}", e))?;
 

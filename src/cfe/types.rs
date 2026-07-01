@@ -198,6 +198,13 @@ pub struct CfePrivateKeysV1 {
     /// Old entries are pruned to `prekey_cleanup_period_secs` on export.
     #[serde(rename = "old_spks", default, skip_serializing_if = "Vec::is_empty")]
     pub old_spks: Vec<CfeOldSpkV1>,
+
+    /// Optional independent hybrid PQ signature private key (Ed25519 + ML-DSA-65).
+    /// 2016 bytes when present: [ed25519_seed(32) | mldsa65_seed(32) | mldsa65_pk(1952)].
+    /// Owned by the core (persisted in CFE) for centralized crypto key management.
+    /// Lazily created; absent for legacy pre-hybrid accounts until first ensure.
+    #[serde(rename = "hs_priv", default, skip_serializing_if = "Option::is_none")]
+    pub hybrid_sig_priv: Option<ByteBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

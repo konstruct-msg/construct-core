@@ -571,6 +571,27 @@ impl Orchestrator {
         Ok(<_ as AsRef<[u8]>>::as_ref(secret).to_vec())
     }
 
+    // Hybrid signature key ownership (centralized; all crypto key material lives here)
+    pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .ensure_hybrid_signature_key()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
+        self.lifecycle.client.key_manager().hybrid_signature_public_key()
+    }
+
+    pub fn sign_hybrid(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .sign_hybrid(message)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn set_my_user_id(&mut self, user_id: String) {
         self.lifecycle.set_my_user_id(user_id);
     }
@@ -677,6 +698,8 @@ impl Orchestrator {
             })
             .collect();
 
+        let hybrid_sig_priv = km.hybrid_signature_private_bytes().map(ByteBuf::from);
+
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
             ik_priv: ByteBuf::from(ik_priv),
@@ -688,6 +711,7 @@ impl Orchestrator {
             vk_pub: ByteBuf::from(vk_pub),
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
+            hybrid_sig_priv,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)

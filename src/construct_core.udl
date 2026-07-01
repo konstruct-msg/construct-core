@@ -678,6 +678,15 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     sequence<u8> sign_bundle_data(sequence<u8> bundle_data_json);
 
+    // Hybrid PQ identity signature key (Ed25519+ML-DSA-65). Centralized in core.
+    [Throws=CryptoError]
+    sequence<u8> ensure_hybrid_signature_key();
+
+    sequence<u8>? hybrid_signature_public_key();
+
+    [Throws=CryptoError]
+    sequence<u8> sign_hybrid(sequence<u8> message);
+
     [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);
 
