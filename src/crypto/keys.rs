@@ -492,8 +492,10 @@ impl<P: CryptoProvider> KeyManager<P> {
         }
         // Derive pub from stored priv (embedded pk or re-derive).
         let priv_key = self.hybrid_sig_priv.as_ref().unwrap();
-        crate::crypto::suites::hybrid::HybridSuiteProvider::from_signature_private_to_public(priv_key)
-            .map_err(ConstructError::Crypto)
+        crate::crypto::suites::hybrid::HybridSuiteProvider::from_signature_private_to_public(
+            priv_key,
+        )
+        .map_err(ConstructError::Crypto)
     }
 
     #[cfg(feature = "post-quantum")]

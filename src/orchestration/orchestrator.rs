@@ -581,7 +581,10 @@ impl Orchestrator {
     }
 
     pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
-        self.lifecycle.client.key_manager().hybrid_signature_public_key()
+        self.lifecycle
+            .client
+            .key_manager()
+            .hybrid_signature_public_key()
     }
 
     pub fn sign_hybrid(&self, message: &[u8]) -> Result<Vec<u8>, String> {
