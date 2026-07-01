@@ -58,11 +58,17 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 // ---- SPK freshness constants ----
-/// Maximum age of a Signed Pre-Key bundle before the client rejects it.
-/// 10 days = 7-day rotation period + 3-day grace for clients that miss one rotation.
-/// Tighter than the old 14-day limit: clients that are offline for more than a week
-/// should not block sessions for others.
-const SPK_MAX_AGE_SECS: u64 = 10 * 24 * 3600;
+/// Age beyond which a peer's Signed Pre-Key is treated as STALE.
+///
+/// 30 days ≈ 4 client rotation cycles (clients rotate every 7 days, force at 8). This is no
+/// longer a *hard* reachability gate: when a bundle is stale the initiator falls back to a
+/// degraded (at-risk) `init_session_allowing_stale` and the session is auto-upgraded once the
+/// peer rotates again (see the `stale-peer-reachability` decision). The limit therefore only
+/// draws the clean-vs-degraded boundary — raised from the old 10 days so a normal absence (a
+/// 1–3 week trip) still yields a clean session, and only genuinely long-dormant peers (a month+)
+/// are reached via the degraded path. Authenticity is unaffected (identity key permanent, SPK
+/// signature still verified); only first-message forward secrecy is marginally older.
+const SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
 
 /// Validate that a received `X3DHPublicKeyBundle` is not stale.
 ///

@@ -1443,7 +1443,7 @@ mod tests {
         let bob = make_orchestrator("bob_user");
 
         let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        bob_bundle.spk_uploaded_at = unix_secs_days_ago(11); // > 10d limit
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(31); // > 30d limit
 
         let err = alice
             .init_session("bob_user".to_string(), bob_bundle)
@@ -1462,7 +1462,7 @@ mod tests {
         let bob = make_orchestrator("bob_user");
 
         let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        bob_bundle.spk_uploaded_at = unix_secs_days_ago(40); // well past the limit
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(60); // well past the 30d limit
 
         let session_id = alice
             .init_session_allowing_stale("bob_user".to_string(), bob_bundle)
@@ -1479,7 +1479,7 @@ mod tests {
         let bob = make_orchestrator("bob_user");
 
         let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        bob_bundle.spk_uploaded_at = unix_secs_days_ago(11);
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(31);
         bob_bundle.suite_id = 2; // PQ_HYBRID
         bob_bundle.kyber_spk_rotation_epoch = 0; // never uploaded a Kyber SPK
 
@@ -1503,7 +1503,7 @@ mod tests {
 
         let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
         let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        bob_bundle.spk_uploaded_at = unix_secs_days_ago(30); // stale → only degraded init works
+        bob_bundle.spk_uploaded_at = unix_secs_days_ago(35); // stale → only degraded init works
 
         let session = alice
             .init_session_allowing_stale("bob_user_id".to_string(), bob_bundle)
@@ -2389,11 +2389,11 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
 /// Check SPK freshness from raw bundle JSON bytes.
 ///
 /// Returns `Err(CryptoError::PeerSpkStale { age_secs })` if the SPK or Kyber SPK is stale
-/// (older than 10 days). Returns `Ok(())` if fresh, absent (legacy server), or unparseable.
-/// Mirrors the logic in `crypto::client_api::validate_bundle_freshness` but runs at the
-/// UniFFI boundary so the error can be surfaced as a typed variant rather than a string.
+/// (older than `SPK_MAX_AGE_SECS`, 30 days). Returns `Ok(())` if fresh, absent (legacy server),
+/// or unparseable. Must stay in lockstep with `crypto::client_api::SPK_MAX_AGE_SECS` (the inner
+/// X3DH gate) — both relaxed from 10→30 days in Phase 4 of the stale-peer-reachability work.
 fn check_bundle_freshness(bundle: &BinaryKeyBundle) -> Result<(), CryptoError> {
-    const SPK_MAX_AGE_SECS: u64 = 10 * 24 * 3600;
+    const SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
