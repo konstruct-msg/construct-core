@@ -1011,6 +1011,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Alice initiates session with Bob
@@ -1085,6 +1086,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         alice
@@ -1238,6 +1240,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         alice
@@ -1299,6 +1302,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         alice
@@ -1361,6 +1365,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         alice

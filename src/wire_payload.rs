@@ -190,8 +190,12 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
             let pdata = data[pdata_start..pdata_start + pql].to_vec();
             cursor = pdata_start + pql;
             match typ {
-                1 => Some(crate::crypto::messaging::double_ratchet::PqRatchetWireField::PublicKey(pdata)),
-                2 => Some(crate::crypto::messaging::double_ratchet::PqRatchetWireField::Ciphertext(pdata)),
+                1 => Some(
+                    crate::crypto::messaging::double_ratchet::PqRatchetWireField::PublicKey(pdata),
+                ),
+                2 => Some(
+                    crate::crypto::messaging::double_ratchet::PqRatchetWireField::Ciphertext(pdata),
+                ),
                 _ => None,
             }
         } else {

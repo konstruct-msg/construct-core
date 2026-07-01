@@ -59,6 +59,7 @@
 //! Сообщения могут быть получены в произвольном порядке и всё равно расшифруются.
 //! Достигается через skipped message keys.
 
+use crate::crypto::SuiteID;
 use crate::crypto::handshake::InitiatorState;
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
         remote_identity: &P::KemPublicKey,
         contact_id: String,
         local_user_id: String,
+        suite_id: SuiteID,
     ) -> Result<Self, String>;
 
     /// Создать сессию как получатель (Bob)

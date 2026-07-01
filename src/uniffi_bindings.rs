@@ -2403,6 +2403,7 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
         spk_rotation_epoch: b.spk_rotation_epoch,
         kyber_spk_uploaded_at: b.kyber_spk_uploaded_at,
         kyber_spk_rotation_epoch: b.kyber_spk_rotation_epoch,
+        supports_pq_ratchet: false,
     })
 }
 
@@ -2586,7 +2587,10 @@ impl OrchestratorCore {
     }
 
     /// Import legacy hybrid private key into core ownership (for migration from separate keychain storage).
-    pub fn import_hybrid_signature_private_key(&self, priv_bytes: Vec<u8>) -> Result<(), CryptoError> {
+    pub fn import_hybrid_signature_private_key(
+        &self,
+        priv_bytes: Vec<u8>,
+    ) -> Result<(), CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_hybrid_signature_private_key(priv_bytes)
             .map_err(|_| CryptoError::InitializationFailed)

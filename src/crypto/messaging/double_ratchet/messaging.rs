@@ -28,6 +28,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         remote_identity: &P::KemPublicKey,
         contact_id: String,
         local_user_id: String,
+        suite_id: SuiteID,
     ) -> Result<Self, String> {
         use tracing::debug;
 
@@ -76,7 +77,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .map_err(|e| format!("KDF_RK failed: {}", e))?;
 
         Ok(Self {
-            suite_id: SuiteID::CLASSIC,
+            suite_id,
             root_key,
             sending_chain_key: chain_key,
             sending_chain_length: 0,
@@ -93,6 +94,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_ratchet_keypair: None,
             pending_pq_ciphertext_to_send: None,
             pq_pending_since: 0,
+            ratchet_turn_count: 0,
+            pending_pq_epoch: 0,
             session_id: shared_session_id,
             contact_id,
             local_user_id,
@@ -206,6 +209,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_ratchet_keypair: None,
             pending_pq_ciphertext_to_send: None,
             pq_pending_since: 0,
+            ratchet_turn_count: 0,
+            pending_pq_epoch: 0,
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
@@ -438,29 +443,32 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
             pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
             pq_pending_since: self.pq_pending_since,
+            ratchet_turn_count: self.ratchet_turn_count,
+            pending_pq_epoch: self.pending_pq_epoch,
         });
 
         let mut pq_mix_secret: Option<Vec<u8>> = None;
-        if self.suite_id.is_pq_ratchet() {
-            if let Some(ref field) = encrypted.pq_ratchet_field {
-                match self.ingest_incoming_pq_field(field) {
-                    Ok(ss) => {
-                        if needs_ratchet {
-                            pq_mix_secret = Some(ss);
-                        } else if matches!(field, super::PqRatchetWireField::Ciphertext(_)) {
-                            // Late ciphertext on non-ratchet continuation: mix into current root
-                            // (no intervening ratchet, so current root is still the sync point).
-                            let cur = self.root_key.as_ref().to_vec();
-                            if let Ok(mixed) = P::hkdf_derive_key(&cur, &ss, b"construct-pqratchet-v1", 32) {
-                                if let Ok(k) = Self::bytes_to_aead_key(&mixed) {
-                                    self.root_key = k;
-                                }
-                            }
+        if self.suite_id.is_pq_ratchet()
+            && let Some(ref field) = encrypted.pq_ratchet_field
+        {
+            match self.ingest_incoming_pq_field(field) {
+                Ok(ss) => {
+                    if needs_ratchet {
+                        pq_mix_secret = Some(ss);
+                    } else if matches!(field, super::PqRatchetWireField::Ciphertext(_)) {
+                        // Late ciphertext on non-ratchet continuation: mix into current root
+                        // (no intervening ratchet, so current root is still the sync point).
+                        let cur = self.root_key.as_ref().to_vec();
+                        if let Ok(mixed) =
+                            P::hkdf_derive_key(&cur, &ss, b"construct-pqratchet-v1", 32)
+                            && let Ok(k) = Self::bytes_to_aead_key(&mixed)
+                        {
+                            self.root_key = k;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(target: "crypto::double_ratchet", "ignoring bad PQ ratchet field (classical proceeds): {}", e);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "crypto::double_ratchet", "ignoring bad PQ ratchet field (classical proceeds): {}", e);
                 }
             }
         }

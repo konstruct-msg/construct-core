@@ -52,6 +52,7 @@
 //! - Хранение ключей (это делает KeyManager)
 //! - Сетевой транспорт (это делает transport layer)
 
+use crate::crypto::SuiteID;
 use crate::crypto::handshake::KeyAgreement;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
@@ -167,6 +168,7 @@ where
             remote_identity,
             contact_id.clone(),
             local_user_id,
+            SuiteID::CLASSIC, // TODO: negotiate PQ_RATCHET when bundle supports it
         )
         .map_err(|e| {
             error!(
@@ -432,6 +434,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Alice initializes session
@@ -483,6 +486,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Alice initializes session as initiator
@@ -579,6 +583,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         let mut session = TestSession::init_as_initiator(

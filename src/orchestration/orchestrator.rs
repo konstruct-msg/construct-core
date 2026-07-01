@@ -627,7 +627,10 @@ impl Orchestrator {
 
     /// Import an existing hybrid signature private key (for migration from legacy separate keychain storage).
     /// After this, the hybrid key is owned by the core and will be persisted in CFE private keys.
-    pub fn import_hybrid_signature_private_key(&mut self, priv_bytes: Vec<u8>) -> Result<(), String> {
+    pub fn import_hybrid_signature_private_key(
+        &mut self,
+        priv_bytes: Vec<u8>,
+    ) -> Result<(), String> {
         self.lifecycle
             .client
             .key_manager_mut()

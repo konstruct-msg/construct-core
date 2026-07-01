@@ -40,6 +40,7 @@ fn make_bob_bundle() -> (
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
     (bundle, bob_priv, bob_spk_priv, bob_pub)
 }
@@ -78,6 +79,7 @@ fn test_alice_bob_full_exchange() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     // Alice performs X3DH as initiator
@@ -95,6 +97,7 @@ fn test_alice_bob_full_exchange() {
         &bob_identity_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -173,6 +176,7 @@ fn test_out_of_order_messages() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     let (root_key, initiator_state) = X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
@@ -187,6 +191,7 @@ fn test_out_of_order_messages() {
         &bob_identity_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -267,6 +272,7 @@ fn test_pqxdh_symmetric_contribution() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     // Alice: INITIATOR
@@ -283,6 +289,7 @@ fn test_pqxdh_symmetric_contribution() {
         &bob_identity_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -365,6 +372,7 @@ fn test_decrypt_rollback_on_failure() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     let (rk_alice, init_state) =
@@ -377,6 +385,7 @@ fn test_decrypt_rollback_on_failure() {
         &bob_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -446,6 +455,7 @@ fn test_max_message_jump_dos_guard() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     let (rk, init_state) =
@@ -456,6 +466,7 @@ fn test_max_message_jump_dos_guard() {
         &bob_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -526,6 +537,7 @@ fn test_cleanup_on_deserialize() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     let (rk, init_state) =
@@ -536,6 +548,7 @@ fn test_cleanup_on_deserialize() {
         &bob_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -616,6 +629,7 @@ fn test_ad_symmetric_with_realistic_uuid_ids() {
         &bob_pub,
         bob_uuid.to_string(),   // contact_id
         alice_uuid.to_string(), // local_user_id
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -685,6 +699,7 @@ fn test_ad_mismatch_inconsistent_ids_fails() {
         &bob_pub,
         bob_id.to_string(),
         alice_local_id.to_string(), // local_user_id: Alice's self-view
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -755,6 +770,7 @@ fn test_ad_mismatch_device_hash_vs_uuid_fails() {
             &bob_pub,
             bob_uuid.to_string(),          // contact_id (UUID — OK)
             alice_device_hash.to_string(), // local_user_id (device hash — WRONG)
+            SuiteID::CLASSIC,
         )
         .unwrap()
     };
@@ -817,6 +833,7 @@ fn test_ad_symmetric_any_consistent_format_works() {
         &bob_pub,
         bob_id.to_string(),
         alice_id.to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -862,6 +879,7 @@ fn test_ad_same_id_both_sides_accidentally_works() {
         &bob_pub,
         shared_id.to_string(), // contact_id
         shared_id.to_string(), // local_user_id (same — not production-valid but tests AD symmetry)
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -908,6 +926,7 @@ fn test_ad_mismatch_empty_local_user_id_fails() {
         &bob_pub,
         bob_uuid.to_string(),
         "".to_string(), // empty — cryptoLocalUserId returned "" (nil cachedUserId)
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -959,6 +978,7 @@ fn test_ad_mismatch_wrong_contact_id_same_format_fails() {
         &bob_pub,
         bob_uuid.to_string(),
         alice_uuid.to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 
@@ -1019,6 +1039,7 @@ fn make_session_pair(
         &bob_pub,
         bob_uuid.to_string(),   // contact_id
         alice_uuid.to_string(), // local_user_id
+        SuiteID::CLASSIC,
     )
     .unwrap();
     let msg0 = alice.encrypt(b"session-init-ping").unwrap();
@@ -1070,6 +1091,7 @@ fn test_concurrent_init_loser_switches_to_responder() {
         &bob_pub,
         bob_uuid.to_string(),
         alice_uuid.to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
     let msg0_from_alice = alice.encrypt(b"concurrent-init-ping").unwrap();

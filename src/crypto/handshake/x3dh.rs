@@ -115,6 +115,12 @@ pub struct X3DHPublicKeyBundle {
     /// 0 = not provided.
     #[serde(default)]
     pub kyber_spk_rotation_epoch: u32,
+
+    /// Whether the owner of this bundle supports SuiteID::PQ_RATCHET (=3) for
+    /// sparse continuous post-quantum ratchet on established sessions.
+    /// Additive capability field (spec: PQ_RATCHET_AND_OTPK_ELIMINATION_SPEC).
+    #[serde(default)]
+    pub supports_pq_ratchet: bool,
 }
 
 /// Регистрационные данные для отправки на сервер
@@ -613,6 +619,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Alice выполняет X3DH как initiator
@@ -668,6 +675,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Alice должна отклонить невалидную подпись
@@ -767,6 +775,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Проверка: perform_as_initiator должен принять старую подпись (обратная совместимость)
@@ -813,6 +822,7 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         };
 
         // Проверка: perform_as_initiator должен принять новую подпись

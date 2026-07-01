@@ -91,6 +91,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.pending_pq_ratchet_keypair = s.pending_pq_ratchet_keypair;
             self.pending_pq_ciphertext_to_send = s.pending_pq_ciphertext_to_send;
             self.pq_pending_since = s.pq_pending_since;
+            self.ratchet_turn_count = s.ratchet_turn_count;
+            self.pending_pq_epoch = s.pending_pq_epoch;
         }
     }
 
@@ -136,8 +138,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         } else {
             dh_receive.to_vec()
         };
-        let (new_root_key, new_receiving_chain) =
-            P::kdf_rk(&self.root_key, &dh_receive_input).map_err(|e| format!("KDF_RK failed: {}", e))?;
+        let (new_root_key, new_receiving_chain) = P::kdf_rk(&self.root_key, &dh_receive_input)
+            .map_err(|e| format!("KDF_RK failed: {}", e))?;
         self.root_key = new_root_key;
         self.receiving_chain_key = new_receiving_chain;
         self.receiving_chain_length = 0;
@@ -164,6 +166,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.dh_ratchet_public = new_dh_public;
         self.remote_dh_public = Some(new_remote_dh.clone());
         self.last_ratchet_at = unix_now();
+        self.ratchet_turn_count = self.ratchet_turn_count.saturating_add(1);
 
         // The peer just moved to a new DH epoch, which proves they processed at
         // least one of our prior replies — that's our implicit ack for any
@@ -245,6 +248,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             public: keypair.public_key,
             secret: keypair.secret_key,
         });
+        self.pending_pq_epoch = self.ratchet_turn_count;
         self.pq_pending_since = unix_now();
         self.pq_turns_since_mix = 0;
         Ok(())
@@ -295,11 +299,18 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         "Received PQ ratchet ciphertext with no pending keypair".to_string()
                     );
                 };
+                // Strict stale rejection: if the pending pub was from an earlier epoch
+                // than current (intervening classical ratchets), reject to avoid root desync.
+                if self.pending_pq_epoch != 0 && self.pending_pq_epoch > self.ratchet_turn_count {
+                    keypair.zeroize();
+                    return Err("stale PQ ratchet ciphertext (epoch/turn mismatch)".to_string());
+                }
                 let shared_secret =
                     crate::crypto::pq_x3dh::mlkem768_decapsulate(&keypair.secret, ciphertext)
                         .map_err(|e| format!("PQ ratchet decapsulate failed: {e}"))?;
                 keypair.zeroize();
                 self.pq_pending_since = 0;
+                self.pending_pq_epoch = 0;
                 Ok(shared_secret)
             }
         }

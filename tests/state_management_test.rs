@@ -50,6 +50,7 @@ fn setup_sessions() -> (
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     // Alice performs X3DH as initiator
@@ -62,6 +63,7 @@ fn setup_sessions() -> (
         &bob_identity_pub,
         "bob".to_string(),
         "alice".to_string(),
+        SuiteID::CLASSIC,
     )
     .unwrap();
 

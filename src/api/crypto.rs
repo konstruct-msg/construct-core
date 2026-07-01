@@ -14,6 +14,8 @@ pub struct KeyBundle {
     pub signature: Vec<u8>,
     pub verifying_key: Vec<u8>,
     pub suite_id: u16, // Added
+    #[serde(default)]
+    pub supports_pq_ratchet: bool,
 }
 
 impl From<X3DHPublicKeyBundle> for KeyBundle {
@@ -24,6 +26,7 @@ impl From<X3DHPublicKeyBundle> for KeyBundle {
             signature: bundle.signature,
             verifying_key: bundle.verifying_key,
             suite_id: bundle.suite_id.as_u16(),
+            supports_pq_ratchet: bundle.supports_pq_ratchet,
         }
     }
 }
@@ -54,6 +57,7 @@ impl From<KeyBundle> for X3DHPublicKeyBundle {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
         }
     }
 }
@@ -151,6 +155,7 @@ where
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: remote_bundle.supports_pq_ratchet,
         };
 
         // Extract remote identity from bundle
@@ -280,6 +285,7 @@ where
         signature: bundle.signature,
         verifying_key: bundle.verifying_key,
         suite_id: bundle.suite_id.as_u16(),
+        supports_pq_ratchet: bundle.supports_pq_ratchet,
     })
 }
 

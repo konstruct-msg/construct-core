@@ -115,6 +115,7 @@ where
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
+        supports_pq_ratchet: false,
     };
 
     let remote_identity = P::kem_public_key_from_bytes(bundle_data.identity_public.clone());

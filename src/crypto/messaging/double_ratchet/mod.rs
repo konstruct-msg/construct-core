@@ -248,6 +248,13 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// that's gone silent (reuses `max_skipped_message_age_seconds` as the cutoff).
     pq_pending_since: u64,
 
+    /// Monotonic count of DH-ratchet turns performed (incremented in perform_dh_ratchet).
+    /// Used to tag PQ exchanges for stale detection.
+    ratchet_turn_count: u32,
+    /// The ratchet_turn_count value recorded when the current pending pubkey was created.
+    /// Ct for a different (older) epoch is rejected as stale.
+    pending_pq_epoch: u32,
+
     session_id: String,
     contact_id: String,
     local_user_id: String,
@@ -275,6 +282,8 @@ struct DecryptSnapshot<P: CryptoProvider> {
     pending_pq_ratchet_keypair: Option<PqRatchetKeyPair>,
     pending_pq_ciphertext_to_send: Option<Vec<u8>>,
     pq_pending_since: u64,
+    ratchet_turn_count: u32,
+    pending_pq_epoch: u32,
 }
 
 impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
@@ -295,6 +304,8 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
             pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
             pq_pending_since: self.pq_pending_since,
+            ratchet_turn_count: self.ratchet_turn_count,
+            pending_pq_epoch: self.pending_pq_epoch,
         }
     }
 }

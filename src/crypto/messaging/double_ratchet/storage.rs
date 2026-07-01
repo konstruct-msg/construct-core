@@ -125,6 +125,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             },
             pending_pq_ciphertext_to_send: data.pq_pending_ciphertext.clone(),
             pq_pending_since: data.pq_pending_since,
+            ratchet_turn_count: data.pq_turns_since_mix, // best-effort default; epoch not critical on restore for old blobs
+            pending_pq_epoch: 0,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
