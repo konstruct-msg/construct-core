@@ -43,6 +43,7 @@ impl From<EncryptedMessage> for EncryptedRatchetMessage {
             message_number: msg.message_number,
             previous_chain_length: msg.previous_chain_length,
             suite_id: msg.suite_id,
+            pq_ratchet_field: None,
         }
     }
 }

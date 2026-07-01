@@ -1451,6 +1451,7 @@ fn test_ad_v2_fallback_decrypts_legacy_messages() {
         nonce,
         previous_chain_length: 0,
         suite_id: SuiteID::CLASSIC.as_u16(),
+        pq_ratchet_field: None,
     };
 
     // Current AD version (v3) must NOT decrypt a v2-encrypted message.

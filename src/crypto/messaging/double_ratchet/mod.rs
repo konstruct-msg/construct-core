@@ -118,8 +118,8 @@ impl Zeroize for PqRatchetKeyPair {
 /// `wire_payload.rs` (see rollout plan) — for now this is the boundary type
 /// between `internals.rs`'s protocol logic and that future wire integration.
 #[allow(dead_code)] // constructed/matched by internals.rs, exercised by unit tests today
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PqRatchetWireField {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PqRatchetWireField {
     /// Sender generated a fresh ML-KEM-768 keypair (1184-byte public key) and is
     /// initiating a new PQ-ratchet exchange.
     PublicKey(Vec<u8>),
@@ -314,6 +314,9 @@ pub struct EncryptedRatchetMessage {
     pub nonce: Vec<u8>,
     pub previous_chain_length: u32,
     pub suite_id: u16,
+    /// PQ ratchet field for SuiteID::PQ_RATCHET=3 (sparse continuous). None for other suites.
+    /// Present only on messages carrying a PQ exchange (pub or ct). Resent until acked by ratchet advance.
+    pub pq_ratchet_field: Option<PqRatchetWireField>,
 }
 
 impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {

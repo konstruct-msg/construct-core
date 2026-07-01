@@ -110,6 +110,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     pub(super) fn perform_dh_ratchet(
         &mut self,
         new_remote_dh: &P::KemPublicKey,
+        pq_mix_secret: Option<&[u8]>,
     ) -> Result<(), String> {
         use tracing::debug;
 
@@ -128,8 +129,15 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         let dh_receive = P::kem_decapsulate(dh_private, new_remote_dh.as_ref())
             .map_err(|e| format!("DH failed: {}", e))?;
 
+        let dh_receive_input: Vec<u8> = if let Some(pq) = pq_mix_secret {
+            let mut v = dh_receive.to_vec();
+            v.extend_from_slice(pq);
+            v
+        } else {
+            dh_receive.to_vec()
+        };
         let (new_root_key, new_receiving_chain) =
-            P::kdf_rk(&self.root_key, &dh_receive).map_err(|e| format!("KDF_RK failed: {}", e))?;
+            P::kdf_rk(&self.root_key, &dh_receive_input).map_err(|e| format!("KDF_RK failed: {}", e))?;
         self.root_key = new_root_key;
         self.receiving_chain_key = new_receiving_chain;
         self.receiving_chain_length = 0;

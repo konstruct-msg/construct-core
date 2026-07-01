@@ -309,6 +309,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: 0,
             suite_id: public_bundle.suite_id.as_u16(),
+            pq_ratchet_field: None,
         };
 
         // Verify the initiator's signed prekey signature before doing any crypto.
@@ -398,6 +399,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: decoded.previous_chain_length,
             suite_id: key_bundle.suite_id,
+            pq_ratchet_field: None,
         };
 
         // Verify the initiator's SPK signature — same check as init_receiving_session_with_msg.
@@ -964,6 +966,7 @@ impl Orchestrator {
             encrypted.suite_id,
             None,
             &sealed_box,
+            encrypted.pq_ratchet_field.clone(),
         )
         .map_err(|e| e.to_string())
     }
@@ -998,6 +1001,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: decoded.previous_chain_length,
             suite_id: decoded.suite_id,
+            pq_ratchet_field: decoded.pq_ratchet_field,
         };
 
         self.lifecycle
@@ -1034,6 +1038,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: 0,
             suite_id: crate::config::Config::global().classic_suite_id,
+            pq_ratchet_field: None,
         };
 
         self.lifecycle
@@ -1166,6 +1171,7 @@ impl Orchestrator {
             encrypted.suite_id,
             kem_ct_ref,
             &sealed_box,
+            encrypted.pq_ratchet_field.clone(),
         ) {
             Ok(p) => p,
             Err(e) => {

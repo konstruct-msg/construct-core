@@ -339,6 +339,11 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             "Encryption successful"
         );
 
+        let pq_ratchet_field = if self.suite_id.is_pq_ratchet() {
+            self.take_outgoing_pq_field()
+        } else {
+            None
+        };
         Ok(EncryptedRatchetMessage {
             dh_public_key,
             message_number,
@@ -346,6 +351,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             nonce,
             previous_chain_length: self.previous_sending_length,
             suite_id: self.suite_id.as_u16(),
+            pq_ratchet_field,
         })
     }
 
@@ -434,6 +440,31 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pq_pending_since: self.pq_pending_since,
         });
 
+        let mut pq_mix_secret: Option<Vec<u8>> = None;
+        if self.suite_id.is_pq_ratchet() {
+            if let Some(ref field) = encrypted.pq_ratchet_field {
+                match self.ingest_incoming_pq_field(field) {
+                    Ok(ss) => {
+                        if needs_ratchet {
+                            pq_mix_secret = Some(ss);
+                        } else if matches!(field, super::PqRatchetWireField::Ciphertext(_)) {
+                            // Late ciphertext on non-ratchet continuation: mix into current root
+                            // (no intervening ratchet, so current root is still the sync point).
+                            let cur = self.root_key.as_ref().to_vec();
+                            if let Ok(mixed) = P::hkdf_derive_key(&cur, &ss, b"construct-pqratchet-v1", 32) {
+                                if let Ok(k) = Self::bytes_to_aead_key(&mixed) {
+                                    self.root_key = k;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "crypto::double_ratchet", "ignoring bad PQ ratchet field (classical proceeds): {}", e);
+                    }
+                }
+            }
+        }
+
         if needs_ratchet {
             // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
             // current receiving chain so out-of-order messages from the old DH epoch
@@ -473,7 +504,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public)
+            self.perform_dh_ratchet(&remote_dh_public, pq_mix_secret.as_deref())
                 .inspect_err(|_e| {
                     self.restore_snapshot(snapshot.clone());
                 })?;

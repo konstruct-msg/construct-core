@@ -84,6 +84,7 @@ impl TryFrom<WireMessage> for EncryptedRatchetMessage {
             nonce: w.nonce,
             previous_chain_length: w.previous_chain_length,
             suite_id: w.suite_id,
+            pq_ratchet_field: None,
         })
     }
 }
@@ -256,6 +257,7 @@ impl SessionLifecycleManager {
             nonce,
             previous_chain_length: decoded.previous_chain_length,
             suite_id: decoded.suite_id,
+            pq_ratchet_field: decoded.pq_ratchet_field,
         };
 
         if !self.client.has_session(contact_id) {
@@ -744,6 +746,7 @@ mod tests {
             nonce: vec![4, 5, 6],
             previous_chain_length: 0,
             suite_id: 1,
+            pq_ratchet_field: None,
         };
         let wire: WireMessage = original.clone().into();
         let json = serde_json::to_string(&wire).unwrap();

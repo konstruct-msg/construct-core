@@ -51,6 +51,9 @@ pub struct DecodedWirePayload {
     pub kem_ciphertext: Option<Vec<u8>>,
     /// `nonce || ciphertext || auth_tag` — the ChaCha20-Poly1305 sealed box.
     pub sealed_box: Vec<u8>,
+    /// Sparse PQ ratchet field (pubkey or ciphertext) for Suite 3 sessions.
+    /// Only parsed/produced when suite_id == 3; additive after kem block.
+    pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
 /// Pack encrypted message components into a single binary blob.
@@ -73,6 +76,7 @@ pub fn pack(
     suite_id: u16,
     kem_ciphertext: Option<&[u8]>,
     sealed_box: &[u8],
+    pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 ) -> Result<Vec<u8>, WirePayloadError> {
     if dh_public_key.len() != DH_KEY_SIZE {
         return Err(WirePayloadError::InvalidDhPublicKey(dh_public_key.len()));
@@ -82,7 +86,27 @@ pub fn pack(
         return Err(WirePayloadError::KemTooLarge(kem_len));
     }
 
-    let mut payload = Vec::with_capacity(HEADER_SIZE + kem_len + sealed_box.len());
+    // Serialize optional PQ ratchet field (only meaningful for suite 3).
+    let pq_bytes: Vec<u8> = if let Some(f) = pq_ratchet_field {
+        match f {
+            crate::crypto::messaging::double_ratchet::PqRatchetWireField::PublicKey(p) => {
+                let mut b = vec![1u8]; // type 1 = pub
+                b.extend_from_slice(&(p.len() as u16).to_le_bytes());
+                b.extend_from_slice(&p);
+                b
+            }
+            crate::crypto::messaging::double_ratchet::PqRatchetWireField::Ciphertext(c) => {
+                let mut b = vec![2u8]; // type 2 = ct
+                b.extend_from_slice(&(c.len() as u16).to_le_bytes());
+                b.extend_from_slice(&c);
+                b
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    let mut payload = Vec::with_capacity(HEADER_SIZE + kem_len + pq_bytes.len() + sealed_box.len());
 
     payload.extend_from_slice(&message_number.to_le_bytes());
     payload.extend_from_slice(dh_public_key);
@@ -94,6 +118,7 @@ pub fn pack(
     if let Some(kem) = kem_ciphertext {
         payload.extend_from_slice(kem);
     }
+    payload.extend_from_slice(&pq_bytes);
     payload.extend_from_slice(sealed_box);
 
     Ok(payload)
@@ -155,7 +180,31 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
         None
     };
 
-    let sealed_box = data[sealed_box_start..].to_vec();
+    // PQ ratchet extension (suite 3 only): type(1B) + len(2B) + data , after kem block.
+    let mut cursor = sealed_box_start;
+    let pq_ratchet_field = if suite_id == 3 && data.len() > cursor + 3 {
+        let typ = data[cursor];
+        let pql = u16::from_le_bytes([data[cursor + 1], data[cursor + 2]]) as usize;
+        let pdata_start = cursor + 3;
+        if data.len() >= pdata_start + pql {
+            let pdata = data[pdata_start..pdata_start + pql].to_vec();
+            cursor = pdata_start + pql;
+            match typ {
+                1 => Some(crate::crypto::messaging::double_ratchet::PqRatchetWireField::PublicKey(pdata)),
+                2 => Some(crate::crypto::messaging::double_ratchet::PqRatchetWireField::Ciphertext(pdata)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if data.len() < cursor {
+        return Err(WirePayloadError::TooShort(data.len()));
+    }
+    let sealed_box = data[cursor..].to_vec();
 
     Ok(DecodedWirePayload {
         message_number,
@@ -166,6 +215,7 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
         suite_id,
         kem_ciphertext,
         sealed_box,
+        pq_ratchet_field,
     })
 }
 
@@ -192,7 +242,7 @@ mod tests {
     fn round_trip_no_pqc() {
         let dh_key = vec![0xAA; 32];
         let sealed = make_sealed_box(0xBB);
-        let packed = pack(&dh_key, 7, 42, 0, 3, 1, None, &sealed).unwrap();
+        let packed = pack(&dh_key, 7, 42, 0, 3, 1, None, &sealed, None).unwrap();
         assert_eq!(packed.len(), HEADER_SIZE + sealed.len());
 
         let decoded = unpack(&packed).unwrap();
@@ -211,7 +261,7 @@ mod tests {
         let dh_key = vec![0x11; 32];
         let kem_ct = vec![0x22; 1088]; // ML-KEM-768 ciphertext size
         let sealed = make_sealed_box(0x33);
-        let packed = pack(&dh_key, 0, 99, 5, 0, 1, Some(&kem_ct), &sealed).unwrap();
+        let packed = pack(&dh_key, 0, 99, 5, 0, 1, Some(&kem_ct), &sealed, None).unwrap();
         assert_eq!(packed.len(), HEADER_SIZE + kem_ct.len() + sealed.len());
 
         let decoded = unpack(&packed).unwrap();
@@ -231,7 +281,7 @@ mod tests {
 
     #[test]
     fn invalid_dh_key_size() {
-        let err = pack(&[0u8; 16], 0, 0, 0, 0, 1, None, &make_sealed_box(0)).unwrap_err();
+        let err = pack(&[0u8; 16], 0, 0, 0, 0, 1, None, &make_sealed_box(0), None).unwrap_err();
         assert!(matches!(err, WirePayloadError::InvalidDhPublicKey(16)));
     }
 
@@ -241,7 +291,7 @@ mod tests {
     fn known_byte_vector() {
         let dh_key = vec![0x01; 32];
         let sealed = vec![0xAA; 60];
-        let packed = pack(&dh_key, 1, 2, 0, 5, 1, None, &sealed).unwrap();
+        let packed = pack(&dh_key, 1, 2, 0, 5, 1, None, &sealed, None).unwrap();
 
         // message_number = 1 LE → [01 00 00 00]
         assert_eq!(&packed[0..4], &[0x01, 0x00, 0x00, 0x00]);

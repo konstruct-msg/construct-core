@@ -625,6 +625,7 @@ impl ClassicCryptoCore {
             nonce,
             previous_chain_length: 0,
             suite_id: recipient_bundle.suite_id,
+            pq_ratchet_field: None,
         };
 
         let remote_identity = ClassicSuiteProvider::kem_public_key_from_bytes(
@@ -804,6 +805,7 @@ impl ClassicCryptoCore {
             nonce,
             previous_chain_length: 0, // Not used by decryption
             suite_id: crate::config::Config::global().classic_suite_id,
+            pq_ratchet_field: None,
         };
 
         // Note: session_id from Swift is actually contact_id in our new API
@@ -1865,6 +1867,7 @@ mod tests {
             nonce: nonce_parsed,
             previous_chain_length: 0,
             suite_id: alice_bundle.suite_id.as_u16(), // Use Alice's bundle suite_id
+            pq_ratchet_field: None,
         };
 
         eprintln!("[UNIFFI FLOW TEST] Reconstructed message:");
