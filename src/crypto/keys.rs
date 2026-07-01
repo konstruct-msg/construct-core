@@ -503,8 +503,7 @@ impl<P: CryptoProvider> KeyManager<P> {
     ///
     /// Format: PROLOGUE || hybrid_public_key
     pub fn build_hybrid_identity_bind_message(hybrid_public: &[u8]) -> Vec<u8> {
-        let mut msg =
-            Vec::with_capacity(Self::HYBRID_ID_BIND_PROLOGUE.len() + hybrid_public.len());
+        let mut msg = Vec::with_capacity(Self::HYBRID_ID_BIND_PROLOGUE.len() + hybrid_public.len());
         msg.extend_from_slice(Self::HYBRID_ID_BIND_PROLOGUE);
         msg.extend_from_slice(hybrid_public);
         msg

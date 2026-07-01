@@ -2572,9 +2572,20 @@ impl OrchestratorCore {
     }
 
     /// Ensure hybrid key + sign the standard X3DH prekey sign message with the hybrid key.
-    pub fn sign_hybrid_prekey(&self, suite_id: u8, public_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+    pub fn sign_hybrid_prekey(
+        &self,
+        suite_id: u8,
+        public_key: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.sign_hybrid_prekey(suite_id, &public_key)
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    /// Import legacy hybrid private key into core ownership (for migration from separate keychain storage).
+    pub fn import_hybrid_signature_private_key(&self, priv_bytes: Vec<u8>) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_hybrid_signature_private_key(priv_bytes)
             .map_err(|_| CryptoError::InitializationFailed)
     }
 

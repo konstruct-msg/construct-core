@@ -698,6 +698,10 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     sequence<u8> sign_hybrid_prekey(u8 suite_id, sequence<u8> public_key);
 
+    // For migration: import a hybrid sig private key that was previously stored outside the core CFE.
+    [Throws=CryptoError]
+    void import_hybrid_signature_private_key(sequence<u8> priv_bytes);
+
     [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);
 

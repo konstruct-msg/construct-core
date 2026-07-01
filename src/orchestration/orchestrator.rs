@@ -611,11 +611,25 @@ impl Orchestrator {
     }
 
     /// Ensure hybrid key and sign the standard prekey message with it.
-    pub fn sign_hybrid_prekey(&mut self, suite_id: u8, public_key: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn sign_hybrid_prekey(
+        &mut self,
+        suite_id: u8,
+        public_key: &[u8],
+    ) -> Result<Vec<u8>, String> {
         self.lifecycle
             .client
             .key_manager_mut()
             .sign_hybrid_prekey(suite_id, public_key)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Import an existing hybrid signature private key (for migration from legacy separate keychain storage).
+    /// After this, the hybrid key is owned by the core and will be persisted in CFE private keys.
+    pub fn import_hybrid_signature_private_key(&mut self, priv_bytes: Vec<u8>) -> Result<(), String> {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .set_hybrid_signature_private(priv_bytes)
             .map_err(|e| e.to_string())
     }
 
