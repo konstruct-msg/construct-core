@@ -477,6 +477,39 @@ impl<P: CryptoProvider> KeyManager<P> {
     // Gated behind post-quantum feature (same as the hybrid module).
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Domain separation for X3DH pre-key signatures (both classic Ed25519 and hybrid).
+    /// Must stay byte-identical to Swift `x3dhPrologue` and server.
+    pub const X3DH_SIGN_PROLOGUE: &'static [u8] = b"KonstruktX3DH-v1";
+
+    /// Domain separation for binding the hybrid identity key to the classic device Ed25519 identity.
+    /// Must stay byte-identical to Swift `bindPrologue` / server `HYBRID_ID_BIND_PROLOGUE`.
+    pub const HYBRID_ID_BIND_PROLOGUE: &'static [u8] = b"KonstruktHybridId-v1";
+
+    /// Build the canonical message that is signed (classically or with hybrid key)
+    /// over a pre-key (SPK or Kyber SPK).
+    ///
+    /// Format: PROLOGUE || [0x00, suite_id] || public_key_bytes
+    pub fn build_x3dh_sign_message(suite_id: u8, public_key: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(Self::X3DH_SIGN_PROLOGUE.len() + 2 + public_key.len());
+        msg.extend_from_slice(Self::X3DH_SIGN_PROLOGUE);
+        msg.push(0x00);
+        msg.push(suite_id);
+        msg.extend_from_slice(public_key);
+        msg
+    }
+
+    /// Build the message for the cross-signature that binds a freshly generated
+    /// hybrid identity public key to the device's classic Ed25519 identity.
+    ///
+    /// Format: PROLOGUE || hybrid_public_key
+    pub fn build_hybrid_identity_bind_message(hybrid_public: &[u8]) -> Vec<u8> {
+        let mut msg =
+            Vec::with_capacity(Self::HYBRID_ID_BIND_PROLOGUE.len() + hybrid_public.len());
+        msg.extend_from_slice(Self::HYBRID_ID_BIND_PROLOGUE);
+        msg.extend_from_slice(hybrid_public);
+        msg
+    }
+
     #[cfg(feature = "post-quantum")]
     /// Ensure a hybrid signature keypair exists. If absent, generate using the
     /// fixed hybrid suite (same as the free hybridSignatureKeygen primitive) and
@@ -517,6 +550,17 @@ impl<P: CryptoProvider> KeyManager<P> {
         })?;
         crate::crypto::suites::hybrid::HybridSuiteProvider::sign(priv_key, message)
             .map_err(ConstructError::Crypto)
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Ensure the hybrid key (if needed) and return a hybrid signature over the
+    /// standard X3DH prekey sign-message for the given suite and public key.
+    ///
+    /// This centralizes both key ownership and message construction.
+    pub fn sign_hybrid_prekey(&mut self, suite_id: u8, public_key: &[u8]) -> Result<Vec<u8>> {
+        let _ = self.ensure_hybrid_signature_key()?;
+        let msg = Self::build_x3dh_sign_message(suite_id, public_key);
+        self.sign_hybrid(&msg)
     }
 
     #[cfg(feature = "post-quantum")]

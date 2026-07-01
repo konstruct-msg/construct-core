@@ -2557,6 +2557,27 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::InitializationFailed)
     }
 
+    pub fn build_x3dh_sign_message(&self, suite_id: u8, public_key: Vec<u8>) -> Vec<u8> {
+        // Pure function, no lock needed. We still go through the type for consistency.
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Drop the guard immediately; build doesn't mutate or read instance state.
+        drop(orch);
+        crate::orchestration::Orchestrator::build_x3dh_sign_message(suite_id, &public_key)
+    }
+
+    pub fn build_hybrid_identity_bind_message(&self, hybrid_public_key: Vec<u8>) -> Vec<u8> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        drop(orch);
+        crate::orchestration::Orchestrator::build_hybrid_identity_bind_message(&hybrid_public_key)
+    }
+
+    /// Ensure hybrid key + sign the standard X3DH prekey sign message with the hybrid key.
+    pub fn sign_hybrid_prekey(&self, suite_id: u8, public_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.sign_hybrid_prekey(suite_id, &public_key)
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
     pub fn export_session(&self, contact_id: String) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_session_cfe(&contact_id)

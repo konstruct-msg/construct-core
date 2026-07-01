@@ -687,6 +687,17 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     sequence<u8> sign_hybrid(sequence<u8> message);
 
+    // High-level helpers to avoid duplicating message construction in every client.
+    // These match the domain-separated formats used for SPK/Kyber-SPK hybrid signatures
+    // and the hybrid<->classic identity binding cross-signature.
+
+    sequence<u8> build_x3dh_sign_message(u8 suite_id, sequence<u8> public_key);
+
+    sequence<u8> build_hybrid_identity_bind_message(sequence<u8> hybrid_public_key);
+
+    [Throws=CryptoError]
+    sequence<u8> sign_hybrid_prekey(u8 suite_id, sequence<u8> public_key);
+
     [Throws=CryptoError]
     sequence<u8> export_session(string contact_id);
 

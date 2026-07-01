@@ -595,6 +595,30 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
+    /// Build the canonical X3DH prekey signature message (used for both
+    /// classic Ed25519 and hybrid ML-DSA signatures).
+    pub fn build_x3dh_sign_message(suite_id: u8, public_key: &[u8]) -> Vec<u8> {
+        crate::crypto::keys::KeyManager::<crate::crypto::suites::classic::ClassicSuiteProvider>::build_x3dh_sign_message(
+            suite_id, public_key,
+        )
+    }
+
+    /// Build the bind message for hybrid identity cross-signature.
+    pub fn build_hybrid_identity_bind_message(hybrid_public: &[u8]) -> Vec<u8> {
+        crate::crypto::keys::KeyManager::<crate::crypto::suites::classic::ClassicSuiteProvider>::build_hybrid_identity_bind_message(
+            hybrid_public,
+        )
+    }
+
+    /// Ensure hybrid key and sign the standard prekey message with it.
+    pub fn sign_hybrid_prekey(&mut self, suite_id: u8, public_key: &[u8]) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .sign_hybrid_prekey(suite_id, public_key)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn set_my_user_id(&mut self, user_id: String) {
         self.lifecycle.set_my_user_id(user_id);
     }
