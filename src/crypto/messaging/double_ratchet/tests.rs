@@ -1,6 +1,4 @@
-use super::{
-    DoubleRatchetSession, EncryptedRatchetMessage, PqRatchetKeyPair, PqRatchetWireField, SuiteID,
-};
+use super::{DoubleRatchetSession, EncryptedRatchetMessage, PqRatchetWireField, SuiteID};
 use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
