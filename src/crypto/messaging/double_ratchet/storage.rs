@@ -45,13 +45,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
-            // Legacy flat PQ fields (pre-SPQR-redesign layout): superseded by
-            // `pq_ratchet` below, kept only so old blobs still decode.
-            pq_turns_since_mix: 0,
-            pq_pending_public: None,
-            pq_pending_secret: None,
-            pq_pending_ciphertext: None,
-            pq_pending_since: 0,
             pq_ratchet: if self.suite_id.is_pq_ratchet() {
                 Some(SerializablePqRatchetState {
                     is_initiator: self.is_pq_initiator,
@@ -147,7 +140,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
-            ratchet_turn_count: 0,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
@@ -395,18 +387,6 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
-    /// DEPRECATED legacy flat PQ fields (pre-SPQR-redesign layout), superseded
-    /// by `pq_ratchet` below. Kept only so old blobs decode; written as 0/None.
-    #[serde(default)]
-    pq_turns_since_mix: u32,
-    #[serde(default)]
-    pq_pending_public: Option<Vec<u8>>,
-    #[serde(default)]
-    pq_pending_secret: Option<Vec<u8>>,
-    #[serde(default)]
-    pq_pending_ciphertext: Option<Vec<u8>>,
-    #[serde(default)]
-    pq_pending_since: u64,
     /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
     /// message-key mixing design. Present only for suite-3 sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
@@ -479,9 +459,6 @@ impl Drop for SerializableSession {
         if let Some(ref mut k) = self.pre_pq_root_key {
             k.zeroize();
         }
-        if let Some(ref mut k) = self.pq_pending_secret {
-            k.zeroize();
-        }
         for entry in &mut self.skipped_keys {
             entry.key_bytes.zeroize();
         }
@@ -533,12 +510,6 @@ impl SerializableSession {
                 .collect(),
             pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
             last_ratchet_at: self.last_ratchet_at,
-            // Legacy flat PQ fields — superseded by `pqr`, written empty.
-            pq_turns_since_mix: 0,
-            pq_pending_public: None,
-            pq_pending_secret: None,
-            pq_pending_ciphertext: None,
-            pq_pending_since: 0,
             pqr: self.pq_ratchet.as_ref().map(|pq| {
                 crate::cfe::CfePqRatchetStateV1 {
                     is_initiator: pq.is_initiator,
@@ -606,13 +577,6 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
-            // Legacy flat PQ fields carried through unchanged (pre-redesign
-            // blobs only; new blobs write them empty).
-            pq_turns_since_mix: data.pq_turns_since_mix,
-            pq_pending_public: data.pq_pending_public.map(|b| b.into_vec()),
-            pq_pending_secret: data.pq_pending_secret.map(|b| b.into_vec()),
-            pq_pending_ciphertext: data.pq_pending_ciphertext.map(|b| b.into_vec()),
-            pq_pending_since: data.pq_pending_since,
             // NB: the CFE sub-structs zeroize on drop, so fields are cloned
             // out by reference (moving out of a Drop type is E0509).
             pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {

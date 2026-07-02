@@ -292,27 +292,11 @@ pub struct CfeSessionStateV1 {
     pub last_ratchet_at: u64,
 
     // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
-    /// DEPRECATED (pre-SPQR-redesign layout, superseded by `pqr` below): DH-ratchet
-    /// turns counter. Kept only so pre-redesign blobs decode; written as 0.
-    #[serde(rename = "pqt")]
-    #[serde(default)]
-    pub pq_turns_since_mix: u32,
-    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
-    #[serde(rename = "pq_pend_pk")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_pending_public: Option<ByteBuf>,
-    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
-    #[serde(rename = "pq_pend_sk")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_pending_secret: Option<ByteBuf>,
-    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
-    #[serde(rename = "pq_pend_ct")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_pending_ciphertext: Option<ByteBuf>,
-    /// DEPRECATED — see `pqr`. Kept for decode compat; written as 0.
-    #[serde(rename = "pq_pend_ts")]
-    #[serde(default)]
-    pub pq_pending_since: u64,
+    // History: a pre-SPQR-redesign layout briefly used flat fields here
+    // (`pqt`, `pq_pend_pk`/`sk`/`ct`, `pq_pend_ts`). They were removed rather
+    // than deprecated: suite 3 never shipped, so no production blob ever
+    // carried data in them, and the msgpack named-map codec ignores the keys
+    // if an old dev blob still has them. Do not reuse those key names.
     /// Sparse continuous PQ ratchet (suite 3) sub-state, SPQR-style message-key
     /// mixing design (see `decisions/pq-ratchet-spqr-message-key-mixing.md`).
     /// Present only for suite-3 sessions; absent on pre-feature blobs and

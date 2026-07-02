@@ -98,7 +98,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
-            ratchet_turn_count: 0,
             session_id: shared_session_id,
             contact_id,
             local_user_id,
@@ -215,7 +214,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
-            ratchet_turn_count: 0,
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
@@ -464,7 +462,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_exchange: self.pending_pq_exchange.clone(),
             pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
-            ratchet_turn_count: self.ratchet_turn_count,
         });
 
         if needs_ratchet {

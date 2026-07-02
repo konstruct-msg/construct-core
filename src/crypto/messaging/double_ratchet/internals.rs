@@ -93,7 +93,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.pending_pq_exchange = s.pending_pq_exchange;
             self.pending_pq_ciphertext = s.pending_pq_ciphertext;
             self.pq_pending_since = s.pq_pending_since;
-            self.ratchet_turn_count = s.ratchet_turn_count;
         }
     }
 
@@ -160,7 +159,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.dh_ratchet_public = new_dh_public;
         self.remote_dh_public = Some(new_remote_dh.clone());
         self.last_ratchet_at = unix_now();
-        self.ratchet_turn_count = self.ratchet_turn_count.saturating_add(1);
 
         // 5. Sparse continuous PQ ratchet — maybe *start* a new exchange
         // (initiator only; never touches root/chain keys).

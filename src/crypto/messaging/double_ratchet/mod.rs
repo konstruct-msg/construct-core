@@ -306,9 +306,6 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// initiator already activated the epoch would make that epoch undecryptable.
     pq_pending_since: u64,
 
-    /// Monotonic count of DH-ratchet turns performed (incremented in perform_dh_ratchet).
-    ratchet_turn_count: u32,
-
     session_id: String,
     contact_id: String,
     local_user_id: String,
@@ -338,7 +335,6 @@ struct DecryptSnapshot<P: CryptoProvider> {
     pending_pq_exchange: Option<PendingPqExchange>,
     pending_pq_ciphertext: Option<PendingPqCiphertext>,
     pq_pending_since: u64,
-    ratchet_turn_count: u32,
 }
 
 impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
@@ -361,7 +357,6 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             pending_pq_exchange: self.pending_pq_exchange.clone(),
             pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
-            ratchet_turn_count: self.ratchet_turn_count,
         }
     }
 }
