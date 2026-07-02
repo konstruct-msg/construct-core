@@ -292,32 +292,123 @@ pub struct CfeSessionStateV1 {
     pub last_ratchet_at: u64,
 
     // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
-    // Additive/optional: absent on session blobs written before this feature,
-    // which deserialize with `pq_turns_since_mix == 0` and no pending exchange.
-    /// DH-ratchet turns since the last ML-KEM-768 mix-in.
+    /// DEPRECATED (pre-SPQR-redesign layout, superseded by `pqr` below): DH-ratchet
+    /// turns counter. Kept only so pre-redesign blobs decode; written as 0.
     #[serde(rename = "pqt")]
     #[serde(default)]
     pub pq_turns_since_mix: u32,
-    /// Our locally-generated ML-KEM-768 public key (1184 bytes), awaiting the
-    /// peer's ciphertext reply. Absent when no exchange is in flight.
+    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
     #[serde(rename = "pq_pend_pk")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pending_public: Option<ByteBuf>,
-    /// The matching secret key (2400 bytes). Zeroized on drop.
+    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
     #[serde(rename = "pq_pend_sk")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pending_secret: Option<ByteBuf>,
-    /// A ciphertext we derived (as the encapsulating peer) that we keep
-    /// re-attaching to outgoing messages until the peer's next DH-ratchet turn
-    /// proves receipt.
+    /// DEPRECATED — see `pqr`. Kept for decode compat; never written.
     #[serde(rename = "pq_pend_ct")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pending_ciphertext: Option<ByteBuf>,
-    /// Unix timestamp when the pending exchange above was first started — bounds
-    /// how long we keep resending before giving up on an unresponsive peer.
+    /// DEPRECATED — see `pqr`. Kept for decode compat; written as 0.
     #[serde(rename = "pq_pend_ts")]
     #[serde(default)]
     pub pq_pending_since: u64,
+    /// Sparse continuous PQ ratchet (suite 3) sub-state, SPQR-style message-key
+    /// mixing design (see `decisions/pq-ratchet-spqr-message-key-mixing.md`).
+    /// Present only for suite-3 sessions; absent on pre-feature blobs and
+    /// non-suite-3 sessions. Atomic: either the whole PQ state is here or the
+    /// session has none — no partial-field combinations to validate.
+    #[serde(rename = "pqr")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pqr: Option<CfePqRatchetStateV1>,
+}
+
+/// One completed PQ-ratchet epoch: id + 32-byte ML-KEM-768 shared secret.
+/// Secret is zeroized on drop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqEpochSecretV1 {
+    #[serde(rename = "e")]
+    pub epoch: u32,
+    #[serde(rename = "ss")]
+    pub secret: ByteBuf,
+}
+
+impl Drop for CfePqEpochSecretV1 {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.secret);
+    }
+}
+
+/// Initiator-side in-flight PQ exchange: fresh ML-KEM-768 keypair proposing
+/// `epoch`. Secret key is zeroized on drop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqPendingExchangeV1 {
+    #[serde(rename = "e")]
+    pub epoch: u32,
+    #[serde(rename = "pk")]
+    pub public: ByteBuf,
+    #[serde(rename = "sk")]
+    pub secret: ByteBuf,
+}
+
+impl Drop for CfePqPendingExchangeV1 {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.secret);
+    }
+}
+
+/// Responder-side pending PQ ciphertext plus the *provisional* epoch secret.
+/// This may be the only copy of an epoch the initiator already activated —
+/// losing it on restore would make that epoch permanently undecryptable,
+/// which is why it must be persisted. Secret is zeroized on drop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqPendingCiphertextV1 {
+    #[serde(rename = "e")]
+    pub epoch: u32,
+    /// 8-byte hash of the encapsulation key this ciphertext was built against.
+    #[serde(rename = "h")]
+    pub ek_hash: ByteBuf,
+    #[serde(rename = "c")]
+    pub ciphertext: ByteBuf,
+    #[serde(rename = "ss")]
+    pub secret: ByteBuf,
+}
+
+impl Drop for CfePqPendingCiphertextV1 {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.secret);
+    }
+}
+
+/// Complete sparse-PQ-ratchet sub-state for a suite-3 session — everything a
+/// restored session needs to keep mixing, completing in-flight exchanges, and
+/// driving the cadence exactly as before serialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqRatchetStateV1 {
+    /// Whether this side drives the exchange cadence (DR initiator).
+    #[serde(rename = "ini")]
+    pub is_initiator: bool,
+    /// Highest completed epoch — mixed into every outgoing message key.
+    #[serde(rename = "cur")]
+    pub current_epoch: u32,
+    /// Completed epoch secrets (bounded by PQ_EPOCH_RETENTION).
+    #[serde(rename = "eps")]
+    #[serde(default)]
+    pub epoch_secrets: Vec<CfePqEpochSecretV1>,
+    #[serde(rename = "pend")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_exchange: Option<CfePqPendingExchangeV1>,
+    #[serde(rename = "ct")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_ciphertext: Option<CfePqPendingCiphertextV1>,
+    /// Unix timestamp when `pending_exchange` was created (abandonment cutoff).
+    #[serde(rename = "ts")]
+    #[serde(default)]
+    pub pending_since: u64,
+    /// DH-ratchet turns since the last exchange started (cadence counter).
+    #[serde(rename = "turns")]
+    #[serde(default)]
+    pub turns_since_mix: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -2088,3 +2088,235 @@ fn test_pq_ratchet_epoch_retention_bounded() {
             .is_some()
     );
 }
+
+// ── PQ ratchet state persistence (step 3 of the activation sequence) ─────────
+//
+// A restored suite-3 session must behave identically to the live one: keep
+// mixing the right epoch secrets, complete in-flight exchanges, and keep
+// driving the cadence. The critical field is the responder's provisional
+// secret (pending ciphertext) — after the initiator activates an epoch it is
+// the responder's only copy, so dropping it on restore bricks the epoch.
+
+/// Serialize a live session through the full production path
+/// (`to_serializable` → `to_cfe_v1` → CFE envelope encode → decode →
+/// `from_cfe_v1` → `from_serializable`) and hand back the restored session.
+#[cfg(feature = "post-quantum")]
+fn cfe_round_trip(
+    session: &DoubleRatchetSession<ClassicSuiteProvider>,
+) -> DoubleRatchetSession<ClassicSuiteProvider> {
+    let cfe = session.to_serializable().to_cfe_v1().unwrap();
+    let bytes = crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &cfe).unwrap();
+    let decoded = crate::cfe::decode_as::<crate::cfe::CfeSessionStateV1>(
+        &bytes,
+        crate::cfe::CfeMessageType::SessionState,
+    )
+    .unwrap();
+    let ser = super::SerializableSession::from_cfe_v1(decoded).unwrap();
+    DoubleRatchetSession::from_serializable(ser).unwrap()
+}
+
+/// Main persistence test: both sides are serialized mid-exchange (initiator
+/// holds a pending epoch-2 keypair, responder holds the provisional epoch-2
+/// secret + ciphertext, not yet promoted), restored through the full CFE
+/// path, and the conversation + exchange + cadence all continue seamlessly.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000e3",
+        "bbbbbbbb-0000-4000-8000-0000000000e4",
+    );
+    let interval = crate::config::Config::global().pq_ratchet_interval;
+
+    // Reach epoch 1, then drive until the epoch-2 exchange is in flight.
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    for round in 1..=(interval + 2) {
+        pq_round(&mut alice, &mut bob, &format!("toward epoch 2, {round}"));
+        if alice.pending_pq_exchange.is_some() {
+            break;
+        }
+    }
+    assert!(alice.pending_pq_exchange.is_some(), "epoch-2 EK in flight");
+
+    // Deliver the EK so Bob holds the provisional epoch-2 secret (unpromoted).
+    let m_ek = alice.encrypt(b"ek carrier before snapshot").unwrap();
+    bob.decrypt(&m_ek).unwrap();
+    assert!(bob.pending_pq_ciphertext.is_some(), "provisional CT pending");
+    assert_eq!(bob.current_pq_epoch, 1, "not yet promoted");
+
+    // Snapshot + restore BOTH sides through the full CFE path.
+    let mut alice2 = cfe_round_trip(&alice);
+    let mut bob2 = cfe_round_trip(&bob);
+    drop(alice);
+    drop(bob);
+
+    assert!(alice2.is_pq_initiator, "initiator role must survive restore");
+    assert!(!bob2.is_pq_initiator);
+    assert_eq!(alice2.current_pq_epoch, 1);
+    assert_eq!(bob2.current_pq_epoch, 1);
+    assert_eq!(
+        alice2.lookup_pq_epoch_secret(1).unwrap(),
+        bob2.lookup_pq_epoch_secret(1).unwrap(),
+        "epoch-1 secret survives on both sides"
+    );
+    assert!(
+        alice2.pending_pq_exchange.is_some(),
+        "in-flight exchange survives"
+    );
+    assert!(
+        bob2.pending_pq_ciphertext.is_some(),
+        "provisional secret + ciphertext survive (the critical field)"
+    );
+
+    // The exchange completes across the restore boundary.
+    let r_ct = bob2.encrypt(b"ct after restore").unwrap();
+    assert!(matches!(
+        r_ct.pq_ratchet_field,
+        Some(PqRatchetWireField::Ciphertext { .. })
+    ));
+    alice2.decrypt(&r_ct).unwrap();
+    assert_eq!(alice2.current_pq_epoch, 2, "restored initiator completed epoch 2");
+
+    let m_tag2 = alice2.encrypt(b"tagged 2 after restore").unwrap();
+    assert_eq!(m_tag2.pq_message_epoch, 2);
+    assert_eq!(bob2.decrypt(&m_tag2).unwrap(), b"tagged 2 after restore");
+    assert_eq!(bob2.current_pq_epoch, 2, "restored responder promoted");
+    assert_eq!(
+        alice2.lookup_pq_epoch_secret(2).unwrap(),
+        bob2.lookup_pq_epoch_secret(2).unwrap()
+    );
+
+    // Cadence survives restore: the restored pair reaches epoch 3 unassisted.
+    pq_drive_to_epoch(&mut alice2, &mut bob2, 3);
+}
+
+/// A suite-3 blob without the `pqr` field (written by the pre-persistence
+/// build) restores degraded-but-alive: classical DR state intact, PQ state
+/// empty. Peer messages tagged > 0 then fail loudly at decrypt.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_blob_without_pqr_restores_degraded() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000e5",
+        "bbbbbbbb-0000-4000-8000-0000000000e6",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    let mut cfe = bob.to_serializable().to_cfe_v1().unwrap();
+    assert!(cfe.pqr.is_some());
+    cfe.pqr = None; // simulate a pre-persistence blob
+
+    let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
+    let mut bob2 =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    assert_eq!(bob2.current_pq_epoch, 0, "PQ state reset");
+    assert!(bob2.pending_pq_ciphertext.is_none());
+
+    // Epoch-tagged traffic fails loudly (no silent downgrade)…
+    let tagged = alice.encrypt(b"tagged 1").unwrap();
+    assert_eq!(tagged.pq_message_epoch, 1);
+    assert!(bob2.decrypt(&tagged).is_err(), "unknown epoch must fail");
+}
+
+/// Old decoders (struct without the `pqr` field) must still parse new blobs:
+/// rmp_serde named-map encoding ignores unknown keys.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_new_blob_readable_by_old_decoder() {
+    use serde::Deserialize;
+    use serde_bytes::ByteBuf;
+
+    /// The required (non-default) subset of `CfeSessionStateV1` as an old
+    /// build would have declared it — no `pqr` field.
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct OldCfeSessionState {
+        ver: u8,
+        suite_id: u8,
+        contact_id: String,
+        local_uid: String,
+        session_id: ByteBuf,
+        rk: ByteBuf,
+        sck: ByteBuf,
+        rck: ByteBuf,
+        scl: u32,
+        rcl: u32,
+        psl: u32,
+        dh_pub: ByteBuf,
+    }
+
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000e7",
+        "bbbbbbbb-0000-4000-8000-0000000000e8",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    let cfe = alice.to_serializable().to_cfe_v1().unwrap();
+    assert!(cfe.pqr.is_some(), "new blob carries the PQ state");
+    let bytes = rmp_serde::to_vec_named(&cfe).unwrap();
+    let old: Result<OldCfeSessionState, _> = rmp_serde::from_slice(&bytes);
+    assert!(
+        old.is_ok(),
+        "old decoder must ignore the unknown pqr key: {:?}",
+        old.err()
+    );
+}
+
+/// Structurally corrupted PQ state is dropped on restore (degrade-not-fail):
+/// the session survives, the PQ state is reset.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
+    use serde_bytes::ByteBuf;
+
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000e9",
+        "bbbbbbbb-0000-4000-8000-0000000000f0",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    // Corrupt variant 1: wrong secret length.
+    let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
+    cfe.pqr.as_mut().unwrap().epoch_secrets[0].secret = ByteBuf::from(vec![0u8; 5]);
+    let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
+    let restored =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    assert_eq!(restored.current_pq_epoch, 0, "corrupted state must be dropped");
+    assert!(restored.pq_epoch_secrets.is_empty());
+
+    // Corrupt variant 2: pending-exchange epoch violating the current+1 invariant.
+    let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
+    cfe.pqr.as_mut().unwrap().pending_exchange = Some(crate::cfe::CfePqPendingExchangeV1 {
+        epoch: 9,
+        public: ByteBuf::from(vec![0u8; 1184]),
+        secret: ByteBuf::from(vec![0u8; 2400]),
+    });
+    let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
+    let restored =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    assert_eq!(restored.current_pq_epoch, 0);
+    assert!(restored.pending_pq_exchange.is_none());
+}
+
+/// The legacy JSON import path (`import_session` fallback) round-trips the PQ
+/// state too — `SerializableSession` carries it in both encodings.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pq_ratchet_state_survives_json_round_trip() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000f5",
+        "bbbbbbbb-0000-4000-8000-0000000000f6",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    let json = serde_json::to_string(&alice.to_serializable()).unwrap();
+    let ser: super::SerializableSession = serde_json::from_str(&json).unwrap();
+    let alice2 = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+
+    assert!(alice2.is_pq_initiator);
+    assert_eq!(alice2.current_pq_epoch, 1);
+    assert_eq!(
+        alice2.lookup_pq_epoch_secret(1).unwrap(),
+        alice.lookup_pq_epoch_secret(1).unwrap()
+    );
+}

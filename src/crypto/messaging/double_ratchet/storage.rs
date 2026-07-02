@@ -45,18 +45,39 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
-            pq_turns_since_mix: self.pq_turns_since_mix,
-            // TODO(pq-ratchet step 3 — persistence): the SPQR-style epoch state
-            // (is_pq_initiator, current_pq_epoch, pq_epoch_secrets, pending
-            // exchange/ciphertext with epoch + ek_hash) is not persisted yet;
-            // these legacy fields stay empty rather than storing state that
-            // from_serializable can't faithfully restore. A restored session
-            // currently drops in-flight PQ exchanges and completed epochs —
-            // acceptable only while suite 3 is not negotiated in production.
+            // Legacy flat PQ fields (pre-SPQR-redesign layout): superseded by
+            // `pq_ratchet` below, kept only so old blobs still decode.
+            pq_turns_since_mix: 0,
             pq_pending_public: None,
             pq_pending_secret: None,
             pq_pending_ciphertext: None,
-            pq_pending_since: self.pq_pending_since,
+            pq_pending_since: 0,
+            pq_ratchet: if self.suite_id.is_pq_ratchet() {
+                Some(SerializablePqRatchetState {
+                    is_initiator: self.is_pq_initiator,
+                    current_epoch: self.current_pq_epoch,
+                    epoch_secrets: self.pq_epoch_secrets.clone(),
+                    pending_exchange: self.pending_pq_exchange.as_ref().map(|ex| {
+                        SerializablePqPendingExchange {
+                            epoch: ex.epoch,
+                            public: ex.keypair.public.clone(),
+                            secret: ex.keypair.secret.clone(),
+                        }
+                    }),
+                    pending_ciphertext: self.pending_pq_ciphertext.as_ref().map(|p| {
+                        SerializablePqPendingCiphertext {
+                            epoch: p.epoch,
+                            ek_hash: p.ek_hash.to_vec(),
+                            ciphertext: p.ciphertext.clone(),
+                            secret: p.secret.clone(),
+                        }
+                    }),
+                    pending_since: self.pq_pending_since,
+                    turns_since_mix: self.pq_turns_since_mix,
+                })
+            } else {
+                None
+            },
         }
     }
 
@@ -116,22 +137,24 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .as_deref()
                 .map(|bytes| Self::bytes_to_aead_key(bytes))
                 .transpose()?,
-            pq_turns_since_mix: data.pq_turns_since_mix,
-            // TODO(pq-ratchet step 3 — persistence): epoch state is not in the
-            // serialized format yet; restored sessions start with no completed
-            // epochs and no in-flight exchange. See to_serializable's note.
+            // PQ ratchet state is restored below from `data.pq_ratchet` after
+            // validation; defaults here cover non-suite-3 sessions and blobs
+            // whose PQ state fails validation (degrade-not-fail).
+            pq_turns_since_mix: 0,
             is_pq_initiator: false,
             current_pq_epoch: 0,
             pq_epoch_secrets: Vec::new(),
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
-            pq_pending_since: data.pq_pending_since,
+            pq_pending_since: 0,
             ratchet_turn_count: 0,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
             last_ratchet_at: data.last_ratchet_at,
         };
+
+        session.restore_pq_ratchet_state(&data);
 
         // Evict any stale skipped-message keys that accumulated while the session was
         // inactive.  Without this, a session that was dormant for weeks would still
@@ -140,6 +163,143 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
         Ok(session)
     }
+
+    /// Restore the sparse-PQ-ratchet sub-state from a serialized session.
+    ///
+    /// Degrade-not-fail: a structurally invalid PQ state (corrupted blob) is
+    /// dropped with a warning instead of failing the whole session restore —
+    /// losing one feature's state beats losing the session. The degraded
+    /// session still decrypts epoch-0 traffic; peer messages tagged with a PQ
+    /// epoch then fail loudly at decrypt ("epoch secret unavailable") rather
+    /// than silently skipping the mix.
+    fn restore_pq_ratchet_state(&mut self, data: &SerializableSession) {
+        if !self.suite_id.is_pq_ratchet() {
+            if data.pq_ratchet.is_some() {
+                tracing::warn!(
+                    target: "crypto::double_ratchet",
+                    "ignoring PQ ratchet state on a non-suite-3 session blob"
+                );
+            }
+            return;
+        }
+        let Some(pq) = &data.pq_ratchet else {
+            tracing::warn!(
+                target: "crypto::double_ratchet",
+                "suite-3 session blob without PQ ratchet state (pre-persistence \
+                 build?) — PQ state reset; peer messages tagged with an epoch \
+                 will not decrypt"
+            );
+            return;
+        };
+        if let Err(e) = validate_pq_ratchet_state(pq) {
+            tracing::warn!(
+                target: "crypto::double_ratchet",
+                "dropping invalid persisted PQ ratchet state: {e}"
+            );
+            return;
+        }
+
+        self.is_pq_initiator = pq.is_initiator;
+        self.current_pq_epoch = pq.current_epoch;
+        self.pq_epoch_secrets = pq.epoch_secrets.clone();
+        self.pending_pq_exchange = pq.pending_exchange.as_ref().map(|ex| PendingPqExchange {
+            epoch: ex.epoch,
+            keypair: PqRatchetKeyPair {
+                public: ex.public.clone(),
+                secret: ex.secret.clone(),
+            },
+        });
+        self.pending_pq_ciphertext = pq.pending_ciphertext.as_ref().map(|p| {
+            let mut ek_hash = [0u8; 8];
+            ek_hash.copy_from_slice(&p.ek_hash); // length validated above
+            PendingPqCiphertext {
+                epoch: p.epoch,
+                ek_hash,
+                ciphertext: p.ciphertext.clone(),
+                secret: p.secret.clone(),
+            }
+        });
+        self.pq_pending_since = pq.pending_since;
+        self.pq_turns_since_mix = pq.turns_since_mix;
+    }
+}
+
+/// ML-KEM-768 material sizes (bytes) — used to validate restored PQ state.
+const MLKEM768_PUBLIC_LEN: usize = 1184;
+const MLKEM768_SECRET_LEN: usize = 2400;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+const MLKEM768_SHARED_SECRET_LEN: usize = 32;
+
+/// Structural validation of a persisted PQ ratchet state. These are invariants
+/// the runtime state machine maintains by construction; a blob violating them
+/// is corrupted (or from an incompatible future format) and must not be
+/// applied, since bad epoch secrets produce undecryptable messages anyway.
+fn validate_pq_ratchet_state(pq: &SerializablePqRatchetState) -> Result<(), String> {
+    if pq.epoch_secrets.len() > PQ_EPOCH_RETENTION {
+        return Err(format!(
+            "{} epoch secrets exceeds retention bound {PQ_EPOCH_RETENTION}",
+            pq.epoch_secrets.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (epoch, secret) in &pq.epoch_secrets {
+        if *epoch == 0 || *epoch > pq.current_epoch {
+            return Err(format!(
+                "epoch secret id {epoch} outside (0, current={}]",
+                pq.current_epoch
+            ));
+        }
+        if secret.len() != MLKEM768_SHARED_SECRET_LEN {
+            return Err(format!("epoch {epoch} secret is {} bytes", secret.len()));
+        }
+        if !seen.insert(*epoch) {
+            return Err(format!("duplicate epoch secret id {epoch}"));
+        }
+    }
+    if let Some(ex) = &pq.pending_exchange {
+        // The initiator only ever proposes current + 1 (single exchange in flight).
+        if ex.epoch != pq.current_epoch.saturating_add(1) {
+            return Err(format!(
+                "pending exchange epoch {} != current {} + 1",
+                ex.epoch, pq.current_epoch
+            ));
+        }
+        if ex.public.len() != MLKEM768_PUBLIC_LEN || ex.secret.len() != MLKEM768_SECRET_LEN {
+            return Err(format!(
+                "pending exchange key sizes {}/{} invalid",
+                ex.public.len(),
+                ex.secret.len()
+            ));
+        }
+    }
+    if let Some(ct) = &pq.pending_ciphertext {
+        // Provisional epochs are strictly ahead of the promoted one.
+        if ct.epoch <= pq.current_epoch {
+            return Err(format!(
+                "pending ciphertext epoch {} not ahead of current {}",
+                ct.epoch, pq.current_epoch
+            ));
+        }
+        if ct.ek_hash.len() != 8 {
+            return Err(format!("ek_hash is {} bytes, expected 8", ct.ek_hash.len()));
+        }
+        if ct.ciphertext.len() != MLKEM768_CIPHERTEXT_LEN
+            || ct.secret.len() != MLKEM768_SHARED_SECRET_LEN
+        {
+            return Err(format!(
+                "pending ciphertext sizes {}/{} invalid",
+                ct.ciphertext.len(),
+                ct.secret.len()
+            ));
+        }
+    }
+    // A pending exchange and a pending ciphertext are mutually exclusive by
+    // the single-initiator discipline (initiator holds only exchanges,
+    // responder only ciphertexts).
+    if pq.pending_exchange.is_some() && pq.pending_ciphertext.is_some() {
+        return Err("both pending exchange and pending ciphertext present".to_string());
+    }
+    Ok(())
 }
 
 /// A single skipped message key entry, keyed by remote DH public key + message number.
@@ -235,8 +395,8 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
-    /// Sparse continuous PQ ratchet (suite_id = PQ_RATCHET). See `CfeSessionStateV1`
-    /// for field-level docs — this mirrors it 1:1. Absent/zero on pre-feature sessions.
+    /// DEPRECATED legacy flat PQ fields (pre-SPQR-redesign layout), superseded
+    /// by `pq_ratchet` below. Kept only so old blobs decode; written as 0/None.
     #[serde(default)]
     pq_turns_since_mix: u32,
     #[serde(default)]
@@ -247,6 +407,65 @@ pub struct SerializableSession {
     pq_pending_ciphertext: Option<Vec<u8>>,
     #[serde(default)]
     pq_pending_since: u64,
+    /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
+    /// message-key mixing design. Present only for suite-3 sessions. Mirrors
+    /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_ratchet: Option<SerializablePqRatchetState>,
+}
+
+/// JSON-side mirror of `CfePqRatchetStateV1` (see `cfe/types.rs` for the field
+/// semantics and why `pending_ciphertext` must be persisted). Secrets are
+/// zeroized on drop.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqRatchetState {
+    pub(crate) is_initiator: bool,
+    pub(crate) current_epoch: u32,
+    #[serde(default)]
+    pub(crate) epoch_secrets: Vec<(u32, Vec<u8>)>,
+    #[serde(default)]
+    pub(crate) pending_exchange: Option<SerializablePqPendingExchange>,
+    #[serde(default)]
+    pub(crate) pending_ciphertext: Option<SerializablePqPendingCiphertext>,
+    #[serde(default)]
+    pub(crate) pending_since: u64,
+    #[serde(default)]
+    pub(crate) turns_since_mix: u32,
+}
+
+impl Drop for SerializablePqRatchetState {
+    fn drop(&mut self) {
+        for (_, secret) in &mut self.epoch_secrets {
+            secret.zeroize();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqPendingExchange {
+    pub(crate) epoch: u32,
+    pub(crate) public: Vec<u8>,
+    pub(crate) secret: Vec<u8>,
+}
+
+impl Drop for SerializablePqPendingExchange {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqPendingCiphertext {
+    pub(crate) epoch: u32,
+    pub(crate) ek_hash: Vec<u8>,
+    pub(crate) ciphertext: Vec<u8>,
+    pub(crate) secret: Vec<u8>,
+}
+
+impl Drop for SerializablePqPendingCiphertext {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 impl Drop for SerializableSession {
@@ -314,11 +533,43 @@ impl SerializableSession {
                 .collect(),
             pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
             last_ratchet_at: self.last_ratchet_at,
-            pq_turns_since_mix: self.pq_turns_since_mix,
-            pq_pending_public: self.pq_pending_public.clone().map(ByteBuf::from),
-            pq_pending_secret: self.pq_pending_secret.clone().map(ByteBuf::from),
-            pq_pending_ciphertext: self.pq_pending_ciphertext.clone().map(ByteBuf::from),
-            pq_pending_since: self.pq_pending_since,
+            // Legacy flat PQ fields — superseded by `pqr`, written empty.
+            pq_turns_since_mix: 0,
+            pq_pending_public: None,
+            pq_pending_secret: None,
+            pq_pending_ciphertext: None,
+            pq_pending_since: 0,
+            pqr: self.pq_ratchet.as_ref().map(|pq| {
+                crate::cfe::CfePqRatchetStateV1 {
+                    is_initiator: pq.is_initiator,
+                    current_epoch: pq.current_epoch,
+                    epoch_secrets: pq
+                        .epoch_secrets
+                        .iter()
+                        .map(|(epoch, secret)| crate::cfe::CfePqEpochSecretV1 {
+                            epoch: *epoch,
+                            secret: ByteBuf::from(secret.clone()),
+                        })
+                        .collect(),
+                    pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
+                        crate::cfe::CfePqPendingExchangeV1 {
+                            epoch: ex.epoch,
+                            public: ByteBuf::from(ex.public.clone()),
+                            secret: ByteBuf::from(ex.secret.clone()),
+                        }
+                    }),
+                    pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
+                        crate::cfe::CfePqPendingCiphertextV1 {
+                            epoch: p.epoch,
+                            ek_hash: ByteBuf::from(p.ek_hash.clone()),
+                            ciphertext: ByteBuf::from(p.ciphertext.clone()),
+                            secret: ByteBuf::from(p.secret.clone()),
+                        }
+                    }),
+                    pending_since: pq.pending_since,
+                    turns_since_mix: pq.turns_since_mix,
+                }
+            }),
         })
     }
 
@@ -355,11 +606,41 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
+            // Legacy flat PQ fields carried through unchanged (pre-redesign
+            // blobs only; new blobs write them empty).
             pq_turns_since_mix: data.pq_turns_since_mix,
             pq_pending_public: data.pq_pending_public.map(|b| b.into_vec()),
             pq_pending_secret: data.pq_pending_secret.map(|b| b.into_vec()),
             pq_pending_ciphertext: data.pq_pending_ciphertext.map(|b| b.into_vec()),
             pq_pending_since: data.pq_pending_since,
+            // NB: the CFE sub-structs zeroize on drop, so fields are cloned
+            // out by reference (moving out of a Drop type is E0509).
+            pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {
+                is_initiator: pq.is_initiator,
+                current_epoch: pq.current_epoch,
+                epoch_secrets: pq
+                    .epoch_secrets
+                    .iter()
+                    .map(|e| (e.epoch, e.secret.to_vec()))
+                    .collect(),
+                pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
+                    SerializablePqPendingExchange {
+                        epoch: ex.epoch,
+                        public: ex.public.to_vec(),
+                        secret: ex.secret.to_vec(),
+                    }
+                }),
+                pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
+                    SerializablePqPendingCiphertext {
+                        epoch: p.epoch,
+                        ek_hash: p.ek_hash.to_vec(),
+                        ciphertext: p.ciphertext.to_vec(),
+                        secret: p.secret.to_vec(),
+                    }
+                }),
+                pending_since: pq.pending_since,
+                turns_since_mix: pq.turns_since_mix,
+            }),
         })
     }
 }
