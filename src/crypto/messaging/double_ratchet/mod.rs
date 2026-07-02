@@ -98,7 +98,7 @@ pub struct DrHealthSnapshot {
 }
 
 /// A locally-generated ML-KEM-768 keypair pending completion of a sparse
-/// PQ-ratchet exchange (see `DoubleRatchetSession::perform_pq_ratchet_step`).
+/// PQ-ratchet exchange (see `internals::maybe_advance_pq_ratchet`).
 /// The public half rides on outgoing messages until the peer replies with a
 /// ciphertext; the secret half is zeroized on drop or on successful decapsulation.
 #[derive(Debug, Clone)]
@@ -113,20 +113,65 @@ impl Zeroize for PqRatchetKeyPair {
     }
 }
 
-/// Wire-level representation of the optional sparse PQ-ratchet field carried on a
-/// post-handshake message. Not yet threaded through `EncryptedRatchetMessage` /
-/// `wire_payload.rs` (see rollout plan) — for now this is the boundary type
-/// between `internals.rs`'s protocol logic and that future wire integration.
-#[allow(dead_code)] // constructed/matched by internals.rs, exercised by unit tests today
+/// Initiator-side pending PQ exchange: a fresh ML-KEM-768 keypair proposing
+/// epoch `epoch`, re-advertised on every outgoing message until the peer's
+/// ciphertext completes it (or it times out and is abandoned).
+#[derive(Debug, Clone)]
+pub(super) struct PendingPqExchange {
+    pub(super) epoch: u32,
+    pub(super) keypair: PqRatchetKeyPair,
+}
+
+impl Zeroize for PendingPqExchange {
+    fn zeroize(&mut self) {
+        self.keypair.zeroize();
+    }
+}
+
+/// Responder-side state for a PQ exchange we've encapsulated but the initiator
+/// hasn't provably completed yet: the ciphertext we re-attach to every outgoing
+/// message, plus the *provisional* epoch secret. The secret is promoted to
+/// `pq_epoch_secrets` (and `epoch` becomes `current_pq_epoch`) only once we
+/// successfully decrypt a peer message tagged `>= epoch` — which proves the
+/// initiator decapsulated the same secret.
+#[derive(Debug, Clone)]
+pub(super) struct PendingPqCiphertext {
+    pub(super) epoch: u32,
+    /// 8-byte hash of the encapsulation key this ciphertext was built against,
+    /// so a re-proposed epoch (same id, fresh keypair) is never completed by a
+    /// stale ciphertext — see the SPQR-style design doc.
+    pub(super) ek_hash: [u8; 8],
+    pub(super) ciphertext: Vec<u8>,
+    pub(super) secret: Vec<u8>,
+}
+
+impl Zeroize for PendingPqCiphertext {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// Wire-level representation of the optional sparse PQ-ratchet field carried on
+/// a suite-3 message, alongside the always-present `pq_message_epoch` tag.
+/// Serialized/parsed by `wire_payload.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PqRatchetWireField {
-    /// Sender generated a fresh ML-KEM-768 keypair (1184-byte public key) and is
-    /// initiating a new PQ-ratchet exchange.
-    PublicKey(Vec<u8>),
-    /// Sender is completing an exchange the recipient previously initiated
-    /// (1088-byte ML-KEM-768 ciphertext).
-    Ciphertext(Vec<u8>),
+    /// Initiator's fresh ML-KEM-768 public key (1184 bytes) proposing epoch `epoch`.
+    PublicKey { epoch: u32, key: Vec<u8> },
+    /// Responder's ML-KEM-768 ciphertext (1088 bytes) completing epoch `epoch`.
+    /// `ek_hash` identifies which encapsulation key it was built against.
+    Ciphertext {
+        epoch: u32,
+        ek_hash: [u8; 8],
+        ct: Vec<u8>,
+    },
 }
+
+/// How many completed PQ epoch secrets to retain for decrypting out-of-order
+/// messages tagged with older epochs. Epochs advance every ~`pq_ratchet_interval`
+/// DH turns, so even the oldest retained epoch is far beyond the classical
+/// skipped-message window in practice.
+pub(super) const PQ_EPOCH_RETENTION: usize = 4;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -230,30 +275,39 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     pre_pq_root_key: Option<P::AeadKey>,
 
     /// Sparse continuous PQ ratchet (suite_id = `PQ_RATCHET`) — see
-    /// `internals::perform_pq_ratchet_step`. Number of DH-ratchet turns since the
-    /// last ML-KEM-768 mix-in. Only consulted when `suite_id.is_pq_ratchet()`.
+    /// `internals::maybe_advance_pq_ratchet`. Number of DH-ratchet turns since the
+    /// last exchange started. Only consulted when `suite_id.is_pq_ratchet()`.
     pq_turns_since_mix: u32,
 
-    /// Our locally-generated ML-KEM-768 keypair, `Some` while we're waiting for the
-    /// peer's ciphertext reply to complete a PQ-ratchet exchange we initiated.
-    pending_pq_ratchet_keypair: Option<PqRatchetKeyPair>,
+    /// Whether this side starts PQ exchanges. `true` only for the DR session
+    /// initiator on suite-3 sessions (single-initiator discipline — see the
+    /// SPQR-style design doc). The responder only ever answers.
+    is_pq_initiator: bool,
 
-    /// A ciphertext we derived (as the encapsulating peer) that we keep re-attaching
-    /// to outgoing messages until the peer's next DH-ratchet turn implicitly
-    /// acknowledges receipt (see `perform_pq_ratchet_step`).
-    pending_pq_ciphertext_to_send: Option<Vec<u8>>,
+    /// Highest *completed* PQ epoch — the epoch whose secret is mixed into every
+    /// outgoing message key (`pq_message_epoch` tag). 0 = no epoch yet (pure DR).
+    current_pq_epoch: u32,
 
-    /// Unix timestamp when `pending_pq_ratchet_keypair`/`pending_pq_ciphertext_to_send`
-    /// was first set — bounds how long we keep resending before giving up on a peer
-    /// that's gone silent (reuses `max_skipped_message_age_seconds` as the cutoff).
+    /// Completed epoch secrets, newest last, capped at `PQ_EPOCH_RETENTION`.
+    /// Needed to decrypt out-of-order messages tagged with older epochs.
+    pq_epoch_secrets: Vec<(u32, Vec<u8>)>,
+
+    /// Initiator only: exchange in flight (fresh keypair proposing `current_pq_epoch + 1`).
+    pending_pq_exchange: Option<PendingPqExchange>,
+
+    /// Responder only: ciphertext being re-attached until the initiator's tag
+    /// acknowledges it, plus the provisional epoch secret (see `PendingPqCiphertext`).
+    pending_pq_ciphertext: Option<PendingPqCiphertext>,
+
+    /// Unix timestamp when `pending_pq_exchange` was created — bounds how long the
+    /// initiator keeps re-advertising an unanswered public key before abandoning
+    /// (reuses `max_skipped_message_age_seconds` as the cutoff). The responder's
+    /// pending ciphertext deliberately has no timeout: abandoning it after the
+    /// initiator already activated the epoch would make that epoch undecryptable.
     pq_pending_since: u64,
 
     /// Monotonic count of DH-ratchet turns performed (incremented in perform_dh_ratchet).
-    /// Used to tag PQ exchanges for stale detection.
     ratchet_turn_count: u32,
-    /// The ratchet_turn_count value recorded when the current pending pubkey was created.
-    /// Ct for a different (older) epoch is rejected as stale.
-    pending_pq_epoch: u32,
 
     session_id: String,
     contact_id: String,
@@ -279,11 +333,12 @@ struct DecryptSnapshot<P: CryptoProvider> {
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
     pq_turns_since_mix: u32,
-    pending_pq_ratchet_keypair: Option<PqRatchetKeyPair>,
-    pending_pq_ciphertext_to_send: Option<Vec<u8>>,
+    current_pq_epoch: u32,
+    pq_epoch_secrets: Vec<(u32, Vec<u8>)>,
+    pending_pq_exchange: Option<PendingPqExchange>,
+    pending_pq_ciphertext: Option<PendingPqCiphertext>,
     pq_pending_since: u64,
     ratchet_turn_count: u32,
-    pending_pq_epoch: u32,
 }
 
 impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
@@ -301,11 +356,12 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
             pq_turns_since_mix: self.pq_turns_since_mix,
-            pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
-            pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
+            current_pq_epoch: self.current_pq_epoch,
+            pq_epoch_secrets: self.pq_epoch_secrets.clone(),
+            pending_pq_exchange: self.pending_pq_exchange.clone(),
+            pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
             ratchet_turn_count: self.ratchet_turn_count,
-            pending_pq_epoch: self.pending_pq_epoch,
         }
     }
 }
@@ -325,8 +381,11 @@ pub struct EncryptedRatchetMessage {
     pub nonce: Vec<u8>,
     pub previous_chain_length: u32,
     pub suite_id: u16,
+    /// Suite-3 only: the PQ epoch whose secret was mixed into this message's key
+    /// (0 = none — pure DR key). Always 0 for other suites.
+    pub pq_message_epoch: u32,
     /// PQ ratchet field for SuiteID::PQ_RATCHET=3 (sparse continuous). None for other suites.
-    /// Present only on messages carrying a PQ exchange (pub or ct). Resent until acked by ratchet advance.
+    /// Present only on messages carrying a PQ exchange (EK or CT). Resent until acked.
     pub pq_ratchet_field: Option<PqRatchetWireField>,
 }
 
@@ -341,8 +400,14 @@ impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
         if let Some(k) = self.pre_pq_root_key.as_mut() {
             k.zeroize();
         }
-        if let Some(kp) = self.pending_pq_ratchet_keypair.as_mut() {
+        if let Some(kp) = self.pending_pq_exchange.as_mut() {
             kp.zeroize();
+        }
+        if let Some(ct) = self.pending_pq_ciphertext.as_mut() {
+            ct.zeroize();
+        }
+        for (_, secret) in self.pq_epoch_secrets.iter_mut() {
+            secret.zeroize();
         }
         for key in self.skipped_message_keys.values_mut() {
             key.zeroize();

@@ -309,6 +309,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: 0,
             suite_id: public_bundle.suite_id.as_u16(),
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 
@@ -399,6 +400,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: decoded.previous_chain_length,
             suite_id: key_bundle.suite_id,
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 
@@ -969,6 +971,7 @@ impl Orchestrator {
             encrypted.suite_id,
             None,
             &sealed_box,
+            encrypted.pq_message_epoch,
             encrypted.pq_ratchet_field.clone(),
         )
         .map_err(|e| e.to_string())
@@ -1004,6 +1007,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: decoded.previous_chain_length,
             suite_id: decoded.suite_id,
+            pq_message_epoch: decoded.pq_message_epoch,
             pq_ratchet_field: decoded.pq_ratchet_field,
         };
 
@@ -1041,6 +1045,7 @@ impl Orchestrator {
             nonce,
             previous_chain_length: 0,
             suite_id: crate::config::Config::global().classic_suite_id,
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 
@@ -1174,6 +1179,7 @@ impl Orchestrator {
             encrypted.suite_id,
             kem_ct_ref,
             &sealed_box,
+            encrypted.pq_message_epoch,
             encrypted.pq_ratchet_field.clone(),
         ) {
             Ok(p) => p,

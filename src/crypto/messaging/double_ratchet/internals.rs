@@ -88,11 +88,12 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.skipped_message_keys = s.skipped_message_keys;
             self.skipped_key_timestamps = s.skipped_key_timestamps;
             self.pq_turns_since_mix = s.pq_turns_since_mix;
-            self.pending_pq_ratchet_keypair = s.pending_pq_ratchet_keypair;
-            self.pending_pq_ciphertext_to_send = s.pending_pq_ciphertext_to_send;
+            self.current_pq_epoch = s.current_pq_epoch;
+            self.pq_epoch_secrets = s.pq_epoch_secrets;
+            self.pending_pq_exchange = s.pending_pq_exchange;
+            self.pending_pq_ciphertext = s.pending_pq_ciphertext;
             self.pq_pending_since = s.pq_pending_since;
             self.ratchet_turn_count = s.ratchet_turn_count;
-            self.pending_pq_epoch = s.pending_pq_epoch;
         }
     }
 
@@ -106,13 +107,13 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// 2. Generate new DH pair
     /// 3. DH(new_private, new_remote_public) → sending_chain
     /// 4. Update state
-    /// 5. (suite_id = PQ_RATCHET only) maybe start a new sparse PQ exchange —
-    ///    see `maybe_advance_pq_ratchet`'s doc for what this does and does not
-    ///    cover yet.
+    /// 5. (suite_id = PQ_RATCHET, initiator only) maybe start a new sparse PQ
+    ///    exchange — see `maybe_advance_pq_ratchet`. The PQ layer never touches
+    ///    `root_key` or chain keys here: PQ secrets are mixed at the
+    ///    message-key level only (see `mix_pq_message_key`).
     pub(super) fn perform_dh_ratchet(
         &mut self,
         new_remote_dh: &P::KemPublicKey,
-        pq_mix_secret: Option<&[u8]>,
     ) -> Result<(), String> {
         use tracing::debug;
 
@@ -131,15 +132,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         let dh_receive = P::kem_decapsulate(dh_private, new_remote_dh.as_ref())
             .map_err(|e| format!("DH failed: {}", e))?;
 
-        let dh_receive_input: Vec<u8> = if let Some(pq) = pq_mix_secret {
-            let mut v = dh_receive.to_vec();
-            v.extend_from_slice(pq);
-            v
-        } else {
-            dh_receive.to_vec()
-        };
-        let (new_root_key, new_receiving_chain) = P::kdf_rk(&self.root_key, &dh_receive_input)
-            .map_err(|e| format!("KDF_RK failed: {}", e))?;
+        let (new_root_key, new_receiving_chain) =
+            P::kdf_rk(&self.root_key, &dh_receive).map_err(|e| format!("KDF_RK failed: {}", e))?;
         self.root_key = new_root_key;
         self.receiving_chain_key = new_receiving_chain;
         self.receiving_chain_length = 0;
@@ -168,13 +162,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.last_ratchet_at = unix_now();
         self.ratchet_turn_count = self.ratchet_turn_count.saturating_add(1);
 
-        // The peer just moved to a new DH epoch, which proves they processed at
-        // least one of our prior replies — that's our implicit ack for any
-        // ciphertext we were resending to complete a peer-initiated PQ exchange.
-        self.pending_pq_ciphertext_to_send = None;
-
-        // 5. Sparse continuous PQ ratchet — maybe *start* a new exchange (never
-        // folds anything itself; see `maybe_advance_pq_ratchet`'s doc).
+        // 5. Sparse continuous PQ ratchet — maybe *start* a new exchange
+        // (initiator only; never touches root/chain keys).
         self.maybe_advance_pq_ratchet()?;
 
         debug!(
@@ -186,48 +175,29 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     }
 
     /// Sparse continuous PQ ratchet — *starts* a new exchange when the cadence
-    /// fires. No-op unless this session's suite is `SuiteID::PQ_RATCHET`.
+    /// fires. No-op unless this session's suite is `SuiteID::PQ_RATCHET` and
+    /// this side is the designated exchange initiator (single-initiator
+    /// discipline — see the SPQR-style design doc).
     ///
-    /// # Scope of what is (and is NOT) implemented
-    ///
-    /// This function, `take_outgoing_pq_field`, and `ingest_incoming_pq_field`
-    /// implement the *mechanical* half of the sparse PQ ratchet: keypair
-    /// generation, cadence bookkeeping, stale-exchange cleanup, and the
-    /// resend-until-acknowledged state machine (`pending_pq_ratchet_keypair`,
-    /// `pending_pq_ciphertext_to_send`). None of this touches `root_key` and
-    /// all of it is safe: it's dead weight unless `suite_id == PQ_RATCHET`,
-    /// which nothing outside tests sets today.
-    ///
-    /// **Deliberately NOT implemented yet: folding the resulting ML-KEM-768
-    /// shared secret into `root_key`.** An initial attempt anchored the fold to
-    /// "whichever `root_key` snapshot is current when a field is ingested" and
-    /// was provably wrong — the two peers' `root_key` values only agree at
-    /// specific classical-ratchet synchronization points (this is why
-    /// `apply_pq_contribution` caches `pre_pq_root_key` for the one-shot
-    /// bootstrap case instead of using "current" `root_key`), and for a
-    /// *recurring* exchange that point shifts depending on how many classical
-    /// ratchet turns interleave between the exchange starting and completing —
-    /// which the resend-until-ack design explicitly allows to vary. Getting
-    /// this right requires either (a) proving the fold anchor is robust against
-    /// arbitrary interleaving/reordering of the 1.5-round-trip exchange with
-    /// ordinary ratchet turns, or (b) constraining when a PQ field may ride
-    /// along so that no interleaving can occur — neither is done here. See the
-    /// plan doc's "Open protocol-design risk" section. Do not wire this
-    /// suite ID into any real session-negotiation path until that's resolved.
+    /// Never touches `root_key`/chain keys: completed epoch secrets are mixed
+    /// at the message-key level only (`mix_pq_message_key`), which is what
+    /// makes the construction immune to the root-key synchronization problem
+    /// documented in the spec's §A.2.
     pub(super) fn maybe_advance_pq_ratchet(&mut self) -> Result<(), String> {
-        if !self.suite_id.is_pq_ratchet() {
+        if !self.suite_id.is_pq_ratchet() || !self.is_pq_initiator {
             return Ok(());
         }
 
-        // Give up on a pending exchange nobody replied to — bandwidth hygiene
-        // only, never a correctness/security concern (see module docs).
+        // Abandon an exchange nobody answered — bandwidth hygiene only. Safe
+        // because nothing was activated: the peer's provisional state (if any)
+        // is superseded by the next proposal's fresh keypair, disambiguated by
+        // `ek_hash`.
         let max_age = Config::global().max_skipped_message_age_seconds.max(0) as u64;
-        if self.pq_pending_since != 0 && unix_now().saturating_sub(self.pq_pending_since) > max_age
+        if self.pq_pending_since != 0
+            && unix_now().saturating_sub(self.pq_pending_since) > max_age
+            && let Some(mut ex) = self.pending_pq_exchange.take()
         {
-            if let Some(mut kp) = self.pending_pq_ratchet_keypair.take() {
-                kp.zeroize();
-            }
-            self.pending_pq_ciphertext_to_send = None;
+            ex.zeroize();
             self.pq_pending_since = 0;
         }
 
@@ -235,112 +205,222 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         if self.pq_turns_since_mix < Config::global().pq_ratchet_interval {
             return Ok(());
         }
-        if self.pending_pq_ratchet_keypair.is_some() || self.pending_pq_ciphertext_to_send.is_some()
-        {
-            // Already mid-exchange (either direction) — don't start a second one
-            // concurrently; try again next turn.
+        if self.pending_pq_exchange.is_some() {
+            // Exchange already in flight — one at a time; try again next turn.
             return Ok(());
         }
 
         let keypair = crate::crypto::pq_x3dh::mlkem768_keygen()
             .map_err(|e| format!("PQ ratchet keygen failed: {e}"))?;
-        self.pending_pq_ratchet_keypair = Some(PqRatchetKeyPair {
-            public: keypair.public_key,
-            secret: keypair.secret_key,
+        self.pending_pq_exchange = Some(PendingPqExchange {
+            epoch: self.current_pq_epoch.saturating_add(1),
+            keypair: PqRatchetKeyPair {
+                public: keypair.public_key,
+                secret: keypair.secret_key,
+            },
         });
-        self.pending_pq_epoch = self.ratchet_turn_count;
         self.pq_pending_since = unix_now();
         self.pq_turns_since_mix = 0;
         Ok(())
     }
 
-    /// Process an incoming PQ-ratchet wire field: performs the KEM math
-    /// (encapsulate/decapsulate) and advances the resend-until-acknowledged
-    /// state machine (`pending_pq_ratchet_keypair`, `pending_pq_ciphertext_to_send`).
-    ///
-    /// **Does NOT mix the resulting shared secret into `root_key`.** See
-    /// `maybe_advance_pq_ratchet`'s doc for why: doing that safely requires
-    /// resolving an open protocol-synchronization question (documented in the
-    /// plan doc) that isn't solved yet. Returning the raw shared secret here
-    /// (rather than silently dropping it) lets callers/tests verify the KEM
-    /// math and state transitions are correct in isolation, without asserting
-    /// anything about root-key security this function doesn't yet provide.
-    ///
-    /// Errors are expected to be handled non-fatally by the caller once wired
-    /// into `decrypt()`: a corrupted or out-of-place PQ field should never
-    /// block decryption of the classical DH-ratchet content it rides on.
-    ///
-    /// `#[allow(dead_code)]`: exercised directly by unit tests; the `decrypt()`
-    /// wiring lands with the wire-format milestone (see plan doc) — and even
-    /// then, only once the root-key-fold question above is resolved.
-    #[allow(dead_code)]
-    pub(super) fn ingest_incoming_pq_field(
-        &mut self,
-        field: &PqRatchetWireField,
-    ) -> Result<Vec<u8>, String> {
-        if !self.suite_id.is_pq_ratchet() {
-            return Err("PQ-ratchet field on a non-PQ_RATCHET session".to_string());
+    /// 8-byte identifier of an ML-KEM encapsulation key, carried alongside a
+    /// ciphertext so the initiator can tell which of its (possibly re-proposed)
+    /// keypairs the ciphertext completes.
+    pub(super) fn pq_ek_hash(ek: &[u8]) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        if let Ok(bytes) = P::hkdf_derive_key(&[], ek, b"construct-pqr-ekhash-v1", 8) {
+            out.copy_from_slice(&bytes);
         }
+        out
+    }
+
+    /// Commit-phase PQ processing, called from `decrypt()` **only after** the
+    /// carrier message authenticated and decrypted successfully (mirrors
+    /// libsignal's commit-on-success discipline). By construction an EK/CT
+    /// field always rides on messages tagged with a pre-completion epoch, so
+    /// decrypting the carrier never depends on the material it carries.
+    ///
+    /// All failures are logged and swallowed: the classical content was already
+    /// delivered, and a malformed PQ field must never poison session state.
+    pub(super) fn commit_pq_post_decrypt(&mut self, encrypted: &EncryptedRatchetMessage) {
+        if !self.suite_id.is_pq_ratchet() {
+            return;
+        }
+
+        // 1. Promotion: a peer message tagged >= our provisional epoch proves
+        // the initiator decapsulated the same secret (that tag was just used,
+        // successfully, to derive this message's key).
+        if self
+            .pending_pq_ciphertext
+            .as_ref()
+            .is_some_and(|p| encrypted.pq_message_epoch >= p.epoch)
+        {
+            let mut p = self.pending_pq_ciphertext.take().expect("checked above");
+            self.current_pq_epoch = self.current_pq_epoch.max(p.epoch);
+            let secret = std::mem::take(&mut p.secret);
+            self.insert_pq_epoch_secret(p.epoch, secret);
+        }
+
+        // 2. Field ingestion.
+        let Some(field) = &encrypted.pq_ratchet_field else {
+            return;
+        };
         match field {
-            PqRatchetWireField::PublicKey(peer_public) => {
-                // Peer started a new exchange: encapsulate, queue the
-                // ciphertext for our next reply.
-                let encapsulation = crate::crypto::pq_x3dh::mlkem768_encapsulate(peer_public)
-                    .map_err(|e| format!("PQ ratchet encapsulate failed: {e}"))?;
-                self.pending_pq_ciphertext_to_send = Some(encapsulation.ciphertext);
-                self.pq_pending_since = unix_now();
-                Ok(encapsulation.shared_secret)
-            }
-            PqRatchetWireField::Ciphertext(ciphertext) => {
-                // Peer completed an exchange we started: decapsulate with our
-                // stored secret, then clear the pending keypair.
-                let Some(mut keypair) = self.pending_pq_ratchet_keypair.take() else {
-                    return Err(
-                        "Received PQ ratchet ciphertext with no pending keypair".to_string()
+            PqRatchetWireField::PublicKey { epoch, key } => {
+                if self.is_pq_initiator {
+                    tracing::warn!(
+                        target: "crypto::double_ratchet",
+                        "ignoring PQ public key from peer: we are the exchange initiator"
                     );
-                };
-                // Strict stale rejection: if the pending pub was from an earlier epoch
-                // than current (intervening classical ratchets), reject to avoid root desync.
-                if self.pending_pq_epoch != 0 && self.pending_pq_epoch > self.ratchet_turn_count {
-                    keypair.zeroize();
-                    return Err("stale PQ ratchet ciphertext (epoch/turn mismatch)".to_string());
+                    return;
                 }
-                let shared_secret =
-                    crate::crypto::pq_x3dh::mlkem768_decapsulate(&keypair.secret, ciphertext)
-                        .map_err(|e| format!("PQ ratchet decapsulate failed: {e}"))?;
-                keypair.zeroize();
-                self.pq_pending_since = 0;
-                self.pending_pq_epoch = 0;
-                Ok(shared_secret)
+                if *epoch <= self.current_pq_epoch {
+                    return; // stale straggler from an epoch already completed
+                }
+                let incoming_hash = Self::pq_ek_hash(key);
+                if let Some(p) = &self.pending_pq_ciphertext
+                    && p.epoch == *epoch
+                    && p.ek_hash == incoming_hash
+                {
+                    return; // duplicate EK — keep resending the existing ciphertext
+                }
+                // New proposal (new epoch, or same epoch re-proposed with a
+                // fresh keypair after abandonment): encapsulate once, replace
+                // any previous provisional state.
+                match crate::crypto::pq_x3dh::mlkem768_encapsulate(key) {
+                    Ok(enc) => {
+                        if let Some(mut old) = self.pending_pq_ciphertext.take() {
+                            old.zeroize();
+                        }
+                        self.pending_pq_ciphertext = Some(PendingPqCiphertext {
+                            epoch: *epoch,
+                            ek_hash: incoming_hash,
+                            ciphertext: enc.ciphertext,
+                            secret: enc.shared_secret,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "crypto::double_ratchet",
+                            "ignoring bad PQ public key (classical delivery unaffected): {e}"
+                        );
+                    }
+                }
+            }
+            PqRatchetWireField::Ciphertext { epoch, ek_hash, ct } => {
+                let Some(p) = &self.pending_pq_exchange else {
+                    return; // duplicate/stale ct after we already completed or abandoned
+                };
+                if p.epoch != *epoch || Self::pq_ek_hash(&p.keypair.public) != *ek_hash {
+                    return; // ct for an abandoned keypair — ignore, keep re-advertising ours
+                }
+                match crate::crypto::pq_x3dh::mlkem768_decapsulate(&p.keypair.secret, ct) {
+                    Ok(shared_secret) => {
+                        // Activate: we (the initiator) start tagging this epoch
+                        // immediately; the responder promotes on our first tag.
+                        let mut ex = self.pending_pq_exchange.take().expect("checked above");
+                        ex.zeroize();
+                        self.current_pq_epoch = *epoch;
+                        self.insert_pq_epoch_secret(*epoch, shared_secret);
+                        self.pq_pending_since = 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "crypto::double_ratchet",
+                            "ignoring bad PQ ciphertext (classical delivery unaffected): {e}"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Fetch the pending outgoing PQ-ratchet field, if any (our fresh public key,
-    /// or our ciphertext reply). Does not clear `pending_pq_ratchet_keypair` /
-    /// `pending_pq_ciphertext_to_send` — both are re-attached to every outgoing
-    /// message until the peer's reply (or DH-ratchet turn) implicitly
-    /// acknowledges receipt, so a single dropped message is self-healing. If both
-    /// are pending simultaneously (each side started its own exchange), the
-    /// ciphertext — closing a loop the peer is waiting on — takes priority; the
-    /// keypair's public key is sent as soon as the ciphertext is acknowledged.
+    /// Store a completed epoch secret, evicting (and zeroizing) the oldest
+    /// beyond `PQ_EPOCH_RETENTION`.
+    pub(super) fn insert_pq_epoch_secret(&mut self, epoch: u32, secret: Vec<u8>) {
+        self.pq_epoch_secrets.retain(|(e, _)| *e != epoch);
+        self.pq_epoch_secrets.push((epoch, secret));
+        self.pq_epoch_secrets.sort_by_key(|(e, _)| *e);
+        while self.pq_epoch_secrets.len() > PQ_EPOCH_RETENTION {
+            let (_, mut old) = self.pq_epoch_secrets.remove(0);
+            old.zeroize();
+        }
+    }
+
+    /// Look up the secret for a completed epoch. Also consults the responder's
+    /// provisional state: the initiator's first message tagged with a new epoch
+    /// arrives *before* we've promoted it (successfully decrypting that very
+    /// message is the promotion trigger).
+    pub(super) fn lookup_pq_epoch_secret(&self, epoch: u32) -> Option<&[u8]> {
+        if let Some((_, s)) = self.pq_epoch_secrets.iter().find(|(e, _)| *e == epoch) {
+            return Some(s.as_slice());
+        }
+        self.pending_pq_ciphertext
+            .as_ref()
+            .filter(|p| p.epoch == epoch)
+            .map(|p| p.secret.as_slice())
+    }
+
+    /// Hybridize a Double Ratchet message key with a completed PQ epoch secret:
+    /// `HKDF(salt = epoch_secret, ikm = dr_message_key)` — the same shape as
+    /// libsignal's Triple Ratchet message-key derivation, where the PQ key is
+    /// the HKDF salt. `epoch == 0` means "no PQ epoch yet" and returns the DR
+    /// key unchanged (also the path for non-suite-3 sessions).
     ///
-    /// `#[allow(dead_code)]`: exercised directly by unit tests; the `encrypt()`
-    /// wiring lands with the wire-format milestone (see plan doc).
-    #[allow(dead_code)]
+    /// Failing to find the epoch's secret is a hard error: silently skipping
+    /// the mix would be a downgrade, so the message is rejected instead.
+    pub(super) fn mix_pq_message_key(
+        &self,
+        dr_key: &P::AeadKey,
+        epoch: u32,
+    ) -> Result<P::AeadKey, String> {
+        if epoch == 0 {
+            return Ok(dr_key.clone());
+        }
+        let secret = self.lookup_pq_epoch_secret(epoch).ok_or_else(|| {
+            format!(
+                "PQ epoch {epoch} secret unavailable (current epoch {}) — \
+                 message tagged with an unknown/evicted epoch",
+                self.current_pq_epoch
+            )
+        })?;
+        let mixed = P::hkdf_derive_key(secret, dr_key.as_ref(), b"construct-pqr-msg-v1", 32)
+            .map_err(|e| format!("PQ message-key mix failed: {e:?}"))?;
+        Self::bytes_to_aead_key(&mixed)
+    }
+
+    /// Fetch the pending outgoing PQ-ratchet field, if any (initiator: our
+    /// fresh public key; responder: our ciphertext reply). Does not clear the
+    /// pending state — the field is re-attached to every outgoing message until
+    /// implicitly acknowledged (initiator: matching ciphertext arrives;
+    /// responder: a peer message tagged >= the provisional epoch), so dropped
+    /// messages are self-healing.
     pub(super) fn take_outgoing_pq_field(&self) -> Option<PqRatchetWireField> {
         if !self.suite_id.is_pq_ratchet() {
             return None;
         }
-        if let Some(ciphertext) = &self.pending_pq_ciphertext_to_send {
-            return Some(PqRatchetWireField::Ciphertext(ciphertext.clone()));
+        if let Some(p) = &self.pending_pq_ciphertext {
+            return Some(PqRatchetWireField::Ciphertext {
+                epoch: p.epoch,
+                ek_hash: p.ek_hash,
+                ct: p.ciphertext.clone(),
+            });
         }
-        self.pending_pq_ratchet_keypair
+        self.pending_pq_exchange
             .as_ref()
-            .map(|kp| PqRatchetWireField::PublicKey(kp.public.clone()))
+            .map(|ex| PqRatchetWireField::PublicKey {
+                epoch: ex.epoch,
+                key: ex.keypair.public.clone(),
+            })
     }
 
     /// Расшифровать с заданным message key.
+    ///
+    /// For suite-3 sessions the stored DR key is first hybridized with the PQ
+    /// epoch secret named by the message's `pq_message_epoch` tag (see
+    /// `mix_pq_message_key`) — this also covers skipped-message keys, which are
+    /// stored pre-mix.
     ///
     /// Tries the current `AD_VERSION` first. If AEAD fails, retries with `AD_VERSION_PREV`
     /// to handle in-flight messages from peers that encrypted before the AD version bump.
@@ -359,6 +439,13 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             ciphertext_len = %encrypted.ciphertext.len(),
             "Decrypting with message key"
         );
+
+        let pq_epoch = if self.suite_id.is_pq_ratchet() {
+            encrypted.pq_message_epoch
+        } else {
+            0
+        };
+        let message_key = &self.mix_pq_message_key(message_key, pq_epoch)?;
 
         // Try current AD version first.
         match self.try_aead_decrypt(message_key, encrypted, AD_VERSION) {
@@ -402,14 +489,19 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 &self.session_id
             )
         })?;
-        let mut associated_data =
-            Vec::with_capacity(1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4);
+        let mut associated_data = Vec::with_capacity(
+            1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4 + 4,
+        );
         associated_data.push(ad_version);
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(&session_id_bytes);
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
+        if self.suite_id.is_pq_ratchet() {
+            // Mirrors encrypt(): suite-3 AD binds the PQ epoch tag (see encrypt's doc).
+            associated_data.extend_from_slice(&encrypted.pq_message_epoch.to_be_bytes());
+        }
 
         tracing::info!(
             target: "crypto::double_ratchet",

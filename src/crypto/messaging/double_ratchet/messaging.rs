@@ -91,11 +91,14 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: None,
             pq_turns_since_mix: 0,
-            pending_pq_ratchet_keypair: None,
-            pending_pq_ciphertext_to_send: None,
+            // Single-initiator discipline: only the DR initiator starts PQ exchanges.
+            is_pq_initiator: suite_id.is_pq_ratchet(),
+            current_pq_epoch: 0,
+            pq_epoch_secrets: Vec::new(),
+            pending_pq_exchange: None,
+            pending_pq_ciphertext: None,
             pq_pending_since: 0,
             ratchet_turn_count: 0,
-            pending_pq_epoch: 0,
             session_id: shared_session_id,
             contact_id,
             local_user_id,
@@ -206,11 +209,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_key_timestamps: HashMap::new(),
             pre_pq_root_key: Some(pre_pq_root_key),
             pq_turns_since_mix: 0,
-            pending_pq_ratchet_keypair: None,
-            pending_pq_ciphertext_to_send: None,
+            is_pq_initiator: false,
+            current_pq_epoch: 0,
+            pq_epoch_secrets: Vec::new(),
+            pending_pq_exchange: None,
+            pending_pq_ciphertext: None,
             pq_pending_since: 0,
             ratchet_turn_count: 0,
-            pending_pq_epoch: 0,
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
@@ -275,6 +280,16 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         })?;
         self.sending_chain_key = next_chain_key;
 
+        // Suite-3: hybridize the DR message key with the current PQ epoch secret
+        // and tag the message with the epoch used, so the receiver mixes the
+        // exact same secret for this message (see mix_pq_message_key).
+        let pq_message_epoch = if self.suite_id.is_pq_ratchet() {
+            self.current_pq_epoch
+        } else {
+            0
+        };
+        let message_key = self.mix_pq_message_key(&message_key, pq_message_epoch)?;
+
         let message_number = self.sending_chain_length;
         self.sending_chain_length = self
             .sending_chain_length
@@ -294,6 +309,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         // Associated Data v3: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
         // v3 marks the era after session_id derivation v2 (HKDF info includes sorted user IDs).
         // The session_id is derived from the shared X3DH root key so both sides compute the same value.
+        // Suite-3 (PQ_RATCHET) sessions additionally append pq_message_epoch(4B BE) — suite 3
+        // launched with this layout, so no AD version bump / fallback is involved.
         let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
             format!(
                 "AEAD encrypt: session_id '{}' is not valid hex — session may be corrupt; \
@@ -301,14 +318,20 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 &self.session_id
             )
         })?;
-        let mut associated_data =
-            Vec::with_capacity(1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4);
+        let mut associated_data = Vec::with_capacity(
+            1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4 + 4,
+        );
         associated_data.push(AD_VERSION); // AD version (see const AD_VERSION)
         associated_data.extend_from_slice(self.local_user_id.as_bytes());
         associated_data.extend_from_slice(self.contact_id.as_bytes());
         associated_data.extend_from_slice(&session_id_bytes);
         associated_data.extend_from_slice(&dh_public_key);
         associated_data.extend_from_slice(&message_number.to_be_bytes());
+        if self.suite_id.is_pq_ratchet() {
+            // Bind the PQ epoch tag under AEAD authentication: a tampered tag
+            // must fail the MAC itself, not merely derive a mismatched key.
+            associated_data.extend_from_slice(&pq_message_epoch.to_be_bytes());
+        }
 
         tracing::info!(
             target: "crypto::double_ratchet",
@@ -344,11 +367,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             "Encryption successful"
         );
 
-        let pq_ratchet_field = if self.suite_id.is_pq_ratchet() {
-            self.take_outgoing_pq_field()
-        } else {
-            None
-        };
         Ok(EncryptedRatchetMessage {
             dh_public_key,
             message_number,
@@ -356,7 +374,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             nonce,
             previous_chain_length: self.previous_sending_length,
             suite_id: self.suite_id.as_u16(),
-            pq_ratchet_field,
+            pq_message_epoch,
+            pq_ratchet_field: self.take_outgoing_pq_field(),
         })
     }
 
@@ -440,38 +459,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
             pq_turns_since_mix: self.pq_turns_since_mix,
-            pending_pq_ratchet_keypair: self.pending_pq_ratchet_keypair.clone(),
-            pending_pq_ciphertext_to_send: self.pending_pq_ciphertext_to_send.clone(),
+            current_pq_epoch: self.current_pq_epoch,
+            pq_epoch_secrets: self.pq_epoch_secrets.clone(),
+            pending_pq_exchange: self.pending_pq_exchange.clone(),
+            pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
             ratchet_turn_count: self.ratchet_turn_count,
-            pending_pq_epoch: self.pending_pq_epoch,
         });
-
-        let mut pq_mix_secret: Option<Vec<u8>> = None;
-        if self.suite_id.is_pq_ratchet()
-            && let Some(ref field) = encrypted.pq_ratchet_field
-        {
-            match self.ingest_incoming_pq_field(field) {
-                Ok(ss) => {
-                    if needs_ratchet {
-                        pq_mix_secret = Some(ss);
-                    } else if matches!(field, super::PqRatchetWireField::Ciphertext(_)) {
-                        // Late ciphertext on non-ratchet continuation: mix into current root
-                        // (no intervening ratchet, so current root is still the sync point).
-                        let cur = self.root_key.as_ref().to_vec();
-                        if let Ok(mixed) =
-                            P::hkdf_derive_key(&cur, &ss, b"construct-pqratchet-v1", 32)
-                            && let Ok(k) = Self::bytes_to_aead_key(&mixed)
-                        {
-                            self.root_key = k;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(target: "crypto::double_ratchet", "ignoring bad PQ ratchet field (classical proceeds): {}", e);
-                }
-            }
-        }
 
         if needs_ratchet {
             // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
@@ -512,7 +506,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public, pq_mix_secret.as_deref())
+            self.perform_dh_ratchet(&remote_dh_public)
                 .inspect_err(|_e| {
                     self.restore_snapshot(snapshot.clone());
                 })?;
@@ -528,9 +522,11 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 msg_num = %encrypted.message_number,
                 "Found skipped message key"
             );
-            return self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
+            let plaintext = self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
                 self.restore_snapshot(snapshot);
-            });
+            })?;
+            self.commit_pq_post_decrypt(encrypted);
+            return Ok(plaintext);
         }
 
         // Derive keys until we reach the message number
@@ -549,11 +545,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                         return Err("receiving_chain_length overflow".to_string());
                     }
                 };
-                return self
+                let plaintext = self
                     .decrypt_with_key(&msg_key, encrypted)
                     .inspect_err(|_e| {
                         self.restore_snapshot(snapshot);
-                    });
+                    })?;
+                self.commit_pq_post_decrypt(encrypted);
+                return Ok(plaintext);
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)
                 // so keys from different DH chains never collide.

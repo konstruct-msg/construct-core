@@ -625,6 +625,7 @@ impl ClassicCryptoCore {
             nonce,
             previous_chain_length: 0,
             suite_id: recipient_bundle.suite_id,
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 
@@ -805,6 +806,7 @@ impl ClassicCryptoCore {
             nonce,
             previous_chain_length: 0, // Not used by decryption
             suite_id: crate::config::Config::global().classic_suite_id,
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 
@@ -1867,6 +1869,7 @@ mod tests {
             nonce: nonce_parsed,
             previous_chain_length: 0,
             suite_id: alice_bundle.suite_id.as_u16(), // Use Alice's bundle suite_id
+            pq_message_epoch: 0,
             pq_ratchet_field: None,
         };
 

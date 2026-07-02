@@ -46,15 +46,16 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
             pq_turns_since_mix: self.pq_turns_since_mix,
-            pq_pending_public: self
-                .pending_pq_ratchet_keypair
-                .as_ref()
-                .map(|kp| kp.public.clone()),
-            pq_pending_secret: self
-                .pending_pq_ratchet_keypair
-                .as_ref()
-                .map(|kp| kp.secret.clone()),
-            pq_pending_ciphertext: self.pending_pq_ciphertext_to_send.clone(),
+            // TODO(pq-ratchet step 3 — persistence): the SPQR-style epoch state
+            // (is_pq_initiator, current_pq_epoch, pq_epoch_secrets, pending
+            // exchange/ciphertext with epoch + ek_hash) is not persisted yet;
+            // these legacy fields stay empty rather than storing state that
+            // from_serializable can't faithfully restore. A restored session
+            // currently drops in-flight PQ exchanges and completed epochs —
+            // acceptable only while suite 3 is not negotiated in production.
+            pq_pending_public: None,
+            pq_pending_secret: None,
+            pq_pending_ciphertext: None,
             pq_pending_since: self.pq_pending_since,
         }
     }
@@ -116,17 +117,16 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .map(|bytes| Self::bytes_to_aead_key(bytes))
                 .transpose()?,
             pq_turns_since_mix: data.pq_turns_since_mix,
-            pending_pq_ratchet_keypair: match (&data.pq_pending_public, &data.pq_pending_secret) {
-                (Some(public), Some(secret)) => Some(PqRatchetKeyPair {
-                    public: public.clone(),
-                    secret: secret.clone(),
-                }),
-                _ => None,
-            },
-            pending_pq_ciphertext_to_send: data.pq_pending_ciphertext.clone(),
+            // TODO(pq-ratchet step 3 — persistence): epoch state is not in the
+            // serialized format yet; restored sessions start with no completed
+            // epochs and no in-flight exchange. See to_serializable's note.
+            is_pq_initiator: false,
+            current_pq_epoch: 0,
+            pq_epoch_secrets: Vec::new(),
+            pending_pq_exchange: None,
+            pending_pq_ciphertext: None,
             pq_pending_since: data.pq_pending_since,
-            ratchet_turn_count: data.pq_turns_since_mix, // best-effort default; epoch not critical on restore for old blobs
-            pending_pq_epoch: 0,
+            ratchet_turn_count: 0,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
