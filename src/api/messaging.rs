@@ -18,6 +18,13 @@ pub struct EncryptedMessage {
     pub message_number: u32,
     pub previous_chain_length: u32,
     pub suite_id: u16,
+    /// Suite-3 only: PQ epoch mixed into this message's key (0 otherwise).
+    #[serde(default)]
+    pub pq_message_epoch: u32,
+    /// Suite-3 only: sparse PQ ratchet EK/CT field.
+    #[serde(default)]
+    pub pq_ratchet_field:
+        Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
 impl From<EncryptedRatchetMessage> for EncryptedMessage {
@@ -30,6 +37,8 @@ impl From<EncryptedRatchetMessage> for EncryptedMessage {
             message_number: msg.message_number,
             previous_chain_length: msg.previous_chain_length,
             suite_id: msg.suite_id,
+            pq_message_epoch: msg.pq_message_epoch,
+            pq_ratchet_field: msg.pq_ratchet_field,
         }
     }
 }
@@ -43,8 +52,8 @@ impl From<EncryptedMessage> for EncryptedRatchetMessage {
             message_number: msg.message_number,
             previous_chain_length: msg.previous_chain_length,
             suite_id: msg.suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            pq_message_epoch: msg.pq_message_epoch,
+            pq_ratchet_field: msg.pq_ratchet_field,
         }
     }
 }

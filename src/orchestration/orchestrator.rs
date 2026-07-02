@@ -1017,6 +1017,10 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
+    /// ⚠️ Legacy component-based path: cannot transport the suite-3 PQ section
+    /// (`pq_message_epoch` / EK/CT field) — not usable for `SuiteID::PQ_RATCHET`
+    /// sessions. Suite-3 traffic must use the wire-payload path
+    /// (`decrypt_bytes_for` / `unpack`), which carries the full section.
     pub fn decrypt_message_for(
         &mut self,
         contact_id: &str,

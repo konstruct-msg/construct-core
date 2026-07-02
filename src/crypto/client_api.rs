@@ -1063,6 +1063,119 @@ mod tests {
         assert_eq!(bob.active_contacts(), vec!["alice"]);
     }
 
+    /// Suite negotiation: a bundle advertising `supports_pq_ratchet` yields a
+    /// suite-3 session end-to-end (initiator tags suite 3 on the wire, the
+    /// responder adopts it from the first message and interops), while a
+    /// bundle without the capability stays on CLASSIC.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn test_client_negotiates_pq_ratchet_from_bundle_capability() {
+        let mut alice = TestClient::new().unwrap();
+        let mut bob = TestClient::new().unwrap();
+        alice.set_local_user_id("aaaaaaaa-0000-4000-8000-0000000000e1".to_string());
+        bob.set_local_user_id("bbbbbbbb-0000-4000-8000-0000000000e2".to_string());
+
+        let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
+        let bob_identity_pub =
+            ClassicSuiteProvider::from_private_key_to_public_key(bob_identity_priv).unwrap();
+        let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
+        let bob_bundle = X3DHPublicKeyBundle {
+            identity_public: bob_identity_pub.clone(),
+            signed_prekey_public: bob_prekey.key_pair.1.clone(),
+            signature: bob_prekey.signature.clone(),
+            verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: true,
+        };
+
+        alice
+            .init_session(
+                "bbbbbbbb-0000-4000-8000-0000000000e2",
+                &bob_bundle,
+                &bob_identity_pub,
+                0,
+            )
+            .unwrap();
+
+        let encrypted1 = alice
+            .encrypt_message("bbbbbbbb-0000-4000-8000-0000000000e2", b"pq hello")
+            .unwrap();
+        assert_eq!(
+            encrypted1.suite_id,
+            SuiteID::PQ_RATCHET.as_u16(),
+            "capable bundle must negotiate suite 3"
+        );
+        assert_eq!(encrypted1.pq_message_epoch, 0, "no PQ epoch at bootstrap");
+
+        let alice_ephemeral_pub =
+            ClassicSuiteProvider::kem_public_key_from_bytes(encrypted1.dh_public_key.to_vec());
+        let alice_identity_priv = alice.key_manager.identity_secret_key().unwrap();
+        let alice_identity_pub =
+            ClassicSuiteProvider::from_private_key_to_public_key(alice_identity_priv).unwrap();
+        let (_sid, decrypted1) = bob
+            .init_receiving_session_with_ephemeral(
+                "aaaaaaaa-0000-4000-8000-0000000000e1",
+                &alice_identity_pub,
+                &alice_ephemeral_pub,
+                &encrypted1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(decrypted1, b"pq hello");
+
+        // Round trip on the negotiated suite.
+        let reply = bob
+            .encrypt_message("aaaaaaaa-0000-4000-8000-0000000000e1", b"pq hi back")
+            .unwrap();
+        assert_eq!(reply.suite_id, SuiteID::PQ_RATCHET.as_u16());
+        assert_eq!(
+            alice
+                .decrypt_message("bbbbbbbb-0000-4000-8000-0000000000e2", &reply)
+                .unwrap(),
+            b"pq hi back"
+        );
+    }
+
+    /// A bundle without the capability must keep negotiating CLASSIC.
+    #[test]
+    fn test_client_without_capability_stays_classic() {
+        let mut alice = TestClient::new().unwrap();
+        let bob = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
+
+        let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
+        let bob_identity_pub =
+            ClassicSuiteProvider::from_private_key_to_public_key(bob_identity_priv).unwrap();
+        let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
+        let bob_bundle = X3DHPublicKeyBundle {
+            identity_public: bob_identity_pub.clone(),
+            signed_prekey_public: bob_prekey.key_pair.1.clone(),
+            signature: bob_prekey.signature.clone(),
+            verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
+        };
+
+        alice
+            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
+            .unwrap();
+        let encrypted = alice.encrypt_message("bob", b"classic hello").unwrap();
+        assert_eq!(encrypted.suite_id, SuiteID::CLASSIC.as_u16());
+        assert_eq!(encrypted.pq_message_epoch, 0);
+    }
+
     #[test]
     fn test_client_remove_session() {
         let mut alice = TestClient::new().unwrap();

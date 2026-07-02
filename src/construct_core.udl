@@ -3,6 +3,11 @@ namespace construct_core {
     string derive_device_id(sequence<u8> identity_public_key);
     string format_federated_id(string device_id, string server_hostname);
 
+    // Whether this core build supports SuiteID::PQ_RATCHET (suite 3).
+    // Pass as supports_pq_ratchet in UploadPreKeysRequest so peers can
+    // negotiate suite-3 sessions against this device.
+    boolean supports_pq_ratchet();
+
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string compute_safety_number(string my_device_id, string their_device_id);
     
@@ -85,6 +90,7 @@ dictionary BinaryKeyBundle {
     sequence<u8>? kyber_pre_key_public;
     sequence<u8>? kyber_one_time_prekey_public;
     u32? kyber_one_time_prekey_id;
+    boolean supports_pq_ratchet;
 };
 
 /// Binary first-message bundle for init_receiving_session — no JSON encoding.

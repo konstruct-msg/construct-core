@@ -185,6 +185,9 @@ pub struct BinaryKeyBundle {
     pub kyber_pre_key_public: Option<Vec<u8>>,
     pub kyber_one_time_prekey_public: Option<Vec<u8>>,
     pub kyber_one_time_prekey_id: Option<u32>,
+    /// Peer capability from the server's PreKeyBundle (key-service field 24,
+    /// migration 063): initiators use it to negotiate `SuiteID::PQ_RATCHET`.
+    pub supports_pq_ratchet: bool,
 }
 
 /// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
@@ -777,6 +780,12 @@ impl ClassicCryptoCore {
     }
 
     /// Decrypt a message from a session - accepts wire format components
+    ///
+    /// ⚠️ Legacy component-based path: it cannot transport the suite-3 PQ
+    /// section (`pq_message_epoch` / EK/CT field), so it must not be used for
+    /// `SuiteID::PQ_RATCHET` sessions — messages tagged with a PQ epoch will
+    /// fail to decrypt here. Suite-3 traffic goes through the wire-payload
+    /// APIs (`OrchestratorCore` pack/unpack), which carry the full section.
     pub fn decrypt_message(
         &self,
         session_id: String,
@@ -1408,6 +1417,7 @@ mod tests {
             kyber_pre_key_public: None,
             kyber_one_time_prekey_public: None,
             kyber_one_time_prekey_id: None,
+            supports_pq_ratchet: false,
         }
     }
 
@@ -1935,6 +1945,15 @@ pub fn derive_device_id(identity_public_key: Vec<u8>) -> String {
     crate::device_id::derive_device_id(&identity_public_key)
 }
 
+/// Whether this core build supports `SuiteID::PQ_RATCHET` (suite 3) sessions.
+///
+/// Platforms must pass this as `supports_pq_ratchet` in `UploadPreKeysRequest`
+/// so the server advertises the capability in this device's PreKeyBundle and
+/// peers can negotiate suite 3 (see key-service migration 063).
+pub fn supports_pq_ratchet() -> bool {
+    crate::crypto::session_api::local_supports_pq_ratchet()
+}
+
 /// Format federated identifier
 /// UniFFI wrapper - accepts owned Strings
 pub fn format_federated_id(device_id: String, server_hostname: String) -> String {
@@ -2406,7 +2425,7 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
         spk_rotation_epoch: b.spk_rotation_epoch,
         kyber_spk_uploaded_at: b.kyber_spk_uploaded_at,
         kyber_spk_rotation_epoch: b.kyber_spk_rotation_epoch,
-        supports_pq_ratchet: false,
+        supports_pq_ratchet: b.supports_pq_ratchet,
     })
 }
 

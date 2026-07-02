@@ -58,6 +58,42 @@ use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use std::marker::PhantomData;
 
+/// Whether this build can run `SuiteID::PQ_RATCHET` sessions (the sparse
+/// continuous PQ ratchet needs the ML-KEM-768 primitives behind the
+/// `post-quantum` feature). Exposed through UniFFI so platforms can advertise
+/// the capability in their uploaded prekey bundle (`supports_pq_ratchet`,
+/// key-service migration 063).
+pub const fn local_supports_pq_ratchet() -> bool {
+    cfg!(feature = "post-quantum")
+}
+
+/// Initiator-side suite negotiation: `PQ_RATCHET` only when this build has the
+/// PQ primitives *and* the peer's fetched bundle advertises support; `CLASSIC`
+/// otherwise (existing behavior, including for peers on older servers whose
+/// bundles lack the field entirely).
+///
+/// Bundle access is generic over `H::PublicKeyBundle` via JSON, following the
+/// `validate_bundle_freshness` idiom in `client_api.rs` — a bundle type without
+/// the field simply negotiates `CLASSIC`.
+fn negotiated_initiator_suite<P, H>(bundle: &H::PublicKeyBundle) -> SuiteID
+where
+    P: CryptoProvider,
+    H: KeyAgreement<P>,
+{
+    if !local_supports_pq_ratchet() {
+        return SuiteID::CLASSIC;
+    }
+    let peer_supports = serde_json::to_value(bundle)
+        .ok()
+        .and_then(|v| v.get("supports_pq_ratchet").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    if peer_supports {
+        SuiteID::PQ_RATCHET
+    } else {
+        SuiteID::CLASSIC
+    }
+}
+
 /// High-level Session для обмена сообщениями с одним контактом
 ///
 /// Объединяет handshake protocol (KeyAgreement) и messaging protocol (SecureMessaging).
@@ -162,13 +198,20 @@ where
 
         // 2. Create messaging session (Double Ratchet)
         // Convert root_key to &[u8] - X3DH returns Vec<u8>
+        let suite_id = negotiated_initiator_suite::<P, H>(remote_bundle);
+        info!(
+            target: "crypto::session",
+            contact_id = %contact_id,
+            suite_id = %suite_id.as_u16(),
+            "Suite negotiated for new session"
+        );
         let messaging_session = M::new_initiator_session(
             root_key.as_ref(),
             initiator_state,
             remote_identity,
             contact_id.clone(),
             local_user_id,
-            SuiteID::CLASSIC, // TODO: negotiate PQ_RATCHET when bundle supports it
+            suite_id,
         )
         .map_err(|e| {
             error!(

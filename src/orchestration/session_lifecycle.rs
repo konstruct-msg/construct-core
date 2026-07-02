@@ -55,6 +55,14 @@ pub struct WireMessage {
     pub nonce: Vec<u8>,
     pub previous_chain_length: u32,
     pub suite_id: u16,
+    /// Suite-3 only: PQ epoch mixed into this message's key (0 otherwise).
+    /// `serde(default)` keeps old JSON blobs parseable.
+    #[serde(default)]
+    pub pq_message_epoch: u32,
+    /// Suite-3 only: sparse PQ ratchet EK/CT field.
+    #[serde(default)]
+    pub pq_ratchet_field:
+        Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
 impl From<EncryptedRatchetMessage> for WireMessage {
@@ -66,6 +74,8 @@ impl From<EncryptedRatchetMessage> for WireMessage {
             nonce: m.nonce,
             previous_chain_length: m.previous_chain_length,
             suite_id: m.suite_id,
+            pq_message_epoch: m.pq_message_epoch,
+            pq_ratchet_field: m.pq_ratchet_field,
         }
     }
 }
@@ -84,8 +94,8 @@ impl TryFrom<WireMessage> for EncryptedRatchetMessage {
             nonce: w.nonce,
             previous_chain_length: w.previous_chain_length,
             suite_id: w.suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            pq_message_epoch: w.pq_message_epoch,
+            pq_ratchet_field: w.pq_ratchet_field,
         })
     }
 }
