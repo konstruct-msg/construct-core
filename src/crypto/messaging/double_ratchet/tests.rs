@@ -2141,7 +2141,10 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
     // Deliver the EK so Bob holds the provisional epoch-2 secret (unpromoted).
     let m_ek = alice.encrypt(b"ek carrier before snapshot").unwrap();
     bob.decrypt(&m_ek).unwrap();
-    assert!(bob.pending_pq_ciphertext.is_some(), "provisional CT pending");
+    assert!(
+        bob.pending_pq_ciphertext.is_some(),
+        "provisional CT pending"
+    );
     assert_eq!(bob.current_pq_epoch, 1, "not yet promoted");
 
     // Snapshot + restore BOTH sides through the full CFE path.
@@ -2150,7 +2153,10 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
     drop(alice);
     drop(bob);
 
-    assert!(alice2.is_pq_initiator, "initiator role must survive restore");
+    assert!(
+        alice2.is_pq_initiator,
+        "initiator role must survive restore"
+    );
     assert!(!bob2.is_pq_initiator);
     assert_eq!(alice2.current_pq_epoch, 1);
     assert_eq!(bob2.current_pq_epoch, 1);
@@ -2175,7 +2181,10 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
         Some(PqRatchetWireField::Ciphertext { .. })
     ));
     alice2.decrypt(&r_ct).unwrap();
-    assert_eq!(alice2.current_pq_epoch, 2, "restored initiator completed epoch 2");
+    assert_eq!(
+        alice2.current_pq_epoch, 2,
+        "restored initiator completed epoch 2"
+    );
 
     let m_tag2 = alice2.encrypt(b"tagged 2 after restore").unwrap();
     assert_eq!(m_tag2.pq_message_epoch, 2);
@@ -2207,8 +2216,7 @@ fn test_pq_ratchet_blob_without_pqr_restores_degraded() {
     cfe.pqr = None; // simulate a pre-persistence blob
 
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
-    let mut bob2 =
-        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    let mut bob2 = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
     assert_eq!(bob2.current_pq_epoch, 0, "PQ state reset");
     assert!(bob2.pending_pq_ciphertext.is_none());
 
@@ -2279,9 +2287,11 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
     let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
     cfe.pqr.as_mut().unwrap().epoch_secrets[0].secret = ByteBuf::from(vec![0u8; 5]);
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
-    let restored =
-        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
-    assert_eq!(restored.current_pq_epoch, 0, "corrupted state must be dropped");
+    let restored = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    assert_eq!(
+        restored.current_pq_epoch, 0,
+        "corrupted state must be dropped"
+    );
     assert!(restored.pq_epoch_secrets.is_empty());
 
     // Corrupt variant 2: pending-exchange epoch violating the current+1 invariant.
@@ -2292,8 +2302,7 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
         secret: ByteBuf::from(vec![0u8; 2400]),
     });
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
-    let restored =
-        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
+    let restored = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
     assert_eq!(restored.current_pq_epoch, 0);
     assert!(restored.pending_pq_exchange.is_none());
 }

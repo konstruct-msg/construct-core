@@ -510,8 +510,10 @@ impl SerializableSession {
                 .collect(),
             pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
             last_ratchet_at: self.last_ratchet_at,
-            pqr: self.pq_ratchet.as_ref().map(|pq| {
-                crate::cfe::CfePqRatchetStateV1 {
+            pqr: self
+                .pq_ratchet
+                .as_ref()
+                .map(|pq| crate::cfe::CfePqRatchetStateV1 {
                     is_initiator: pq.is_initiator,
                     current_epoch: pq.current_epoch,
                     epoch_secrets: pq
@@ -539,8 +541,7 @@ impl SerializableSession {
                     }),
                     pending_since: pq.pending_since,
                     turns_since_mix: pq.turns_since_mix,
-                }
-            }),
+                }),
         })
     }
 

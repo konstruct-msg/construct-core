@@ -171,7 +171,8 @@ fn bench_wire_payload(c: &mut Criterion) {
         });
     });
 
-    let packed = wire_payload::pack(&dh_pub_key, 42, 0, 0, 0, 1, None, &sealed_box, 0, None).unwrap();
+    let packed =
+        wire_payload::pack(&dh_pub_key, 42, 0, 0, 0, 1, None, &sealed_box, 0, None).unwrap();
     group.bench_function("unpack", |b| {
         b.iter(|| wire_payload::unpack(&packed).expect("unpack failed"));
     });

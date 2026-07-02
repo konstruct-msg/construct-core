@@ -61,8 +61,7 @@ pub struct WireMessage {
     pub pq_message_epoch: u32,
     /// Suite-3 only: sparse PQ ratchet EK/CT field.
     #[serde(default)]
-    pub pq_ratchet_field:
-        Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+    pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
 impl From<EncryptedRatchetMessage> for WireMessage {
