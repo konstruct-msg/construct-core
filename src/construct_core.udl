@@ -856,6 +856,16 @@ namespace construct_core {
         sequence<u8> server_pubkey_bytes
     );
 
+    /// Seal a finalized 32-byte token to the server's X25519 token-encryption
+    /// key (token_encryption_key from /.well-known/construct-server) so relay
+    /// operators cannot read spent tokens. Returns
+    /// ephemeral_pub(32) || nonce(12) || ciphertext || tag(16).
+    [Throws=CryptoError]
+    sequence<u8> pp_seal_token_bytes(
+        sequence<u8> token,
+        sequence<u8> server_encryption_key
+    );
+
     // ── ConstructSEALED (sealed sender, stealth-sealed-sender-v2 Phase 5) ────
 
     /// Seal serialized SenderCertificate bytes to the recipient's X25519

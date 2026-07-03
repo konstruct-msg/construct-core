@@ -3348,6 +3348,17 @@ pub fn pp_verify_client(
     crate::crypto::privacy_pass::pp_verify_client(evaluated_bytes, nonce, server_pubkey_bytes)
 }
 
+pub fn pp_seal_token_bytes(
+    token: Vec<u8>,
+    server_encryption_key: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::privacy_pass::pp_seal_token_bytes(token, server_encryption_key).map_err(|e| {
+        CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        }
+    })
+}
+
 // ── ConstructSEALED UniFFI bindings ───────────────────────────────────────────
 
 pub fn sealed_seal_sender_cert(

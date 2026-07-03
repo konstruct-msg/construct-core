@@ -31,6 +31,7 @@ use sha2::{Digest, Sha512};
 use crate::error::CryptoError;
 
 const HKDF_INFO: &[u8] = b"ConstructPP-v1";
+const TOKEN_SEAL_INFO: &[u8] = b"construct-token-seal-v1";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared helper
@@ -236,6 +237,55 @@ pub fn pp_verify_client(
         .is_some()
 }
 
+/// Seal a finalized token to the server's X25519 token-encryption public key
+/// (`token_encryption_key` from `/.well-known/construct-server`) so relay
+/// operators cannot read spent tokens in transit.
+///
+/// Format: `ephemeral_pub(32) ‖ nonce(12) ‖ ciphertext ‖ tag(16)`.
+/// Key: `HKDF-SHA256(ikm = X25519(eph, server), salt = ∅,
+/// info = "construct-token-seal-v1")` — matches iOS `ServerKeyManager.sealBox`
+/// and construct-server's `privacy_pass::open_sealed_token_bytes`.
+pub fn pp_seal_token_bytes(
+    token: Vec<u8>,
+    server_encryption_key: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+    use rand_core::RngCore;
+    use sha2::Sha256;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let server_pub_arr: [u8; 32] = server_encryption_key.try_into().map_err(|_| {
+        CryptoError::InvalidInputError("pp_seal_token_bytes: server key must be 32 bytes".into())
+    })?;
+    let server_pub = PublicKey::from(server_pub_arr);
+
+    let mut eph_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut eph_seed);
+    let ephemeral = StaticSecret::from(eph_seed);
+    let ephemeral_pub = PublicKey::from(&ephemeral);
+
+    let shared = ephemeral.diffie_hellman(&server_pub);
+    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(TOKEN_SEAL_INFO, &mut key)
+        .expect("HKDF-SHA256 with 32-byte output always succeeds");
+
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let ct_and_tag = cipher
+        .encrypt(Nonce::from_slice(&nonce), token.as_slice())
+        .map_err(|_| CryptoError::AeadEncryptionError("token seal failed".into()))?;
+
+    let mut out = Vec::with_capacity(32 + 12 + ct_and_tag.len());
+    out.extend_from_slice(ephemeral_pub.as_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct_and_tag);
+    Ok(out)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -324,5 +374,46 @@ mod tests {
     fn issuer_pubkey_deterministic() {
         let k = random_scalar_bytes();
         assert_eq!(issuer_pubkey(&k).unwrap(), issuer_pubkey(&k).unwrap());
+    }
+
+    /// Round trip against a reimplementation of construct-server's
+    /// `open_sealed_token_bytes` (same derivation: HKDF-SHA256 no salt,
+    /// info "construct-token-seal-v1").
+    #[test]
+    fn seal_token_bytes_server_open_round_trip() {
+        use chacha20poly1305::aead::Aead;
+        use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+        use hkdf::Hkdf;
+        use rand_core::RngCore;
+        use sha2::Sha256;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut server_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut server_seed);
+        let server_secret = StaticSecret::from(server_seed);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let token = [0x42u8; 32];
+        let sealed = pp_seal_token_bytes(token.to_vec(), server_pub.as_bytes().to_vec()).unwrap();
+        assert!(sealed.len() >= 32 + 12 + 16);
+
+        // Server-side open
+        let eph_pub_arr: [u8; 32] = sealed[..32].try_into().unwrap();
+        let eph_pub = PublicKey::from(eph_pub_arr);
+        let shared = server_secret.diffie_hellman(&eph_pub);
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(TOKEN_SEAL_INFO, &mut key).unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let opened = cipher
+            .decrypt(Nonce::from_slice(&sealed[32..44]), &sealed[44..])
+            .unwrap();
+
+        assert_eq!(opened, token);
+    }
+
+    #[test]
+    fn seal_token_bytes_rejects_bad_key_length() {
+        assert!(pp_seal_token_bytes(vec![0u8; 32], vec![0u8; 31]).is_err());
     }
 }
