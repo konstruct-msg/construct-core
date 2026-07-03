@@ -1,4 +1,6 @@
-use super::{DoubleRatchetSession, EncryptedRatchetMessage, PqRatchetWireField, SuiteID};
+#[cfg(feature = "post-quantum")]
+use super::PqRatchetWireField;
+use super::{DoubleRatchetSession, EncryptedRatchetMessage, SuiteID};
 use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
