@@ -122,7 +122,9 @@ pub mod social_recovery;
 // Post-Quantum (conditionally compiled)
 // ============================================================================
 
-#[cfg(feature = "post-quantum")]
+// Not feature-gated: the module carries its own #[cfg(not(feature =
+// "post-quantum"))] error stubs precisely so call sites (PQ ratchet in
+// double_ratchet/internals.rs) compile in default builds.
 pub mod pq_x3dh;
 
 /// Post-quantum hybrid crypto suite (Ed25519 + ML-DSA-65).

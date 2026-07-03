@@ -605,6 +605,12 @@ impl<P: CryptoProvider> KeyManager<P> {
         )))
     }
     #[cfg(not(feature = "post-quantum"))]
+    pub fn sign_hybrid_prekey(&mut self, _suite_id: u8, _public_key: &[u8]) -> Result<Vec<u8>> {
+        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
+            "hybrid signatures require post-quantum feature".into(),
+        )))
+    }
+    #[cfg(not(feature = "post-quantum"))]
     pub fn set_hybrid_signature_private(&mut self, _priv_bytes: Vec<u8>) -> Result<()> {
         Ok(())
     }
