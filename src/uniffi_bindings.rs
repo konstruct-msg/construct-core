@@ -3348,6 +3348,53 @@ pub fn pp_verify_client(
     crate::crypto::privacy_pass::pp_verify_client(evaluated_bytes, nonce, server_pubkey_bytes)
 }
 
+// ── ConstructSEALED UniFFI bindings ───────────────────────────────────────────
+
+pub fn sealed_seal_sender_cert(
+    cert_bytes: Vec<u8>,
+    recipient_identity_key: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::seal_sender_cert(&cert_bytes, &recipient_identity_key).map_err(
+        |e| CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        },
+    )
+}
+
+pub fn sealed_unseal_sender_cert(
+    sealed_box: Vec<u8>,
+    our_identity_priv: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::unseal_sender_cert(&sealed_box, &our_identity_priv).map_err(
+        |e| CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sealed_verify_sender_cert(
+    user_id: String,
+    domain: String,
+    identity_key: Vec<u8>,
+    device_id: String,
+    issued_at: i64,
+    expires_at: i64,
+    signature: Vec<u8>,
+    server_verifying_key: Vec<u8>,
+) -> bool {
+    crate::crypto::sealed_sender::verify_sender_cert(
+        &user_id,
+        &domain,
+        &identity_key,
+        &device_id,
+        issued_at,
+        expires_at,
+        &signature,
+        &server_verifying_key,
+    )
+}
+
 // ── SLIP-39 Social Recovery UniFFI bindings ───────────────────────────────────
 
 /// Mirror of `crypto::social_recovery::RecoveryBundle` with UniFFI-compatible types.

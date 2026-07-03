@@ -112,6 +112,9 @@ pub mod key_transparency;
 /// ConstructPrivacyPass — OPRF blind token primitives (Ristretto255)
 pub mod privacy_pass;
 
+/// ConstructSEALED — sealed sender box + sender-certificate verification
+pub mod sealed_sender;
+
 /// SLIP-39 social recovery — vault key Shamir Secret Sharing + bundle encryption
 pub mod social_recovery;
 

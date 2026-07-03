@@ -856,6 +856,43 @@ namespace construct_core {
         sequence<u8> server_pubkey_bytes
     );
 
+    // ── ConstructSEALED (sealed sender, stealth-sealed-sender-v2 Phase 5) ────
+
+    /// Seal serialized SenderCertificate bytes to the recipient's X25519
+    /// identity public key (32 bytes). Returns the sealed box:
+    /// ephemeral_pub(32) || nonce(12) || ciphertext || tag(16).
+    /// Bit-compatible with the iOS CryptoKit implementation.
+    [Throws=CryptoError]
+    sequence<u8> sealed_seal_sender_cert(
+        sequence<u8> cert_bytes,
+        sequence<u8> recipient_identity_key
+    );
+
+    /// Open a sealed sender box with our X25519 identity private key
+    /// (32 bytes). Returns the serialized SenderCertificate bytes — the caller
+    /// parses the proto and then calls sealed_verify_sender_cert.
+    [Throws=CryptoError]
+    sequence<u8> sealed_unseal_sender_cert(
+        sequence<u8> sealed_box,
+        sequence<u8> our_identity_priv
+    );
+
+    /// Verify the server Ed25519 signature over a SenderCertificate's fields
+    /// (variant-0 payload: user_id || domain || identity_key || device_id ||
+    /// BE64(issued_at) || BE64(expires_at) — no separators).
+    /// server_verifying_key is the 32-byte bundle verification key from
+    /// /.well-known/construct-server. Returns false on any malformed input.
+    boolean sealed_verify_sender_cert(
+        string user_id,
+        string domain,
+        sequence<u8> identity_key,
+        string device_id,
+        i64 issued_at,
+        i64 expires_at,
+        sequence<u8> signature,
+        sequence<u8> server_verifying_key
+    );
+
     // ── SLIP-39 Social Recovery ───────────────────────────────────────────────
 
     /// Generate a 32-byte random vault key.
