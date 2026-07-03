@@ -3376,11 +3376,11 @@ pub fn sealed_unseal_sender_cert(
     sealed_box: Vec<u8>,
     our_identity_priv: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::unseal_sender_cert(&sealed_box, &our_identity_priv).map_err(
-        |e| CryptoError::DecryptionFailed {
+    crate::crypto::sealed_sender::unseal_sender_cert(&sealed_box, &our_identity_priv).map_err(|e| {
+        CryptoError::DecryptionFailed {
             message: e.to_string(),
-        },
-    )
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
