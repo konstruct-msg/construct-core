@@ -1069,6 +1069,7 @@ mod tests {
     /// bundle without the capability stays on CLASSIC.
     #[cfg(feature = "post-quantum")]
     #[test]
+    #[ignore = "PQ_RATCHET (suite 3) negotiation temporarily disabled — task #12 (msg0 PQ-contribution ordering). Re-enable with PQ_RATCHET_ENABLED."]
     fn test_client_negotiates_pq_ratchet_from_bundle_capability() {
         let mut alice = TestClient::new().unwrap();
         let mut bob = TestClient::new().unwrap();

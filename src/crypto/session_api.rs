@@ -64,8 +64,23 @@ use std::marker::PhantomData;
 /// the capability in their uploaded prekey bundle (`supports_pq_ratchet`,
 /// key-service migration 063).
 pub const fn local_supports_pq_ratchet() -> bool {
-    cfg!(feature = "post-quantum")
+    cfg!(feature = "post-quantum") && PQ_RATCHET_ENABLED
 }
+
+/// Master switch for `SuiteID::PQ_RATCHET` (suite 3) negotiation.
+///
+/// TEMPORARILY `false` (task #12 / `key-store-consolidation-and-server-authority`): on real
+/// devices a session that negotiates suite 3 fails to decrypt the FIRST message (mutual msg0
+/// AEAD failure), while the pure-core suite-3 round-trip unit test passes — pointing at the iOS
+/// deferred-PQXDH-contribution integration (the Kyber KEM is decapsulated/mixed into the root in
+/// a separate step whose ordering relative to msg0 differs from the initiator) rather than the
+/// core ratchet. Forcing `CLASSIC` negotiation both unblocks messaging and bisects the layer:
+/// if delivery returns, the defect is suite-3-specific; if it persists, it is in the deferred
+/// PQXDH contribution (suite-independent). The deferred PQXDH Kyber KEM itself (HNDL protection)
+/// is unaffected by this switch. Gates BOTH the advertised capability (`supports_pq_ratchet`
+/// UDL) and initiator negotiation, so no suite-3 first message is ever created once both peers
+/// rebuild. Flip back to `true` once the first-message PQ-contribution ordering is symmetric.
+const PQ_RATCHET_ENABLED: bool = false;
 
 /// Initiator-side suite negotiation: `PQ_RATCHET` only when this build has the
 /// PQ primitives *and* the peer's fetched bundle advertises support; `CLASSIC`
