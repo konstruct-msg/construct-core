@@ -50,8 +50,8 @@ pub enum CryptoError {
     #[error("Invalid ciphertext")]
     InvalidCiphertext,
 
-    #[error("Serialization failed")]
-    SerializationFailed,
+    #[error("Serialization failed: {message}")]
+    SerializationFailed { message: String },
 
     #[error("MessagePack deserialization failed - check format")]
     MessagePackDeserializationFailed,
@@ -71,6 +71,19 @@ impl From<crate::error::CryptoError> for CryptoError {
                 message: e.to_string(),
             },
         }
+    }
+}
+
+/// Build a `SerializationFailed` that carries the underlying error's detail so an
+/// otherwise-opaque CFE/serde failure becomes diagnosable in client logs — e.g. the
+/// exact `CfeError` variant (`ChecksumMismatch` vs `LegacyJson` vs `DeserializeFailed`
+/// vs `TypeMismatch`). Before this, every distinct cause collapsed into a bare
+/// "Serialization failed", which is why the recurring OTPK-import corruption could not
+/// be root-caused from logs. `{:?}` (Debug) works for every error type at the call
+/// sites (CfeError, serde_json::Error, String).
+fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError {
+    CryptoError::SerializationFailed {
+        message: format!("{context}: {err:?}"),
     }
 }
 
@@ -392,7 +405,7 @@ impl ClassicCryptoCore {
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("classic export_private_keys/encode", e))
     }
 
     /// Import private keys from CFE bytes.
@@ -401,7 +414,7 @@ impl ClassicCryptoCore {
             &data,
             crate::cfe::CfeMessageType::PrivateKeys,
         )
-        .map_err(|_| CryptoError::SerializationFailed)?;
+        .map_err(|e| serialization_failed("classic import_private_keys/decode", e))?;
 
         let mut client = self
             .inner
@@ -456,10 +469,10 @@ impl ClassicCryptoCore {
         let serializable = session.messaging_session().to_serializable();
         let payload = serializable
             .to_cfe_v1()
-            .map_err(|_| CryptoError::SerializationFailed)?;
+            .map_err(|e| serialization_failed("classic export_session/to_cfe_v1", e))?;
 
         crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("classic export_session/encode", e))
     }
 
     /// Import session from CFE bytes (with legacy JSON fallback).
@@ -471,16 +484,17 @@ impl ClassicCryptoCore {
             crate::cfe::CfeMessageType::SessionState,
         ) {
             Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
-                .map_err(|_| CryptoError::SerializationFailed)?,
+                .map_err(|e| serialization_failed("classic import_session/from_cfe_v1", e))?,
             Err(crate::cfe::CfeError::LegacyJson) => {
                 let s = std::str::from_utf8(&data).map_err(|_| CryptoError::InvalidKeyData)?;
-                serde_json::from_str(s).map_err(|_| CryptoError::SerializationFailed)?
+                serde_json::from_str(s)
+                    .map_err(|e| serialization_failed("classic import_session/legacy_json", e))?
             }
-            Err(_) => return Err(CryptoError::SerializationFailed),
+            Err(e) => return Err(serialization_failed("classic import_session/decode", e)),
         };
 
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
-            .map_err(|_| CryptoError::SerializationFailed)?;
+            .map_err(|e| serialization_failed("classic import_session/from_serializable", e))?;
 
         let mut client = self
             .inner
@@ -920,7 +934,7 @@ impl ClassicCryptoCore {
         let payload = crate::cfe::CfeOtpkBundleV1 { records, next_id };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::OtpkBundle, &payload)
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("classic export_one_time_prekeys/encode", e))
     }
 
     /// Import OTPKs from CFE bytes.
@@ -929,7 +943,7 @@ impl ClassicCryptoCore {
             &data,
             crate::cfe::CfeMessageType::OtpkBundle,
         )
-        .map_err(|_| CryptoError::SerializationFailed)?;
+        .map_err(|e| serialization_failed("classic import_one_time_prekeys/decode", e))?;
 
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
@@ -1031,7 +1045,7 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
         &keys,
         crate::cfe::CfeMessageType::PrivateKeys,
     )
-    .map_err(|_| CryptoError::SerializationFailed)?;
+    .map_err(|e| serialization_failed("create_crypto_core_from_keys/decode", e))?;
 
     let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
     let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
@@ -1061,7 +1075,7 @@ pub fn create_orchestrator_core_from_keys(
         &keys_data,
         crate::cfe::CfeMessageType::PrivateKeys,
     )
-    .map_err(|_| CryptoError::SerializationFailed)?;
+    .map_err(|e| serialization_failed("create_orchestrator_core_from_keys/decode", e))?;
 
     let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
     let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
@@ -2553,7 +2567,7 @@ impl OrchestratorCore {
     pub fn export_private_keys(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_private_keys_cfe()
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("orchestrator export_private_keys", e))
     }
 
     pub fn sign_bundle_data(&self, bundle_data_json: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
@@ -2627,7 +2641,7 @@ impl OrchestratorCore {
     pub fn import_session(&self, contact_id: String, data: Vec<u8>) -> Result<String, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_session_cfe(&contact_id, &data)
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("orchestrator import_session", e))
     }
 
     pub fn get_all_session_contact_ids(&self) -> Vec<String> {
@@ -2811,13 +2825,13 @@ impl OrchestratorCore {
     pub fn export_one_time_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_otpks_cfe()
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("orchestrator export_one_time_prekeys", e))
     }
 
     pub fn import_one_time_prekeys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_otpks_cfe(&data)
-            .map_err(|_| CryptoError::SerializationFailed)
+            .map_err(|e| serialization_failed("orchestrator import_one_time_prekeys", e))
     }
 
     pub fn set_local_user_id(&self, user_id: String) {
