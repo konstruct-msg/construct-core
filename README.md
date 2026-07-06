@@ -3,7 +3,7 @@
 **The cryptographic core of [Konstruct](https://github.com/konstruct-msg) — a privacy-first,
 end-to-end encrypted messenger.**
 
-[![Rust](https://img.shields.io/badge/Rust-1.92+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.96-orange.svg)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
