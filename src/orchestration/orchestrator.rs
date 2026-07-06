@@ -1112,6 +1112,31 @@ impl Orchestrator {
         is_control: bool,
         content_type: u8,
     ) -> Vec<Action> {
+        // `data` IS the wire payload — derive the routing fields from the canonical
+        // parser instead of trusting the platform's copy of the header parse.
+        // Android passes zeros (it has no wire-format knowledge at all); the event's
+        // msg_num/kem_ct stay only as a fallback for callers that still fill them
+        // (iOS). Control messages are routed before decrypt, so their `data` is not
+        // required to be a wire payload.
+        let (msg_num, kem_ct) = if is_control {
+            (msg_num, kem_ct)
+        } else {
+            match crate::wire_payload::unpack(&data) {
+                Ok(d) => (d.message_number, d.kem_ciphertext.unwrap_or_default()),
+                // Legacy caller supplied fields — keep its exact routing behavior.
+                Err(_) if msg_num != 0 || !kem_ct.is_empty() => (msg_num, kem_ct),
+                // Unparseable and nothing to fall back on: decrypt uses this same
+                // parser, so the payload can never decrypt — routing it with
+                // msg_num=0 would spuriously trigger the heal machinery.
+                Err(e) => {
+                    return vec![Action::NotifyError {
+                        code: "MALFORMED_WIRE_PAYLOAD".to_string(),
+                        message: format!("{e} (message {message_id} from {from})"),
+                    }];
+                }
+            }
+        };
+
         // All content types — including CALL_SIGNAL (12) — go through the full
         // routing pipeline (ACK dedup, session check, heal path, PQ contribution).
         let incoming = IncomingMessage {
@@ -1724,14 +1749,31 @@ mod tests {
         assert_eq!(o.pending_message_count("bob"), 0);
     }
 
+    /// A minimal valid packed wire payload (suite 1) for router tests — the
+    /// orchestrator derives msg_num/kem_ct from `data` via the canonical parser.
+    fn packed_wire(msg_num: u32, kem_ct: Option<&[u8]>) -> Vec<u8> {
+        crate::wire_payload::pack(
+            &[7u8; 32],
+            msg_num,
+            0,
+            0,
+            0,
+            1,
+            kem_ct,
+            &[0u8; 32], // sealed box (never decrypted in these tests)
+            0,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_message_received_no_session_fetches_bundle() {
         let mut o = make_orchestrator("alice");
-        let wire = r#"{"dh_public_key":[0],"message_number":0,"ciphertext":[],"nonce":[],"previous_chain_length":0,"suite_id":1}"#;
         let actions = o.handle_event(IncomingEvent::MessageReceived {
             message_id: "msg-001".to_string(),
             from: "bob".to_string(),
-            data: wire.as_bytes().to_vec(),
+            data: packed_wire(0, None),
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
@@ -1749,14 +1791,15 @@ mod tests {
     #[test]
     fn test_message_received_pq_ciphertext_produces_apply_action() {
         let mut o = make_orchestrator("alice");
-        let wire = r#"{"dh_public_key":[0],"message_number":0,"ciphertext":[],"nonce":[],"previous_chain_length":0,"suite_id":1}"#;
+        // kem_ct travels inside the wire payload; the event fields are zeros
+        // (Android-style caller) — the orchestrator must derive it from `data`.
         let actions = o.handle_event(IncomingEvent::MessageReceived {
             message_id: "msg-002".to_string(),
             from: "bob".to_string(),
-            data: wire.as_bytes().to_vec(),
+            data: packed_wire(0, Some(&[1, 2, 3])),
             msg_num: 0,
-            kem_ct: vec![1, 2, 3],
-            otpk_id: 42,
+            kem_ct: vec![],
+            otpk_id: 0,
             is_control: false,
             content_type: 0,
         });
@@ -1767,6 +1810,25 @@ mod tests {
         assert!(
             !pq_actions.is_empty(),
             "expected ApplyPQContribution action"
+        );
+    }
+
+    #[test]
+    fn test_message_received_malformed_payload_notifies_without_heal() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::MessageReceived {
+            message_id: "msg-003".to_string(),
+            from: "bob".to_string(),
+            data: vec![0u8; 4], // not a wire payload
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: false,
+            content_type: 0,
+        });
+        assert!(
+            matches!(actions.as_slice(), [Action::NotifyError { code, .. }] if code == "MALFORMED_WIRE_PAYLOAD"),
+            "expected single MALFORMED_WIRE_PAYLOAD NotifyError, got {actions:?}"
         );
     }
 
