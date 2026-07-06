@@ -8,6 +8,15 @@ namespace construct_core {
     // negotiate suite-3 sessions against this device.
     boolean supports_pq_ratchet();
 
+    // Wire payload framing — the SINGLE source of truth for the encrypted_payload
+    // byte layout (see wire_payload.rs). Platform SDKs (iOS/Android) MUST call
+    // these instead of re-implementing the format, so suite_id / pq_message_epoch /
+    // pq_ratchet_field can never be silently dropped on the wire again.
+    [Throws=CryptoError]
+    sequence<u8> wire_payload_pack(WirePayload payload);
+    [Throws=CryptoError]
+    WirePayload wire_payload_unpack(sequence<u8> data);
+
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string compute_safety_number(string my_device_id, string their_device_id);
     
@@ -19,6 +28,26 @@ namespace construct_core {
         PowProgressCallback? progress_callback
     );
     boolean verify_pow(string challenge, PowSolution solution, u32 required_difficulty);
+};
+
+// ============================================================================
+// Wire payload framing (canonical binary layout owned by wire_payload.rs)
+// ============================================================================
+
+// Mirrors wire_payload::DecodedWirePayload. `pq_ratchet_field` is the opaque
+// serialized suite-3 field (empty = none); the core translates it to/from the
+// canonical wire encoding so platform SDKs never touch the byte layout.
+dictionary WirePayload {
+    sequence<u8> dh_public_key;        // 32-byte X25519 ephemeral public key
+    u32 message_number;
+    u32 one_time_prekey_id;            // 0 = fallback 3-DH / not a first message
+    u32 kyber_otpk_id;                 // 0 = Kyber SPK used; >0 = Kyber OTPK id
+    u32 previous_chain_length;         // Double Ratchet PN field
+    u16 suite_id;                      // crypto-suite identifier (1/2/3)
+    sequence<u8>? kem_ciphertext;      // ML-KEM-768 ciphertext for first messages
+    sequence<u8> sealed_box;           // nonce || ciphertext || auth_tag
+    u32 pq_message_epoch;              // suite-3 PQ epoch tag (0 otherwise)
+    sequence<u8> pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
 };
 
 // ============================================================================

@@ -229,6 +229,24 @@ pub struct BinaryFirstMessage {
     pub pq_ratchet_field: Vec<u8>,
 }
 
+/// Mirrors the UDL `WirePayload` dictionary and `wire_payload::DecodedWirePayload`.
+/// The canonical binary layout lives in `wire_payload.rs`; this is just the FFI
+/// shuttle so platform SDKs pack/unpack via the core instead of duplicating it.
+#[derive(Debug, Clone)]
+pub struct WirePayload {
+    pub dh_public_key: Vec<u8>,
+    pub message_number: u32,
+    pub one_time_prekey_id: u32,
+    pub kyber_otpk_id: u32,
+    pub previous_chain_length: u32,
+    pub suite_id: u16,
+    pub kem_ciphertext: Option<Vec<u8>>,
+    pub sealed_box: Vec<u8>,
+    pub pq_message_epoch: u32,
+    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
+    pub pq_ratchet_field: Vec<u8>,
+}
+
 /// Serialize the optional suite-3 sparse PQ-ratchet field for the FFI/wire boundary.
 /// Empty vec = `None`. Opaque bytes as far as the transport (iOS) is concerned.
 fn pq_field_to_bytes(
@@ -1680,6 +1698,55 @@ mod tests {
         );
     }
 
+    /// Variant-2 guard: the suite-3 fields must survive the SAME `wire_payload_pack`
+    /// → `wire_payload_unpack` path iOS/Android now call, instead of each SDK
+    /// re-implementing the byte layout (the original wire-drop). If the canonical
+    /// packer ever loses suite_id / pq_message_epoch / pq_ratchet_field, this fails.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn test_wire_payload_pack_roundtrip_suite3() {
+        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
+
+        let field = PqRatchetWireField::PublicKey {
+            epoch: 9,
+            key: vec![0x5A; 1184],
+        };
+        let original = WirePayload {
+            dh_public_key: vec![0x11; 32],
+            message_number: 7,
+            one_time_prekey_id: 42,
+            kyber_otpk_id: 3,
+            previous_chain_length: 5,
+            suite_id: 3,
+            kem_ciphertext: Some(vec![0x22; 1088]),
+            sealed_box: vec![0x33; 60],
+            pq_message_epoch: 9,
+            pq_ratchet_field: pq_field_to_bytes(&Some(field.clone())),
+        };
+
+        let bytes = wire_payload_pack(original.clone()).expect("pack must succeed");
+        let decoded = wire_payload_unpack(bytes).expect("unpack must succeed");
+
+        assert_eq!(decoded.suite_id, 3, "suite_id must survive the wire");
+        assert_eq!(
+            decoded.pq_message_epoch, 9,
+            "pq_message_epoch must survive the wire"
+        );
+        assert_eq!(decoded.dh_public_key, original.dh_public_key);
+        assert_eq!(decoded.message_number, 7);
+        assert_eq!(decoded.one_time_prekey_id, 42);
+        assert_eq!(decoded.kyber_otpk_id, 3);
+        assert_eq!(decoded.previous_chain_length, 5);
+        assert_eq!(decoded.kem_ciphertext, original.kem_ciphertext);
+        assert_eq!(decoded.sealed_box, original.sealed_box);
+        // The opaque field bytes must round-trip back to the same enum.
+        assert_eq!(
+            pq_field_from_bytes(&decoded.pq_ratchet_field),
+            Some(field),
+            "pq_ratchet_field must survive the wire intact"
+        );
+    }
+
     /// Test full end-to-end encryption/decryption flow
     /// Verifies that sessions are created consistently and messages can be exchanged
     #[test]
@@ -2085,6 +2152,52 @@ pub fn derive_device_id(identity_public_key: Vec<u8>) -> String {
 /// peers can negotiate suite 3 (see key-service migration 063).
 pub fn supports_pq_ratchet() -> bool {
     crate::crypto::session_api::local_supports_pq_ratchet()
+}
+
+/// Pack encrypted message components into the canonical `encrypted_payload` blob.
+///
+/// This is the ONLY sanctioned way for a platform SDK to produce the wire bytes:
+/// it forwards straight to [`wire_payload::pack`], so `suite_id`,
+/// `pq_message_epoch` and `pq_ratchet_field` are always framed correctly (the
+/// suite-3 wire-drop that broke messaging came from iOS re-implementing this).
+pub fn wire_payload_pack(payload: WirePayload) -> Result<Vec<u8>, CryptoError> {
+    let field = pq_field_from_bytes(&payload.pq_ratchet_field);
+    crate::wire_payload::pack(
+        &payload.dh_public_key,
+        payload.message_number,
+        payload.one_time_prekey_id,
+        payload.kyber_otpk_id,
+        payload.previous_chain_length,
+        payload.suite_id,
+        payload.kem_ciphertext.as_deref(),
+        &payload.sealed_box,
+        payload.pq_message_epoch,
+        field,
+    )
+    .map_err(|e| CryptoError::SerializationFailed {
+        message: format!("wire_payload_pack: {e}"),
+    })
+}
+
+/// Unpack a received `encrypted_payload` blob into its components.
+/// Inverse of [`wire_payload_pack`]; forwards to [`wire_payload::unpack`].
+pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
+    let decoded =
+        crate::wire_payload::unpack(&data).map_err(|e| CryptoError::SerializationFailed {
+            message: format!("wire_payload_unpack: {e}"),
+        })?;
+    Ok(WirePayload {
+        dh_public_key: decoded.dh_public_key,
+        message_number: decoded.message_number,
+        one_time_prekey_id: decoded.one_time_prekey_id,
+        kyber_otpk_id: decoded.kyber_otpk_id,
+        previous_chain_length: decoded.previous_chain_length,
+        suite_id: decoded.suite_id,
+        kem_ciphertext: decoded.kem_ciphertext,
+        sealed_box: decoded.sealed_box,
+        pq_message_epoch: decoded.pq_message_epoch,
+        pq_ratchet_field: pq_field_to_bytes(&decoded.pq_ratchet_field),
+    })
 }
 
 /// Format federated identifier
