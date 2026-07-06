@@ -1638,6 +1638,55 @@ mod tests {
         );
     }
 
+    /// REPRO (suite-3 activation): a DEVICE-SHAPED bundle — classic crypto suite (1), a real
+    /// one-time prekey, Kyber SPK + Kyber OTPK present, fresh SPK timestamps/epochs, and
+    /// `supports_pq_ratchet = true` — must still negotiate `SuiteID::PQ_RATCHET`. The minimal
+    /// test below strips all optional fields, so it cannot catch a negotiation drop that only
+    /// happens when the PQXDH branch runs.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn test_pq_ratchet_negotiated_from_device_shaped_bundle() {
+        use crate::crypto::SuiteID;
+
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+
+        let bob_otpk = bob
+            .generate_one_time_prekeys(1)
+            .expect("bob generates an OTPK")
+            .pop()
+            .unwrap();
+        let bob_kyber = mlkem768_keygen().expect("kyber SPK keygen");
+        let bob_kyber_otpk = mlkem768_keygen().expect("kyber OTPK keygen");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        bob_bundle.suite_id = 1; // server bundles advertise the CLASSIC crypto suite
+        bob_bundle.one_time_prekey_public = Some(bob_otpk.public_key);
+        bob_bundle.one_time_prekey_id = Some(bob_otpk.key_id);
+        bob_bundle.kyber_pre_key_public = Some(bob_kyber.public_key);
+        bob_bundle.kyber_one_time_prekey_public = Some(bob_kyber_otpk.public_key);
+        bob_bundle.kyber_one_time_prekey_id = Some(1);
+        bob_bundle.spk_uploaded_at = now;
+        bob_bundle.spk_rotation_epoch = 4;
+        bob_bundle.kyber_spk_uploaded_at = now;
+        bob_bundle.kyber_spk_rotation_epoch = 5;
+        bob_bundle.supports_pq_ratchet = true;
+
+        alice
+            .init_session("bob_user_id".to_string(), bob_bundle)
+            .expect("device-shaped init_session should succeed");
+
+        assert_eq!(
+            alice.get_session_suite_id("bob_user_id".to_string()),
+            SuiteID::PQ_RATCHET.as_u16(),
+            "device-shaped bundle with supports_pq_ratchet=true must negotiate suite 3"
+        );
+    }
+
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
     /// FIRST message through the uniffi wire types the iOS app uses.
     ///
