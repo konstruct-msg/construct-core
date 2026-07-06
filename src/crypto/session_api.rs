@@ -69,23 +69,11 @@ pub const fn local_supports_pq_ratchet() -> bool {
 
 /// Master switch for `SuiteID::PQ_RATCHET` (suite 3) negotiation.
 ///
-/// DISABLED in SHIPPED builds (task #12 / `key-store-consolidation-and-server-authority`): the
-/// bisect proved the blocker was suite-3-specific and ROOT-CAUSED it to the uniffi/iOS wire
-/// boundary — `EncryptedMessageComponents` → `BinaryFirstMessage` → `init_receiving_session`
-/// drop the DR message's `suite_id`/`pq_message_epoch`/`pq_ratchet_field`, so the responder
-/// rebuilds the message as the bundle's crypto suite (1/2, never 3) and its AEAD associated
-/// data omits the suite-3 epoch tag the initiator authenticated → msg0 AEAD-fails. Forcing
-/// `CLASSIC` keeps messaging working (deferred PQXDH Kyber KEM / HNDL protection unaffected)
-/// while the wire is fixed to carry those fields. Gates BOTH the advertised capability
-/// (`supports_pq_ratchet` UDL) and initiator negotiation.
-///
-/// In-core TEST builds keep it enabled so the negotiation and the wire round-trip stay
-/// exercisable — the passing direct-struct test and the (currently `#[ignore]`d) wire-drop
-/// reproduction both need suite 3 to actually negotiate. Flip the shipped value to match the
-/// test value once Phase B/C carries the fields across the wire.
-#[cfg(not(test))]
-const PQ_RATCHET_ENABLED: bool = false;
-#[cfg(test)]
+/// Gates BOTH the advertised capability (`supports_pq_ratchet` UDL) and initiator
+/// negotiation. Was disabled in shipped builds while the uniffi/iOS wire boundary
+/// dropped the DR message's `suite_id`/`pq_message_epoch`/`pq_ratchet_field`
+/// (task #12); the canonical `wire_payload` pack/unpack is now exposed over UniFFI
+/// and platforms carry all three fields end-to-end, so suite 3 is live.
 const PQ_RATCHET_ENABLED: bool = true;
 
 /// Initiator-side suite negotiation: `PQ_RATCHET` only when this build has the
