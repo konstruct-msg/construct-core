@@ -65,6 +65,9 @@ dictionary EncryptedMessageComponents {
     sequence<u8> content;
     u32 one_time_prekey_id;
     sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
+    u16 suite_id;              // negotiated DR suite (e.g. 3 = PQ_RATCHET); transmit so the receiver rebuilds the exact AEAD AD (task #12)
+    u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
+    sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
 };
 
 dictionary SessionInitResult {
@@ -99,6 +102,9 @@ dictionary BinaryFirstMessage {
     u32 message_number;
     sequence<u8> content;
     u32 one_time_prekey_id;
+    u16 suite_id;              // negotiated DR suite the initiator encrypted with (task #12)
+    u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
+    sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
 };
 
 /// Read-only health snapshot of a Double Ratchet session.
@@ -124,6 +130,9 @@ dictionary OfflineBatchMessage {
     sequence<u8> ephemeral_public_key;  // 32 bytes
     u32 message_number;
     sequence<u8> content;               // raw ciphertext (already unpadded by Swift caller)
+    u16 suite_id;                       // negotiated DR suite (task #12); 1/CLASSIC for non-PQ_RATCHET
+    u32 pq_message_epoch;               // suite-3 PQ epoch tag (0 otherwise)
+    sequence<u8> pq_ratchet_field;      // suite-3 sparse PQ-ratchet field, serialized (empty = none)
 };
 
 /// Per-message result from decrypt_offline_batch.
@@ -213,7 +222,7 @@ interface ClassicCryptoCore {
     EncryptedMessageComponents encrypt_message(string session_id, string plaintext);
 
     [Throws=CryptoError]
-    DecryptedMessageResult decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+    DecryptedMessageResult decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content, u16 suite_id, u32 pq_message_epoch, sequence<u8> pq_ratchet_field);
 
     boolean remove_session(string contact_id);
 
@@ -738,7 +747,7 @@ interface OrchestratorCore {
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
 
     [Throws=CryptoError]
-    DecryptedMessageResult decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content);
+    DecryptedMessageResult decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content, u16 suite_id, u32 pq_message_epoch, sequence<u8> pq_ratchet_field);
 
     /// Batch offline decrypt — single mutex acquisition for the whole batch.
     /// Session is never archived on per-message failure.

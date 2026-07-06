@@ -69,18 +69,24 @@ pub const fn local_supports_pq_ratchet() -> bool {
 
 /// Master switch for `SuiteID::PQ_RATCHET` (suite 3) negotiation.
 ///
-/// TEMPORARILY `false` (task #12 / `key-store-consolidation-and-server-authority`): on real
-/// devices a session that negotiates suite 3 fails to decrypt the FIRST message (mutual msg0
-/// AEAD failure), while the pure-core suite-3 round-trip unit test passes — pointing at the iOS
-/// deferred-PQXDH-contribution integration (the Kyber KEM is decapsulated/mixed into the root in
-/// a separate step whose ordering relative to msg0 differs from the initiator) rather than the
-/// core ratchet. Forcing `CLASSIC` negotiation both unblocks messaging and bisects the layer:
-/// if delivery returns, the defect is suite-3-specific; if it persists, it is in the deferred
-/// PQXDH contribution (suite-independent). The deferred PQXDH Kyber KEM itself (HNDL protection)
-/// is unaffected by this switch. Gates BOTH the advertised capability (`supports_pq_ratchet`
-/// UDL) and initiator negotiation, so no suite-3 first message is ever created once both peers
-/// rebuild. Flip back to `true` once the first-message PQ-contribution ordering is symmetric.
+/// DISABLED in SHIPPED builds (task #12 / `key-store-consolidation-and-server-authority`): the
+/// bisect proved the blocker was suite-3-specific and ROOT-CAUSED it to the uniffi/iOS wire
+/// boundary — `EncryptedMessageComponents` → `BinaryFirstMessage` → `init_receiving_session`
+/// drop the DR message's `suite_id`/`pq_message_epoch`/`pq_ratchet_field`, so the responder
+/// rebuilds the message as the bundle's crypto suite (1/2, never 3) and its AEAD associated
+/// data omits the suite-3 epoch tag the initiator authenticated → msg0 AEAD-fails. Forcing
+/// `CLASSIC` keeps messaging working (deferred PQXDH Kyber KEM / HNDL protection unaffected)
+/// while the wire is fixed to carry those fields. Gates BOTH the advertised capability
+/// (`supports_pq_ratchet` UDL) and initiator negotiation.
+///
+/// In-core TEST builds keep it enabled so the negotiation and the wire round-trip stay
+/// exercisable — the passing direct-struct test and the (currently `#[ignore]`d) wire-drop
+/// reproduction both need suite 3 to actually negotiate. Flip the shipped value to match the
+/// test value once Phase B/C carries the fields across the wire.
+#[cfg(not(test))]
 const PQ_RATCHET_ENABLED: bool = false;
+#[cfg(test)]
+const PQ_RATCHET_ENABLED: bool = true;
 
 /// Initiator-side suite negotiation: `PQ_RATCHET` only when this build has the
 /// PQ primitives *and* the peer's fetched bundle advertises support; `CLASSIC`

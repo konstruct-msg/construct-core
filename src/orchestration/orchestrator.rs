@@ -45,6 +45,15 @@ pub struct IncomingFirstMessage {
     /// Raw sealed box: nonce[12] ++ ciphertext
     pub content: Vec<u8>,
     pub one_time_prekey_id: u32,
+    /// DR message suite (the NEGOTIATED suite the initiator encrypted with, e.g.
+    /// `SuiteID::PQ_RATCHET`=3), distinct from the bundle's crypto suite. Must be carried from
+    /// the wire so the responder rebuilds the exact AEAD associated data — see task #12.
+    pub suite_id: u16,
+    /// Suite-3 PQ epoch tag the initiator authenticated into the AD (0 for other suites).
+    pub pq_message_epoch: u32,
+    /// Suite-3 sparse PQ-ratchet field (initiator KEM public / responder ciphertext); `None`
+    /// for other suites.
+    pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
 pub struct Orchestrator {
@@ -308,12 +317,18 @@ impl Orchestrator {
             ciphertext,
             nonce,
             previous_chain_length: 0,
-            suite_id: public_bundle.suite_id.as_u16(),
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            // Carry the DR message's NEGOTIATED suite / PQ tags from the wire — NOT the bundle's
+            // crypto suite. The responder must reconstruct the exact AEAD associated data the
+            // initiator authenticated; defaulting these to the bundle suite made suite-3 msg0
+            // fail to decrypt (task #12).
+            suite_id: first_message.suite_id,
+            pq_message_epoch: first_message.pq_message_epoch,
+            pq_ratchet_field: first_message.pq_ratchet_field.clone(),
         };
 
-        // Verify the initiator's signed prekey signature before doing any crypto.
+        // Verify the initiator's signed prekey signature before doing any crypto. This prologue
+        // uses the BUNDLE's crypto suite (how the SPK signature was produced), which is a
+        // different concept from the DR message suite above.
         let suite_id = public_bundle.suite_id;
         let verifying_key = ClassicSuiteProvider::signature_public_key_from_bytes(
             public_bundle.verifying_key.clone(),
@@ -399,9 +414,11 @@ impl Orchestrator {
             ciphertext,
             nonce,
             previous_chain_length: decoded.previous_chain_length,
-            suite_id: key_bundle.suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            // The wire payload already carries the DR message's negotiated suite + PQ section;
+            // use them (not the bundle's crypto suite) so suite-3 first messages decrypt (task #12).
+            suite_id: decoded.suite_id,
+            pq_message_epoch: decoded.pq_message_epoch,
+            pq_ratchet_field: decoded.pq_ratchet_field,
         };
 
         // Verify the initiator's SPK signature — same check as init_receiving_session_with_msg.
@@ -907,11 +924,27 @@ impl Orchestrator {
     }
 
     /// Returns `(ephemeral_public_key, message_number, content_b64, one_time_prekey_id)`.
+    /// Returns `(ephemeral_public_key, message_number, sealed_box, one_time_prekey_id, suite_id,
+    /// pq_message_epoch, pq_ratchet_field)`. The last three carry the DR message's negotiated
+    /// suite + suite-3 PQ section so the responder can reconstruct the exact AEAD associated data
+    /// (task #12); they are `(1/2, 0, None)`-equivalent for non-PQ_RATCHET suites.
+    #[allow(clippy::type_complexity)]
     pub fn encrypt_message_for(
         &mut self,
         contact_id: &str,
         plaintext: &[u8],
-    ) -> Result<(Vec<u8>, u32, Vec<u8>, u32), String> {
+    ) -> Result<
+        (
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            u16,
+            u32,
+            Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+        ),
+        String,
+    > {
         let encrypted = self
             .lifecycle
             .client
@@ -933,6 +966,9 @@ impl Orchestrator {
             encrypted.message_number,
             sealed_box,
             one_time_prekey_id,
+            encrypted.suite_id,
+            encrypted.pq_message_epoch,
+            encrypted.pq_ratchet_field,
         ))
     }
 
@@ -1017,16 +1053,20 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
-    /// ⚠️ Legacy component-based path: cannot transport the suite-3 PQ section
-    /// (`pq_message_epoch` / EK/CT field) — not usable for `SuiteID::PQ_RATCHET`
-    /// sessions. Suite-3 traffic must use the wire-payload path
-    /// (`decrypt_bytes_for` / `unpack`), which carries the full section.
+    /// Component-based decrypt. The caller MUST pass the DR message's `suite_id`,
+    /// `pq_message_epoch` and `pq_ratchet_field` from the wire (task #12): defaulting them to
+    /// classic made `SuiteID::PQ_RATCHET` traffic fail to decrypt because the reconstructed AEAD
+    /// associated data omitted the suite-3 epoch tag. `(classic, 0, None)` reproduces the old
+    /// behaviour for non-PQ suites.
     pub fn decrypt_message_for(
         &mut self,
         contact_id: &str,
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: &[u8],
+        suite_id: u16,
+        pq_message_epoch: u32,
+        pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
     ) -> Result<Vec<u8>, String> {
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 
@@ -1048,9 +1088,9 @@ impl Orchestrator {
             ciphertext,
             nonce,
             previous_chain_length: 0,
-            suite_id: crate::config::Config::global().classic_suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            suite_id,
+            pq_message_epoch,
+            pq_ratchet_field,
         };
 
         self.lifecycle

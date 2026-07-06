@@ -139,6 +139,13 @@ pub struct EncryptedMessageComponents {
     pub content: Vec<u8>,        // raw bytes: nonce || ciphertext_with_tag
     pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
     pub storage_key: Vec<u8>,    // 32-byte random key — caller must store in MessageKeyStore
+    /// Negotiated DR message suite (e.g. `SuiteID::PQ_RATCHET`=3). Transmitted so the receiver
+    /// rebuilds the exact AEAD associated data — see task #12. 1/CLASSIC for non-PQ_RATCHET.
+    pub suite_id: u16,
+    /// Suite-3 PQ epoch tag the initiator authenticated into the AD (0 for other suites).
+    pub pq_message_epoch: u32,
+    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
+    pub pq_ratchet_field: Vec<u8>,
 }
 
 // Result of decrypting a message: plaintext + per-message storage key.
@@ -158,6 +165,9 @@ pub struct OfflineBatchMessage {
     pub ephemeral_public_key: Vec<u8>, // 32 bytes
     pub message_number: u32,
     pub content: Vec<u8>, // raw sealed box from wire: nonce[12] || ciphertext || tag (unpadding happens in Rust after decrypt)
+    pub suite_id: u16,    // negotiated DR suite (task #12); 1/CLASSIC for non-PQ_RATCHET
+    pub pq_message_epoch: u32, // suite-3 PQ epoch tag (0 otherwise)
+    pub pq_ratchet_field: Vec<u8>, // suite-3 sparse PQ-ratchet field, serialized (empty = none)
 }
 
 // Per-message result from decrypt_offline_batch.
@@ -211,6 +221,34 @@ pub struct BinaryFirstMessage {
     pub message_number: u32,
     pub content: Vec<u8>, // raw sealed box: nonce[12] ++ ciphertext
     pub one_time_prekey_id: u32,
+    /// Negotiated DR suite the initiator encrypted with (task #12). 1/CLASSIC for non-PQ_RATCHET.
+    pub suite_id: u16,
+    /// Suite-3 PQ epoch tag (0 otherwise).
+    pub pq_message_epoch: u32,
+    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
+    pub pq_ratchet_field: Vec<u8>,
+}
+
+/// Serialize the optional suite-3 sparse PQ-ratchet field for the FFI/wire boundary.
+/// Empty vec = `None`. Opaque bytes as far as the transport (iOS) is concerned.
+fn pq_field_to_bytes(
+    field: &Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+) -> Vec<u8> {
+    match field {
+        Some(f) => serde_json::to_vec(f).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Inverse of [`pq_field_to_bytes`]. An empty (or unparseable) slice yields `None`.
+fn pq_field_from_bytes(
+    bytes: &[u8],
+) -> Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField> {
+    if bytes.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(bytes).ok()
+    }
 }
 
 /// One-time prekey pair for upload to server
@@ -641,9 +679,11 @@ impl ClassicCryptoCore {
             ciphertext,
             nonce,
             previous_chain_length: 0,
-            suite_id: recipient_bundle.suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            // Carry the DR message's negotiated suite + PQ tags from the wire, not the bundle's
+            // crypto suite — otherwise a suite-3 first message fails to decrypt (task #12).
+            suite_id: first_message.suite_id,
+            pq_message_epoch: first_message.pq_message_epoch,
+            pq_ratchet_field: pq_field_from_bytes(&first_message.pq_ratchet_field),
         };
 
         let remote_identity = ClassicSuiteProvider::kem_public_key_from_bytes(
@@ -790,22 +830,26 @@ impl ClassicCryptoCore {
             content: sealed_box,
             one_time_prekey_id,
             storage_key: gen_storage_key(),
+            suite_id: encrypted_message.suite_id,
+            pq_message_epoch: encrypted_message.pq_message_epoch,
+            pq_ratchet_field: pq_field_to_bytes(&encrypted_message.pq_ratchet_field),
         })
     }
 
-    /// Decrypt a message from a session - accepts wire format components
+    /// Decrypt a message from a session - accepts wire format components.
     ///
-    /// ⚠️ Legacy component-based path: it cannot transport the suite-3 PQ
-    /// section (`pq_message_epoch` / EK/CT field), so it must not be used for
-    /// `SuiteID::PQ_RATCHET` sessions — messages tagged with a PQ epoch will
-    /// fail to decrypt here. Suite-3 traffic goes through the wire-payload
-    /// APIs (`OrchestratorCore` pack/unpack), which carry the full section.
+    /// The caller MUST pass the DR message's `suite_id`, `pq_message_epoch` and
+    /// `pq_ratchet_field` from the wire so `SuiteID::PQ_RATCHET` traffic reconstructs the exact
+    /// AEAD associated data (task #12). `(classic, 0, empty)` reproduces the old behaviour.
     pub fn decrypt_message(
         &self,
         session_id: String,
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: Vec<u8>,
+        suite_id: u16,
+        pq_message_epoch: u32,
+        pq_ratchet_field: Vec<u8>,
     ) -> Result<DecryptedMessageResult, CryptoError> {
         let sealed_box = content;
 
@@ -828,9 +872,9 @@ impl ClassicCryptoCore {
             ciphertext,
             nonce,
             previous_chain_length: 0, // Not used by decryption
-            suite_id: crate::config::Config::global().classic_suite_id,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            suite_id,
+            pq_message_epoch,
+            pq_ratchet_field: pq_field_from_bytes(&pq_ratchet_field),
         };
 
         // Note: session_id from Swift is actually contact_id in our new API
@@ -1562,6 +1606,9 @@ mod tests {
             message_number: encrypted.message_number,
             content: encrypted.content,
             one_time_prekey_id: encrypted.one_time_prekey_id,
+            suite_id: encrypted.suite_id,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
         };
         let bob_result = bob
             .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
@@ -1570,6 +1617,66 @@ mod tests {
         assert_eq!(
             bob_result.decrypted_message, plaintext,
             "degraded-init first message must decrypt when the peer still holds its SPK key"
+        );
+    }
+
+    /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
+    /// FIRST message through the uniffi wire types the iOS app uses.
+    ///
+    /// The wire now carries the DR message's `suite_id` / `pq_message_epoch` / `pq_ratchet_field`
+    /// (on `EncryptedMessageComponents` / `BinaryFirstMessage`), so the responder rebuilds the
+    /// exact AEAD associated data and decrypts. Before the fix this failed with
+    /// `"All 1 prekey(s) failed. AEAD decryption failed"` because `init_receiving_session`
+    /// defaulted `suite_id` to the bundle's crypto suite (1/2, never 3) and the AD omitted the
+    /// suite-3 epoch tag. This test locks that in — the pure-core
+    /// `test_client_negotiates_pq_ratchet_from_bundle_capability` can't catch it because it hands
+    /// the full struct straight across, bypassing this boundary (which is why the bug shipped).
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn test_pq_ratchet_first_message_survives_uniffi_wire() {
+        use crate::crypto::SuiteID;
+
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+
+        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        // Advertise the PQ-ratchet capability so Alice negotiates suite 3 as initiator.
+        bob_bundle.supports_pq_ratchet = true;
+
+        let session = alice
+            .init_session("bob_user_id".to_string(), bob_bundle)
+            .expect("init_session should succeed");
+
+        // Precondition: the sending session must really be suite 3, else this test proves nothing.
+        assert_eq!(
+            alice.get_session_suite_id("bob_user_id".to_string()),
+            SuiteID::PQ_RATCHET.as_u16(),
+            "setup must negotiate suite 3 (PQ_RATCHET_ENABLED is on in test builds)"
+        );
+
+        let plaintext = b"pq ratchet over the wire".to_vec();
+        let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
+
+        // Serialize exactly as the iOS app does — now carrying the negotiated suite + PQ section.
+        let first_msg = BinaryFirstMessage {
+            ephemeral_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            content: encrypted.content,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+            suite_id: encrypted.suite_id,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
+        };
+
+        let bob_result = bob
+            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .expect("Bob must establish a receiving session from a suite-3 first message");
+
+        assert_eq!(
+            bob_result.decrypted_message, plaintext,
+            "suite-3 first message must decrypt across the uniffi wire — currently FAILS because \
+             suite_id/pq_message_epoch are dropped and the responder builds a classic AEAD AD"
         );
     }
 
@@ -1622,6 +1729,9 @@ mod tests {
             message_number: encrypted.message_number,
             content: encrypted.content,
             one_time_prekey_id: encrypted.one_time_prekey_id,
+            suite_id: encrypted.suite_id,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
         };
 
         let bob_session_result = bob
@@ -1662,6 +1772,9 @@ mod tests {
                 reply_encrypted.ephemeral_public_key,
                 reply_encrypted.message_number,
                 reply_encrypted.content,
+                reply_encrypted.suite_id,
+                reply_encrypted.pq_message_epoch,
+                reply_encrypted.pq_ratchet_field,
             )
             .unwrap();
 
@@ -1722,6 +1835,9 @@ mod tests {
             message_number: msg1.message_number,
             content: msg1.content,
             one_time_prekey_id: msg1.one_time_prekey_id,
+            suite_id: msg1.suite_id,
+            pq_message_epoch: msg1.pq_message_epoch,
+            pq_ratchet_field: msg1.pq_ratchet_field,
         };
 
         let bob_session_result = bob
@@ -1743,6 +1859,9 @@ mod tests {
                 msg2.ephemeral_public_key,
                 msg2.message_number,
                 msg2.content,
+                msg2.suite_id,
+                msg2.pq_message_epoch,
+                msg2.pq_ratchet_field,
             )
             .unwrap();
 
@@ -2712,6 +2831,9 @@ impl OrchestratorCore {
             message_number: first_message.message_number,
             content: first_message.content,
             one_time_prekey_id: first_message.one_time_prekey_id,
+            suite_id: first_message.suite_id,
+            pq_message_epoch: first_message.pq_message_epoch,
+            pq_ratchet_field: pq_field_from_bytes(&first_message.pq_ratchet_field),
         };
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
@@ -2730,7 +2852,15 @@ impl OrchestratorCore {
         plaintext: Vec<u8>,
     ) -> Result<EncryptedMessageComponents, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (ephemeral_public_key, message_number, content, one_time_prekey_id) = orch
+        let (
+            ephemeral_public_key,
+            message_number,
+            content,
+            one_time_prekey_id,
+            suite_id,
+            pq_message_epoch,
+            pq_ratchet_field,
+        ) = orch
             .encrypt_message_for(&contact_id, &plaintext)
             .map_err(|e| CryptoError::EncryptionFailed { message: e })?;
         Ok(EncryptedMessageComponents {
@@ -2739,6 +2869,9 @@ impl OrchestratorCore {
             content,
             one_time_prekey_id,
             storage_key: gen_storage_key(),
+            suite_id,
+            pq_message_epoch,
+            pq_ratchet_field: pq_field_to_bytes(&pq_ratchet_field),
         })
     }
 
@@ -2748,10 +2881,21 @@ impl OrchestratorCore {
         ephemeral_public_key: Vec<u8>,
         message_number: u32,
         content: Vec<u8>,
+        suite_id: u16,
+        pq_message_epoch: u32,
+        pq_ratchet_field: Vec<u8>,
     ) -> Result<DecryptedMessageResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let plaintext = orch
-            .decrypt_message_for(&contact_id, ephemeral_public_key, message_number, &content)
+            .decrypt_message_for(
+                &contact_id,
+                ephemeral_public_key,
+                message_number,
+                &content,
+                suite_id,
+                pq_message_epoch,
+                pq_field_from_bytes(&pq_ratchet_field),
+            )
             .map_err(|e| CryptoError::DecryptionFailed { message: e })?;
         Ok(DecryptedMessageResult {
             plaintext,
@@ -2773,11 +2917,15 @@ impl OrchestratorCore {
         messages
             .into_iter()
             .map(|msg| {
+                let pq_field = pq_field_from_bytes(&msg.pq_ratchet_field);
                 match orch.decrypt_message_for(
                     &msg.contact_id,
                     msg.ephemeral_public_key,
                     msg.message_number,
                     &msg.content,
+                    msg.suite_id,
+                    msg.pq_message_epoch,
+                    pq_field,
                 ) {
                     Ok(plaintext) => OfflineBatchResult {
                         id: msg.id,
