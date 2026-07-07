@@ -958,6 +958,11 @@ where
     pub fn import_one_time_prekeys(&mut self, keys: Vec<(u32, Vec<u8>, Vec<u8>)>) {
         self.key_manager.import_one_time_prekeys(keys);
     }
+
+    /// Prune OTPKs below `min_keep_id` after a replace-all upload converged the server set.
+    pub fn prune_one_time_prekeys_below(&mut self, min_keep_id: u32) -> usize {
+        self.key_manager.prune_one_time_prekeys_below(min_keep_id)
+    }
 }
 
 /// Convenience type alias для X3DH + Double Ratchet с Classic Suite

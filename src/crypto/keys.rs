@@ -754,6 +754,19 @@ impl<P: CryptoProvider> KeyManager<P> {
         }
     }
 
+    /// Remove all stored OTPKs with `key_id < min_keep_id`; returns how many were pruned.
+    ///
+    /// Convergence point after a replace-all upload: the server set is then exactly
+    /// the batch just uploaded, so no *future* bundle fetch can reference an older key.
+    /// The caller keeps a small ID window below the batch for first messages already
+    /// in flight; everything older is dead weight that only grows the persisted blob.
+    /// Never touches `next_otpk_id` — IDs stay monotonic.
+    pub fn prune_one_time_prekeys_below(&mut self, min_keep_id: u32) -> usize {
+        let before = self.one_time_prekeys.len();
+        self.one_time_prekeys.retain(|&id, _| id >= min_keep_id);
+        before - self.one_time_prekeys.len()
+    }
+
     /// Iterate over all prekey private keys: current first, then old ones.
     ///
     /// Used by `init_receiving_session_with_ephemeral` to try all available
@@ -823,5 +836,34 @@ mod tests {
         let zeroed_secret = *pair.private_key;
         assert_ne!(original_secret, zeroed_secret);
         assert!(zeroed_secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_prune_one_time_prekeys_below() {
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        let mut km: KeyManager<ClassicSuiteProvider> = KeyManager::new();
+        let pairs = km.generate_one_time_prekeys(10).unwrap();
+        assert_eq!(km.one_time_prekey_count(), 10);
+        let cutoff = pairs[7].0; // keep the last 3
+
+        let pruned = km.prune_one_time_prekeys_below(cutoff);
+        assert_eq!(pruned, 7);
+        assert_eq!(km.one_time_prekey_count(), 3);
+        // Retained keys are exactly the ones at/above the cutoff, still consumable.
+        for (id, _) in &pairs[7..] {
+            assert!(km.consume_one_time_prekey(*id).is_some());
+        }
+        for (id, _) in &pairs[..7] {
+            assert!(km.consume_one_time_prekey(*id).is_none());
+        }
+        // The ID counter is untouched — pruning must never enable ID reuse.
+        let next = km.next_otpk_id();
+        assert_eq!(next, pairs[9].0 + 1);
+
+        // Pruning everything (cutoff above all IDs) empties the store.
+        km.generate_one_time_prekeys(2).unwrap();
+        assert_eq!(km.prune_one_time_prekeys_below(u32::MAX), 2);
+        assert_eq!(km.one_time_prekey_count(), 0);
+        assert_eq!(km.next_otpk_id(), next + 2);
     }
 }

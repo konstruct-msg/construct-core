@@ -268,6 +268,8 @@ interface ClassicCryptoCore {
     [Throws=CryptoError]
     void import_one_time_prekeys(sequence<u8> data);
 
+    u32 prune_one_time_prekeys_below(u32 min_keep_id);
+
     void set_local_user_id(string user_id);
 
     /// Rotate the signed pre-key. Generates a new X25519 keypair, signs it with
@@ -796,6 +798,8 @@ interface OrchestratorCore {
 
     [Throws=CryptoError]
     void import_one_time_prekeys(sequence<u8> data);
+
+    u32 prune_one_time_prekeys_below(u32 min_keep_id);
 
     void set_local_user_id(string user_id);
 

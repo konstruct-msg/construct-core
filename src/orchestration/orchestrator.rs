@@ -678,6 +678,11 @@ impl Orchestrator {
         self.lifecycle.client.one_time_prekey_count() as u32
     }
 
+    /// Prune OTPKs below `min_keep_id` after a replace-all upload converged the server set.
+    pub fn prune_otpks_below(&mut self, min_keep_id: u32) -> u32 {
+        self.lifecycle.client.prune_one_time_prekeys_below(min_keep_id) as u32
+    }
+
     /// Returns the raw bytes of our X3DH identity public key.
     /// Used by the UI for safety-number display and key export.
     pub fn identity_public_key_bytes(&self) -> Result<Vec<u8>, String> {

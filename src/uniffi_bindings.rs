@@ -1023,6 +1023,17 @@ impl ClassicCryptoCore {
         Ok(())
     }
 
+    /// Prune stored OTPK private keys with `key_id < min_keep_id`; returns the number removed.
+    /// Call after a successful replace-all upload — the server set is then exactly the new
+    /// batch, so older keys can never be referenced by a future bundle fetch.
+    pub fn prune_one_time_prekeys_below(&self, min_keep_id: u32) -> u32 {
+        let mut client = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.prune_one_time_prekeys_below(min_keep_id) as u32
+    }
+
     /// Set the local user ID — must be called after login/registration so AAD binds
     /// the correct sender identity to every encrypted message.
     pub fn set_local_user_id(&self, user_id: String) {
@@ -3142,6 +3153,14 @@ impl OrchestratorCore {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_otpks_cfe(&data)
             .map_err(|e| serialization_failed("orchestrator import_one_time_prekeys", e))
+    }
+
+    /// Prune stored OTPK private keys with `key_id < min_keep_id`; returns the number removed.
+    /// Call after a successful replace-all upload — the server set is then exactly the new
+    /// batch, so older keys can never be referenced by a future bundle fetch.
+    pub fn prune_one_time_prekeys_below(&self, min_keep_id: u32) -> u32 {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.prune_otpks_below(min_keep_id)
     }
 
     pub fn set_local_user_id(&self, user_id: String) {
