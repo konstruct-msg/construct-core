@@ -4,6 +4,7 @@ use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
 use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
+use crate::group::{MemberAddition, MlsError};
 pub use crate::orchestration::PlatformBridge;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1512,6 +1513,95 @@ pub fn battery_aware_jitter_ms(base_ms: u64, max_jitter_ms: u64, battery_level: 
 pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> u64 {
     crate::traffic_protection::recommended_send_delay(is_high_priority, battery_level).as_millis()
         as u64
+}
+
+// ============================================================================
+// MLS Group Chat (RFC 9420) — device-level MlsStore
+// ============================================================================
+
+/// UniFFI wrapper around `group::MlsStore` (Mutex for the &self interface,
+/// same pattern as OrchestratorCore).
+pub struct MlsStore {
+    inner: std::sync::Mutex<crate::group::MlsStore>,
+}
+
+impl MlsStore {
+    pub fn new(signer_private_key: Vec<u8>, signer_public_key: Vec<u8>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(crate::group::MlsStore::new(
+                signer_private_key,
+                signer_public_key,
+            )),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, crate::group::MlsStore> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn generate_key_package(&self) -> Result<Vec<u8>, MlsError> {
+        self.lock().generate_key_package()
+    }
+
+    pub fn create_group(&self) -> Result<Vec<u8>, MlsError> {
+        self.lock().create_group()
+    }
+
+    pub fn join_from_welcome(&self, welcome: Vec<u8>) -> Result<Vec<u8>, MlsError> {
+        self.lock().join_from_welcome(&welcome)
+    }
+
+    pub fn encrypt(&self, group_id: Vec<u8>, plaintext: Vec<u8>) -> Result<Vec<u8>, MlsError> {
+        self.lock().encrypt(&group_id, &plaintext)
+    }
+
+    pub fn decrypt(&self, group_id: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, MlsError> {
+        self.lock().decrypt(&group_id, &ciphertext)
+    }
+
+    pub fn add_member(
+        &self,
+        group_id: Vec<u8>,
+        key_package: Vec<u8>,
+    ) -> Result<MemberAddition, MlsError> {
+        self.lock().add_member(&group_id, &key_package)
+    }
+
+    pub fn remove_member(&self, group_id: Vec<u8>, leaf_index: u32) -> Result<Vec<u8>, MlsError> {
+        self.lock().remove_member(&group_id, leaf_index)
+    }
+
+    pub fn leave_group(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MlsError> {
+        self.lock().leave_group(&group_id)
+    }
+
+    pub fn process_commit(&self, group_id: Vec<u8>, commit: Vec<u8>) -> Result<(), MlsError> {
+        self.lock().process_commit(&group_id, &commit)
+    }
+
+    pub fn member_count(&self, group_id: Vec<u8>) -> Result<u32, MlsError> {
+        self.lock().member_count(&group_id)
+    }
+
+    pub fn epoch(&self, group_id: Vec<u8>) -> Result<u64, MlsError> {
+        self.lock().epoch(&group_id)
+    }
+
+    pub fn export_cfe(&self) -> Result<Vec<u8>, MlsError> {
+        self.lock().export_cfe()
+    }
+}
+
+/// Restore an MlsStore from a CFE blob previously produced by `export_cfe()`.
+pub fn import_mls_store_cfe(
+    data: Vec<u8>,
+    signer_private_key: Vec<u8>,
+    signer_public_key: Vec<u8>,
+) -> Result<std::sync::Arc<MlsStore>, MlsError> {
+    let store = crate::group::MlsStore::import_cfe(&data, signer_private_key, signer_public_key)?;
+    Ok(std::sync::Arc::new(MlsStore {
+        inner: std::sync::Mutex::new(store),
+    }))
 }
 
 #[cfg(test)]

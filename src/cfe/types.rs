@@ -33,6 +33,9 @@ pub enum CfeMessageType {
     MlsCommit = 0x41,
     MlsProposal = 0x42,
     MlsKeyPackage = 0x43,
+    /// Device-level OpenMLS storage snapshot (all groups + key package
+    /// private material). See `group::MlsStore`.
+    MlsStore = 0x44,
 
     // Utilities
     Generic = 0x7F,
@@ -59,6 +62,7 @@ impl CfeMessageType {
             0x41 => Self::MlsCommit,
             0x42 => Self::MlsProposal,
             0x43 => Self::MlsKeyPackage,
+            0x44 => Self::MlsStore,
             0x7F => Self::Generic,
             _ => return None,
         })
@@ -471,6 +475,39 @@ pub struct CfeKyberSessionStateV1 {
     /// Next OTPK ID to allocate (monotonically increasing across restarts).
     #[serde(rename = "next_id")]
     pub next_otpk_id: u32,
+}
+
+// ── OpenMLS store CFE types (0x44) ────────────────────────────────────────────
+
+/// One key/value pair of the OpenMLS `MemoryStorage` snapshot.
+///
+/// Part of `CfeMlsStoreV1`. Keys and values are opaque OpenMLS-internal
+/// encodings (versioned by openmls itself) — we persist them verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeMlsStoreEntryV1 {
+    #[serde(rename = "k")]
+    pub key: ByteBuf,
+    #[serde(rename = "v")]
+    pub value: ByteBuf,
+}
+
+/// Device-level OpenMLS storage snapshot: ALL group states, ratchet secrets
+/// and key-package private material in one blob.
+///
+/// msg_type = `MlsStore` (0x44).
+///
+/// Exported by `group::MlsStore::export_cfe()` after every mutating MLS
+/// operation; the host app persists it in the platform secure store and
+/// restores via `MlsStore::import_cfe()` (device Ed25519 signer is passed
+/// separately — it is never part of the blob).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeMlsStoreV1 {
+    /// Schema version — always 1 for this format.
+    #[serde(rename = "ver")]
+    pub version: u8,
+    /// Storage entries, sorted by key for deterministic encoding.
+    #[serde(rename = "entries")]
+    pub entries: Vec<CfeMlsStoreEntryV1>,
 }
 
 // ── Orchestrator State CFE types (0x05) ───────────────────────────────────────
