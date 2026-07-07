@@ -170,6 +170,22 @@ pub struct CfeOldSpkV1 {
     pub created_at: i64,
 }
 
+/// The ML-KEM-768 (Kyber) signed prekey — the PQXDH KEM leg.
+///
+/// Folded into the core key-state so it persists atomically with the other private
+/// keys (Phase 2 of key-store-consolidation-and-server-authority). Formerly a
+/// standalone platform Keychain triple (`construct.kyber.spk.*`) that desynced
+/// independently of the core snapshot — the build-497 blocker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeKyberSpkV1 {
+    #[serde(rename = "id")]
+    pub key_id: u32,
+    #[serde(rename = "priv")]
+    pub kyber_priv: ByteBuf,
+    #[serde(rename = "pub")]
+    pub kyber_pub: ByteBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfePrivateKeysV1 {
     #[serde(rename = "suite_id")]
@@ -205,6 +221,11 @@ pub struct CfePrivateKeysV1 {
     /// Lazily created; absent for legacy pre-hybrid accounts until first ensure.
     #[serde(rename = "hs_priv", default, skip_serializing_if = "Option::is_none")]
     pub hybrid_sig_priv: Option<ByteBuf>,
+
+    /// Optional ML-KEM-768 signed prekey, persisted atomically with the rest of the
+    /// key-state. Absent until the platform commits one (post-upload confirmation).
+    #[serde(rename = "kyber_spk", default, skip_serializing_if = "Option::is_none")]
+    pub kyber_spk: Option<CfeKyberSpkV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -683,6 +683,18 @@ impl Orchestrator {
         self.lifecycle.client.prune_one_time_prekeys_below(min_keep_id) as u32
     }
 
+    /// Store the ML-KEM-768 signed prekey in the key-state (commit-after-confirm).
+    pub fn set_kyber_spk(&mut self, key_id: u32, private_key: Vec<u8>, public_key: Vec<u8>) {
+        self.lifecycle
+            .client
+            .set_kyber_spk(key_id, private_key, public_key);
+    }
+
+    /// The stored ML-KEM-768 signed prekey as `(key_id, private, public)`, if any.
+    pub fn kyber_spk_bytes(&self) -> Option<(u32, Vec<u8>, Vec<u8>)> {
+        self.lifecycle.client.kyber_spk_bytes()
+    }
+
     /// Returns the raw bytes of our X3DH identity public key.
     /// Used by the UI for safety-number display and key export.
     pub fn identity_public_key_bytes(&self) -> Result<Vec<u8>, String> {
@@ -769,6 +781,13 @@ impl Orchestrator {
             .collect();
 
         let hybrid_sig_priv = km.hybrid_signature_private_bytes().map(ByteBuf::from);
+        let kyber_spk = km
+            .kyber_spk_bytes()
+            .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
+                key_id,
+                kyber_priv: ByteBuf::from(priv_b),
+                kyber_pub: ByteBuf::from(pub_b),
+            });
 
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
@@ -782,6 +801,7 @@ impl Orchestrator {
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
             hybrid_sig_priv,
+            kyber_spk,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)

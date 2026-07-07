@@ -284,6 +284,16 @@ pub struct OtpkRecord {
     pub public_key: Vec<u8>,  // Base64-encoded public key bytes
 }
 
+/// The ML-KEM-768 signed prekey held in the core key-state (PQXDH KEM leg).
+/// Persisted atomically with the private-keys CFE blob — replaces the standalone
+/// platform Keychain triple (key-store consolidation Phase 2).
+#[derive(Debug, Clone)]
+pub struct KyberSpkRecord {
+    pub key_id: u32,
+    pub public_key: Vec<u8>,
+    pub secret_key: Vec<u8>,
+}
+
 // Private keys for persistence (exported via UDL)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivateKeysJson {
@@ -445,6 +455,14 @@ impl ClassicCryptoCore {
             .key_manager()
             .hybrid_signature_private_bytes()
             .map(ByteBuf::from);
+        let kyber_spk = client
+            .key_manager()
+            .kyber_spk_bytes()
+            .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
+                key_id,
+                kyber_priv: ByteBuf::from(priv_b),
+                kyber_pub: ByteBuf::from(pub_b),
+            });
 
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
@@ -458,6 +476,7 @@ impl ClassicCryptoCore {
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
             hybrid_sig_priv,
+            kyber_spk,
         };
 
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
@@ -494,7 +513,7 @@ impl ClassicCryptoCore {
 
         let hybrid_priv: Option<Vec<u8>> = keys.hybrid_sig_priv.map(|b| b.into_vec());
 
-        let new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
+        let mut new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
             keys.ik_priv.into_vec(),
             keys.sk_priv.into_vec(),
             keys.spk_priv.into_vec(),
@@ -504,6 +523,10 @@ impl ClassicCryptoCore {
             hybrid_priv,
         )
         .map_err(|_| CryptoError::InitializationFailed)?;
+
+        if let Some(k) = keys.kyber_spk {
+            new_client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
+        }
 
         *client = new_client;
         if !local_uid.is_empty() {
@@ -1121,7 +1144,7 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
     .map_err(|e| serialization_failed("create_crypto_core_from_keys/decode", e))?;
 
     let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
-    let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
+    let mut client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
         decoded.ik_priv.into_vec(),
         decoded.sk_priv.into_vec(),
         decoded.spk_priv.into_vec(),
@@ -1131,6 +1154,10 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
         hybrid,
     )
     .map_err(|_| CryptoError::InitializationFailed)?;
+
+    if let Some(k) = decoded.kyber_spk {
+        client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
+    }
 
     Ok(Arc::new(ClassicCryptoCore {
         inner: Mutex::new(client),
@@ -1151,7 +1178,7 @@ pub fn create_orchestrator_core_from_keys(
     .map_err(|e| serialization_failed("create_orchestrator_core_from_keys/decode", e))?;
 
     let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
-    let client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
+    let mut client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
         decoded.ik_priv.into_vec(),
         decoded.sk_priv.into_vec(),
         decoded.spk_priv.into_vec(),
@@ -1161,6 +1188,10 @@ pub fn create_orchestrator_core_from_keys(
         hybrid,
     )
     .map_err(|_| CryptoError::InitializationFailed)?;
+
+    if let Some(k) = decoded.kyber_spk {
+        client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
+    }
 
     let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
     Ok(Arc::new(OrchestratorCore {
@@ -1550,6 +1581,36 @@ mod tests {
         let classic = create_crypto_core().unwrap();
         let keys = classic.export_private_keys().unwrap();
         create_orchestrator_core_from_keys(keys, user_id.to_string()).unwrap()
+    }
+
+    /// Phase 2 of key-store consolidation: the Kyber SPK lives in the core key-state and
+    /// must survive the full uniffi persistence path (set_kyber_spk → export_private_keys →
+    /// create_orchestrator_core_from_keys → kyber_spk), exactly like the X25519 SPK.
+    /// Also guards additive compat: a blob exported WITHOUT a Kyber SPK must import fine.
+    #[test]
+    fn test_kyber_spk_survives_private_keys_cfe_roundtrip() {
+        let core = make_orchestrator("kyber_spk_user");
+        assert!(core.kyber_spk().is_none(), "fresh core must have no Kyber SPK");
+
+        // Blob without a Kyber SPK imports cleanly (backward compat — existing installs).
+        let legacy_blob = core.export_private_keys().unwrap();
+        let restored_legacy =
+            create_orchestrator_core_from_keys(legacy_blob, "kyber_spk_user".into()).unwrap();
+        assert!(restored_legacy.kyber_spk().is_none());
+
+        // Commit a Kyber SPK (ML-KEM-768 sizes) and round-trip it through the CFE blob.
+        let secret = vec![7u8; 2400];
+        let public = vec![9u8; 1184];
+        core.set_kyber_spk(42, secret.clone(), public.clone());
+        let blob = core.export_private_keys().unwrap();
+        let restored =
+            create_orchestrator_core_from_keys(blob, "kyber_spk_user".into()).unwrap();
+        let spk = restored
+            .kyber_spk()
+            .expect("Kyber SPK must survive the CFE round-trip");
+        assert_eq!(spk.key_id, 42);
+        assert_eq!(spk.secret_key, secret);
+        assert_eq!(spk.public_key, public);
     }
 
     /// Strict `init_session` must REJECT a bundle whose SPK is past the 10-day staleness limit.
@@ -3161,6 +3222,25 @@ impl OrchestratorCore {
     pub fn prune_one_time_prekeys_below(&self, min_keep_id: u32) -> u32 {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.prune_otpks_below(min_keep_id)
+    }
+
+    /// Store the ML-KEM-768 signed prekey in the core key-state. Commit-after-confirm is
+    /// the caller's contract: call only once the server has confirmed the public upload,
+    /// then persist the core snapshot (`export_private_keys`) — the key lives in that blob.
+    pub fn set_kyber_spk(&self, key_id: u32, secret_key: Vec<u8>, public_key: Vec<u8>) {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.set_kyber_spk(key_id, secret_key, public_key);
+    }
+
+    /// The ML-KEM-768 signed prekey held in the core key-state, or None if not committed yet.
+    pub fn kyber_spk(&self) -> Option<KyberSpkRecord> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.kyber_spk_bytes()
+            .map(|(key_id, secret_key, public_key)| KyberSpkRecord {
+                key_id,
+                public_key,
+                secret_key,
+            })
     }
 
     pub fn set_local_user_id(&self, user_id: String) {

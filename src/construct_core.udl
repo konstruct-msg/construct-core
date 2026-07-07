@@ -209,6 +209,15 @@ dictionary OtpkRecord {
     sequence<u8> public_key;
 };
 
+/// ML-KEM-768 signed prekey held in the core key-state (PQXDH KEM leg).
+/// Persisted atomically inside the private-keys CFE blob — replaces the
+/// standalone platform Keychain triple (key-store consolidation Phase 2).
+dictionary KyberSpkRecord {
+    u32 key_id;
+    sequence<u8> public_key;
+    sequence<u8> secret_key;
+};
+
 interface ClassicCryptoCore {
     /// Typed registration bundle fields.
     [Throws=CryptoError]
@@ -800,6 +809,10 @@ interface OrchestratorCore {
     void import_one_time_prekeys(sequence<u8> data);
 
     u32 prune_one_time_prekeys_below(u32 min_keep_id);
+
+    void set_kyber_spk(u32 key_id, sequence<u8> secret_key, sequence<u8> public_key);
+
+    KyberSpkRecord? kyber_spk();
 
     void set_local_user_id(string user_id);
 

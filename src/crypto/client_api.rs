@@ -963,6 +963,17 @@ where
     pub fn prune_one_time_prekeys_below(&mut self, min_keep_id: u32) -> usize {
         self.key_manager.prune_one_time_prekeys_below(min_keep_id)
     }
+
+    /// Store the ML-KEM-768 signed prekey in the key-state (commit-after-confirm).
+    pub fn set_kyber_spk(&mut self, key_id: u32, private_key: Vec<u8>, public_key: Vec<u8>) {
+        self.key_manager
+            .set_kyber_spk(key_id, private_key, public_key);
+    }
+
+    /// The stored ML-KEM-768 signed prekey as `(key_id, private, public)`, if any.
+    pub fn kyber_spk_bytes(&self) -> Option<(u32, Vec<u8>, Vec<u8>)> {
+        self.key_manager.kyber_spk_bytes()
+    }
 }
 
 /// Convenience type alias для X3DH + Double Ratchet с Classic Suite

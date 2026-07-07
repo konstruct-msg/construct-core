@@ -132,6 +132,13 @@ pub struct KeyManager<P: CryptoProvider> {
     /// Lazily initialized on first ensure_hybrid; not part of the main suite signing_key.
     hybrid_sig_priv: Option<Vec<u8>>,
 
+    /// The ML-KEM-768 signed prekey as `(key_id, private, public)` raw bytes — the PQXDH
+    /// KEM leg. Plain byte storage (decapsulation happens in the PQXDH layer), kept here
+    /// so it persists atomically with the rest of the key-state instead of a separate
+    /// platform store that can desync (Phase 2 of key-store consolidation). Not cfg-gated:
+    /// no PQ primitives are needed to carry the bytes.
+    kyber_spk: Option<(u32, Vec<u8>, Vec<u8>)>,
+
     _phantom: PhantomData<P>,
 }
 
@@ -148,6 +155,7 @@ impl<P: CryptoProvider> KeyManager<P> {
             next_otpk_id: 1_000_000,
             #[cfg(feature = "post-quantum")]
             hybrid_sig_priv: None,
+            kyber_spk: None,
             _phantom: PhantomData,
         }
     }
@@ -585,6 +593,18 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Export the hybrid sig private (if any) for CFE persistence.
     pub fn hybrid_signature_private_bytes(&self) -> Option<Vec<u8>> {
         self.hybrid_sig_priv.clone()
+    }
+
+    /// Store the ML-KEM-768 signed prekey `(key_id, private, public)` in the key-state.
+    /// Commit-after-confirm is the caller's contract: only call once the server has
+    /// confirmed the matching public key upload.
+    pub fn set_kyber_spk(&mut self, key_id: u32, private_key: Vec<u8>, public_key: Vec<u8>) {
+        self.kyber_spk = Some((key_id, private_key, public_key));
+    }
+
+    /// The stored ML-KEM-768 signed prekey as `(key_id, private, public)`, if any.
+    pub fn kyber_spk_bytes(&self) -> Option<(u32, Vec<u8>, Vec<u8>)> {
+        self.kyber_spk.clone()
     }
 
     // Non-pq stubs (no-op / None) so call sites in export/import don't need per-cfg.
