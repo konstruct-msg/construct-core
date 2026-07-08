@@ -514,16 +514,17 @@ impl ClassicCryptoCore {
 
         let hybrid_priv: Option<Vec<u8>> = keys.hybrid_sig_priv.map(|b| b.into_vec());
 
-        let mut new_client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
-            keys.ik_priv.into_vec(),
-            keys.sk_priv.into_vec(),
-            keys.spk_priv.into_vec(),
-            keys.spk_sig.into_vec(),
-            keys.spk_id,
-            old_spks_history,
-            hybrid_priv,
-        )
-        .map_err(|_| CryptoError::InitializationFailed)?;
+        let mut new_client =
+            ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
+                keys.ik_priv.into_vec(),
+                keys.sk_priv.into_vec(),
+                keys.spk_priv.into_vec(),
+                keys.spk_sig.into_vec(),
+                keys.spk_id,
+                old_spks_history,
+                hybrid_priv,
+            )
+            .map_err(|_| CryptoError::InitializationFailed)?;
 
         if let Some(k) = keys.kyber_spk {
             new_client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
@@ -1680,7 +1681,10 @@ mod tests {
     #[test]
     fn test_kyber_spk_survives_private_keys_cfe_roundtrip() {
         let core = make_orchestrator("kyber_spk_user");
-        assert!(core.kyber_spk().is_none(), "fresh core must have no Kyber SPK");
+        assert!(
+            core.kyber_spk().is_none(),
+            "fresh core must have no Kyber SPK"
+        );
 
         // Blob without a Kyber SPK imports cleanly (backward compat — existing installs).
         let legacy_blob = core.export_private_keys().unwrap();
@@ -1693,8 +1697,7 @@ mod tests {
         let public = vec![9u8; 1184];
         core.set_kyber_spk(42, secret.clone(), public.clone());
         let blob = core.export_private_keys().unwrap();
-        let restored =
-            create_orchestrator_core_from_keys(blob, "kyber_spk_user".into()).unwrap();
+        let restored = create_orchestrator_core_from_keys(blob, "kyber_spk_user".into()).unwrap();
         let spk = restored
             .kyber_spk()
             .expect("Kyber SPK must survive the CFE round-trip");

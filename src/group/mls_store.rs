@@ -423,7 +423,9 @@ mod tests {
         let addition = alice.add_member(&group_id, &bob_kp).expect("add bob");
         bob.join_from_welcome(&addition.welcome).expect("join");
 
-        let ct = alice.encrypt(&group_id, b"before restart").expect("encrypt");
+        let ct = alice
+            .encrypt(&group_id, b"before restart")
+            .expect("encrypt");
         assert_eq!(
             bob.decrypt(&group_id, &ct).expect("decrypt"),
             b"before restart"

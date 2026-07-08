@@ -680,7 +680,9 @@ impl Orchestrator {
 
     /// Prune OTPKs below `min_keep_id` after a replace-all upload converged the server set.
     pub fn prune_otpks_below(&mut self, min_keep_id: u32) -> u32 {
-        self.lifecycle.client.prune_one_time_prekeys_below(min_keep_id) as u32
+        self.lifecycle
+            .client
+            .prune_one_time_prekeys_below(min_keep_id) as u32
     }
 
     /// Store the ML-KEM-768 signed prekey in the key-state (commit-after-confirm).
@@ -781,13 +783,13 @@ impl Orchestrator {
             .collect();
 
         let hybrid_sig_priv = km.hybrid_signature_private_bytes().map(ByteBuf::from);
-        let kyber_spk = km
-            .kyber_spk_bytes()
-            .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
-                key_id,
-                kyber_priv: ByteBuf::from(priv_b),
-                kyber_pub: ByteBuf::from(pub_b),
-            });
+        let kyber_spk =
+            km.kyber_spk_bytes()
+                .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
+                    key_id,
+                    kyber_priv: ByteBuf::from(priv_b),
+                    kyber_pub: ByteBuf::from(pub_b),
+                });
 
         let payload = crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
@@ -1778,16 +1780,9 @@ mod tests {
     /// orchestrator derives msg_num/kem_ct from `data` via the canonical parser.
     fn packed_wire(msg_num: u32, kem_ct: Option<&[u8]>) -> Vec<u8> {
         crate::wire_payload::pack(
-            &[7u8; 32],
-            msg_num,
-            0,
-            0,
-            0,
-            1,
-            kem_ct,
+            &[7u8; 32], msg_num, 0, 0, 0, 1, kem_ct,
             &[0u8; 32], // sealed box (never decrypted in these tests)
-            0,
-            None,
+            0, None,
         )
         .unwrap()
     }
