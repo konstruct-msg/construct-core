@@ -19,6 +19,10 @@ pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;
 
+// Kani formal verification proofs (only compiled under `cargo kani`)
+#[cfg(kani)]
+mod proofs;
+
 // MLS group chat (RFC 9420) — feature-gated, pulls in openmls
 #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 pub mod group;
