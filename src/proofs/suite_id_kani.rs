@@ -116,7 +116,10 @@ fn proof_try_from_equivalent_to_new() {
     );
 
     if let (Ok(try_suite), Ok(new_suite)) = (try_result, new_result) {
-        assert_eq!(try_suite, new_suite, "TryFrom and new must produce same suite");
+        assert_eq!(
+            try_suite, new_suite,
+            "TryFrom and new must produce same suite"
+        );
     }
 }
 

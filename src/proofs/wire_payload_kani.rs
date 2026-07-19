@@ -7,7 +7,7 @@
 //! - W4: sealed_box is always at the end of the packed payload
 //! - W5: Suite-3 PQ section round-trip (no field)
 
-use crate::wire_payload::{pack, unpack, DecodedWirePayload, HEADER_SIZE};
+use crate::wire_payload::{DecodedWirePayload, HEADER_SIZE, pack, unpack};
 
 /// W1: Round-trip invariant — unpack(pack(fields)) == fields
 /// Bounded sealed_box and kem_ciphertext for tractable verification.
@@ -122,18 +122,7 @@ fn proof_pack_rejects_bad_dh_key() {
     let bad_key: Vec<u8> = (0..bad_len).map(|_| kani::any()).collect();
     let sealed_box: Vec<u8> = vec![0xAA; 60];
 
-    let result = pack(
-        &bad_key,
-        0,
-        0,
-        0,
-        0,
-        1,
-        None,
-        &sealed_box,
-        0,
-        None,
-    );
+    let result = pack(&bad_key, 0, 0, 0, 0, 1, None, &sealed_box, 0, None);
 
     assert!(
         result.is_err(),
@@ -151,19 +140,7 @@ fn proof_packed_length_correct() {
     kani::assume(sealed_len >= 60 && sealed_len <= 128);
     let sealed_box: Vec<u8> = (0..sealed_len).map(|_| kani::any()).collect();
 
-    let packed = pack(
-        &dh_key,
-        0,
-        0,
-        0,
-        0,
-        1,
-        None,
-        &sealed_box,
-        0,
-        None,
-    )
-    .unwrap();
+    let packed = pack(&dh_key, 0, 0, 0, 0, 1, None, &sealed_box, 0, None).unwrap();
 
     assert_eq!(
         packed.len(),

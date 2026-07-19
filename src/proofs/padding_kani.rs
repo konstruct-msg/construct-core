@@ -8,7 +8,7 @@
 //! - P5: oversized message rejected
 
 use crate::traffic_protection::padding::{
-    pad_message, unpad_message, PaddingError, MAX_MESSAGE_SIZE,
+    MAX_MESSAGE_SIZE, PaddingError, pad_message, unpad_message,
 };
 
 /// P1: Round-trip invariant — concrete test vectors

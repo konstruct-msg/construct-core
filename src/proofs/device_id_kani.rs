@@ -23,7 +23,15 @@ fn proof_device_id_deterministic() {
 #[kani::proof]
 fn proof_device_id_format() {
     // Test with several concrete keys
-    for key in [[0u8; 32], [0xFF; 32], [0x42; 32], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]] {
+    for key in [
+        [0u8; 32],
+        [0xFF; 32],
+        [0x42; 32],
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ],
+    ] {
         let device_id = derive_device_id(&key);
 
         assert_eq!(device_id.len(), 32, "Device ID must be 32 hex characters");
