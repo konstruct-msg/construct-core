@@ -42,7 +42,7 @@ const END_SESSION_MARKER: &str = "__END_SESSION__";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Role in a tie-break scenario (lower userId = INITIATOR).
+/// Role in a tie-break scenario (HIGHER userId = INITIATOR — see `tie_break_role`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
     Initiator,
