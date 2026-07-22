@@ -911,6 +911,19 @@ namespace construct_core {
         sequence<u8> server_pubkey_bytes
     );
 
+    /// Verify a batched DLEQ proof (IssueTokensResponse.dleq_proof) against the
+    /// client-pinned issuer public key K. Returns true iff the same k links
+    /// K = k*G and every evaluated[i] = k*blinded[i] — closes malicious-issuer
+    /// key-tagging (Phase C). blinded/evaluated are the batch of 32-byte points
+    /// (blinded as sent to IssueTokens, evaluated as returned); proof is 64 bytes;
+    /// issuer_public is the pinned 32-byte K. False on any malformed input.
+    boolean pp_verify_dleq(
+        sequence<sequence<u8>> blinded,
+        sequence<sequence<u8>> evaluated,
+        sequence<u8> proof,
+        sequence<u8> issuer_public
+    );
+
     /// Seal a finalized 32-byte token to the server's X25519 token-encryption
     /// key (token_encryption_key from /.well-known/construct-server) so relay
     /// operators cannot read spent tokens. Returns

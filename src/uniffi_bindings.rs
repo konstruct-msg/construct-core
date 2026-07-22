@@ -3864,6 +3864,18 @@ pub fn pp_verify_client(
     crate::crypto::privacy_pass::pp_verify_client(evaluated_bytes, nonce, server_pubkey_bytes)
 }
 
+/// Verify a batched DLEQ proof (`IssueTokensResponse.dleq_proof`) against the client-pinned
+/// issuer public key `K`. Returns true iff the same `k` links `K = k·G` and every
+/// `evaluated[i] = k·blinded[i]`. See `crate::crypto::privacy_pass::pp_verify_dleq`.
+pub fn pp_verify_dleq(
+    blinded: Vec<Vec<u8>>,
+    evaluated: Vec<Vec<u8>>,
+    proof: Vec<u8>,
+    issuer_public: Vec<u8>,
+) -> bool {
+    crate::crypto::privacy_pass::pp_verify_dleq(blinded, evaluated, proof, issuer_public)
+}
+
 pub fn pp_seal_token_bytes(
     token: Vec<u8>,
     server_encryption_key: Vec<u8>,

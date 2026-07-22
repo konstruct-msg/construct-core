@@ -20,9 +20,10 @@
 ///   expected = HKDF-SHA512(N_compressed || nonce, info="ConstructPP-v1")
 ///   valid  = expected == token  &&  token not in spent-set
 use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
-    traits::MultiscalarMul,
+    traits::{Identity, IsIdentity, MultiscalarMul},
 };
 use hkdf::Hkdf;
 use rand_core::OsRng;
@@ -237,6 +238,154 @@ pub fn pp_verify_client(
         .is_some()
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Batched DLEQ proof verification (Phase C — verifiable VOPRF)
+//
+// Ported byte-for-byte from construct-server `construct-crypto::privacy_pass`
+// (`verify_dleq_proof` / `compute_composites` / `dleq_hash_to_scalar`). MUST stay
+// byte-identical or issuance proofs will not verify — see construct-docs
+// `cryptocore/privacy-pass-dleq-v1.md`. Client pins `issuer_public` (K) and verifies the
+// proof from `IssueTokensResponse.dleq_proof` against the pin, closing malicious-issuer
+// key-tagging (a per-user `k_u` where `K = k·G` but `Z = k_u·B` is rejected).
+// ──────────────────────────────────────────────────────────────────────────────
+
+const DLEQ_DOMAIN: &[u8] = b"ConstructPP-DLEQ-v1";
+
+/// Hash to a Ristretto scalar via SHA-512 + `Scalar::from_hash` (sha2 0.10, matching the
+/// server's `sha2_dalek_compat` alias). Callers prepend `DLEQ_DOMAIN` + a 1-byte tag.
+fn dleq_hash_to_scalar(parts: &[&[u8]]) -> Scalar {
+    let mut h = Sha512::new();
+    for p in parts {
+        h.update(p);
+    }
+    Scalar::from_hash(h)
+}
+
+fn decompress_nonidentity(bytes: &[u8; 32]) -> Option<RistrettoPoint> {
+    let p = CompressedRistretto::from_slice(bytes).ok()?.decompress()?;
+    if p.is_identity() {
+        return None;
+    }
+    Some(p)
+}
+
+/// Deterministic random-linear-combination of the `(B_i, Z_i)` batch — identical on prover
+/// and verifier. `None` if empty, length-mismatched, or any point fails to decompress / is
+/// the identity. `k_pub` (`K`) is bound into the seed so a proof can't be replayed under a
+/// different commitment.
+fn compute_composites(
+    k_pub: &[u8; 32],
+    blinded: &[[u8; 32]],
+    evaluated: &[[u8; 32]],
+) -> Option<(RistrettoPoint, RistrettoPoint)> {
+    if blinded.is_empty() || blinded.len() != evaluated.len() {
+        return None;
+    }
+
+    let mut b_pts = Vec::with_capacity(blinded.len());
+    let mut z_pts = Vec::with_capacity(evaluated.len());
+    for (b, z) in blinded.iter().zip(evaluated.iter()) {
+        b_pts.push(decompress_nonidentity(b)?);
+        z_pts.push(decompress_nonidentity(z)?);
+    }
+
+    // seed = SHA512(DOMAIN ‖ 0x00 ‖ K ‖ Σ_i (B_i ‖ Z_i))
+    let mut sh = Sha512::new();
+    sh.update(DLEQ_DOMAIN);
+    sh.update([0x00u8]);
+    sh.update(k_pub);
+    for (b, z) in blinded.iter().zip(evaluated.iter()) {
+        sh.update(b);
+        sh.update(z);
+    }
+    let seed = sh.finalize();
+
+    // M = Σ d_i·B_i, Zc = Σ d_i·Z_i, d_i = H(DOMAIN ‖ 0x01 ‖ seed ‖ u32_be(i) ‖ B_i ‖ Z_i)
+    let mut m = RistrettoPoint::identity();
+    let mut zc = RistrettoPoint::identity();
+    for (i, (b, z)) in blinded.iter().zip(evaluated.iter()).enumerate() {
+        let idx = (i as u32).to_be_bytes();
+        let d = dleq_hash_to_scalar(&[DLEQ_DOMAIN, &[0x01], &seed[..], &idx[..], &b[..], &z[..]]);
+        m += d * b_pts[i];
+        zc += d * z_pts[i];
+    }
+    Some((m, zc))
+}
+
+/// Verify a batched DLEQ proof against the pinned public commitment `issuer_public` (`K`).
+/// Returns `true` iff the same `k` links `K = k·G` and every `evaluated[i] = k·blinded[i]`.
+///
+/// UniFFI-facing: each point/proof is a `Vec<u8>` (32 / 32 / 64 bytes). Any malformed input
+/// (wrong length, non-canonical scalar, bad point) returns `false` — never panics.
+pub fn pp_verify_dleq(
+    blinded: Vec<Vec<u8>>,
+    evaluated: Vec<Vec<u8>>,
+    proof: Vec<u8>,
+    issuer_public: Vec<u8>,
+) -> bool {
+    // Convert the batch to fixed-size arrays; bail on any wrong-length input.
+    fn to_arrays(v: &[Vec<u8>]) -> Option<Vec<[u8; 32]>> {
+        v.iter()
+            .map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .collect()
+    }
+    let blinded_arr = match to_arrays(&blinded) {
+        Some(v) => v,
+        None => return false,
+    };
+    let evaluated_arr = match to_arrays(&evaluated) {
+        Some(v) => v,
+        None => return false,
+    };
+    let issuer_public: [u8; 32] = match issuer_public.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let proof: [u8; 64] = match proof.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    let c_bytes: [u8; 32] = proof[..32].try_into().expect("32-byte slice");
+    let s_bytes: [u8; 32] = proof[32..].try_into().expect("32-byte slice");
+    let c = Option::<Scalar>::from(Scalar::from_canonical_bytes(c_bytes));
+    let s = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes));
+    let (c, s) = match (c, s) {
+        (Some(c), Some(s)) => (c, s),
+        _ => return false, // non-canonical scalar encoding
+    };
+
+    let k_point = match CompressedRistretto::from_slice(&issuer_public)
+        .ok()
+        .and_then(|cp| cp.decompress())
+    {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let (m, zc) = match compute_composites(&issuer_public, &blinded_arr, &evaluated_arr) {
+        Some(v) => v,
+        None => return false,
+    };
+    let m_c = m.compress().to_bytes();
+    let zc_c = zc.compress().to_bytes();
+
+    // A1' = s·G − c·K, A2' = s·M − c·Zc; accept iff H(...A1'‖A2') == c.
+    let a1p = s * RISTRETTO_BASEPOINT_POINT - c * k_point;
+    let a2p = s * m - c * zc;
+    let c_prime = dleq_hash_to_scalar(&[
+        DLEQ_DOMAIN,
+        &[0x03],
+        &issuer_public[..],
+        &m_c[..],
+        &zc_c[..],
+        &a1p.compress().to_bytes()[..],
+        &a2p.compress().to_bytes()[..],
+    ]);
+
+    c_prime == c
+}
+
 /// Seal a finalized token to the server's X25519 token-encryption public key
 /// (`token_encryption_key` from `/.well-known/construct-server`) so relay
 /// operators cannot read spent tokens in transit.
@@ -415,5 +564,93 @@ mod tests {
     #[test]
     fn seal_token_bytes_rejects_bad_key_length() {
         assert!(pp_seal_token_bytes(vec![0u8; 32], vec![0u8; 31]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod dleq_tests {
+    use super::*;
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Cross-impl golden vector: the exact `(k, batch, proof)` pinned in construct-server
+    /// `construct-crypto::privacy_pass::dleq_kat_vector`. The client verifier MUST accept the
+    /// server-generated proof byte-for-byte, or issuance breaks. This locks the
+    /// privacy-pass-dleq-v1.md client-parity contract.
+    #[test]
+    fn pp_verify_dleq_accepts_server_kat_and_rejects_tampering() {
+        let k = Scalar::from_bytes_mod_order([7u8; 32]);
+        let mk = |label: &[u8]| -> [u8; 32] {
+            let t = hash_to_ristretto(label);
+            let r = Scalar::from_bytes_mod_order([3u8; 32]);
+            (r * t).compress().to_bytes()
+        };
+        let blinded_arr = [mk(b"kat-0"), mk(b"kat-1")];
+        let evaluated_arr: Vec<[u8; 32]> = blinded_arr
+            .iter()
+            .map(|b| {
+                let p = CompressedRistretto::from_slice(b)
+                    .unwrap()
+                    .decompress()
+                    .unwrap();
+                (k * p).compress().to_bytes()
+            })
+            .collect();
+        let k_pub = (RISTRETTO_BASEPOINT_POINT * k).compress().to_bytes();
+
+        // Golden proof from construct-server (privacy-pass-dleq-v1.md).
+        const KAT_PROOF_HEX: &str = "a5fc43539f4acf319af0035bc73a19006588f75a5d425fc3039e906597c08d06bfa8b0cd50bb08d6d7bcb90dae2222fd2384e8404de57260fd412f729d29ab08";
+        let proof = from_hex(KAT_PROOF_HEX);
+
+        let blinded: Vec<Vec<u8>> = blinded_arr.iter().map(|b| b.to_vec()).collect();
+        let evaluated: Vec<Vec<u8>> = evaluated_arr.iter().map(|z| z.to_vec()).collect();
+
+        // (1) Accepts the real server proof under the correct pinned K.
+        assert!(
+            pp_verify_dleq(
+                blinded.clone(),
+                evaluated.clone(),
+                proof.clone(),
+                k_pub.to_vec()
+            ),
+            "client DLEQ verify must accept the server KAT proof (byte-compat broke)"
+        );
+
+        // (2) Rejects a mismatched issuer key — the per-user key-tag threat Phase C closes.
+        let wrong_k = (RISTRETTO_BASEPOINT_POINT * Scalar::from_bytes_mod_order([8u8; 32]))
+            .compress()
+            .to_bytes();
+        assert!(
+            !pp_verify_dleq(
+                blinded.clone(),
+                evaluated.clone(),
+                proof.clone(),
+                wrong_k.to_vec()
+            ),
+            "verify must reject a mismatched issuer key"
+        );
+
+        // (3) Rejects a tampered proof.
+        let mut bad = proof.clone();
+        bad[0] ^= 0x01;
+        assert!(!pp_verify_dleq(
+            blinded.clone(),
+            evaluated.clone(),
+            bad,
+            k_pub.to_vec()
+        ));
+
+        // (4) Malformed inputs never panic → false.
+        assert!(!pp_verify_dleq(
+            vec![vec![0u8; 31]],
+            evaluated,
+            proof,
+            k_pub.to_vec()
+        ));
     }
 }
