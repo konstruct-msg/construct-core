@@ -22,6 +22,36 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
     }
 
+    /// Deterministic 16-hex-char fingerprint of the salient ratchet state.
+    ///
+    /// One-way (SHA-256 over a domain tag + counters + chain/root keys + DH publics), so it is
+    /// safe to log. It lets two peers — or the same session before and after a persist
+    /// round-trip — be compared cheaply: an equal fingerprint ⇒ identical ratchet position; a
+    /// mismatch localises a desync instantly instead of hunting through logs. Excludes
+    /// timestamps and the *contents* of the skipped-key map (only its count) so it is stable
+    /// across export/import and independent of HashMap iteration order.
+    pub fn state_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"ConstructDR-fingerprint-v1");
+        h.update(self.suite_id.as_u16().to_be_bytes());
+        h.update(self.sending_chain_length.to_be_bytes());
+        h.update(self.receiving_chain_length.to_be_bytes());
+        h.update(self.previous_sending_length.to_be_bytes());
+        h.update(self.current_pq_epoch.to_be_bytes());
+        h.update(self.pq_turns_since_mix.to_be_bytes());
+        h.update(self.root_key.as_ref());
+        h.update(self.sending_chain_key.as_ref());
+        h.update(self.receiving_chain_key.as_ref());
+        h.update(self.dh_ratchet_public.as_ref());
+        match &self.remote_dh_public {
+            Some(k) => h.update(k.as_ref()),
+            None => h.update([0u8]),
+        }
+        h.update((self.skipped_message_keys.len() as u32).to_be_bytes());
+        hex::encode(&h.finalize()[..8])
+    }
+
     /// Mix a post-quantum KEM shared secret into the session root key (PQXDH contribution).
     ///
     /// Both sender and receiver call this after `init_session`/`init_receiving_session`
@@ -159,6 +189,28 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.dh_ratchet_public = new_dh_public;
         self.remote_dh_public = Some(new_remote_dh.clone());
         self.last_ratchet_at = unix_now();
+
+        // Post-condition invariant: a DH ratchet step resets both chains to zero (the old
+        // sending length was captured into previous_sending_length above). If this ever fails,
+        // a counter is being carried across a ratchet → guaranteed key-derivation desync.
+        debug_assert_eq!(
+            self.sending_chain_length, 0,
+            "DH ratchet must reset the sending chain to 0"
+        );
+        debug_assert_eq!(
+            self.receiving_chain_length, 0,
+            "DH ratchet must reset the receiving chain to 0"
+        );
+
+        // Ratchet-boundary observability: a DH step is the highest-risk state transition for a
+        // desync. Logging the post-step fingerprint lets a captured device transcript (or the
+        // soak harness) pinpoint exactly where two peers' ratchets diverge.
+        debug!(
+            target: "crypto::double_ratchet",
+            fp = %self.state_fingerprint(),
+            pn = self.previous_sending_length,
+            "DH ratchet step complete"
+        );
 
         // 5. Sparse continuous PQ ratchet — maybe *start* a new exchange
         // (initiator only; never touches root/chain keys).

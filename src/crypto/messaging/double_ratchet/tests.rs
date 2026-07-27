@@ -1065,6 +1065,52 @@ fn make_session_pair(
     (alice, bob)
 }
 
+/// Fingerprint observability (`state_fingerprint`):
+/// 1. A persist round-trip (`to_serializable` → `from_serializable`) preserves the fingerprint —
+///    proving it commits only to state that survives serialization, and that a healthy
+///    save/restore does not itself cause divergence.
+/// 2. The fingerprint tracks ratchet position: two peers at different positions differ, and
+///    advancing one side's sending chain changes it (a real desync would show up the same way).
+#[test]
+fn test_state_fingerprint_stable_across_roundtrip_and_detects_divergence() {
+    let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000001";
+    let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000002";
+    let (mut alice, mut bob) = make_session_pair(alice_uuid, bob_uuid);
+
+    // Exchange both ways to advance the chains (and cross a DH ratchet).
+    let m1 = alice.encrypt(b"hello 1").unwrap();
+    bob.decrypt(&m1).unwrap();
+    let m2 = bob.encrypt(b"reply 1").unwrap();
+    alice.decrypt(&m2).unwrap();
+    let m3 = alice.encrypt(b"hello 2").unwrap();
+    bob.decrypt(&m3).unwrap();
+
+    let fp_alice = alice.state_fingerprint();
+
+    // (1) Persist round-trip must preserve the fingerprint.
+    let restored =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(alice.to_serializable())
+            .unwrap();
+    assert_eq!(
+        fp_alice,
+        restored.state_fingerprint(),
+        "fingerprint must survive a save/restore round-trip"
+    );
+
+    // (2) Distinct peers ⇒ distinct fingerprints; advancing the chain ⇒ fingerprint changes.
+    assert_ne!(
+        fp_alice,
+        bob.state_fingerprint(),
+        "two peers at different ratchet positions must have different fingerprints"
+    );
+    alice.encrypt(b"hello 3").unwrap();
+    assert_ne!(
+        fp_alice,
+        alice.state_fingerprint(),
+        "advancing the sending chain must change the fingerprint"
+    );
+}
+
 /// Concurrent init / tie-break: both parties call new_initiator_session
 /// simultaneously. The LOSE side (Bob) receives Alice's msg0, discards its
 /// own initiator session, and switches to new_responder_session.
