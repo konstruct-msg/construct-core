@@ -1204,6 +1204,94 @@ fn soak_crash_reload_out_of_order_burst() {
     let _ = alice; // keep alice alive to end of scope
 }
 
+// ── Fault-injection soak: DROPPED save (in-memory advances, disk lags) ──────
+//
+// The soaks above round-trip a *successful* persist. The real client bug class
+// ([[2026-07-27-silent-persist-failures-observability]]) is a save that silently *fails*: the
+// in-memory ratchet advances, but the durable snapshot is stale, and on the next crash the session
+// reloads from that stale snapshot — losing the last operation(s). These two tests characterise the
+// recovery boundary: which dropped-save shapes self-heal (via server redelivery) and which wedge into
+// the permanent "never heals" desync.
+//
+// Model: `*_saved` holds the last *durable* SerializableSession; a "dropped save" simply does NOT
+// update it before the crash; a "crash" = `from_serializable(saved)`.
+
+/// Dropped save on the RECEIVER, with no send in between → RECOVERS via redelivery.
+/// Bob decrypts a message but its save is dropped; Bob crashes and reloads the stale snapshot (as if
+/// the message was never processed). Because Bob never durably ACKed it, the server redelivers it,
+/// and the stale Bob re-consumes it from the same chain position. The session stays healthy.
+#[test]
+fn fault_stale_receiver_reload_recovers_on_redelivery() {
+    let a = "aaaaaaaa-0000-4000-8000-000000000005";
+    let b = "bbbbbbbb-0000-4000-8000-000000000006";
+    let (mut alice, mut bob) = make_session_pair(a, b);
+
+    let mut bob_saved = bob.to_serializable();
+    for i in 0..3u32 {
+        let ct = alice.encrypt(format!("warm-{i}").as_bytes()).unwrap();
+        bob.decrypt(&ct).unwrap();
+        bob_saved = bob.to_serializable(); // save succeeds
+    }
+
+    // Fateful message: Bob decrypts it, but the save is DROPPED (bob_saved not updated).
+    let x = b"the-dropped-one".to_vec();
+    let ctx = alice.encrypt(&x).unwrap();
+    assert_eq!(bob.decrypt(&ctx).unwrap(), x);
+
+    // Crash → reload the stale snapshot (message X never recorded).
+    let mut bob =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(bob_saved).unwrap();
+
+    // Server redelivers X (never durably ACKed). Stale Bob must re-consume it.
+    let pt = bob
+        .decrypt(&ctx)
+        .expect("stale receiver must recover by re-decrypting the redelivered message");
+    assert_eq!(pt, x);
+
+    // Session continues healthy: Alice's next message (chain X+1) decrypts on the recovered Bob.
+    let ct_next = alice.encrypt(b"after").unwrap();
+    assert_eq!(bob.decrypt(&ct_next).unwrap(), b"after");
+}
+
+/// Dropped save on the SENDER → WEDGES (documents the unrecoverable desync).
+/// Alice encrypts a message (sending chain advances) and Bob receives it, but Alice's save is
+/// dropped; Alice crashes and reloads the stale snapshot (as if she never sent it). Her next send
+/// REUSES the already-consumed message number, which Bob — now one position ahead — cannot decrypt.
+/// This is the "never heals" case (mid-session, so session healing at msgNum==0 does not apply).
+#[test]
+fn fault_stale_sender_reload_wedges_desync() {
+    let a = "aaaaaaaa-0000-4000-8000-000000000007";
+    let b = "bbbbbbbb-0000-4000-8000-000000000008";
+    let (mut alice, mut bob) = make_session_pair(a, b);
+
+    let mut alice_saved = alice.to_serializable();
+    for i in 0..3u32 {
+        let ct = alice.encrypt(format!("warm-{i}").as_bytes()).unwrap();
+        bob.decrypt(&ct).unwrap();
+        alice_saved = alice.to_serializable(); // save succeeds
+    }
+
+    // Alice sends X (chain advances), Bob receives the real X. Alice's save is DROPPED.
+    let ctx = alice.encrypt(b"real-X").unwrap();
+    assert_eq!(bob.decrypt(&ctx).unwrap(), b"real-X");
+
+    // Crash → Alice reloads the stale snapshot (as if X was never sent).
+    let mut alice =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(alice_saved).unwrap();
+
+    // Alice sends fresh content Y — but on the stale chain it reuses X's message number.
+    let cty = alice.encrypt(b"new-Y").unwrap();
+
+    // Bob already consumed that number in-order and is one position ahead. The reused-number
+    // message does not decrypt → documented, currently-unrecoverable desync.
+    assert!(
+        bob.decrypt(&cty).is_err(),
+        "EXPECTED CURRENT BEHAVIOUR: a stale-sender reload reuses a consumed message number, so the \
+         peer cannot decrypt (mid-session desync that healing does not cover). If this ever starts \
+         passing, the recovery story changed — update this characterisation test."
+    );
+}
+
 /// Concurrent init / tie-break: both parties call new_initiator_session
 /// simultaneously. The LOSE side (Bob) receives Alice's msg0, discards its
 /// own initiator session, and switches to new_responder_session.
