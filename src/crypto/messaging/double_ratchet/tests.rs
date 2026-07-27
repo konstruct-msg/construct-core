@@ -1111,6 +1111,99 @@ fn test_state_fingerprint_stable_across_roundtrip_and_detects_divergence() {
     );
 }
 
+// ── Crash-recovery soak (п.2) ──────────────────────────────────────────────
+//
+// A "crash" is simulated by serialising the live session and rebuilding it from those bytes
+// (`to_serializable` -> `from_serializable`) — the exact round-trip the app performs when it
+// persists to / restores from the Keychain. `state_fingerprint()` is the oracle: a *healthy*
+// reload must not change it. The soak then asserts that reloading at boundaries never breaks
+// subsequent decryption — the deterministic, off-device reproduction of the recurring
+// "works, then desyncs, never heals" symptom.
+
+/// Serialise → deserialise a session (a simulated crash + restore) and assert the fingerprint
+/// is unchanged (a lossy/altered persist would move it). Returns the reloaded session.
+fn crash_reload(
+    s: &DoubleRatchetSession<ClassicSuiteProvider>,
+) -> DoubleRatchetSession<ClassicSuiteProvider> {
+    let fp = s.state_fingerprint();
+    let restored =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(s.to_serializable())
+            .expect("crash-reload: from_serializable failed");
+    assert_eq!(
+        fp,
+        restored.state_fingerprint(),
+        "crash-reload changed the session fingerprint — persistence lost or altered ratchet state"
+    );
+    restored
+}
+
+/// Reload BOTH peers at every send and receive boundary across a long alternating exchange
+/// (each turn forces a DH ratchet). If any serialize/restore drops or corrupts ratchet state,
+/// a later decrypt fails here instead of silently desyncing on a device weeks later.
+#[test]
+fn soak_crash_reload_every_boundary_alternating() {
+    let a_uuid = "aaaaaaaa-0000-4000-8000-000000000001";
+    let b_uuid = "bbbbbbbb-0000-4000-8000-000000000002";
+    let (mut alice, mut bob) = make_session_pair(a_uuid, b_uuid);
+
+    for i in 0..200u32 {
+        let msg = format!("msg-{i}").into_bytes();
+        if i % 2 == 0 {
+            let ct = alice.encrypt(&msg).expect("A encrypt");
+            alice = crash_reload(&alice); // crash the sender right after send
+            let pt = bob
+                .decrypt(&ct)
+                .unwrap_or_else(|e| panic!("A->B decrypt failed at {i}: {e}"));
+            bob = crash_reload(&bob); // crash the receiver right after receive
+            assert_eq!(pt, msg, "A->B plaintext mismatch at step {i}");
+        } else {
+            let ct = bob.encrypt(&msg).expect("B encrypt");
+            bob = crash_reload(&bob);
+            let pt = alice
+                .decrypt(&ct)
+                .unwrap_or_else(|e| panic!("B->A decrypt failed at {i}: {e}"));
+            alice = crash_reload(&alice);
+            assert_eq!(pt, msg, "B->A plaintext mismatch at step {i}");
+        }
+    }
+}
+
+/// Out-of-order delivery with a reload between every receive. Alice sends a burst; Bob receives
+/// it in reverse (worst case: the newest message first forces the whole chain of skipped keys to
+/// be stored, then each older message is served from that store). The crash_reload between each
+/// receive asserts the skipped-message keys survive a persist round-trip — the prime desync
+/// suspect, since fingerprint-equality only guarantees the skip *count*, while the actual key
+/// material must round-trip for the older messages to decrypt.
+#[test]
+fn soak_crash_reload_out_of_order_burst() {
+    let a_uuid = "aaaaaaaa-0000-4000-8000-000000000003";
+    let b_uuid = "bbbbbbbb-0000-4000-8000-000000000004";
+    let (mut alice, mut bob) = make_session_pair(a_uuid, b_uuid);
+
+    const BURST: usize = 12;
+    let sent: Vec<(Vec<u8>, EncryptedRatchetMessage)> = (0..BURST)
+        .map(|i| {
+            let m = format!("burst-{i}").into_bytes();
+            let ct = alice.encrypt(&m).expect("A encrypt burst");
+            (m, ct)
+        })
+        .collect();
+    alice = crash_reload(&alice);
+
+    // Deliver newest-first; reload Bob between each receive.
+    for (idx, (m, ct)) in sent.iter().enumerate().rev() {
+        let pt = bob
+            .decrypt(ct)
+            .unwrap_or_else(|e| panic!("out-of-order decrypt failed for burst msg {idx}: {e}"));
+        assert_eq!(
+            &pt, m,
+            "out-of-order plaintext mismatch for burst msg {idx}"
+        );
+        bob = crash_reload(&bob);
+    }
+    let _ = alice; // keep alice alive to end of scope
+}
+
 /// Concurrent init / tie-break: both parties call new_initiator_session
 /// simultaneously. The LOSE side (Bob) receives Alice's msg0, discards its
 /// own initiator session, and switches to new_responder_session.
