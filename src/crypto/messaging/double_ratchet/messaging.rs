@@ -365,6 +365,15 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             "Encryption successful"
         );
 
+        // Counter invariant: one encrypt consumes exactly one sending-chain slot. If this ever
+        // fails, the sending counter and the emitted message_number have diverged → the peer
+        // will derive the wrong message key → desync.
+        debug_assert_eq!(
+            self.sending_chain_length,
+            message_number + 1,
+            "encrypt must advance the sending chain by exactly one message"
+        );
+
         Ok(EncryptedRatchetMessage {
             dh_public_key,
             message_number,
@@ -519,9 +528,16 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 msg_num = %encrypted.message_number,
                 "Found skipped message key"
             );
+            let recv_len_before = self.receiving_chain_length;
             let plaintext = self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
                 self.restore_snapshot(snapshot);
             })?;
+            // Counter invariant: an out-of-order message decrypted from a stored skipped key must
+            // NOT advance the live receiving chain — that key belongs to an earlier position.
+            debug_assert_eq!(
+                self.receiving_chain_length, recv_len_before,
+                "decrypting a skipped (out-of-order) message must not advance the receiving chain"
+            );
             self.commit_pq_post_decrypt(encrypted);
             return Ok(plaintext);
         }
@@ -542,6 +558,14 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                         return Err("receiving_chain_length overflow".to_string());
                     }
                 };
+                // Counter invariant: consuming the in-order message N leaves the receiving chain
+                // at exactly N+1. A mismatch means a message key was derived at the wrong chain
+                // position → the AEAD/AD would not match → desync.
+                debug_assert_eq!(
+                    self.receiving_chain_length,
+                    encrypted.message_number + 1,
+                    "in-order decrypt must leave the receiving chain one past the consumed message"
+                );
                 let plaintext = self
                     .decrypt_with_key(&msg_key, encrypted)
                     .inspect_err(|_e| {
