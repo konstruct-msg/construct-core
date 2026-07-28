@@ -21,8 +21,60 @@ ignore = [
     # REMOVE THIS IGNORE when: openmls/hpke-rs upstream stops pinning the libcrux
     # backend in the lock, or we move to an openmls release whose lock no longer
     # carries hpke-rs-libcrux (then prefer upgrading to libcrux >=0.0.8).
-    # Tracking: wiki/decisions/cargo-audit-not-compiled-advisories.md
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
     "RUSTSEC-2026-0124",
+
+    # RUSTSEC-2026-0209: libcrux-aesgcm 0.0.7 — AES-GCM did not enforce limits on
+    # AAD length. NOT COMPILED, same reason as RUSTSEC-2026-0124 above: reachable
+    # only through hpke-rs-libcrux → libcrux-aead → libcrux-aesgcm, an optional
+    # edge no enabled feature selects.
+    # Verified 2026-07-28: `cargo tree --no-default-features --features ios,post-quantum
+    #   -e normal --target aarch64-apple-ios -i libcrux-aesgcm` → "nothing to print".
+    # REMOVE THIS IGNORE together with RUSTSEC-2026-0124 (same upstream trigger).
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0209",
+
+    # RUSTSEC-2026-0211: libcrux-aesgcm 0.0.7 — non-constant-time authentication tag
+    # check in AES-GCM decryption. NOT COMPILED — identical path and evidence as
+    # RUSTSEC-2026-0209 above.
+    # REMOVE THIS IGNORE together with RUSTSEC-2026-0124 (same upstream trigger).
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0211",
+
+    # RUSTSEC-2026-0207: libcrux-sha3 0.0.8 — incorrect output of the *incremental*
+    # portable SHAKE API when squeeze() is called more than once. libcrux-sha3 IS
+    # compiled (hpke-rs → openmls_rust_crypto), but the vulnerable API is not used:
+    # hpke-rs calls only the one-shot form, `libcrux_sha3::shake256::<32|64>(ikm)`
+    # (hpke-rs-0.6.1/src/kem.rs:154,158). No incremental/multi-squeeze call site.
+    # A fix exists (libcrux-sha3 >=0.0.10) but is unreachable: it requires hpke-rs
+    # 0.7.0, and openmls_rust_crypto 0.5.1 (latest) hard-pins `hpke = ^0.6.0`.
+    # Verified 2026-07-28: `cargo update -p libcrux-sha3 --precise 0.0.10` → rejected
+    #   by the `^0.0.8` requirement of hpke-rs 0.6.1.
+    # REMOVE THIS IGNORE when: openmls_rust_crypto releases a version depending on
+    # hpke-rs >=0.7.0, then bump to libcrux-sha3 >=0.0.10.
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0207",
+
+    # RUSTSEC-2026-0208: libcrux-sha3 0.0.8 — potential panic in the AVX2 SHAKE-256
+    # implementation. NOT APPLICABLE to any target we ship: AVX2 is x86-64 only and
+    # every shipped target is aarch64 (aarch64-apple-ios, -ios-sim, -darwin,
+    # -linux-android). The AVX2 code path is not even compiled.
+    # REMOVE THIS IGNORE when: we add an x86-64 shipping target, or libcrux-sha3
+    # >=0.0.10 becomes reachable (see RUSTSEC-2026-0207 above) — whichever first.
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0208",
+
+    # RUSTSEC-2026-0212: libcrux-secrets 0.0.5 — potentially incorrect output of the
+    # constant-time swap/select helpers on aarch64. The crate IS in the iOS graph,
+    # but only as a transitive *type* dependency: libcrux-sha3 → libcrux-traits →
+    # libcrux-secrets. The vulnerable helpers are never invoked on our path.
+    # Verified 2026-07-28: no reference to `libcrux_secrets` anywhere in the
+    #   libcrux-sha3 0.0.8 sources; the AEAD/KEM crates that do use cswap/select
+    #   (libcrux-aead, libcrux-ml-kem via the libcrux HPKE backend) are not compiled.
+    # Patched upstream in 0.0.6, unreachable: libcrux-aead 0.0.7 pins `^0.0.5`.
+    # REMOVE THIS IGNORE together with RUSTSEC-2026-0124 (same upstream trigger).
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0212",
 
     # RUSTSEC-2023-0071: rsa 0.9.10 — Marvin timing sidechannel (MEDIUM, no fixed
     # upgrade available). NOT COMPILED into our library: it arrives only via
@@ -33,7 +85,7 @@ ignore = [
     # REMOVE THIS IGNORE when: sqlx no longer pins sqlx-mysql in the lock for a
     # sqlite-only consumer (sqlx feature-resolution fix), or rsa ships a constant
     # -time fix.
-    # Tracking: wiki/decisions/cargo-audit-not-compiled-advisories.md
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
     "RUSTSEC-2023-0071",
 ]
 
