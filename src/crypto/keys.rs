@@ -776,11 +776,14 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Remove all stored OTPKs with `key_id < min_keep_id`; returns how many were pruned.
     ///
-    /// Convergence point after a replace-all upload: the server set is then exactly
-    /// the batch just uploaded, so no *future* bundle fetch can reference an older key.
-    /// The caller keeps a small ID window below the batch for first messages already
-    /// in flight; everything older is dead weight that only grows the persisted blob.
-    /// Never touches `next_otpk_id` — IDs stay monotonic.
+    /// Called after **every** upload — replace-all *and* append. The caller keeps a small
+    /// ID window below the newest batch so first messages already in flight against
+    /// recently-replaced keys still decrypt; everything older is dead weight that only
+    /// grows the persisted blob. Running this on appends too is what keeps the store
+    /// bounded on the hot path: a device was observed holding 2294 private keys (~160 KB
+    /// re-serialised into the Keychain on every top-up) because appends never pruned.
+    /// Never touches `next_otpk_id` — IDs stay monotonic, so pruning can never enable
+    /// ID reuse.
     pub fn prune_one_time_prekeys_below(&mut self, min_keep_id: u32) -> usize {
         let before = self.one_time_prekeys.len();
         self.one_time_prekeys.retain(|&id, _| id >= min_keep_id);
@@ -885,5 +888,43 @@ mod tests {
         assert_eq!(km.prune_one_time_prekeys_below(u32::MAX), 2);
         assert_eq!(km.one_time_prekey_count(), 0);
         assert_eq!(km.next_otpk_id(), next + 2);
+    }
+
+    #[test]
+    fn test_append_replenish_treadmill_stays_bounded() {
+        // Models the real client loop: a contact's bundle fetches burn server-side keys,
+        // the device tops up 20 more, repeat. Pruning used to run only on the replace-all
+        // path, so this loop grew the local store without bound — a field device was found
+        // holding 2294 private keys (~160 KB rewritten to the Keychain on every top-up).
+        // With the prune applied on appends too, the store stays within batch + grace.
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        const BATCH: u32 = 20;
+        const GRACE: u32 = 200; // mirrors OtpkReplenishmentService.pruneGraceWindow
+
+        let mut km: KeyManager<ClassicSuiteProvider> = KeyManager::new();
+        for _ in 0..120 {
+            let pairs = km.generate_one_time_prekeys(BATCH).unwrap();
+            let min_new_id = pairs.iter().map(|(id, _)| *id).min().unwrap();
+            let cutoff = min_new_id.saturating_sub(GRACE);
+            km.prune_one_time_prekeys_below(cutoff);
+        }
+
+        let count = km.one_time_prekey_count() as u32;
+        assert!(
+            count <= BATCH + GRACE,
+            "append treadmill must stay bounded by batch + grace, got {count}"
+        );
+        // Without the prune this would be 120 * 20 = 2400 — the observed failure mode.
+        assert!(
+            count < 2400,
+            "unbounded growth regression: {count} keys retained"
+        );
+
+        // The grace window is genuinely retained (not pruned to just the last batch), so
+        // in-flight first messages against recently-replaced keys still resolve.
+        assert!(
+            count > BATCH,
+            "grace window must be kept, got only {count} keys"
+        );
     }
 }
