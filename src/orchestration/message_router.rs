@@ -474,6 +474,65 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_detection_survives_restart_via_durable_store() {
+        // The orchestrator blob no longer snapshots the ACK cache, so after a
+        // restart L1 is empty and `post_restart_mode` is on. A re-delivered
+        // message must then be caught by the platform's durable ACK store rather
+        // than silently re-processed. This is the path that makes dropping the
+        // snapshot safe — assert the full round-trip, not just the store.
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+
+        // Simulate a launch that restored a blob carrying no processed IDs.
+        lifecycle.ack_store.restore_cache(vec![]);
+
+        let m = IncomingMessage {
+            contact_id: "bob".to_string(),
+            wire_payload: vec![],
+            message_id: "dup-across-restart".to_string(),
+            msg_number: 1,
+            is_control: false,
+            content_type: 0,
+        };
+
+        // L1 misses → the platform is asked instead of assuming "new".
+        let decision = router.route_message(&mut lifecycle, &m);
+        assert!(
+            matches!(decision, RoutingDecision::PendingAckCheck { .. }),
+            "must defer to the durable ACK store, not treat the message as new"
+        );
+
+        // Platform reports it as already processed → duplicate, message dropped.
+        let resumed = router.resume_after_ack_check("dup-across-restart", true, &mut lifecycle);
+        assert!(matches!(resumed, RoutingDecision::Duplicate { .. }));
+    }
+
+    #[test]
+    fn test_unseen_message_after_restart_is_routed_normally() {
+        // Same path, negative case: the durable store says "not seen", so the
+        // message must proceed to routing instead of being dropped.
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        lifecycle.ack_store.restore_cache(vec![]);
+
+        let m = IncomingMessage {
+            contact_id: "bob".to_string(),
+            wire_payload: vec![],
+            message_id: "fresh-after-restart".to_string(),
+            msg_number: 1,
+            is_control: false,
+            content_type: 0,
+        };
+        router.route_message(&mut lifecycle, &m);
+
+        let resumed = router.resume_after_ack_check("fresh-after-restart", false, &mut lifecycle);
+        assert!(
+            !matches!(resumed, RoutingDecision::Duplicate { .. }),
+            "a message the durable store has never seen must not be dropped"
+        );
+    }
+
+    #[test]
     fn test_end_session_control_message() {
         let mut router = MessageRouter::new();
         let mut lifecycle = make_lifecycle("alice");

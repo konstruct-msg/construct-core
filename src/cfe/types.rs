@@ -570,6 +570,13 @@ pub struct CfeOrchestratorStateV1 {
     #[serde(rename = "uid")]
     pub my_user_id: String,
     /// Snapshot of the in-memory ACK dedup cache.
+    ///
+    /// **Always written empty since 2026-07-28** — the durable owner of dedup
+    /// state is the platform ACK store, and snapshotting the L1 cache grew this
+    /// blob without bound (~42 B per received message, forever). Kept in the
+    /// struct so the format is unchanged and pre-existing blobs still decode;
+    /// readers must tolerate both empty and populated lists.
+    /// See `SessionLifecycleManager::export_orchestrator_state_cfe`.
     #[serde(rename = "acks")]
     pub processed_ids: Vec<CfeAckRecordV1>,
     /// Active session-healing queue entries.

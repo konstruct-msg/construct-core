@@ -464,29 +464,37 @@ impl SessionLifecycleManager {
         self.pq_manager.import_cfe(data)
     }
 
-    /// Export the full orchestrator coordination state (ACK cache, healing queue,
-    /// archive index, prekey tracker) as a CFE binary blob — msg_type 0x05.
+    /// Export the full orchestrator coordination state (healing queue, archive
+    /// index, prekey tracker) as a CFE binary blob — msg_type 0x05.
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
     /// The caller should persist the blob under `"orchestrator_state"` via
     /// `SaveSessionToSecureStore` after every significant state change.
+    ///
+    /// **`processed_ids` is deliberately exported empty.** The ACK cache is an L1
+    /// hot-path cache only; the durable owner of dedup state is the platform ACK
+    /// store (iOS: Core Data `ProcessedMessage`, 30-day TTL matching the server
+    /// re-delivery window). Snapshotting the cache bought nothing — `restore_cache`
+    /// sets `post_restart_mode`, which is never cleared, so *every* cache miss
+    /// already round-trips to the platform store via `Action::CheckAckInDb`
+    /// regardless of what was restored. It only cost an unbounded blob: the state
+    /// grew ~42 B per received message forever and is rewritten to the Keychain on
+    /// every send and receive, and (since the fail-closed send-durability change)
+    /// gates outgoing messages. Field devices were observed at 90 KB / ~2100 IDs.
+    /// The field stays in the struct so the wire format is unchanged and older
+    /// blobs still decode; `import` keeps reading it, so an existing device warms
+    /// L1 once on the launch after the update and the next save shrinks the blob
+    /// permanently.
     pub fn export_orchestrator_state_cfe(
         &self,
         init_locks: &std::collections::HashSet<String>,
     ) -> Result<Vec<u8>, String> {
-        use crate::cfe::{
-            CfeAckRecordV1, CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1,
-        };
+        use crate::cfe::{CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1};
 
         let state = CfeOrchestratorStateV1 {
             ver: 1,
             my_user_id: self.my_user_id.clone(),
-            processed_ids: self
-                .ack_store
-                .snapshot_cache()
-                .into_iter()
-                .map(|id| CfeAckRecordV1 { message_id: id })
-                .collect(),
+            processed_ids: Vec::new(),
             healing_records: self
                 .healing_queue
                 .snapshot_records()
@@ -911,6 +919,125 @@ mod tests {
             result.is_err(),
             "import_session_bytes does not handle CfeSessionJsonWrapperV1 — use import_session_cfe"
         );
+    }
+
+    // ── ACK cache is not snapshotted (orchestrator blob stays bounded) ────────
+    //
+    // Field devices were observed carrying a 90 KB orchestrator blob that grew
+    // ~42 B per received message and is rewritten to the Keychain on every send
+    // and receive. The cause was snapshotting the L1 ACK cache, which bought
+    // nothing: `restore_cache` sets `post_restart_mode` (never cleared), so every
+    // miss already round-trips to the durable platform store.
+
+    fn decode_orchestrator_state(bytes: &[u8]) -> crate::cfe::CfeOrchestratorStateV1 {
+        crate::cfe::decode_as::<crate::cfe::CfeOrchestratorStateV1>(
+            bytes,
+            crate::cfe::CfeMessageType::OrchestratorState,
+        )
+        .expect("orchestrator state decodes")
+    }
+
+    #[test]
+    fn test_orchestrator_state_export_omits_processed_ids() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let locks = std::collections::HashSet::new();
+
+        for i in 0..100 {
+            mgr.ack_store.mark_processed(&format!("msg-{i:04}"));
+        }
+        assert_eq!(mgr.ack_store.cache_len(), 100, "L1 cache still tracks them");
+
+        let state = decode_orchestrator_state(&mgr.export_orchestrator_state_cfe(&locks).unwrap());
+        assert!(
+            state.processed_ids.is_empty(),
+            "ACK cache must never be snapshotted — it is what made the blob unbounded"
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_state_blob_does_not_grow_with_acks() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let locks = std::collections::HashSet::new();
+
+        let baseline = mgr.export_orchestrator_state_cfe(&locks).unwrap().len();
+        for i in 0..1_000 {
+            mgr.ack_store
+                .mark_processed(&format!("11111111-2222-3333-4444-{i:012}"));
+        }
+        let after = mgr.export_orchestrator_state_cfe(&locks).unwrap().len();
+
+        assert_eq!(
+            baseline, after,
+            "1000 processed messages must not add a single byte to the persisted blob \
+             (was ~42 B each, forever)"
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_state_import_still_reads_legacy_processed_ids() {
+        // A blob written before the change carries a populated list. It must still
+        // decode and warm L1 once, so the launch right after the update does not
+        // lose dedup state it already had in memory.
+        use crate::cfe::{CfeAckRecordV1, CfeMessageType, CfeOrchestratorStateV1};
+        let legacy = CfeOrchestratorStateV1 {
+            ver: 1,
+            my_user_id: "alice".to_string(),
+            processed_ids: vec![
+                CfeAckRecordV1 {
+                    message_id: "old-msg-1".to_string(),
+                },
+                CfeAckRecordV1 {
+                    message_id: "old-msg-2".to_string(),
+                },
+            ],
+            healing_records: vec![],
+            init_locks: vec![],
+            archives: vec![],
+            archive_timestamps: vec![],
+            prekey_tracker: vec![],
+        };
+        let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        mgr.import_orchestrator_state_cfe(&bytes).unwrap();
+
+        assert_eq!(
+            mgr.ack_store.is_processed("old-msg-1"),
+            crate::orchestration::AckCheckResult::InCache
+        );
+
+        // …and the very next save drops them permanently — the blob shrinks itself.
+        let locks = std::collections::HashSet::new();
+        let re_exported =
+            decode_orchestrator_state(&mgr.export_orchestrator_state_cfe(&locks).unwrap());
+        assert!(re_exported.processed_ids.is_empty());
+    }
+
+    #[test]
+    fn test_ack_miss_after_restart_defers_to_durable_store() {
+        // With nothing restored, a miss must NOT be answered `NotProcessed` from
+        // memory — it has to ask the platform's durable ACK store, which is what
+        // makes dropping the snapshot safe.
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let locks = std::collections::HashSet::new();
+
+        mgr.ack_store.mark_processed("msg-seen-before-restart");
+        let bytes = mgr.export_orchestrator_state_cfe(&locks).unwrap();
+
+        let fresh_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restarted = SessionLifecycleManager::new(fresh_client, "alice".to_string());
+        restarted.import_orchestrator_state_cfe(&bytes).unwrap();
+
+        assert_eq!(
+            restarted.ack_store.is_processed("msg-seen-before-restart"),
+            crate::orchestration::AckCheckResult::NeedDbCheck,
+            "must defer to the durable store, not silently re-process"
+        );
+        assert_eq!(restarted.ack_store.cache_len(), 0);
     }
 
     #[test]

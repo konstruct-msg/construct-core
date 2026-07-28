@@ -128,10 +128,16 @@ impl AckStore {
 
     // ── Maintenance ───────────────────────────────────────────────────────────
 
-    /// Prune expired entries from the in-memory cache.
+    /// Ask the platform to prune its persistent ACK store.
     ///
-    /// Returns a `PruneAckStore` action so the platform can delete records
-    /// older than `max_age_seconds` from its persistent ACK store.
+    /// Returns a `PruneAckStore` action so the platform can delete records older
+    /// than `max_age_seconds` from its durable store (the owner of dedup state).
+    ///
+    /// This does **not** touch the in-memory cache, and cannot: entries carry no
+    /// timestamp, so there is nothing to age them by. The cache is bounded by
+    /// process lifetime instead — it starts empty on launch (see
+    /// `export_orchestrator_state_cfe`, which no longer snapshots it) and a miss
+    /// falls through to the platform store via `Action::CheckAckInDb`.
     pub fn prune_expired(&self) -> Vec<Action> {
         let cutoff = self.clock.now_secs().saturating_sub(self.max_age_seconds);
         vec![Action::PruneAckStore { cutoff_ts: cutoff }]
@@ -142,15 +148,25 @@ impl AckStore {
         self.cache.len()
     }
 
-    /// Export all in-memory message IDs for CFE snapshot serialisation.
+    /// Export all in-memory message IDs.
+    ///
+    /// **Not** used for persistence — `export_orchestrator_state_cfe` writes an
+    /// empty `processed_ids` on purpose (the durable owner of dedup state is the
+    /// platform ACK store; snapshotting this cache grew the orchestrator blob
+    /// without bound). Diagnostics only.
     pub fn snapshot_cache(&self) -> Vec<String> {
         self.cache.iter().cloned().collect()
     }
 
-    /// Restore in-memory cache from a CFE snapshot.
+    /// Restore the in-memory cache from a CFE snapshot.
     /// Existing entries are replaced (idempotent for identical snapshots).
     /// Enables `post_restart_mode` so cache misses trigger a DB check until
     /// the crash-window gap is covered.
+    ///
+    /// Current blobs carry an empty list (see `export_orchestrator_state_cfe`), so
+    /// this normally restores nothing and leaves the store in post-restart mode —
+    /// which is the intended steady state: every miss consults the durable store.
+    /// Blobs written before that change still decode and warm the cache once.
     pub fn restore_cache(&mut self, ids: Vec<String>) {
         self.cache.clear();
         self.cache.extend(ids);
