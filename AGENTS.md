@@ -57,12 +57,6 @@
 The vault's own `~/Code/construct-docs/AGENTS.md` is **authoritative** for how to contribute docs —
 read it. The summary below is the operational subset for coding agents.
 
-> **There is no pipeline anymore.** The old `raw/` → olw → `wiki/` three-way synthesis workflow is
-> gone. Agents patch docs **directly** and write session/decision notes by hand. No olw, no
-> `wiki/.drafts/`, no "let the pipeline cross-link it". `raw/` and `wiki/` no longer exist — the
-> corpus is the flat domain folders (`architecture/`, `backend/`, `client/`, `cryptocore/`,
-> `security/`, …) listed under *Documentation* above.
-
 ### Where durable reasoning goes
 
 Any reasoning that informed a code change must survive beyond the chat session — conclusions,
