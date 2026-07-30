@@ -4,7 +4,9 @@
 /fuzz/
 /benches
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS tracked: construct-core ships inside a signed binary, so the
+# dependency set must be reproducible and auditable (cargo-audit reads this file).
+# construct-veil / -transport / -server all track theirs; this one was an oversight.
 
 # IDE
 .idea/
