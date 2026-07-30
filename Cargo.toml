@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.12.2"
+version = "0.12.3"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -83,7 +83,11 @@ ml-dsa = { version = "0.1.1", optional = true }
 
 # MLS (Messaging Layer Security) — group chat protocol (RFC 9420)
 # Feature-gated: mls + group-conversation. Pulls in ~15 additional crates.
-openmls = { version = "0.8", optional = true, features = ["test-utils"] }
+# NOTE: `test-utils` must NOT be enabled here — it is a dev-dependency activation
+# (see [dev-dependencies]). It exposes unvalidated conversions such as
+# `From<KeyPackageIn> for KeyPackage`, which is exactly what a shipped library
+# must not be able to reach.
+openmls = { version = "0.8", optional = true }
 openmls_rust_crypto = { version = "0.5", optional = true }
 openmls_basic_credential = { version = "0.5", optional = true }
 
@@ -97,6 +101,13 @@ construct-veil = { path = "../construct-veil", features = ["ffi"], optional = tr
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]
+# openmls `test-utils` lives here, not in [dependencies]: the MLS unit tests need
+# SignatureKeyPair::private(), but the feature also unlocks unvalidated KeyPackage
+# conversions that must stay unreachable from shipped code. resolver = "2" keeps
+# dev-dependency features out of non-test builds, so `--features ios` gets a
+# test-utils-free openmls.
+openmls = { version = "0.8", features = ["test-utils"] }
+openmls_basic_credential = { version = "0.5", features = ["test-utils"] }
 hex = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 

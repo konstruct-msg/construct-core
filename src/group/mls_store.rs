@@ -26,8 +26,8 @@ use openmls::group::StagedWelcome;
 use openmls::prelude::tls_codec::Deserialize;
 use openmls::prelude::{
     Ciphersuite, CredentialWithKey, GroupId, KeyPackage, MlsGroup as OpenMlsGroup,
-    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
-    ProtocolMessage,
+    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    OpenMlsProvider, ProtocolMessage, ProtocolVersion,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -198,9 +198,17 @@ impl MlsStore {
     ) -> Result<MemberAddition, MlsError> {
         let kp_msg = MlsMessageIn::tls_deserialize_exact(key_package_bytes)
             .map_err(|e| MlsError::CryptoError(format!("kp deserialize: {e}")))?;
-        let key_package = kp_msg
-            .into_keypackage()
-            .ok_or_else(|| MlsError::CryptoError("not a KeyPackage".into()))?;
+        let MlsMessageBodyIn::KeyPackage(key_package_in) = kp_msg.extract() else {
+            return Err(MlsError::CryptoError("not a KeyPackage".into()));
+        };
+        // Validate instead of converting straight through: `MlsMessageIn::into_keypackage`
+        // and the `From<KeyPackageIn> for KeyPackage` impl behind it are both
+        // `#[cfg(test-utils)]` and skip every check — KeyPackage and LeafNode signatures,
+        // protocol version, init-key ≠ encryption-key, extension support, lifetime.
+        // `key_package_bytes` is relayed by the server, so it is untrusted input.
+        let key_package = key_package_in
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| MlsError::CryptoError(format!("kp validate: {e}")))?;
 
         let group = load_group(&self.provider, &mut self.groups, group_id)?;
         let (commit, welcome, _group_info) = group
