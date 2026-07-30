@@ -11,19 +11,13 @@ use std::future::Future;
 pub use super::models::*;
 
 // ============================================================================
-// Conditional Send Bound
+// Send Bound
 // ============================================================================
 
-// For WASM targets, futures can't be Send because JS is single-threaded
-#[cfg(target_arch = "wasm32")]
-pub trait MaybeSend {}
-#[cfg(target_arch = "wasm32")]
-impl<T> MaybeSend for T {}
-
-// For non-WASM targets, require Send for thread safety
-#[cfg(not(target_arch = "wasm32"))]
+// Was conditional to accommodate wasm32, where futures can't be Send. The wasm
+// target is no longer supported, so this is now plain `Send`; the alias is kept
+// because it is the bound used across every storage future signature.
 pub trait MaybeSend: Send {}
-#[cfg(not(target_arch = "wasm32"))]
 impl<T: Send> MaybeSend for T {}
 
 // ============================================================================

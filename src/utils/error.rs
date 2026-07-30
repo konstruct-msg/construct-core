@@ -68,11 +68,3 @@ impl From<&str> for ConstructError {
         ConstructError::StorageError(error.to_string())
     }
 }
-
-// Для WASM-биндингов
-#[cfg(target_arch = "wasm32")]
-impl From<ConstructError> for wasm_bindgen::JsValue {
-    fn from(error: ConstructError) -> Self {
-        wasm_bindgen::JsValue::from_str(&error.to_string())
-    }
-}
