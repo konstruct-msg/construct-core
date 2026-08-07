@@ -658,6 +658,11 @@ interface CfeAction {
     SessionHealNeeded(string contact_id, string role);
     /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
     HealSuppressed(string contact_id, u64 retry_after_ms);
+    /// END_SESSION suppressed by cooldown — the core owes it and sends it in retry_after_ms.
+    /// Platform must NOT ACK.
+    EndSessionSuppressed(string contact_id, u64 retry_after_ms);
+    /// Message queued inside the core behind an in-flight session init. Nothing lost.
+    MessageQueuedPendingInit(string contact_id, u32 queued_count);
     SaveSessionToSecureStore(string key, bytes data);
     LoadSessionFromSecureStore(string key);
     PersistMessage(string message_json);

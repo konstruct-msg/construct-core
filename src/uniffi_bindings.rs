@@ -3668,6 +3668,18 @@ pub enum CfeAction {
         contact_id: String,
         retry_after_ms: u64,
     },
+    /// END_SESSION suppressed by cooldown — the core owes it and will send it in
+    /// `retry_after_ms`. Platform must NOT ACK.
+    EndSessionSuppressed {
+        contact_id: String,
+        retry_after_ms: u64,
+    },
+    /// Message is queued inside the core behind an in-flight session init. Nothing lost,
+    /// nothing required of the platform; it is drained when the init completes.
+    MessageQueuedPendingInit {
+        contact_id: String,
+        queued_count: u32,
+    },
     /// Platform should encrypt and send a heartbeat to this contact.
     SendHeartbeat {
         contact_id: String,
@@ -3781,6 +3793,20 @@ impl CfeAction {
             } => Self::HealSuppressed {
                 contact_id,
                 retry_after_ms,
+            },
+            EndSessionSuppressed {
+                contact_id,
+                retry_after_ms,
+            } => Self::EndSessionSuppressed {
+                contact_id,
+                retry_after_ms,
+            },
+            MessageQueuedPendingInit {
+                contact_id,
+                queued_count,
+            } => Self::MessageQueuedPendingInit {
+                contact_id,
+                queued_count,
             },
             SendHeartbeat { contact_id } => Self::SendHeartbeat { contact_id },
             NotifyLinkedDevicesOfSessionReset { contact_id } => {

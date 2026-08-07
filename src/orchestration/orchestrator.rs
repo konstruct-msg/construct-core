@@ -65,6 +65,14 @@ pub struct Orchestrator {
     init_locks: HashMap<String, u64>,
     /// contactId → Unix ms of last END_SESSION / prewarm (anti-loop cooldown).
     cooldowns: HashMap<String, u64>,
+    /// Contacts whose END_SESSION was suppressed by the cooldown and is owed once it clears.
+    ///
+    /// The cooldown exists to stop an END_SESSION storm, and it must keep doing that — so this
+    /// is a set, not a queue: N suppressions inside one window collapse into exactly one
+    /// teardown afterwards. In-memory on purpose. It is not part of the persisted coordination
+    /// state because it does not need to be: the condition that produced it (a session that
+    /// cannot decrypt) survives the restart, and the next incoming message re-raises it.
+    pending_end_sessions: HashSet<String>,
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
     #[allow(dead_code)]
     prewarm_done: HashSet<String>,
@@ -92,6 +100,7 @@ impl Orchestrator {
             router: MessageRouter::new(),
             init_locks: HashMap::new(),
             cooldowns: HashMap::new(),
+            pending_end_sessions: HashSet::new(),
             prewarm_done: HashSet::new(),
             active_chats: HashSet::new(),
             clock,
@@ -1352,6 +1361,9 @@ impl Orchestrator {
         session_data: Vec<u8>,
     ) -> Vec<Action> {
         self.init_locks.remove(&contact_id);
+        // A session exists again, so any END_SESSION owed from before it was built is void —
+        // sending it would tear down the session that just replaced the broken one.
+        self.pending_end_sessions.remove(&contact_id);
 
         // Import the newly created session from CFE binary (or JSON legacy fallback).
         // If import fails, emit an error action and abort — do not drain the queue
@@ -1474,13 +1486,49 @@ impl Orchestrator {
                 actions
             }
             _ if timer_id.starts_with("cooldown_expired:") => {
-                // Cooldown expired — schedule a GC so stale locks/cooldowns are evicted.
-                // The server will re-deliver any unACKed messages; this just ensures
-                // the orchestrator is ready to process them.
-                vec![Action::ScheduleTimer {
+                let contact_id = timer_id["cooldown_expired:".len()..].to_string();
+                let mut actions = vec![Action::ScheduleTimer {
                     timer_id: "gc_sweep".to_string(),
                     delay_ms: 100,
-                }]
+                }];
+
+                // Pay out an END_SESSION this contact is owed.
+                //
+                // The old comment here said "the server will re-deliver any unACKed messages" and
+                // left it at that. It is not the server's to do: re-delivery only happens while
+                // the client holds its stream cursor back, and a message that arrived through
+                // GetPendingMessages is not tracked by any cursor at all. Both layers deferred to
+                // a third that was not holding anything.
+                if self.pending_end_sessions.remove(&contact_id) {
+                    // Unless the session came back meanwhile. This is the case that MUST NOT
+                    // fire: tearing down a session established during the cooldown is the
+                    // crossing-teardown defect, and it is exactly what an unconditional
+                    // re-send would cause here.
+                    //
+                    // NOT COVERED: this belt itself. `handle_session_init_completed` cancels the
+                    // debt on the path iOS actually takes, and that *is* tested
+                    // (`test_owed_end_session_is_void_once_the_session_is_re_established`); this
+                    // check catches a session that appeared without that event, and reaching it
+                    // from a test needs a real established session in the harness. On device it
+                    // is the log line below — if a teardown ever surprises a healthy session,
+                    // its absence is what to look for.
+                    if self.lifecycle.has_active_session(&contact_id) {
+                        tracing::info!(
+                            target: "orchestration",
+                            contact_id = %contact_id,
+                            "cooldown expired — owed END_SESSION dropped, session was re-established meanwhile"
+                        );
+                    } else {
+                        self.set_cooldown(contact_id.clone());
+                        actions.push(Action::SendEndSession {
+                            contact_id: contact_id.clone(),
+                        });
+                        actions.push(Action::NotifyLinkedDevicesOfSessionReset {
+                            contact_id: contact_id.clone(),
+                        });
+                    }
+                }
+                actions
             }
             _ if timer_id.starts_with("heartbeat:") => {
                 let contact_id = &timer_id["heartbeat:".len()..];
@@ -1610,10 +1658,17 @@ impl Orchestrator {
                 all
             }
             RoutingDecision::NeedSessionInit {
-                contact_id: cid, ..
+                contact_id: cid,
+                queued_count,
             } => {
                 if self.is_init_locked(&cid) {
-                    return vec![];
+                    // The message is already in `pending_queues` (see `enqueue_or_reject`) and is
+                    // drained by `handle_session_init_completed`. Say so: the empty list this used
+                    // to return was read by the platform as a drop.
+                    return vec![Action::MessageQueuedPendingInit {
+                        contact_id: cid,
+                        queued_count: queued_count as u32,
+                    }];
                 }
                 self.acquire_init_lock(cid.clone());
                 vec![Action::FetchPublicKeyBundle { user_id: cid }]
@@ -1655,8 +1710,33 @@ impl Orchestrator {
                 reason: _,
             } => {
                 if self.on_cooldown(&cid) {
-                    return vec![];
+                    // Owe the teardown instead of dropping it. A message that failed to decrypt
+                    // at msgNum > 0 is bound to a ratchet we no longer hold and will never be
+                    // readable — the only thing that recovers it is the peer re-establishing and
+                    // re-sending, which is what END_SESSION asks for. Swallowing it here removed
+                    // the recovery, silently: build 585 lost three media messages inside one
+                    // five-second window.
+                    //
+                    // The cooldown still does its job. `pending_end_sessions` is a set, so every
+                    // suppression in the window folds into the single teardown sent when the
+                    // timer fires.
+                    let now_ms = self.clock.now_ms();
+                    let elapsed =
+                        now_ms.saturating_sub(*self.cooldowns.get(&cid).unwrap_or(&now_ms));
+                    let remaining = END_SESSION_COOLDOWN_MS.saturating_sub(elapsed) + 100;
+                    self.pending_end_sessions.insert(cid.clone());
+                    return vec![
+                        Action::EndSessionSuppressed {
+                            contact_id: cid.clone(),
+                            retry_after_ms: remaining,
+                        },
+                        Action::ScheduleTimer {
+                            timer_id: format!("cooldown_expired:{cid}"),
+                            delay_ms: remaining,
+                        },
+                    ];
                 }
+                self.pending_end_sessions.remove(&cid);
                 self.set_cooldown(cid.clone());
                 vec![
                     Action::SendEndSession {
@@ -1762,6 +1842,7 @@ mod tests {
     use super::*;
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
+    use crate::orchestration::clock::MockClock;
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
@@ -1917,6 +1998,185 @@ mod tests {
         let mut o = make_orchestrator("alice");
         o.set_cooldown("bob".to_string());
         assert!(o.on_cooldown("bob"));
+    }
+
+    // ── Suppression is a debt, not a drop ─────────────────────────────────────
+    //
+    // Build 585, iOS device 6bf51980, one five-second window:
+    //
+    //     msgNum=4  ackDbResult … actions=2 flags=end_session
+    //               SESSION_STATE[rust_end_session]: DR diverged for 0a1c609f… — sending END_SESSION
+    //     msgNum=5  ackDbResult … actions=0
+    //     msgNum=6  ackDbResult … actions=0
+    //     msgNum=7  ackDbResult … actions=0
+    //
+    // msgNum 4 set the cooldown; 5, 6 and 7 each produced `EndSessionNeeded` and each was
+    // answered with `vec![]`. Three media messages (3910 B, content_type 1) were never seen
+    // again. A message that fails to decrypt at msgNum > 0 is bound to a ratchet we no longer
+    // hold — it is not recoverable by re-reading it. What recovers it is the peer tearing down
+    // and re-sending, which is what END_SESSION asks for; suppressing the END_SESSION removed
+    // the only recovery there was, and said nothing about it.
+
+    fn make_orchestrator_with_clock(user_id: &str, clock: Arc<dyn Clock>) -> Orchestrator {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        Orchestrator::new_with_clock(client, user_id.to_string(), clock)
+    }
+
+    fn end_session_needed(cid: &str) -> RoutingDecision {
+        RoutingDecision::EndSessionNeeded {
+            contact_id: cid.to_string(),
+            reason: "AEAD decryption failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_end_session_suppressed_by_cooldown_is_owed_not_dropped() {
+        let mut o = make_orchestrator("alice");
+        o.set_cooldown("bob".to_string());
+
+        let actions = o.decision_to_actions(end_session_needed("bob"), "");
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::EndSessionSuppressed { contact_id, .. } if contact_id == "bob")),
+            "the platform must be told, not handed an empty list it has to guess about"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "cooldown_expired:bob")),
+            "nothing else will wake the orchestrator to pay the debt"
+        );
+        assert!(o.pending_end_sessions.contains("bob"));
+    }
+
+    #[test]
+    fn test_owed_end_session_is_sent_when_the_cooldown_expires() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.set_cooldown("bob".to_string());
+        let _ = o.decision_to_actions(end_session_needed("bob"), "");
+
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "cooldown_expired:bob".to_string(),
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == "bob")),
+            "the teardown the cooldown deferred must actually go out"
+        );
+        assert!(!o.pending_end_sessions.contains("bob"), "and only once");
+    }
+
+    #[test]
+    fn test_three_suppressions_in_one_window_collapse_into_one_teardown() {
+        // msgNum 5, 6, 7 — the incident. The cooldown must still damp the storm it was
+        // written for: three debts, one payment.
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.set_cooldown("bob".to_string());
+        for _ in 0..3 {
+            let _ = o.decision_to_actions(end_session_needed("bob"), "");
+        }
+
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "cooldown_expired:bob".to_string(),
+        });
+
+        let sends = actions
+            .iter()
+            .filter(|a| matches!(a, Action::SendEndSession { .. }))
+            .count();
+        assert_eq!(sends, 1);
+    }
+
+    // ── What must NOT fire ────────────────────────────────────────────────────
+    //
+    // An owed teardown paid out unconditionally is worse than the bug it fixes: it destroys
+    // whatever session exists when the timer happens to land. That is the crossing-teardown
+    // defect this project has been chasing all week from the other end.
+
+    #[test]
+    fn test_owed_end_session_is_void_once_the_session_is_re_established() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.set_cooldown("bob".to_string());
+        let _ = o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(o.pending_end_sessions.contains("bob"));
+
+        // A new session is built during the cooldown (iOS: proactive_init_success → SRI).
+        let _ = o.handle_event(IncomingEvent::SessionInitCompleted {
+            contact_id: "bob".to_string(),
+            session_data: vec![],
+        });
+
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "cooldown_expired:bob".to_string(),
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. })),
+            "the session that replaced the broken one must not be torn down by its debt"
+        );
+    }
+
+    #[test]
+    fn test_a_timer_for_a_contact_with_no_debt_sends_nothing() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "cooldown_expired:bob".to_string(),
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. }))
+        );
+    }
+
+    #[test]
+    fn test_end_session_off_cooldown_is_still_sent_immediately() {
+        // The unchanged path. If this ever starts deferring, every teardown is a round trip late.
+        let mut o = make_orchestrator("alice");
+        let actions = o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == "bob"))
+        );
+        assert!(!o.pending_end_sessions.contains("bob"));
+    }
+
+    // ── The init lock says what it did ────────────────────────────────────────
+
+    #[test]
+    fn test_message_arriving_during_init_is_reported_queued_not_dropped() {
+        // Also formerly `vec![]`. The message is in `pending_queues` and drained by
+        // SessionInitCompleted — iOS logged "holding the cursor for redelivery" over a message
+        // the core was holding perfectly well.
+        let mut o = make_orchestrator("alice");
+        o.acquire_init_lock("bob".to_string());
+
+        let actions = o.decision_to_actions(
+            RoutingDecision::NeedSessionInit {
+                contact_id: "bob".to_string(),
+                queued_count: 2,
+            },
+            "",
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::MessageQueuedPendingInit { contact_id, queued_count }]
+                if contact_id == "bob" && *queued_count == 2
+        ));
     }
 
     #[test]

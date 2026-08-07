@@ -60,6 +60,31 @@ pub enum Action {
         retry_after_ms: u64,
     },
 
+    /// An `EndSessionNeeded` decision was suppressed by the per-contact cooldown, and the
+    /// orchestrator has taken ownership of sending it once the cooldown clears (in
+    /// `retry_after_ms`). The platform must NOT acknowledge the message.
+    ///
+    /// This used to be `return vec![]` — indistinguishable from `Duplicate`'s empty verdict,
+    /// so iOS guessed ("dropped, pending redelivery") and the teardown was never sent at all.
+    /// Recovery for a message that failed to decrypt at msgNum > 0 runs entirely through the
+    /// peer: END_SESSION makes it re-establish and re-send. Suppressing the END_SESSION
+    /// suppresses the recovery, and build 585 lost three media messages that way.
+    EndSessionSuppressed {
+        contact_id: String,
+        retry_after_ms: u64,
+    },
+
+    /// A message arrived while session init for this contact was already in flight. It is
+    /// **queued inside the core** (`pending_queues`) and drained on `SessionInitCompleted` —
+    /// nothing is required of the platform, and nothing has been lost.
+    ///
+    /// Also formerly `return vec![]`. iOS read that as a drop and logged "holding the cursor
+    /// for redelivery" over a message the core was safely holding.
+    MessageQueuedPendingInit {
+        contact_id: String,
+        queued_count: u32,
+    },
+
     // ── Persistence ───────────────────────────────────────────────────────────
     SaveSessionToSecureStore {
         key: String,
