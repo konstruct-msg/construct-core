@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# Не отдавать в CI то, что CI отвергнет на первом шаге.
+#
+# В construct-server три деплоя подряд упали на `cargo fmt --all -- --check`
+# (2026-08-13): локально всё собиралось — `cargo check` не смотрит на
+# форматирование. Тот же риск здесь: Linux job `Lint + Tests` начинает с
+# fmt, потом двумя clippy (default + post-quantum) с `-D warnings`.
+#
+# Порядок совпадает с `.github/workflows/ci.yml` job `test`. Хук ценен
+# ровно настолько, насколько он повторяет то, что решает судьбу пуша.
+#
+# Включается:   git config core.hooksPath .githooks
+# (hooksPath — локальная настройка, свежий клон требует этой строки снова.)
+#
+# Аварийный выход:   git push --no-verify
+# Для случая «CI сейчас не важен», а не для того, чтобы заглушить настоящую находку.
+
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+
+printf '\n[pre-push] cargo fmt\n'
+if ! cargo fmt --all -- --check; then
+    fail=1
+    printf '\n  чинится одной командой: cargo fmt --all\n'
+fi
+
+# Clippy идёт последним и только если fmt прошёл: он самый долгий
+# (минуты на холодном target), и ждать его ради ошибки форматирования незачем.
+# Два вызова — как в CI. Не `--all-features`: это тянет ios/mac/android и
+# construct-veil, а Linux lint job этого не гоняет.
+# Пропускается через SKIP_CLIPPY=1, когда правка заведомо не касается Rust.
+if [ "$fail" -eq 0 ] && [ "${SKIP_CLIPPY:-0}" != "1" ]; then
+    printf '\n[pre-push] clippy default -D warnings (SKIP_CLIPPY=1 чтобы пропустить)\n'
+    cargo clippy --all-targets -- -D warnings || fail=1
+    if [ "$fail" -eq 0 ]; then
+        printf '\n[pre-push] clippy post-quantum -D warnings\n'
+        cargo clippy --all-targets --features post-quantum -- -D warnings || fail=1
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    cat <<'EOF'
+
+[pre-push] ОСТАНОВЛЕНО — CI отверг бы это на первом же шаге Lint + Tests.
+
+EOF
+    exit 1
+fi
+
+printf '\n[pre-push] ок\n\n'

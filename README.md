@@ -157,6 +157,16 @@ cargo audit
 > `--all-features` requires the sibling `construct-veil` crate checked out at `../construct-veil`
 > (pulled in by `ios`/`mac`/`android`).
 
+### Pre-push
+
+After clone, point git at the tracked hooks (local config, not copied by clone):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`pre-push` runs the same first steps as the Linux `Lint + Tests` job: `cargo fmt --all -- --check`, then clippy default and clippy `--features post-quantum`, both `-D warnings`. Bypass with `git push --no-verify` or skip clippy with `SKIP_CLIPPY=1`.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). NOTICE file carries attribution.

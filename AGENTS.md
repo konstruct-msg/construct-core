@@ -17,6 +17,7 @@
 - **Test**: `cargo test --all-features` (Required for full coverage including PQ schemes)
 - **Benchmarks**: `cargo bench --bench crypto_bench`
 - **Desktop Target**: `cargo build --features desktop` (Enables Tokio runtime)
+- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo fmt --check` then clippy default + `post-quantum` (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
 
 ### Feature Flags
 - `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support.
