@@ -10,7 +10,7 @@ end-to-end encrypted messenger.**
 ## About
 
 `construct-core` is the Rust crypto engine shared verbatim by every Konstruct client. iOS,
-macOS, and Android run the *same* audited code via UniFFI rather than reimplementing crypto
+macOS, and Android run the *same* code via UniFFI rather than reimplementing crypto
 per platform. It provides:
 
 - **X3DH + PQXDH** asynchronous key agreement (classical and post-quantum hybrid)
