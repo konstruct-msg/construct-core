@@ -115,6 +115,9 @@ pub mod privacy_pass;
 /// ConstructSEALED — sealed sender box + sender-certificate verification
 pub mod sealed_sender;
 
+/// Per-message tag naming which device a copy is for, readable only by the two devices
+pub mod device_copy_tag;
+
 /// SLIP-39 social recovery — vault key Shamir Secret Sharing + bundle encryption
 pub mod social_recovery;
 

@@ -3960,6 +3960,46 @@ pub fn sealed_verify_sender_cert(
     )
 }
 
+// ── Per-device copy tag UniFFI bindings ──────────────────────────────────────
+
+/// The tag a copy addressed to `target_device_id` travels under.
+/// See `crypto::device_copy_tag` for the construction and why the target is bound into the MAC.
+pub fn device_copy_tag(
+    base_message_id: String,
+    target_device_id: String,
+    our_identity_private: Vec<u8>,
+    peer_identity_public: Vec<u8>,
+) -> Result<String, CryptoError> {
+    // Mapped explicitly rather than through `From<crate::error::CryptoError>`: that impl funnels
+    // every unlisted variant into `SessionInitializationFailed`, and the only way this can fail is
+    // key material that is not 32 bytes. Reporting that as a session-init failure would send the
+    // reader looking at the session layer for a caller's argument bug.
+    crate::crypto::device_copy_tag::device_copy_tag(
+        &base_message_id,
+        &target_device_id,
+        &our_identity_private,
+        &peer_identity_public,
+    )
+    .map_err(|_| CryptoError::InvalidKeyData)
+}
+
+/// Whether `tag` was written for `our_device_id` by the device behind `peer_identity_public`.
+pub fn device_copy_tag_matches(
+    tag: String,
+    base_message_id: String,
+    our_device_id: String,
+    our_identity_private: Vec<u8>,
+    peer_identity_public: Vec<u8>,
+) -> bool {
+    crate::crypto::device_copy_tag::device_copy_tag_matches(
+        &tag,
+        &base_message_id,
+        &our_device_id,
+        &our_identity_private,
+        &peer_identity_public,
+    )
+}
+
 // ── SLIP-39 Social Recovery UniFFI bindings ───────────────────────────────────
 
 /// Mirror of `crypto::social_recovery::RecoveryBundle` with UniFFI-compatible types.

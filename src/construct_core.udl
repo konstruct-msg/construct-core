@@ -976,6 +976,44 @@ namespace construct_core {
         sequence<u8> server_verifying_key
     );
 
+    // ── Per-device copy tag ───────────────────────────────────────────────────
+    //
+    // Delivery is per account: the same envelope reaches every one of the
+    // recipient's per-device streams. When one message produces one ciphertext
+    // per target device, each device must recognise which copy is its own — and
+    // the relay must not be able to. See crypto::device_copy_tag.
+    //
+    //   secret = HKDF-SHA256(X25519(our priv, peer pub),
+    //                        salt = "ConstructSSTAG-v1", info = "")
+    //   tag    = HMAC-SHA256(secret, base_message_id || 0x00 || target_device_id)
+    //            [0..8], lowercase hex — 16 characters.
+    //
+    // Vectors: construct-protos/conformance/knst_device_copy_tag.json.
+
+    /// The tag a copy addressed to target_device_id travels under.
+    /// base_message_id carries no per-device or per-chunk suffix, so every chunk
+    /// of one message shares a tag.
+    [Throws=CryptoError]
+    string device_copy_tag(
+        string base_message_id,
+        string target_device_id,
+        sequence<u8> our_identity_private,
+        sequence<u8> peer_identity_public
+    );
+
+    /// Whether tag was written for our_device_id by the device behind
+    /// peer_identity_public. False for any unusable input: callers ask "is this
+    /// copy foreign?", and an undecidable answer there must be "not foreign" —
+    /// wrongly opening a copy costs failed decrypts, wrongly discarding one
+    /// loses a message from the transcript, silently.
+    boolean device_copy_tag_matches(
+        string tag,
+        string base_message_id,
+        string our_device_id,
+        sequence<u8> our_identity_private,
+        sequence<u8> peer_identity_public
+    );
+
     // ── SLIP-39 Social Recovery ───────────────────────────────────────────────
 
     /// Generate a 32-byte random vault key.
