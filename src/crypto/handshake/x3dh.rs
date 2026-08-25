@@ -337,56 +337,59 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
                 None
             };
 
-        eprintln!(
-            "[X3DH INITIATOR] IK_A_priv[:4]={}",
-            hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())])
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]),
+            "INITIATOR IK_A_priv"
         );
-        eprintln!(
-            "[X3DH INITIATOR] SPK_B_pub[:4]={}",
-            hex::encode(
-                &remote_signed_prekey_public.as_ref()
-                    [..4.min(remote_signed_prekey_public.as_ref().len())]
-            )
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&remote_signed_prekey_public.as_ref()[..4.min(remote_signed_prekey_public.as_ref().len())]),
+            "INITIATOR SPK_B_pub"
         );
-        eprintln!(
-            "[X3DH INITIATOR] EK_A_pub[:4]={}",
-            hex::encode(
-                P::from_private_key_to_public_key(&ephemeral_private)
-                    .map(|k| k.as_ref()[..4.min(k.as_ref().len())].to_vec())
-                    .unwrap_or_default()
-            )
+        let ephemeral_public_prefix = P::from_private_key_to_public_key(&ephemeral_private)
+            .map(|k| hex::encode(&k.as_ref()[..4.min(k.as_ref().len())]))
+            .unwrap_or_default();
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %ephemeral_public_prefix,
+            "INITIATOR EK_A_pub"
         );
-        eprintln!(
-            "[X3DH INITIATOR] IK_B_pub[:4]={}",
-            hex::encode(
-                &remote_identity_public.as_ref()[..4.min(remote_identity_public.as_ref().len())]
-            )
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&remote_identity_public.as_ref()[..4.min(remote_identity_public.as_ref().len())]),
+            "INITIATOR IK_B_pub"
         );
-        eprintln!(
-            "[X3DH INITIATOR] DH1[:4]={}",
-            hex::encode(&dh1[..4.min(dh1.len())])
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&dh1[..4.min(dh1.len())]),
+            "INITIATOR DH1"
         );
-        eprintln!(
-            "[X3DH INITIATOR] DH2[:4]={}",
-            hex::encode(&dh2[..4.min(dh2.len())])
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&dh2[..4.min(dh2.len())]),
+            "INITIATOR DH2"
         );
-        eprintln!(
-            "[X3DH INITIATOR] DH3[:4]={}",
-            hex::encode(&dh3[..4.min(dh3.len())])
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %hex::encode(&dh3[..4.min(dh3.len())]),
+            "INITIATOR DH3"
         );
-        eprintln!(
-            "[X3DH INITIATOR] DH4[:4]={} has_dh4={}",
-            dh4_opt
+        trace!(
+            target: "crypto::x3dh",
+            key_prefix = %dh4_opt
                 .as_ref()
                 .map(|d| hex::encode(&d[..4.min(d.len())]))
                 .unwrap_or_else(|| "NONE".to_string()),
-            dh4_opt.is_some()
+            has_dh4 = dh4_opt.is_some(),
+            "INITIATOR DH4"
         );
         if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
-            eprintln!(
-                "[X3DH INITIATOR] OTPK_B_pub[:4]={} id={:?}",
-                hex::encode(&otpk_bytes[..4.min(otpk_bytes.len())]),
-                remote_bundle.one_time_prekey_id
+            trace!(
+                target: "crypto::x3dh",
+                key_prefix = %hex::encode(&otpk_bytes[..4.min(otpk_bytes.len())]),
+                otpk_id = ?remote_bundle.one_time_prekey_id,
+                "INITIATOR OTPK_B_pub"
             );
         }
 
@@ -422,9 +425,10 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         )
         .map_err(|e| format!("HKDF derivation failed: {}", e))?;
 
-        eprintln!(
-            "[X3DH INITIATOR] root_key[:8]={}",
-            hex::encode(&root_key[..8.min(root_key.len())])
+        trace!(
+            target: "crypto::x3dh",
+            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            "INITIATOR root_key"
         );
 
         debug!(
