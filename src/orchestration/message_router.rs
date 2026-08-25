@@ -249,6 +249,17 @@ impl MessageRouter {
             .collect()
     }
 
+    /// Remove all volatile routing state for a locally forgotten contact.
+    ///
+    /// This is not a protocol END_SESSION. It is the local "delete/re-add"
+    /// boundary: old queued deliveries for the contact must not force the next
+    /// add to take the RESPONDER path.
+    pub fn forget_contact(&mut self, contact_id: &str) {
+        self.pending_queues.remove(contact_id);
+        self.pending_ack_checks
+            .retain(|_, msg| msg.contact_id != contact_id);
+    }
+
     /// Handle the platform's response to `Action::CheckAckInDb`.
     ///
     /// - `is_processed = true`  → duplicate; returns `RoutingDecision::Duplicate`.
@@ -438,6 +449,41 @@ mod tests {
             }
         ));
         assert_eq!(router.pending_count("bob"), 1);
+    }
+
+    #[test]
+    fn forget_contact_clears_pending_queue_for_that_contact_only() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+
+        router.route_message(&mut lifecycle, &msg("bob", "bob-1", 0));
+        router.route_message(&mut lifecycle, &msg("carol", "carol-1", 0));
+
+        router.forget_contact("bob");
+
+        assert_eq!(router.pending_count("bob"), 0);
+        assert_eq!(router.pending_count("carol"), 1);
+    }
+
+    #[test]
+    fn forget_contact_clears_pending_ack_checks_for_that_contact_only() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        lifecycle.ack_store.restore_cache(vec![]);
+
+        router.route_message(&mut lifecycle, &msg("bob", "bob-ack", 0));
+        router.route_message(&mut lifecycle, &msg("carol", "carol-ack", 0));
+
+        router.forget_contact("bob");
+
+        assert!(
+            !router.pending_ack_checks.contains_key("bob-ack"),
+            "forgotten contact must not leave a buffered DB-ack retry"
+        );
+        assert!(
+            router.pending_ack_checks.contains_key("carol-ack"),
+            "forgetting one contact must not drop another contact's buffered message"
+        );
     }
 
     #[test]

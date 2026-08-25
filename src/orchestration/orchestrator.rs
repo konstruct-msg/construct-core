@@ -190,6 +190,22 @@ impl Orchestrator {
         self.router.pending_count(contact_id)
     }
 
+    /// Remove all volatile local orchestration state for a contact the platform
+    /// deliberately forgot.
+    ///
+    /// This is not a protocol reset and does not emit END_SESSION. It exists so
+    /// local delete/re-add cannot reuse stale pending/heal/control state and
+    /// force the next add down the RESPONDER path.
+    pub fn forget_contact_state(&mut self, contact_id: &str) {
+        self.router.forget_contact(contact_id);
+        self.lifecycle.forget_contact_state(contact_id);
+        self.init_locks.remove(contact_id);
+        self.cooldowns.remove(contact_id);
+        self.pending_end_sessions.remove(contact_id);
+        self.prewarm_done.remove(contact_id);
+        self.active_chats.remove(contact_id);
+    }
+
     pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
         self.lifecycle.ack_store.is_processed(message_id)
     }
@@ -1887,6 +1903,35 @@ mod tests {
             .filter(|a| matches!(a, Action::FetchPublicKeyBundle { .. }))
             .collect();
         assert!(!fetches.is_empty(), "expected FetchPublicKeyBundle action");
+    }
+
+    #[test]
+    fn forget_contact_state_clears_pending_router_state_before_re_add() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::MessageReceived {
+            message_id: "old-backlog".to_string(),
+            from: "bob".to_string(),
+            data: packed_wire(0, None),
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: false,
+            content_type: 0,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::FetchPublicKeyBundle { user_id } if user_id == "bob"))
+        );
+        assert_eq!(o.pending_message_count("bob"), 1);
+
+        o.forget_contact_state("bob");
+
+        assert_eq!(
+            o.pending_message_count("bob"),
+            0,
+            "local delete must remove stale queued msgNum=0 carriers before re-add"
+        );
     }
 
     #[test]

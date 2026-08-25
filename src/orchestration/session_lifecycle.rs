@@ -161,6 +161,21 @@ impl SessionLifecycleManager {
         &self.my_user_id
     }
 
+    /// Remove all local session lifecycle state for a contact that the
+    /// platform deliberately forgot.
+    ///
+    /// This is a local deletion boundary, not a protocol reset. It must not
+    /// archive or send END_SESSION; it only prevents stale local retry/heal
+    /// state from steering the next add.
+    pub fn forget_contact_state(&mut self, contact_id: &str) {
+        self.client.remove_session(contact_id);
+        self.archives.remove(contact_id);
+        self.archive_timestamps.remove(contact_id);
+        self.prekey_tracker.remove(contact_id);
+        self.healing_queue.remove(contact_id);
+        self.pq_manager.discard_for_contact(contact_id);
+    }
+
     /// Update the local user-id on both the lifecycle manager and the
     /// underlying `ClassicClient`.  Both fields must stay in sync so that
     /// newly created sessions bake in the correct sender/receiver ID.
@@ -740,6 +755,30 @@ mod tests {
         mgr.track_prekey("bob", 42);
         assert!(!mgr.is_reinstall("bob", 42)); // same key → not reinstall
         assert!(mgr.is_reinstall("bob", 99)); // different → reinstall
+    }
+
+    #[test]
+    fn forget_contact_state_clears_archive_heal_prekey_and_pq_state() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        mgr.archives.insert("bob".to_string(), b"archive".to_vec());
+        mgr.archive_timestamps.insert("bob".to_string(), unix_now());
+        mgr.track_prekey("bob", 42);
+        mgr.healing_queue.enqueue(
+            "bob",
+            b"heal-payload".to_vec(),
+            crate::orchestration::healing_queue::HealDirection::Incoming,
+        );
+        let _ = mgr
+            .pq_manager
+            .register_shared_secret("bob", 7, b"pq-secret");
+
+        mgr.forget_contact_state("bob");
+
+        assert!(!mgr.has_archive("bob"));
+        assert!(!mgr.is_reinstall("bob", 99));
+        assert!(!mgr.healing_queue.has_pending("bob"));
+        assert!(mgr.pq_manager.peek_deferred("bob").is_none());
     }
 
     #[test]

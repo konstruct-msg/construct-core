@@ -228,6 +228,16 @@ impl PQContributionManager {
         }
     }
 
+    /// Drop any deferred PQ contribution for a locally forgotten contact.
+    ///
+    /// Unlike `finalize_consumed`, this does not imply the contribution was
+    /// applied to a session. The caller is tearing down local contact state and
+    /// owns persistent key deletion at the same boundary.
+    pub fn discard_for_contact(&mut self, contact_id: &str) -> bool {
+        self.pending_ciphertexts.remove(contact_id);
+        self.pending.remove(contact_id).is_some()
+    }
+
     /// Retrieve and remove the deferred contribution for `contact_id`.
     ///
     /// **Prefer using `peek_deferred` + `finalize_consumed`** when you need
