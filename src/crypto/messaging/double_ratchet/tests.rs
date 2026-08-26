@@ -730,50 +730,53 @@ fn test_ad_mismatch_inconsistent_ids_fails() {
     );
 }
 
-/// Bug-reproduction test: Alice stores `local_user_id` as a 32-char device-hash
-/// but Bob stores `contact_id` for Alice as a 36-char server UUID.  The AD bytes
-/// differ in length → AEAD authentication MUST fail.
+/// The two identifier spaces must be distinguishable at the AD layer: one side naming a device
+/// and the other naming an account is a mismatch AEAD has to reject, never absorb.
 ///
-/// This test only runs in release mode (`--release`); in debug mode the
-/// `debug_assert!` guard in `new_initiator_session` fires before AEAD is reached.
-/// The debug-mode path is covered by `test_debug_assert_catches_device_hash_as_local_user_id`.
-#[cfg(not(debug_assertions))]
+/// The neighbouring tests state the general rule (any mismatch fails, any *consistent* format
+/// works). This one pins it on the shapes the two spaces actually have — 32 hex chars against a
+/// 36-char dashed UUID — because that is the specific confusion this codebase has shipped twice.
+///
+/// **Which side is wrong here changed on 2026-08-26.** Alice used to be "buggy" for holding a
+/// device hash: back then both sides were meant to be account UUIDs. After the flip to device
+/// addressing, the device id is the correct value and the account UUID is the intruder. The test
+/// is written the current way round.
+///
+/// It also **did not run for the whole of that period.** It was gated `#[cfg(not(debug_assertions))]`
+/// to dodge a `debug_assert!` in `new_initiator_session`, and `cargo test` builds in debug — so it
+/// was never compiled. Both the guard and the companion test its doc named
+/// (`test_debug_assert_catches_device_hash_as_local_user_id`) have since been removed, and the
+/// gate outlived them. A test that cannot run occupies the place where someone would otherwise
+/// have looked.
 #[test]
-fn test_ad_mismatch_device_hash_vs_uuid_fails() {
+fn test_ad_mismatch_across_identifier_spaces_fails() {
     let (alice_priv, alice_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
     let (bundle, bob_priv, bob_spk_priv, bob_pub) = make_bob_bundle();
 
-    // Alice (buggy): local_user_id = 32-char hex device-hash (old broken behavior).
-    let alice_device_hash = "6f5e37ac88bd2cc53348f01f78cdf5db"; // 32 chars, no dashes
-    // Bob's view of Alice: a 36-char server UUID (what the server hands out).
-    let alice_server_uuid = "14f28d31-2dab-44aa-a123-456789abcdef"; // 36 chars
-    let bob_uuid = "81f02199-8374-48f8-8a5f-549434ccc53f";
+    // Alice names herself correctly: a 32-char crypto device id.
+    let alice_device_id = "6f5e37ac88bd2cc53348f01f78cdf5db"; // 32 chars, no dashes
+    // Bob still knows her by the account UUID — the stale half of a half-migrated peer.
+    let alice_account_uuid = "14f28d31-2dab-44aa-a123-456789abcdef"; // 36 chars
+    let bob_device_id = "81f02199837448f88a5f549434ccc53f"; // 32 chars, no dashes
 
     assert_ne!(
-        alice_device_hash.len(),
-        alice_server_uuid.len(),
-        "Precondition: device-hash and server UUID must have different lengths"
+        alice_device_id.len(),
+        alice_account_uuid.len(),
+        "Precondition: the two spaces must have different lengths for this to be the shape test"
     );
 
     let (rk_alice, init_state) =
         X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
 
-    // Alice creates session with WRONG local_user_id (device hash, not server UUID).
-    // The debug_assert in new_initiator_session would fire here in a debug build;
-    // we bypass it for this test to verify the AEAD layer also catches it.
-    let mut alice = {
-        // Temporarily side-step the debug_assert by calling through the internal path.
-        // We construct the session directly to ensure the mismatch reaches AEAD.
-        DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
-            &rk_alice,
-            init_state,
-            &bob_pub,
-            bob_uuid.to_string(),          // contact_id (UUID — OK)
-            alice_device_hash.to_string(), // local_user_id (device hash — WRONG)
-            SuiteID::CLASSIC,
-        )
-        .unwrap()
-    };
+    let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
+        &rk_alice,
+        init_state,
+        &bob_pub,
+        bob_device_id.to_string(),   // contact_id — device space, correct
+        alice_device_id.to_string(), // local_user_id — device space, correct
+        SuiteID::CLASSIC,
+    )
+    .unwrap();
 
     let msg0 = alice
         .encrypt(b"This AEAD tag will not verify on Bob's side")
@@ -789,20 +792,20 @@ fn test_ad_mismatch_device_hash_vs_uuid_fails() {
     )
     .unwrap();
 
-    // Bob knows Alice by her server UUID, not her device hash.
-    // AD mismatch: Alice used "6f5e37ac…" (32B), Bob expects "14f28d31-…" (36B).
+    // Bob still knows Alice by her account UUID. AD mismatch: Alice bound "6f5e37ac…" (32B),
+    // Bob reconstructs with "14f28d31-…" (36B).
     let result = DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
         &rk_bob,
         &bob_priv,
         &msg0,
-        alice_server_uuid.to_string(), // contact_id = Alice UUID (≠ alice device hash)
-        bob_uuid.to_string(),
+        alice_account_uuid.to_string(), // contact_id — account space, the intruder
+        bob_device_id.to_string(),
     );
 
     assert!(
         result.is_err(),
-        "AEAD must fail when initiator local_user_id (device hash) \
-         differs from responder contact_id (server UUID)"
+        "AEAD must fail when the initiator binds a device id and the responder \
+         reconstructs with an account UUID — the two are naming different pairs"
     );
     let err_msg = result.err().unwrap();
     assert!(

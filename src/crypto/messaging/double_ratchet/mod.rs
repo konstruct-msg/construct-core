@@ -65,8 +65,14 @@ pub use storage::{SerializableSession, SkippedKeyEntry};
 ///
 /// History:
 ///   v1 — original format (before the AD identity bug fix)
-///   v2 — after AD bug fix: local_user_id/contact_id are both server UUIDs (36-char)
+///   v2 — after AD bug fix: local_user_id/contact_id agree in *kind* on both sides
 ///   v3 — after session_id derivation v2: HKDF info includes sorted user IDs
+///
+/// The version byte says nothing about which identifier space those two fields hold, and it did
+/// not change when that space did. What belongs in them is one meaning with one owner: the
+/// platform seam (`SessionAddressing` on iOS) puts a **crypto device id** there, and has since
+/// 2026-08-26. v2's line here named account UUIDs until then, which was true when written and
+/// silently stopped being true — the same way the AEAD failure hint in `internals.rs` did.
 const AD_VERSION: u8 = 3;
 
 /// Previous AD version used as a fallback during rolling upgrades.
