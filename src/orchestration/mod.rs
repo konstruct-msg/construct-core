@@ -28,7 +28,7 @@ pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
 pub use healing_queue::{HealDirection, HealingDecision, HealingQueue, HealingRecord};
-pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
+pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role};
 pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
 pub use pq_contribution::{

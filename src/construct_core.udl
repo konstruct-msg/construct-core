@@ -19,6 +19,14 @@ namespace construct_core {
 
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string compute_safety_number(string my_device_id, string their_device_id);
+
+    /// Which side opens the session when both try at once: "Initiator" or "Responder".
+    ///
+    /// Higher id wins, by plain byte comparison — no normalisation, no parsing. Both peers
+    /// compute it over the same pair, so a disagreement is a permanent deadlock rather than a
+    /// retryable error. Pass the ids the session is addressed by; anything else ranks a
+    /// different pair.
+    string tie_break_role(string my_id, string peer_id);
     
     // Proof of Work functions
     PowSolution compute_pow(string challenge, u32 difficulty);

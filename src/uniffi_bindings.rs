@@ -2425,6 +2425,21 @@ pub fn format_federated_id(device_id: String, server_hostname: String) -> String
     crate::device_id::format_federated_id(&device_id, &server_hostname)
 }
 
+/// Which side opens the session when both try at once.
+///
+/// The platform used to carry its own copy of this rule (`SessionReducer.tieBreakRole`) under a
+/// comment promising it matched the core byte-for-byte. The addressing flip broke that promise
+/// without touching either line: the core began ranking device ids while the platform still
+/// ranked account ids, so the two compared *different pairs* and agreed only by coincidence —
+/// and a disagreement here is both-initiator or both-responder, a permanent deadlock.
+///
+/// Returns the same spelling the `SessionHealNeeded` action carries.
+pub fn tie_break_role(my_id: String, peer_id: String) -> String {
+    crate::orchestration::tie_break_role(&my_id, &peer_id)
+        .as_wire()
+        .to_string()
+}
+
 /// Compute a Safety Number for two Construct devices.
 ///
 /// Returns a 60-digit string (12 groups of 5, space-separated) that both parties

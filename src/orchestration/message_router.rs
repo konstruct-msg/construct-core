@@ -42,11 +42,45 @@ const END_SESSION_MARKER: &str = "__END_SESSION__";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Role in a tie-break scenario (HIGHER userId = INITIATOR — see `tie_break_role`).
+/// Role in a tie-break scenario (HIGHER id = INITIATOR — see `tie_break_role`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
     Initiator,
     Responder,
+}
+
+impl Role {
+    /// The name the platform sees on `Action::SessionHealNeeded` and gets back from
+    /// `tie_break_role`. One spelling, so the answer to "what role am I" and the role announced
+    /// in an action cannot disagree — they were two `match` blocks in `orchestrator.rs` until
+    /// 2026-08-26.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Role::Initiator => "Initiator",
+            Role::Responder => "Responder",
+        }
+    }
+}
+
+/// Which side opens the session when both try at once.
+///
+/// **Higher id wins as INITIATOR**, by plain byte comparison of the two ids — no normalisation,
+/// no parsing. Both peers compute it independently over the same pair, so any disagreement means
+/// both-initiator or both-responder, which is a permanent deadlock rather than a retryable error.
+///
+/// That is why this is exported rather than described. iOS carried its own copy in
+/// `SessionReducer.tieBreakRole` under a comment promising it matched this function
+/// byte-for-byte — and the addressing flip broke the promise without touching either line: the
+/// core began comparing device ids while the platform still compared account ids, so the two
+/// ranked *different pairs* and agreed only by coincidence.
+///
+/// The ids must be the ones the session is addressed by. Anything else ranks a different pair.
+pub fn tie_break_role(my_id: &str, peer_id: &str) -> Role {
+    if my_id > peer_id {
+        Role::Initiator
+    } else {
+        Role::Responder
+    }
 }
 
 /// Outcome of routing one message.
@@ -332,7 +366,7 @@ impl MessageRouter {
             }
             Err(e) => {
                 if msg.msg_number == 0 {
-                    let role = self.tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
+                    let role = tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
                     // Reject if attacker has exhausted the incoming-trigger budget
                     // for this contact. This preserves the 3-retry heal budget for
                     // a legitimate peer that sends a real session-init later.
@@ -390,16 +424,6 @@ impl MessageRouter {
         RoutingDecision::NeedSessionInit {
             contact_id: msg.contact_id.clone(),
             queued_count: queue.len(),
-        }
-    }
-
-    /// Determine the local node's role using the tie-break rule:
-    /// Higher userId (lexicographic) wins as INITIATOR — matches iOS `DeviceIdOrdering.isNaturalInitiator`.
-    fn tie_break_role(&self, my_user_id: &str, contact_id: &str) -> Role {
-        if my_user_id > contact_id {
-            Role::Initiator
-        } else {
-            Role::Responder
         }
     }
 }
@@ -598,18 +622,57 @@ mod tests {
         ));
     }
 
+    // ── The exported rule ────────────────────────────────────────────────────
+    //
+    // Both peers compute this independently, so a disagreement is a permanent deadlock rather
+    // than a retryable error. Each test names the mutation that must redden it.
+
+    /// Mutation: flip the comparison to `<` — this reddens.
     #[test]
-    fn test_tie_break_role_initiator() {
-        let router = MessageRouter::new();
-        // "bob" > "alice" → bob is INITIATOR (higher deviceId wins)
-        assert_eq!(router.tie_break_role("bob", "alice"), Role::Initiator);
+    fn test_the_higher_id_is_the_initiator() {
+        assert_eq!(tie_break_role("b", "a"), Role::Initiator);
+        assert_eq!(tie_break_role("a", "b"), Role::Responder);
     }
 
+    /// Equal ids are not an initiator. A self-addressed or echoed message must not make both
+    /// halves of one device think they opened the session.
+    ///
+    /// Mutation: use `>=` — this reddens.
     #[test]
-    fn test_tie_break_role_responder() {
-        let router = MessageRouter::new();
-        // "alice" < "bob" → alice is RESPONDER (lower deviceId loses)
-        assert_eq!(router.tie_break_role("alice", "bob"), Role::Responder);
+    fn test_an_id_does_not_win_against_itself() {
+        assert_eq!(tie_break_role("a", "a"), Role::Responder);
+    }
+
+    /// Plain byte comparison, no normalisation. Lowercasing either side here would rank a
+    /// different pair than a caller that did not, which is the divergence this rule cannot
+    /// survive — and it is why the platform must call this rather than describe it.
+    ///
+    /// Mutation: compare `my_id.to_lowercase()` — this reddens.
+    #[test]
+    fn test_the_comparison_does_not_normalise() {
+        // 'B' (0x42) < 'a' (0x61): case-sensitively "a" wins, case-insensitively "b" would.
+        assert_eq!(tie_break_role("a", "B"), Role::Initiator);
+        assert_eq!(tie_break_role("B", "a"), Role::Responder);
+    }
+
+    /// Device ids are 32 lowercase hex characters; the rule must order them the same way the
+    /// platform's own comparison of the same strings does.
+    #[test]
+    fn test_device_ids_order_by_their_bytes() {
+        let lower = "0620d675aad44cf88fa0a389040c487c";
+        let higher = "b814c8ab96bc4496b80795fa256eed9f";
+        assert_eq!(tie_break_role(higher, lower), Role::Initiator);
+        assert_eq!(tie_break_role(lower, higher), Role::Responder);
+    }
+
+    /// The name the platform sees is one spelling: the answer to "what role am I" and the role
+    /// announced on `SessionHealNeeded` were two separate `match` blocks until 2026-08-26.
+    ///
+    /// Mutation: return "initiator" (lowercase) from one of them — this reddens.
+    #[test]
+    fn test_the_wire_name_is_one_spelling() {
+        assert_eq!(Role::Initiator.as_wire(), "Initiator");
+        assert_eq!(Role::Responder.as_wire(), "Responder");
     }
 
     #[test]
