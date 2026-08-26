@@ -16,7 +16,7 @@ use crate::crypto::client_api::ClassicClient;
 use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::ack_store::AckStore;
-use crate::orchestration::actions::Action;
+use crate::orchestration::actions::{Action, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::healing_queue::HealingQueue;
 use crate::orchestration::pq_contribution::PQContributionManager;
@@ -193,7 +193,7 @@ impl SessionLifecycleManager {
     /// `restore_latest_archive`).
     ///
     /// Returns `EncryptResult` with ciphertext JSON and follow-up `Action`s
-    /// (always includes `SaveSessionToSecureStore` to persist the updated session).
+    /// (always includes `SaveToSecureStore` to persist the updated session).
     pub fn encrypt(&mut self, contact_id: &str, plaintext: &[u8]) -> Result<EncryptResult, String> {
         // Ensure session is loaded.
         if !self.client.has_session(contact_id) {
@@ -210,8 +210,10 @@ impl SessionLifecycleManager {
 
         // Always save updated session state after encrypt.
         let session_bytes = self.export_session_bytes_for(contact_id)?;
-        let actions = vec![Action::SaveSessionToSecureStore {
-            key: session_key(contact_id),
+        let actions = vec![Action::SaveToSecureStore {
+            slot: SecureStoreSlot::Session {
+                contact_id: contact_id.to_string(),
+            },
             data: session_bytes,
         }];
 
@@ -243,8 +245,10 @@ impl SessionLifecycleManager {
 
         // Persist updated session state.
         let session_bytes = self.export_session_bytes_for(contact_id)?;
-        let actions = vec![Action::SaveSessionToSecureStore {
-            key: session_key(contact_id),
+        let actions = vec![Action::SaveToSecureStore {
+            slot: SecureStoreSlot::Session {
+                contact_id: contact_id.to_string(),
+            },
             data: session_bytes,
         }];
 
@@ -293,8 +297,10 @@ impl SessionLifecycleManager {
         let plaintext = self.client.decrypt_message(contact_id, &msg)?;
 
         let session_bytes = self.export_session_bytes_for(contact_id)?;
-        let actions = vec![Action::SaveSessionToSecureStore {
-            key: session_key(contact_id),
+        let actions = vec![Action::SaveToSecureStore {
+            slot: SecureStoreSlot::Session {
+                contact_id: contact_id.to_string(),
+            },
             data: session_bytes,
         }];
 
@@ -370,8 +376,10 @@ impl SessionLifecycleManager {
         for contact_id in &expired {
             self.archives.remove(contact_id);
             self.archive_timestamps.remove(contact_id);
-            actions.push(Action::SaveSessionToSecureStore {
-                key: archive_key(contact_id),
+            actions.push(Action::SaveToSecureStore {
+                slot: SecureStoreSlot::SessionArchive {
+                    contact_id: contact_id.to_string(),
+                },
                 data: vec![], // empty = delete sentinel
             });
         }
@@ -445,15 +453,17 @@ impl SessionLifecycleManager {
         // Including this in the same batch ensures that a restart after partial
         // persistence replays from a consistent state (either both applied or neither).
         let cfe_export_action = match self.pq_manager.export_cfe() {
-            Ok(cfe) => vec![Action::SaveSessionToSecureStore {
-                key: "kyber_session_state".to_string(),
+            Ok(cfe) => vec![Action::SaveToSecureStore {
+                slot: SecureStoreSlot::KyberSessionState,
                 data: cfe,
             }],
             Err(_) => vec![], // Non-fatal: CFE re-exported on next PQ state change.
         };
 
-        let mut actions = vec![Action::SaveSessionToSecureStore {
-            key: session_key(contact_id),
+        let mut actions = vec![Action::SaveToSecureStore {
+            slot: SecureStoreSlot::Session {
+                contact_id: contact_id.to_string(),
+            },
             data: session_bytes,
         }];
         actions.extend(delete_actions);
@@ -465,8 +475,7 @@ impl SessionLifecycleManager {
 
     /// Export the Kyber `PQContributionManager` state as a CFE binary blob.
     ///
-    /// The caller should persist the returned bytes under the well-known key
-    /// `"kyber_session_state"` via `SaveSessionToSecureStore`.
+    /// The caller should persist the returned bytes in `SecureStoreSlot::KyberSessionState`.
     pub fn export_kyber_session_state_cfe(&self) -> Result<Vec<u8>, String> {
         self.pq_manager.export_cfe()
     }
@@ -484,7 +493,7 @@ impl SessionLifecycleManager {
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
     /// The caller should persist the blob under `"orchestrator_state"` via
-    /// `SaveSessionToSecureStore` after every significant state change.
+    /// `SaveToSecureStore` after every significant state change.
     ///
     /// **`processed_ids` is deliberately exported empty.** The ACK cache is an L1
     /// hot-path cache only; the durable owner of dedup state is the platform ACK
@@ -651,14 +660,6 @@ impl SessionLifecycleManager {
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
 
-pub fn session_key(contact_id: &str) -> String {
-    format!("session_{}", contact_id)
-}
-
-pub fn archive_key(contact_id: &str) -> String {
-    format!("archive_{}", contact_id)
-}
-
 #[cfg(test)]
 fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -784,12 +785,6 @@ mod tests {
         assert!(!mgr.is_reinstall("bob", 99));
         assert!(!mgr.healing_queue.has_pending("bob"));
         assert!(mgr.pq_manager.peek_deferred("bob").is_none());
-    }
-
-    #[test]
-    fn test_session_and_archive_keys() {
-        assert_eq!(session_key("alice"), "session_alice");
-        assert_eq!(archive_key("alice"), "archive_alice");
     }
 
     #[test]

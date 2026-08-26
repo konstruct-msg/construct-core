@@ -3,6 +3,41 @@
 /// Rust принимает события, вычисляет решения и возвращает `Vec<Action>`.
 /// Платформенный слой исполняет каждое действие и при необходимости передаёт
 /// результат обратно через `IncomingEvent`.
+/// Which durable slot a `SaveToSecureStore` payload belongs in.
+///
+/// The core names *what* the bytes are; the platform names *where* they go. Until 2026-08-26 the
+/// action carried a formatted string (`"session_<id>"`, `"archive_<id>"`, `"pq_deferred_<id>"`, …)
+/// and the platform parsed it back apart — so the naming rule for a store the core does not own
+/// was written six times: `session_key()` here, twice more inline in `orchestrator.rs`, once in
+/// reverse in `handle_session_loaded`, and twice again on the iOS side, which stripped the prefix
+/// only to rebuild the identical string two layers down. A rule written six times is a rule that
+/// can change in five places and hold in the sixth.
+///
+/// A variant here is also the only way a new slot can be added: the platform's `switch` stops
+/// compiling until it says what to do with it. The string form had an `else` branch that logged
+/// "unhandled storage key" at debug level and returned success, which is where `kyber_session_state`
+/// and `kyber_spk_<id>` have been landing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SecureStoreSlot {
+    /// Double Ratchet state for one contact. Empty payload means delete.
+    Session { contact_id: String },
+    /// A terminated session, kept for late-arriving messages.
+    SessionArchive { contact_id: String },
+    /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
+    PqDeferred { contact_id: String },
+    /// Whole `PQContributionManager` snapshot.
+    KyberSessionState,
+    /// Secret half of a committed ML-KEM signed prekey.
+    ///
+    /// Nothing reaches this today: `commit_spk_rotation` is called only from its own tests, and
+    /// iOS rotates the Kyber SPK through `PreKeyRotationService` instead. Kept faithful rather
+    /// than dropped so that if the emitter ever becomes reachable the platform is forced to
+    /// answer for it.
+    KyberSignedPrekey { key_id: u32 },
+    /// Orchestrator coordination state.
+    OrchestratorState,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     // ── Cryptographic operations ──────────────────────────────────────────────
@@ -86,12 +121,11 @@ pub enum Action {
     },
 
     // ── Persistence ───────────────────────────────────────────────────────────
-    SaveSessionToSecureStore {
-        key: String,
+    /// Write `data` into `slot`. An empty `data` is a delete sentinel for the slots whose doc
+    /// says so.
+    SaveToSecureStore {
+        slot: SecureStoreSlot,
         data: Vec<u8>,
-    },
-    LoadSessionFromSecureStore {
-        key: String,
     },
     PersistMessage {
         message_json: String,
@@ -258,11 +292,6 @@ pub enum IncomingEvent {
     AckReceived {
         message_id: String,
     },
-    /// Result of `LoadSessionFromSecureStore` action.
-    SessionLoaded {
-        key: String,
-        data: Option<Vec<u8>>,
-    },
     /// Server returned a key bundle in response to `FetchPublicKeyBundle`.
     KeyBundleFetched {
         user_id: String,
@@ -305,13 +334,20 @@ mod tests {
 
     #[test]
     fn test_action_debug() {
-        let a = Action::SaveSessionToSecureStore {
-            key: "session_bob".to_string(),
+        let a = Action::SaveToSecureStore {
+            slot: SecureStoreSlot::Session {
+                contact_id: "bob".to_string(),
+            },
             data: vec![1, 2, 3],
         };
         let s = format!("{:?}", a);
-        assert!(s.contains("SaveSessionToSecureStore"));
-        assert!(s.contains("session_bob"));
+        assert!(s.contains("SaveToSecureStore"));
+        // The slot names the contact; it does not name a place to put it.
+        assert!(s.contains("bob"));
+        assert!(
+            !s.contains("session_bob"),
+            "the core must not format a storage key: {s}"
+        );
     }
 
     #[test]

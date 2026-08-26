@@ -632,7 +632,6 @@ interface CfeIncomingEvent {
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
     AckReceived(string message_id);
-    SessionLoaded(string key, bytes? data);
     KeyBundleFetched(string user_id, string bundle_json);
     NetworkReconnected();
     AppLaunched();
@@ -643,6 +642,27 @@ interface CfeIncomingEvent {
     ActiveChatChanged(string contact_id, boolean is_active);
     /// A heartbeat message was received from the peer.
     HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
+};
+
+/// Which durable slot a `SaveToSecureStore` payload belongs in.
+///
+/// The core names what the bytes are; the platform names where they go. This replaced a formatted
+/// string key (`"session_<id>"`, `"archive_<id>"`, …) that the platform parsed back apart — a
+/// naming rule for a store the core does not own, written six times across two repositories.
+[Enum]
+interface CfeSecureStoreSlot {
+    /// Double Ratchet state for one contact. Empty payload means delete.
+    Session(string contact_id);
+    /// A terminated session, kept for late-arriving messages.
+    SessionArchive(string contact_id);
+    /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
+    PqDeferred(string contact_id);
+    /// Whole PQContributionManager snapshot.
+    KyberSessionState();
+    /// Secret half of a committed ML-KEM signed prekey. No reachable emitter today.
+    KyberSignedPrekey(u32 key_id);
+    /// Orchestrator coordination state.
+    OrchestratorState();
 };
 
 /// Typed replacement for `Action` JSON strings.
@@ -663,8 +683,8 @@ interface CfeAction {
     EndSessionSuppressed(string contact_id, u64 retry_after_ms);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
-    SaveSessionToSecureStore(string key, bytes data);
-    LoadSessionFromSecureStore(string key);
+    /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
+    SaveToSecureStore(CfeSecureStoreSlot slot, bytes data);
     PersistMessage(string message_json);
     PersistAck(string message_id, u64 timestamp);
     PruneAckStore(u64 cutoff_ts);

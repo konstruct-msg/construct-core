@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
-use crate::orchestration::actions::{Action, IncomingEvent};
+use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
@@ -151,7 +151,6 @@ impl Orchestrator {
                 session_data,
             } => self.handle_session_init_completed(contact_id, session_data),
             IncomingEvent::AckReceived { message_id } => self.handle_ack_received(message_id),
-            IncomingEvent::SessionLoaded { key, data } => self.handle_session_loaded(key, data),
             IncomingEvent::KeyBundleFetched {
                 user_id,
                 bundle_json,
@@ -948,7 +947,7 @@ impl Orchestrator {
     /// `PQContributionManager` and included in `export_kyber_session_state_cfe`
     /// snapshots.
     ///
-    /// Returns a `SaveSessionToSecureStore` action that the platform **must**
+    /// Returns a `SaveToSecureStore` action that the platform **must**
     /// execute to persist the per-entry deferred secret for crash-safety.
     pub fn register_pq_deferred(
         &mut self,
@@ -1235,7 +1234,7 @@ impl Orchestrator {
     /// Encrypt a regular outgoing message and pack it into a WirePayload ready to send.
     ///
     /// Called when Swift feeds `OutgoingMessage` — single source of truth for all outgoing
-    /// E2EE text encryption. Emits `SaveSessionToSecureStore` to persist updated DR state.
+    /// E2EE text encryption. Emits `SaveToSecureStore` to persist updated DR state.
     fn handle_outgoing_message(
         &mut self,
         contact_id: String,
@@ -1320,8 +1319,10 @@ impl Orchestrator {
         // session.  Saving first means a crash-before-send results in a locally-advanced
         // but unsent message, which is recoverable (resend).
         if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
-            actions.push(Action::SaveSessionToSecureStore {
-                key: format!("session_{}", contact_id),
+            actions.push(Action::SaveToSecureStore {
+                slot: SecureStoreSlot::Session {
+                    contact_id: contact_id.clone(),
+                },
                 data: session_bytes,
             });
         }
@@ -1337,7 +1338,7 @@ impl Orchestrator {
     /// Encrypt a call signal proto blob and pack it into a WirePayload ready to send.
     ///
     /// Called when Swift feeds `OutgoingCallSignal` — no base64, no JSON, no Strings.
-    /// Also emits `SaveSessionToSecureStore` to persist the updated DR state.
+    /// Also emits `SaveToSecureStore` to persist the updated DR state.
     fn handle_outgoing_call_signal(
         &mut self,
         contact_id: String,
@@ -1349,8 +1350,10 @@ impl Orchestrator {
                 let mut actions = Vec::new();
                 // SAFETY ORDER: save before send (same rationale as handle_outgoing_message).
                 if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
-                    actions.push(Action::SaveSessionToSecureStore {
-                        key: format!("session_{}", contact_id),
+                    actions.push(Action::SaveToSecureStore {
+                        slot: SecureStoreSlot::Session {
+                            contact_id: contact_id.clone(),
+                        },
                         data: session_bytes,
                     });
                 }
@@ -1405,8 +1408,10 @@ impl Orchestrator {
         // Save the session to secure store.
         let mut actions = vec![];
         if let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
-            actions.push(Action::SaveSessionToSecureStore {
-                key: crate::orchestration::session_lifecycle::session_key(&contact_id),
+            actions.push(Action::SaveToSecureStore {
+                slot: SecureStoreSlot::Session {
+                    contact_id: contact_id.clone(),
+                },
                 data: bytes,
             });
         }
@@ -1433,22 +1438,6 @@ impl Orchestrator {
             self.router
                 .resume_after_ack_check(&message_id, is_processed, &mut self.lifecycle);
         self.decision_to_actions(decision, "")
-    }
-
-    fn handle_session_loaded(&mut self, key: String, data: Option<Vec<u8>>) -> Vec<Action> {
-        // key format: "session_<contact_id>" or "archive_<contact_id>"
-        let contact_id = key
-            .strip_prefix("session_")
-            .or_else(|| key.strip_prefix("archive_"))
-            .unwrap_or(&key)
-            .to_string();
-
-        if let Some(bytes) = data
-            && !bytes.is_empty()
-        {
-            self.lifecycle.load_archive_bytes(&contact_id, bytes);
-        }
-        vec![]
     }
 
     fn handle_key_bundle_fetched(&mut self, user_id: String, _bundle_json: String) -> Vec<Action> {
@@ -1813,7 +1802,7 @@ impl Orchestrator {
 
     // ── Orchestrator state persistence ────────────────────────────────────────
 
-    /// Build a `SaveSessionToSecureStore` action that persists the full
+    /// Build a `SaveToSecureStore` action that persists the full
     /// orchestrator coordination state (ACK cache, healing queue, init_locks,
     /// archive index, prekey tracker) to the platform's secure store.
     ///
@@ -1827,8 +1816,8 @@ impl Orchestrator {
         self.lifecycle
             .export_orchestrator_state_cfe(&lock_ids)
             .ok()
-            .map(|cfe| Action::SaveSessionToSecureStore {
-                key: "construct.orchestrator_state".to_string(),
+            .map(|cfe| Action::SaveToSecureStore {
+                slot: SecureStoreSlot::OrchestratorState,
                 data: cfe,
             })
     }

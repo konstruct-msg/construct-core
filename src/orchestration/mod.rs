@@ -25,7 +25,7 @@ pub mod pq_contribution;
 pub mod session_lifecycle;
 
 pub use ack_store::{AckCheckResult, AckStore};
-pub use actions::{Action, IncomingEvent, ReceiptStatus};
+pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
 pub use healing_queue::{HealDirection, HealingDecision, HealingQueue, HealingRecord};
 pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};

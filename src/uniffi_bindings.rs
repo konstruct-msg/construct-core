@@ -3401,7 +3401,7 @@ impl OrchestratorCore {
     /// init locks, archive index, prekey tracker) as a CFE binary blob.
     ///
     /// Persist under the well-known key `"orchestrator_state"` via
-    /// `SaveSessionToSecureStore`.  Import at app startup to restore all queues.
+    /// `SaveToSecureStore`.  Import at app startup to restore all queues.
     pub fn export_orchestrator_state(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_orchestrator_state_cfe()
@@ -3453,10 +3453,6 @@ pub enum CfeIncomingEvent {
     },
     AckReceived {
         message_id: String,
-    },
-    SessionLoaded {
-        key: String,
-        data: Option<Vec<u8>>,
     },
     KeyBundleFetched {
         user_id: String,
@@ -3535,7 +3531,6 @@ impl CfeIncomingEvent {
                 session_data,
             },
             Self::AckReceived { message_id } => AckReceived { message_id },
-            Self::SessionLoaded { key, data } => SessionLoaded { key, data },
             Self::KeyBundleFetched {
                 user_id,
                 bundle_json,
@@ -3575,6 +3570,33 @@ impl CfeIncomingEvent {
     }
 }
 
+/// Typed durable slot — UDL `[Enum] interface CfeSecureStoreSlot`.
+///
+/// Mirrors `orchestration::SecureStoreSlot`. The core says what the bytes are; the platform
+/// decides where they live. See that type for why the string key it replaced was a defect.
+pub enum CfeSecureStoreSlot {
+    Session { contact_id: String },
+    SessionArchive { contact_id: String },
+    PqDeferred { contact_id: String },
+    KyberSessionState,
+    KyberSignedPrekey { key_id: u32 },
+    OrchestratorState,
+}
+
+impl From<crate::orchestration::SecureStoreSlot> for CfeSecureStoreSlot {
+    fn from(slot: crate::orchestration::SecureStoreSlot) -> Self {
+        use crate::orchestration::SecureStoreSlot as S;
+        match slot {
+            S::Session { contact_id } => Self::Session { contact_id },
+            S::SessionArchive { contact_id } => Self::SessionArchive { contact_id },
+            S::PqDeferred { contact_id } => Self::PqDeferred { contact_id },
+            S::KyberSessionState => Self::KyberSessionState,
+            S::KyberSignedPrekey { key_id } => Self::KyberSignedPrekey { key_id },
+            S::OrchestratorState => Self::OrchestratorState,
+        }
+    }
+}
+
 /// Typed platform action — UDL `[Enum] interface CfeAction`.
 pub enum CfeAction {
     DecryptMessage {
@@ -3605,12 +3627,9 @@ pub enum CfeAction {
         contact_id: String,
         role: String,
     },
-    SaveSessionToSecureStore {
-        key: String,
+    SaveToSecureStore {
+        slot: CfeSecureStoreSlot,
         data: Vec<u8>,
-    },
-    LoadSessionFromSecureStore {
-        key: String,
     },
     PersistMessage {
         message_json: String,
@@ -3742,8 +3761,10 @@ impl CfeAction {
                 plaintext,
             },
             SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
-            SaveSessionToSecureStore { key, data } => Self::SaveSessionToSecureStore { key, data },
-            LoadSessionFromSecureStore { key } => Self::LoadSessionFromSecureStore { key },
+            SaveToSecureStore { slot, data } => Self::SaveToSecureStore {
+                slot: slot.into(),
+                data,
+            },
             PersistMessage { message_json } => Self::PersistMessage { message_json },
             PersistAck {
                 message_id,

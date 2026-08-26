@@ -21,7 +21,7 @@
 /// If the upload fails, call `rollback_spk_rotation`.
 use std::collections::HashMap;
 
-use crate::orchestration::actions::Action;
+use crate::orchestration::actions::{Action, SecureStoreSlot};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -93,7 +93,7 @@ impl PQContributionManager {
     /// included in the initial message. The shared secret is stored internally
     /// and retrieved via `consume_deferred` once the session is initialised.
     ///
-    /// The returned `Vec<Action>` contains a `SaveSessionToSecureStore` action
+    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action
     /// that the platform **must** execute to persist the deferred contribution
     /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`,
     /// data: `otpk_id (4 bytes LE) || shared_secret`.
@@ -138,7 +138,7 @@ impl PQContributionManager {
     /// secure store by the caller. The shared secret is stored and returned
     /// via `consume_deferred`.
     ///
-    /// The returned `Vec<Action>` contains a `SaveSessionToSecureStore` action
+    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action
     /// that the platform **must** execute to persist the deferred contribution
     /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`.
     pub fn decapsulate_and_store(
@@ -169,7 +169,7 @@ impl PQContributionManager {
     /// so that it is included in CFE snapshots and consumed by
     /// `consume_deferred`.
     ///
-    /// Returns a `SaveSessionToSecureStore` persist action with the same wire
+    /// Returns a `SaveToSecureStore` persist action with the same wire
     /// format as `encapsulate_and_defer` and `decapsulate_and_store`.
     pub fn register_shared_secret(
         &mut self,
@@ -198,7 +198,7 @@ impl PQContributionManager {
     /// This two-phase design prevents data loss on a crash between applying
     /// the PQ shared secret to the Double Ratchet state and persisting it:
     /// if the process dies before the platform executes the returned
-    /// `SaveSessionToSecureStore` actions, the contribution survives in the
+    /// `SaveToSecureStore` actions, the contribution survives in the
     /// `kyber_session_state` CFE snapshot and can be replayed on next launch.
     pub fn peek_deferred(&self, contact_id: &str) -> Option<DeferredContribution> {
         self.pending.get(contact_id).map(|c| DeferredContribution {
@@ -210,7 +210,7 @@ impl PQContributionManager {
     /// Remove the deferred contribution after the caller has successfully
     /// applied and persisted the updated session state.
     ///
-    /// Returns the `SaveSessionToSecureStore` delete sentinel (empty `data`)
+    /// Returns the `SaveToSecureStore` delete sentinel (empty `data`)
     /// for the individual `pq_deferred_{contact_id}` Keychain / Keystore entry.
     /// The caller **must** also export a fresh `kyber_session_state` CFE
     /// (via `export_cfe`) and include it in the same persist batch so that
@@ -221,8 +221,10 @@ impl PQContributionManager {
         self.pending_ciphertexts.remove(contact_id);
         match self.pending.remove(contact_id) {
             None => vec![],
-            Some(_) => vec![Action::SaveSessionToSecureStore {
-                key: format!("pq_deferred_{}", contact_id),
+            Some(_) => vec![Action::SaveToSecureStore {
+                slot: SecureStoreSlot::PqDeferred {
+                    contact_id: contact_id.to_string(),
+                },
                 data: vec![],
             }],
         }
@@ -325,8 +327,10 @@ impl PQContributionManager {
     pub fn commit_spk_rotation(&mut self) -> Vec<Action> {
         match self.spk_rotation.take() {
             None => vec![],
-            Some(pending) => vec![Action::SaveSessionToSecureStore {
-                key: format!("kyber_spk_{}", pending.new_id),
+            Some(pending) => vec![Action::SaveToSecureStore {
+                slot: SecureStoreSlot::KyberSignedPrekey {
+                    key_id: pending.new_id,
+                },
                 data: pending.new_secret,
             }],
         }
@@ -421,14 +425,16 @@ impl Default for PQContributionManager {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Serialize a pending contribution to `Action::SaveSessionToSecureStore`.
+/// Serialize a pending contribution to `Action::SaveToSecureStore`.
 /// Wire format: `otpk_id (4 bytes LE) || shared_secret`.
 fn serialize_pending_action(contact_id: &str, otpk_id: u32, shared_secret: &[u8]) -> Action {
     let mut data = Vec::with_capacity(4 + shared_secret.len());
     data.extend_from_slice(&otpk_id.to_le_bytes());
     data.extend_from_slice(shared_secret);
-    Action::SaveSessionToSecureStore {
-        key: format!("pq_deferred_{}", contact_id),
+    Action::SaveToSecureStore {
+        slot: SecureStoreSlot::PqDeferred {
+            contact_id: contact_id.to_string(),
+        },
         data,
     }
 }
@@ -528,9 +534,16 @@ mod tests {
         });
         let actions = mgr.commit_spk_rotation();
         assert_eq!(actions.len(), 1);
-        matches!(
-            &actions[0],
-            Action::SaveSessionToSecureStore { key, .. } if key == "kyber_spk_7"
+        assert!(
+            matches!(
+                &actions[0],
+                Action::SaveToSecureStore {
+                    slot: SecureStoreSlot::KyberSignedPrekey { key_id: 7 },
+                    ..
+                }
+            ),
+            "commit must persist the new SPK secret under its own id: {:?}",
+            &actions[0]
         );
         assert!(!mgr.is_rotation_pending());
     }
@@ -568,8 +581,9 @@ mod tests {
         assert_eq!(result.otpk_id, 42);
         assert_eq!(persist_actions.len(), 1);
         assert!(
-            matches!(&persist_actions[0], Action::SaveSessionToSecureStore { key, data }
-                if key == "pq_deferred_bob" && !data.is_empty()),
+            matches!(&persist_actions[0], Action::SaveToSecureStore { slot, data }
+                if *slot == SecureStoreSlot::PqDeferred { contact_id: "bob".to_string() }
+                    && !data.is_empty()),
             "persist action must save deferred entry"
         );
         assert!(mgr.has_pending("bob"));
@@ -580,8 +594,9 @@ mod tests {
         assert!(!mgr.has_pending("bob"));
         assert_eq!(delete_actions.len(), 1);
         assert!(
-            matches!(&delete_actions[0], Action::SaveSessionToSecureStore { key, data }
-                if key == "pq_deferred_bob" && data.is_empty()),
+            matches!(&delete_actions[0], Action::SaveToSecureStore { slot, data }
+                if *slot == SecureStoreSlot::PqDeferred { contact_id: "bob".to_string() }
+                    && data.is_empty()),
             "delete action must be empty-data sentinel"
         );
 
@@ -603,8 +618,9 @@ mod tests {
             .unwrap();
         assert_eq!(actions.len(), 1);
         assert!(
-            matches!(&actions[0], Action::SaveSessionToSecureStore { key, data }
-                if key == "pq_deferred_alice" && !data.is_empty()),
+            matches!(&actions[0], Action::SaveToSecureStore { slot, data }
+                if *slot == SecureStoreSlot::PqDeferred { contact_id: "alice".to_string() }
+                    && !data.is_empty()),
             "decapsulate must return persist action"
         );
         assert!(mgr.has_pending("alice"));
@@ -614,8 +630,9 @@ mod tests {
         assert!(deferred.is_some());
         assert_eq!(delete_actions.len(), 1);
         assert!(
-            matches!(&delete_actions[0], Action::SaveSessionToSecureStore { key, data }
-                if key == "pq_deferred_alice" && data.is_empty()),
+            matches!(&delete_actions[0], Action::SaveToSecureStore { slot, data }
+                if *slot == SecureStoreSlot::PqDeferred { contact_id: "alice".to_string() }
+                    && data.is_empty()),
         );
     }
 
