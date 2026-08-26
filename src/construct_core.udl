@@ -653,7 +653,7 @@ interface CfeIncomingEvent {
 interface CfeSecureStoreSlot {
     /// Double Ratchet state for one contact. Empty payload means delete.
     Session(string contact_id);
-    /// A terminated session, kept for late-arriving messages.
+    /// A terminated session, kept for late-arriving messages. Empty payload means delete.
     SessionArchive(string contact_id);
     /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
     PqDeferred(string contact_id);
@@ -848,7 +848,7 @@ interface OrchestratorCore {
     void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
 
     /// Export the PQContributionManager state as a CFE binary blob.
-    /// Persist under key "kyber_session_state" in the secure store.
+    /// Persist under CfeSecureStoreSlot::KyberSessionState.
     [Throws=CryptoError]
     sequence<u8> export_kyber_session_state();
 
@@ -858,7 +858,7 @@ interface OrchestratorCore {
 
     /// Export the full orchestrator coordination state (ACK cache, healing queue,
     /// init locks, archive index, prekey tracker) as a CFE binary blob.
-    /// Persist under key "orchestrator_state" in the secure store.
+    /// Persist under CfeSecureStoreSlot::OrchestratorState.
     [Throws=CryptoError]
     sequence<u8> export_orchestrator_state();
 

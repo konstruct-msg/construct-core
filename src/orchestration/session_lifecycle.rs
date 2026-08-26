@@ -336,8 +336,8 @@ impl SessionLifecycleManager {
 
     /// Restore the latest archive for `contact_id` into the active session map.
     ///
-    /// The archive bytes must already be in memory (either via a previous
-    /// `archive_session` call or loaded via `load_archive_bytes`).
+    /// The archive bytes must already be in memory, via a previous
+    /// `archive_session` call or an `import_orchestrator_state_cfe` restore.
     pub fn restore_latest_archive(&mut self, contact_id: &str) -> Result<(), String> {
         let cfe_bytes = self
             .archives
@@ -345,19 +345,6 @@ impl SessionLifecycleManager {
             .cloned()
             .ok_or_else(|| format!("No archive for {}", contact_id))?;
         self.import_session_bytes(contact_id, &cfe_bytes)
-    }
-
-    /// Feed an archive CFE binary loaded from the platform secure store into memory.
-    pub fn load_archive_bytes(&mut self, contact_id: &str, data: Vec<u8>) {
-        self.archives.insert(contact_id.to_string(), data.clone());
-        if let Err(e) = self.import_session_bytes(contact_id, &data) {
-            tracing::warn!(
-                target: "orchestration::lifecycle",
-                contact_id = %contact_id,
-                error = %e,
-                "load_archive_bytes: import_session_bytes failed — archive stored but session unavailable"
-            );
-        }
     }
 
     /// Garbage-collect archives older than 24 h.
@@ -412,7 +399,8 @@ impl SessionLifecycleManager {
     /// 2. Apply it to the session (mutates in-memory DR state).
     /// 3. Export the updated session JSON.
     /// 4. Only if both steps succeed: finalize (remove from in-memory pending).
-    /// 5. Include an updated `kyber_session_state` CFE in the same action batch.
+    /// 5. Include an updated `SecureStoreSlot::KyberSessionState` CFE in the
+    ///    same action batch.
     ///
     /// The platform must persist all returned actions atomically.  If the
     /// process crashes before that, the next launch restores the contribution
@@ -492,8 +480,8 @@ impl SessionLifecycleManager {
     /// index, prekey tracker) as a CFE binary blob — msg_type 0x05.
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
-    /// The caller should persist the blob under `"orchestrator_state"` via
-    /// `SaveToSecureStore` after every significant state change.
+    /// The caller should persist the blob under `SecureStoreSlot::OrchestratorState`
+    /// via `SaveToSecureStore` after every significant state change.
     ///
     /// **`processed_ids` is deliberately exported empty.** The ACK cache is an L1
     /// hot-path cache only; the durable owner of dedup state is the platform ACK

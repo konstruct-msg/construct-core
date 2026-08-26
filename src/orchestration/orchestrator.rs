@@ -216,7 +216,7 @@ impl Orchestrator {
     /// Export the full orchestrator coordination state as a CFE binary blob.
     ///
     /// Captures ACK dedup cache, healing queue, init locks, archive index, and
-    /// prekey tracker.  Persist under `"orchestrator_state"` in Keychain.
+    /// prekey tracker.  Persist under `SecureStoreSlot::OrchestratorState`.
     pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
         // Serialise only the contact IDs (keys) — timestamps are ephemeral.
         let lock_ids: std::collections::HashSet<String> = self.init_locks.keys().cloned().collect();
@@ -964,8 +964,8 @@ impl Orchestrator {
 
     /// Export the `PQContributionManager` state as a CFE binary blob.
     ///
-    /// Persist the returned bytes under `"kyber_session_state"` in the platform
-    /// secure store after any encapsulate / decapsulate / consume operation.
+    /// Persist the returned bytes under `SecureStoreSlot::KyberSessionState`
+    /// after any encapsulate / decapsulate / consume operation.
     pub fn export_kyber_session_state_cfe(&self) -> Result<Vec<u8>, String> {
         self.lifecycle.export_kyber_session_state_cfe()
     }

@@ -21,7 +21,7 @@
 pub enum SecureStoreSlot {
     /// Double Ratchet state for one contact. Empty payload means delete.
     Session { contact_id: String },
-    /// A terminated session, kept for late-arriving messages.
+    /// A terminated session, kept for late-arriving messages. Empty payload means delete.
     SessionArchive { contact_id: String },
     /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
     PqDeferred { contact_id: String },

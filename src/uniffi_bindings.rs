@@ -3380,9 +3380,9 @@ impl OrchestratorCore {
 
     /// Export the `PQContributionManager` state as a CFE binary blob.
     ///
-    /// Persist the returned bytes under the key `"kyber_session_state"` in the
-    /// platform secure store.  Call after any encapsulate / decapsulate /
-    /// consume operation so that deferred contributions survive process restarts.
+    /// Persist the returned bytes under `SecureStoreSlot::KyberSessionState`.
+    /// Call after any encapsulate / decapsulate / consume operation so that
+    /// deferred contributions survive process restarts.
     pub fn export_kyber_session_state(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_kyber_session_state_cfe()
@@ -3400,7 +3400,7 @@ impl OrchestratorCore {
     /// Export the full orchestrator coordination state (ACK cache, healing queue,
     /// init locks, archive index, prekey tracker) as a CFE binary blob.
     ///
-    /// Persist under the well-known key `"orchestrator_state"` via
+    /// Persist under `SecureStoreSlot::OrchestratorState` via
     /// `SaveToSecureStore`.  Import at app startup to restore all queues.
     pub fn export_orchestrator_state(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());

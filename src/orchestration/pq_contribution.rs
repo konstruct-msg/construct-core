@@ -93,10 +93,10 @@ impl PQContributionManager {
     /// included in the initial message. The shared secret is stored internally
     /// and retrieved via `consume_deferred` once the session is initialised.
     ///
-    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action
-    /// that the platform **must** execute to persist the deferred contribution
-    /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`,
-    /// data: `otpk_id (4 bytes LE) || shared_secret`.
+    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action for
+    /// `SecureStoreSlot::PqDeferred { contact_id }` that the platform **must**
+    /// execute to persist the deferred contribution across process restarts.
+    /// Data layout: `otpk_id (4 bytes LE) || shared_secret`.
     ///
     /// Calls the actual ML-KEM-768 primitive from `crate::crypto::pq_x3dh`
     /// when the `post-quantum` feature is enabled; otherwise returns an error.
@@ -138,9 +138,9 @@ impl PQContributionManager {
     /// secure store by the caller. The shared secret is stored and returned
     /// via `consume_deferred`.
     ///
-    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action
-    /// that the platform **must** execute to persist the deferred contribution
-    /// across process restarts.  Key format: `"pq_deferred_<contact_id>"`.
+    /// The returned `Vec<Action>` contains a `SaveToSecureStore` action for
+    /// `SecureStoreSlot::PqDeferred { contact_id }` that the platform **must**
+    /// execute to persist the deferred contribution across process restarts.
     pub fn decapsulate_and_store(
         &mut self,
         contact_id: &str,
@@ -211,9 +211,9 @@ impl PQContributionManager {
     /// applied and persisted the updated session state.
     ///
     /// Returns the `SaveToSecureStore` delete sentinel (empty `data`)
-    /// for the individual `pq_deferred_{contact_id}` Keychain / Keystore entry.
-    /// The caller **must** also export a fresh `kyber_session_state` CFE
-    /// (via `export_cfe`) and include it in the same persist batch so that
+    /// for `SecureStoreSlot::PqDeferred { contact_id }`.
+    /// The caller **must** also export a fresh `SecureStoreSlot::KyberSessionState`
+    /// CFE (via `export_cfe`) and include it in the same persist batch so that
     /// a subsequent restart does not replay the already-applied contribution.
     ///
     /// No-op (returns empty Vec) if no pending contribution exists.
@@ -359,9 +359,8 @@ impl PQContributionManager {
     /// Serialize the complete manager state to a CFE binary blob
     /// (`KyberSessionState` / msg_type 0x21).
     ///
-    /// The caller should persist the returned bytes via
-    /// `SaveSessionToSecureStore { key: "kyber_session_state", data: ... }`
-    /// after any state change.
+    /// The caller should persist the returned bytes under
+    /// `SecureStoreSlot::KyberSessionState` after any state change.
     pub fn export_cfe(&self) -> Result<Vec<u8>, String> {
         use crate::cfe::{CfeKyberDeferredEntryV1, CfeKyberSessionStateV1, CfeMessageType};
         use serde_bytes::ByteBuf;
