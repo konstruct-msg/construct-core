@@ -465,7 +465,76 @@ impl Drop for SerializableSession {
     }
 }
 
+/// First 8 characters of an identifier, for diagnostics that must not carry the whole value.
+/// Indexed by `char_indices` rather than by byte, so a non-ASCII id cannot panic the error path.
+fn id_prefix(id: &str) -> &str {
+    let end = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
+    &id[..end]
+}
+
 impl SerializableSession {
+    /// Check that this record is the session the caller believes it is loading.
+    ///
+    /// The identity of a session — who it is with, and who we were when it was made — is
+    /// written *inside* the record (`contact_id` / `local_uid` in `CfeSessionStateV1`), but
+    /// every import path also takes a `contact_id` argument and, until 2026-08-26, silently let
+    /// the argument win. A blob stored under one name and loaded under another was imported
+    /// without complaint: the caller's name went into the AD, the record's ratchet state went
+    /// behind it, and nothing compared the two. That does not fail at import. It fails later,
+    /// as a permanent AEAD error on a session healthy by every other measure — which is how
+    /// per-device sessions spent months unable to open, the sender addressing a device as
+    /// `<uuid>:<hex>` while the receiver's own `local_user_id` stayed a bare UUID.
+    ///
+    /// `try_aead_decrypt` already carries a comment predicting exactly this mismatch. It could
+    /// only report it after the fact, from the far side of a failed decrypt; this reports it at
+    /// the moment the wrong name is applied, which is the moment someone can act on it.
+    ///
+    /// An empty field on either side means "this predates the field", not "this belongs to
+    /// someone else": `local_user_id` carries `#[serde(default)]` for legacy JSON blobs, and
+    /// the core's own id is empty until `set_local_user_id` runs. Those are skipped with a
+    /// warning — rejecting them would discard live ratchet state to enforce a comparison that
+    /// cannot conclude anything. `contact_id` has no default and is always compared.
+    ///
+    /// Diagnostics carry an 8-character prefix and a length, never the whole identifier: a
+    /// mismatch is precisely the case where both ids would otherwise be written to a log.
+    pub fn verify_identity(
+        &self,
+        expected_contact_id: &str,
+        expected_local_user_id: &str,
+    ) -> Result<(), String> {
+        if self.contact_id != expected_contact_id {
+            return Err(format!(
+                "session identity mismatch: record is for contact {}… ({} chars), loaded as {}… ({} chars)",
+                id_prefix(&self.contact_id),
+                self.contact_id.len(),
+                id_prefix(expected_contact_id),
+                expected_contact_id.len(),
+            ));
+        }
+
+        if self.local_user_id.is_empty() || expected_local_user_id.is_empty() {
+            tracing::warn!(
+                target: "crypto::double_ratchet",
+                record_local_uid_len = %self.local_user_id.len(),
+                expected_local_uid_len = %expected_local_user_id.len(),
+                "session identity: local_user_id unverifiable (empty on one side) — importing anyway"
+            );
+            return Ok(());
+        }
+
+        if self.local_user_id != expected_local_user_id {
+            return Err(format!(
+                "session identity mismatch: record was made by {}… ({} chars), importing as {}… ({} chars)",
+                id_prefix(&self.local_user_id),
+                self.local_user_id.len(),
+                id_prefix(expected_local_user_id),
+                expected_local_user_id.len(),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn to_cfe_v1(&self) -> Result<crate::cfe::CfeSessionStateV1, String> {
         use serde_bytes::ByteBuf;
 

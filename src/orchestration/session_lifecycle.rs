@@ -637,6 +637,11 @@ impl SessionLifecycleManager {
                 Err(e) => return Err(format!("decode_as: {}", e)),
             };
 
+        // The record names its own contact and author; the argument is only what the caller
+        // believed. Disagreement means the blob is being loaded under a name it was not saved
+        // under, which does not fail here — it fails as a permanent AEAD error later.
+        serializable.verify_identity(contact_id, self.client.local_user_id())?;
+
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
         self.client.import_session(contact_id, ratchet);
@@ -901,14 +906,137 @@ mod tests {
 
     #[test]
     fn test_export_bytes_import_bytes_round_trip() {
-        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        // The restoring manager must be the same identity that exported. Until 2026-08-26 this
+        // test restored into a manager whose local id was the literal `"alice"` rather than
+        // Alice's device id, and passed: it asserted the session was *present*, and presence is
+        // not usability — the restored session would have built its AD with the wrong name and
+        // failed every decrypt. `verify_identity` is what turns that into a visible failure.
+        let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
         let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
 
         let alice_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut restored = SessionLifecycleManager::new(alice_client, "alice".to_string());
+        let mut restored = SessionLifecycleManager::new(alice_client, alice_id);
         restored
             .import_session_bytes(&bob_device_id, &bytes)
             .unwrap();
+        assert!(restored.has_active_session(&bob_device_id));
+    }
+
+    // ── Import verifies the record's own identity ────────────────────────────
+    //
+    // A session record carries `contact_id` and `local_uid` inside it, and every import path
+    // also takes a `contact_id` argument. Until 2026-08-26 the argument simply won: a blob
+    // loaded under the wrong name was imported without complaint and failed later, as a
+    // permanent AEAD error on a session that looked healthy. Each test below names the
+    // mutation of `SerializableSession::verify_identity` that must redden it.
+
+    /// Mutation: drop the `contact_id` comparison — this reddens.
+    #[test]
+    fn test_import_rejects_a_record_saved_for_another_contact() {
+        let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, alice_id);
+        let stranger = "0".repeat(32);
+
+        let err = restored
+            .import_session_bytes(&stranger, &bytes)
+            .expect_err("a record for Bob must not import as a session with someone else");
+        assert!(err.contains("identity mismatch"), "unexpected error: {err}");
+        assert!(
+            !restored.has_active_session(&stranger),
+            "a rejected import must leave no session behind"
+        );
+    }
+
+    /// Mutation: drop the `local_user_id` comparison — this reddens.
+    ///
+    /// This is the half that catches the addressing drift: the record was written while we were
+    /// one identity and is being loaded while we are another, so the AD it will build no longer
+    /// mirrors what the peer builds.
+    #[test]
+    fn test_import_rejects_a_record_made_by_another_local_identity() {
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, "1".repeat(32));
+
+        let err = restored
+            .import_session_bytes(&bob_device_id, &bytes)
+            .expect_err("a record made by another identity must not import");
+        assert!(err.contains("identity mismatch"), "unexpected error: {err}");
+        assert!(!restored.has_active_session(&bob_device_id));
+    }
+
+    /// Diagnostics name the mismatch without writing either identifier out in full — the
+    /// mismatch is exactly the case where both would otherwise reach a log.
+    ///
+    /// Mutation: format the whole id instead of `id_prefix` — this reddens.
+    #[test]
+    fn test_the_mismatch_error_does_not_carry_a_whole_identifier() {
+        let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, alice_id.clone());
+        let err = restored
+            .import_session_bytes(&"0".repeat(32), &bytes)
+            .unwrap_err();
+
+        assert!(
+            !err.contains(&bob_device_id),
+            "leaked the record's contact id: {err}"
+        );
+        assert!(
+            err.contains(&bob_device_id[..8]),
+            "should still say which contact: {err}"
+        );
+    }
+
+    /// Mutation: reject instead of skipping when a side is empty — this reddens.
+    ///
+    /// The core's own id is empty until `set_local_user_id` runs, and startup imports sessions.
+    /// Refusing them would discard live ratchet state to enforce a comparison that cannot
+    /// conclude anything.
+    #[test]
+    fn test_import_skips_the_local_id_check_before_the_identity_is_set() {
+        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, String::new());
+
+        restored
+            .import_session_bytes(&bob_device_id, &bytes)
+            .expect("an unset local identity cannot disprove the record");
+        assert!(restored.has_active_session(&bob_device_id));
+    }
+
+    /// A legacy JSON blob predates `local_user_id` (the field carries `#[serde(default)]`).
+    /// Empty on the record's side means "this predates the field", not "this belongs to
+    /// someone else".
+    ///
+    /// Mutation: reject a record with an empty `local_user_id` — this reddens.
+    #[test]
+    fn test_import_accepts_a_legacy_record_with_no_local_user_id() {
+        let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
+        let json = alice.export_session_json_for(&bob_device_id).unwrap();
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("local_user_id")
+            .expect("the exported JSON should carry the field this test removes");
+        let legacy = serde_json::to_vec(&value).unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, alice_id);
+        restored
+            .import_session_bytes(&bob_device_id, &legacy)
+            .expect("a pre-field record must still load");
         assert!(restored.has_active_session(&bob_device_id));
     }
 

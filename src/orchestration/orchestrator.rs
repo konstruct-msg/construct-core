@@ -893,6 +893,7 @@ impl Orchestrator {
                 .map_err(|e| e.to_string())?;
         let serializable = SerializableSession::from_cfe_v1(cfe_state)
             .map_err(|e| format!("from_cfe_v1: {}", e))?;
+        serializable.verify_identity(contact_id, self.lifecycle.client.local_user_id())?;
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
         let session_id = self.lifecycle.client.import_session(contact_id, ratchet);

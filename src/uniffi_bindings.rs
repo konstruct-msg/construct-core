@@ -574,13 +574,18 @@ impl ClassicCryptoCore {
             Err(e) => return Err(serialization_failed("classic import_session/decode", e)),
         };
 
-        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
-            .map_err(|e| serialization_failed("classic import_session/from_serializable", e))?;
-
         let mut client = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        serializable
+            .verify_identity(&contact_id, client.local_user_id())
+            .map_err(|e| serialization_failed("classic import_session/identity", e))?;
+
+        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
+            .map_err(|e| serialization_failed("classic import_session/from_serializable", e))?;
+
         let session_id = client.import_session(&contact_id, ratchet);
         Ok(session_id)
     }
