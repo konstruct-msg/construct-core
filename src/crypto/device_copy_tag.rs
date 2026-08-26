@@ -116,8 +116,7 @@ fn pair_secret(
 ///
 /// The NUL separator is unambiguous because neither a message id nor a device id contains one.
 fn mac_input(base_message_id: &str, target_device_id: &str) -> Vec<u8> {
-    let mut input =
-        Vec::with_capacity(base_message_id.len() + 1 + target_device_id.len());
+    let mut input = Vec::with_capacity(base_message_id.len() + 1 + target_device_id.len());
     input.extend_from_slice(base_message_id.as_bytes());
     input.push(0x00);
     input.extend_from_slice(target_device_id.as_bytes());
@@ -200,7 +199,10 @@ mod tests {
         let (_, b_pub) = keypair(2);
         let tag = device_copy_tag("msg", "device-b", &a_priv, &b_pub).unwrap();
         assert_eq!(tag.len(), TAG_HEX_LEN);
-        assert!(tag.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            tag.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
     }
 
     #[test]
@@ -229,8 +231,12 @@ mod tests {
         let (b_priv, b_pub) = keypair(2);
         let tag = device_copy_tag("msg", "device-b", &a_priv, &b_pub).unwrap();
 
-        assert!(device_copy_tag_matches(&tag, "msg", "device-b", &b_priv, &a_pub));
-        assert!(!device_copy_tag_matches(&tag, "msg", "device-a", &a_priv, &b_pub));
+        assert!(device_copy_tag_matches(
+            &tag, "msg", "device-b", &b_priv, &a_pub
+        ));
+        assert!(!device_copy_tag_matches(
+            &tag, "msg", "device-a", &a_priv, &b_pub
+        ));
     }
 
     #[test]
@@ -297,7 +303,10 @@ mod tests {
 
         const PAIR_SECRET: &str =
             "7af783d487a32aa296b82c9198ca34a848a3ae2cf9323389d968e65d1ab99e45";
-        assert_eq!(hex::encode(pair_secret(&a_priv, &b_pub).unwrap()), PAIR_SECRET);
+        assert_eq!(
+            hex::encode(pair_secret(&a_priv, &b_pub).unwrap()),
+            PAIR_SECRET
+        );
         assert_eq!(
             hex::encode(pair_secret(&b_priv, &a_pub).unwrap()),
             PAIR_SECRET,
