@@ -18,7 +18,7 @@ namespace construct_core {
     WirePayload wire_payload_unpack(sequence<u8> data);
 
     // Safety Numbers — human-verifiable key fingerprint for two devices
-    string compute_safety_number(string my_device_id, string their_device_id);
+    string? compute_safety_number(string my_device_id, string their_device_id);
 
     /// Which side opens the session when both try at once: "Initiator" or "Responder".
     ///

@@ -2444,7 +2444,7 @@ pub fn tie_break_role(my_id: String, peer_id: String) -> String {
 ///
 /// Returns a 60-digit string (12 groups of 5, space-separated) that both parties
 /// can compare verbally or via QR to verify no MITM has occurred.
-pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> String {
+pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> Option<String> {
     crate::crypto::recovery::compute_safety_number(&my_device_id, &their_device_id)
 }
 

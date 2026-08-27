@@ -119,7 +119,7 @@ pub fn compute_key_fingerprint(public_key: &[u8]) -> String {
         .join(" ")
 }
 
-/// Compute a Safety Number for two Construct devices.
+/// Compute a Safety Number for two Construct devices, or `None` when either id cannot be read.
 ///
 /// Both parties derive the same 60-digit string from their device IDs.
 /// Device IDs are cryptographic commitments to identity keys (HKDF of Ed25519 pubkey),
@@ -128,12 +128,37 @@ pub fn compute_key_fingerprint(public_key: &[u8]) -> String {
 /// Algorithm:
 /// 1. Canonicalize: sort device IDs lexicographically so both sides get the same order.
 /// 2. Iterative SHA-512: 1024 rounds of hash(prev_hash || input) — hardens brute-force.
-/// 3. Format: first 24 bytes → 12 groups of 5 decimal digits (00000–99999).
+/// 3. Format: first 24 bytes → 12 groups of 5 decimal digits, zero-padded. Each group is a
+///    big-endian u16, so the range that actually occurs is **00000–65535** — the leading digit is
+///    never 7, 8 or 9. The number carries 192 bits, not the ~199 that twelve free 0–99999 groups
+///    would suggest.
 ///
 /// Display format: "12345 67890 11111 22222 ..."
-pub fn compute_safety_number(my_device_id: &str, their_device_id: &str) -> String {
-    let my_bytes = hex::decode(my_device_id).unwrap_or_default();
-    let their_bytes = hex::decode(their_device_id).unwrap_or_default();
+///
+/// # Why this is fallible
+///
+/// It returned `String` until 2026-08-27, decoding with `hex::decode(..).unwrap_or_default()` —
+/// which turns "I could not read this id" into "the id is empty", and an empty id is a *valid*
+/// input that yields a real-looking 60-digit number. So `"abc"`, `"zzzz"` and `""` all produced
+/// **the same** safety number against a given peer.
+///
+/// That is a verification bypass, not a formatting wart: two people whose ids failed to decode
+/// would be shown matching numbers and would conclude the session is verified. This value exists
+/// for exactly one purpose — to differ when a key was substituted — so any input it cannot read
+/// must produce no number at all. A safety number that means "something went wrong" and a safety
+/// number that means "you are talking to who you think" must not be the same string.
+///
+/// Not reachable from iOS today (`derive_device_id` always yields 32 valid hex chars), but this is
+/// exported over UniFFI and takes whatever the caller passes, and it is now the only
+/// implementation.
+pub fn compute_safety_number(my_device_id: &str, their_device_id: &str) -> Option<String> {
+    // Empty is rejected too. It decodes fine, which is the trap: it is the value an unreadable id
+    // used to collapse into, and two devices that both supplied nothing would match each other.
+    if my_device_id.is_empty() || their_device_id.is_empty() {
+        return None;
+    }
+    let my_bytes = hex::decode(my_device_id).ok()?;
+    let their_bytes = hex::decode(their_device_id).ok()?;
 
     let (first, second) = if my_device_id < their_device_id {
         (my_bytes.as_slice(), their_bytes.as_slice())
@@ -153,16 +178,27 @@ pub fn compute_safety_number(my_device_id: &str, their_device_id: &str) -> Strin
         hash = h.finalize().to_vec();
     }
 
-    hash[..24]
-        .chunks(2)
-        .map(|pair| {
-            format!(
-                "{:05}",
-                (u32::from(pair[0]) * 256 + u32::from(pair[1])) % 100_000
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    // `% 100_000` is **inert today** and is kept as a width guard, not as a reduction: a
+    // big-endian u16 is at most 65535, so the modulus never fires and the displayed range is
+    // 00000–65535, not 00000–99999 as the doc above used to imply. It earns its place only
+    // against a future `chunks(3)`, where it is what keeps `{:05}` from printing six digits and
+    // breaking the 71-character format every client parses.
+    //
+    // Found by mutation on 2026-08-27: changing it to `% 99_999` reddened nothing, which is the
+    // correct outcome for an operation that cannot execute — not a missing test.
+    // `test_safety_number_group_range` pins the range that actually occurs.
+    Some(
+        hash[..24]
+            .chunks(2)
+            .map(|pair| {
+                format!(
+                    "{:05}",
+                    (u32::from(pair[0]) * 256 + u32::from(pair[1])) % 100_000
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 // ── SLIP-0010 internals ───────────────────────────────────────────────────────
@@ -290,7 +326,7 @@ mod tests {
     fn test_safety_number_format() {
         let id_a = "deadbeefcafe1234deadbeefcafe1234";
         let id_b = "1234cafe5678abcd1234cafe5678abcd";
-        let sn = compute_safety_number(id_a, id_b);
+        let sn = compute_safety_number(id_a, id_b).expect("valid ids must produce a number");
         // 12 groups of 5 digits with spaces: "DDDDD DDDDD ..." = 12*5 + 11 spaces = 71 chars
         assert_eq!(sn.len(), 71);
         assert_eq!(sn.chars().filter(|c| *c == ' ').count(), 11);
@@ -310,6 +346,7 @@ mod tests {
             compute_safety_number(id_a, id_b),
             compute_safety_number(id_b, id_a)
         );
+        assert!(compute_safety_number(id_a, id_b).is_some());
     }
 
     #[test]
@@ -322,4 +359,105 @@ mod tests {
             compute_safety_number(id_a, id_c)
         );
     }
+
+    /// An id this function cannot read must produce **no number**, not a number.
+    ///
+    /// The old body decoded with `unwrap_or_default()`, so an unreadable id became an empty one —
+    /// and an empty id is valid input that yields a real-looking 60-digit string. Every broken id
+    /// therefore collapsed onto the *same* value, which is a matching safety number shown to two
+    /// people who have verified nothing.
+    ///
+    /// Mutation: restore `unwrap_or_default()` — the first two assertions redden.
+    #[test]
+    fn test_safety_number_declines_an_unreadable_id() {
+        let good = "deadbeefcafe1234deadbeefcafe1234";
+
+        assert_eq!(compute_safety_number("abc", good), None, "odd length is not hex");
+        assert_eq!(compute_safety_number("zzzz", good), None, "not hex at all");
+        assert_eq!(compute_safety_number(good, "abc"), None, "either side, not just the first");
+
+        // The trap the old code fell into: empty decodes cleanly, so it has to be refused by name.
+        //
+        // Mutation: drop the `is_empty` guard — this reddens, and it is the assertion that stops
+        // two devices which both supplied nothing from matching each other.
+        assert_eq!(compute_safety_number("", good), None);
+        assert_eq!(compute_safety_number(good, ""), None);
+        assert_eq!(compute_safety_number("", ""), None);
+    }
+
+    /// The range a group can actually take. The formatting suggests 00000–99999; a big-endian u16
+    /// gives 00000–65535, and the modulus in the formatter never fires.
+    ///
+    /// Worth pinning because it is a claim about the value's entropy — anyone reasoning about how
+    /// hard this is to collide reads the digit count, and the digit count overstates it.
+    ///
+    /// Mutation: widen the chunks to 3 bytes — the modulus starts firing, the group count drops,
+    /// and this reddens along with the pinned values.
+    #[test]
+    fn test_safety_number_group_range() {
+        let sn = compute_safety_number(
+            "deadbeefcafe1234deadbeefcafe1234",
+            "1234cafe5678abcd1234cafe5678abcd",
+        )
+        .unwrap();
+        let groups: Vec<u32> = sn.split(' ').map(|g| g.parse().unwrap()).collect();
+        assert_eq!(groups.len(), 12);
+        for g in groups {
+            assert!(g <= 65_535, "{g} is above the u16 range a group is built from");
+        }
+    }
+
+    /// The value itself, pinned here as well as in `construct-protos/conformance/
+    /// knst_safety_number.json`.
+    ///
+    /// The properties above (length, symmetry, distinctness) all survive a change to the round
+    /// count, the group width or the digest — every one of those produces a different number for
+    /// every input while keeping the shape perfect. Only a pinned value catches them, and it must
+    /// be pinned *here* too: with the check living only in the iOS conformance test, a change to
+    /// this function is green in its own repo and red in another one.
+    ///
+    /// Mutation: change `1..1024` to `1..1023`, or `% 100_000` to `% 99_999` — this reddens and
+    /// nothing else in this file does.
+    #[test]
+    fn test_safety_number_pins_its_value() {
+        assert_eq!(
+            compute_safety_number(
+                "deadbeefcafe1234deadbeefcafe1234",
+                "1234cafe5678abcd1234cafe5678abcd"
+            )
+            .as_deref(),
+            Some("29923 11327 33797 39770 55644 15437 29152 58888 63756 22781 21915 47107"),
+            "a change here is a change every client must make in the same release"
+        );
+        // The sort, over a pair that orders the other way round.
+        assert_eq!(
+            compute_safety_number(
+                "ffffffffffffffffffffffffffffffff",
+                "0f0e0d0c0b0a09080706050403020100"
+            )
+            .as_deref(),
+            Some("64486 46034 27606 61533 65387 50416 61186 59737 40043 64512 57578 59097")
+        );
+    }
+
+    /// The property the refusal protects: no two *different* inputs may share a number, including
+    /// the broken ones. Before the fix every unreadable id produced the value of the empty id.
+    ///
+    /// Mutation: restore `unwrap_or_default()` — `"abc"` and `"zzzz"` then both produce
+    /// `Some(<the empty-id number>)` and this reddens on the first pair.
+    #[test]
+    fn test_no_two_unreadable_ids_share_a_number() {
+        let good = "deadbeefcafe1234deadbeefcafe1234";
+        let broken = ["abc", "zzzz", "", "nothex!!", "0x1234"];
+        for id in broken {
+            assert_eq!(
+                compute_safety_number(id, good),
+                None,
+                "{id} produced a number it has no business producing"
+            );
+        }
+        // And the one shape that must still work is unaffected.
+        assert!(compute_safety_number(good, "1234cafe5678abcd1234cafe5678abcd").is_some());
+    }
 }
+
