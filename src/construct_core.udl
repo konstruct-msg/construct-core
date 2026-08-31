@@ -39,6 +39,11 @@ namespace construct_core {
     /// recipient is itself — and passes them in; the decision over the sets is made here.
     /// Empty strings mean "unknown"/"none" for `our_device_id` and `primary_send_covered`.
     sequence<DeliveryTarget> plan_send(sequence<string> recipient_device_ids, sequence<string> own_device_ids, string our_device_id, boolean recipient_is_self, string primary_send_covered);
+
+    // Which of a peer's device sessions an incoming message is tried against, in order.
+    // Empty `preferred_device_id` means no preference. Attempting is non-destructive: a failed
+    // decrypt restores the ratchet snapshot it took before touching anything.
+    sequence<string> plan_receiving_decrypt(sequence<string> session_device_ids, string preferred_device_id);
     
     // Proof of Work functions
     PowSolution compute_pow(string challenge, u32 difficulty);

@@ -2785,6 +2785,17 @@ pub fn plan_send(
     .collect()
 }
 
+/// Which of a peer's device sessions an incoming message is tried against, in order.
+///
+/// See `orchestration::receiving_decrypt_plan` for why this is a core decision and not a client
+/// one, and for why attempting a wrong session is safe.
+pub fn plan_receiving_decrypt(
+    session_device_ids: Vec<String>,
+    preferred_device_id: String,
+) -> Vec<String> {
+    crate::orchestration::plan_receiving_decrypt(&session_device_ids, &preferred_device_id)
+}
+
 /// Mirror of the UDL `ReceivingInitKind` enum (must match UDL name exactly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceivingInitKind {

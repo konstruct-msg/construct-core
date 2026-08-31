@@ -15,6 +15,7 @@
 ///   teardown_plan    — Which of a peer's devices a teardown touches
 ///   receiving_init_plan — Which queued message opens a session, against which device
 ///   send_plan        — Who gets a copy of an outgoing message
+///   receiving_decrypt_plan — Which device session an incoming message is tried against
 ///   orchestrator     — Top-level facade (Phase 5)        [TODO]
 /// ```
 pub mod ack_store;
@@ -25,6 +26,7 @@ pub mod message_router;
 pub mod orchestrator;
 pub mod platform_bridge;
 pub mod pq_contribution;
+pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
 pub mod send_plan;
 pub mod session_lifecycle;
@@ -40,6 +42,7 @@ pub use platform_bridge::PlatformBridge;
 pub use pq_contribution::{
     DeferredContribution, EncapsulationResult, PQContributionManager, SPKRotationPending,
 };
+pub use receiving_decrypt_plan::plan_receiving_decrypt;
 pub use receiving_init_plan::{
     ReceivingInitAttempt, ReceivingInitCarrier, ReceivingInitKind, plan_receiving_init,
     receiving_init_kind,
