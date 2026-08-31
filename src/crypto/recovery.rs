@@ -372,9 +372,17 @@ mod tests {
     fn test_safety_number_declines_an_unreadable_id() {
         let good = "deadbeefcafe1234deadbeefcafe1234";
 
-        assert_eq!(compute_safety_number("abc", good), None, "odd length is not hex");
+        assert_eq!(
+            compute_safety_number("abc", good),
+            None,
+            "odd length is not hex"
+        );
         assert_eq!(compute_safety_number("zzzz", good), None, "not hex at all");
-        assert_eq!(compute_safety_number(good, "abc"), None, "either side, not just the first");
+        assert_eq!(
+            compute_safety_number(good, "abc"),
+            None,
+            "either side, not just the first"
+        );
 
         // The trap the old code fell into: empty decodes cleanly, so it has to be refused by name.
         //
@@ -403,7 +411,10 @@ mod tests {
         let groups: Vec<u32> = sn.split(' ').map(|g| g.parse().unwrap()).collect();
         assert_eq!(groups.len(), 12);
         for g in groups {
-            assert!(g <= 65_535, "{g} is above the u16 range a group is built from");
+            assert!(
+                g <= 65_535,
+                "{g} is above the u16 range a group is built from"
+            );
         }
     }
 
@@ -460,4 +471,3 @@ mod tests {
         assert!(compute_safety_number(good, "1234cafe5678abcd1234cafe5678abcd").is_some());
     }
 }
-
