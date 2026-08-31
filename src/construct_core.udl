@@ -27,6 +27,18 @@ namespace construct_core {
     /// retryable error. Pass the ids the session is addressed by; anything else ranks a
     /// different pair.
     string tie_break_role(string my_id, string peer_id);
+
+    /// Classify a queued message: can it open a receiving session?
+    /// One rule, one implementation — every client asks rather than reimplements. A
+    /// `message_number == 0` with an advanced PQ epoch is shaped like an opener and is not one,
+    /// which is why this is a named function and not an inline check.
+    ReceivingInitKind receiving_init_kind(ReceivingInitCarrier carrier);
+
+    /// Every device that must receive its own ciphertext of an outgoing message.
+    /// The caller owns the account-space facts — whose devices these are, and whether the
+    /// recipient is itself — and passes them in; the decision over the sets is made here.
+    /// Empty strings mean "unknown"/"none" for `our_device_id` and `primary_send_covered`.
+    sequence<DeliveryTarget> plan_send(sequence<string> recipient_device_ids, sequence<string> own_device_ids, string our_device_id, boolean recipient_is_self, string primary_send_covered);
     
     // Proof of Work functions
     PowSolution compute_pow(string challenge, u32 difficulty);
@@ -552,6 +564,62 @@ callback interface PlatformBridge {
 // ── AckCheckResult ────────────────────────────────────────────────────────────
 
 /// Result of checking whether a message has already been processed.
+/// Whose device an outgoing copy is for. A copy to our own device is the pair (me, me), which the
+/// relay already knows; a copy to a peer's device is not, and must be sealed to that device's key.
+enum DeliveryAudience {
+    "Recipient",
+    "OwnReplica",
+};
+
+dictionary DeliveryTarget {
+    string device_id;
+    DeliveryAudience audience;
+};
+
+/// What a queued message is, for the purpose of opening a receiving session.
+enum ReceivingInitKind {
+    /// Carries an X3DH init: this message can open a session.
+    "Handshake",
+    /// Already inside a ratchet. Initialising from it fails and destroys the queue behind it.
+    "MidRatchet",
+    /// `message_number == 0` but a PQ epoch has advanced — a re-keyed continuation, not an opener.
+    "MidSessionLeftover",
+};
+
+/// The wire-visible shape of a queued message, for planning a receiving-session init.
+/// No ciphertext: deciding whether a message *could* open a session must not require its body.
+dictionary ReceivingInitCarrier {
+    u32 message_number;
+    u32 one_time_prekey_id;
+    u32 kem_ciphertext_bytes;
+    u32 pq_message_epoch;
+    boolean is_session_reset_init;
+};
+
+/// One attempt: open carrier `carrier_index` against bundle `bundle_index`.
+/// Indices into the caller's own arrays.
+dictionary ReceivingInitAttempt {
+    u32 carrier_index;
+    u32 bundle_index;
+};
+
+/// What to do about one device when tearing down a session with a peer.
+/// See orchestration::teardown_plan — the decision lives in the core because it is a plan,
+/// and a plan is protocol.
+enum TeardownAction {
+    /// We hold a session with this device: send, then archive ours.
+    "SendAndArchive",
+    /// No session of ours, but the peer is demonstrably still on one — send, archive nothing.
+    "SendOnly",
+    /// Nothing to condemn, no evidence anyone is on a dead session — say nothing.
+    "Skip",
+};
+
+dictionary TeardownDecision {
+    string device_id;
+    TeardownAction action;
+};
+
 enum AckCheckResult {
     /// Definitely a duplicate — found in the in-memory cache.
     "InCache",
@@ -797,6 +865,16 @@ interface OrchestratorCore {
     string import_session(string contact_id, sequence<u8> data);
 
     sequence<string> get_all_session_contact_ids();
+
+    /// Which of `candidate_device_ids` a teardown goes to, and what to do with each.
+    /// The caller passes the device set (it owns the account→devices translation, which this
+    /// crate deliberately cannot do); the decision over the set is made here.
+    sequence<TeardownDecision> plan_teardown(sequence<string> candidate_device_ids, boolean peer_on_dead_session);
+
+    /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
+    /// Both dimensions vary: fixing the carrier and rotating only the bundle finds the session
+    /// only if the right carrier was guessed, and a wrong guess looks exactly like a broken bundle.
+    sequence<ReceivingInitAttempt> plan_receiving_init(sequence<ReceivingInitCarrier> carriers, u32 bundle_count);
 
     boolean has_session(string contact_id);
 

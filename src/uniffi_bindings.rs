@@ -2739,6 +2739,134 @@ impl RustAckStore {
     }
 }
 
+/// Mirror of the UDL `DeliveryAudience` enum (must match UDL name exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryAudience {
+    Recipient,
+    OwnReplica,
+}
+
+/// Mirror of the UDL `DeliveryTarget` dictionary.
+#[derive(Debug, Clone)]
+pub struct DeliveryTarget {
+    pub device_id: String,
+    pub audience: DeliveryAudience,
+}
+
+impl From<crate::orchestration::DeliveryAudience> for DeliveryAudience {
+    fn from(a: crate::orchestration::DeliveryAudience) -> Self {
+        match a {
+            crate::orchestration::DeliveryAudience::Recipient => DeliveryAudience::Recipient,
+            crate::orchestration::DeliveryAudience::OwnReplica => DeliveryAudience::OwnReplica,
+        }
+    }
+}
+
+/// Who gets a copy of an outgoing message — the one implementation every client asks.
+pub fn plan_send(
+    recipient_device_ids: Vec<String>,
+    own_device_ids: Vec<String>,
+    our_device_id: String,
+    recipient_is_self: bool,
+    primary_send_covered: String,
+) -> Vec<DeliveryTarget> {
+    crate::orchestration::plan_send(
+        &recipient_device_ids,
+        &own_device_ids,
+        &our_device_id,
+        recipient_is_self,
+        &primary_send_covered,
+    )
+    .into_iter()
+    .map(|t| DeliveryTarget {
+        device_id: t.device_id,
+        audience: t.audience.into(),
+    })
+    .collect()
+}
+
+/// Mirror of the UDL `ReceivingInitKind` enum (must match UDL name exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceivingInitKind {
+    Handshake,
+    MidRatchet,
+    MidSessionLeftover,
+}
+
+impl From<crate::orchestration::ReceivingInitKind> for ReceivingInitKind {
+    fn from(k: crate::orchestration::ReceivingInitKind) -> Self {
+        match k {
+            crate::orchestration::ReceivingInitKind::Handshake => ReceivingInitKind::Handshake,
+            crate::orchestration::ReceivingInitKind::MidRatchet => ReceivingInitKind::MidRatchet,
+            crate::orchestration::ReceivingInitKind::MidSessionLeftover => {
+                ReceivingInitKind::MidSessionLeftover
+            }
+        }
+    }
+}
+
+/// Classify a queued message — the one implementation every client asks.
+pub fn receiving_init_kind(carrier: ReceivingInitCarrier) -> ReceivingInitKind {
+    crate::orchestration::receiving_init_kind(&(&carrier).into()).into()
+}
+
+/// Mirror of the UDL `ReceivingInitCarrier` dictionary — the wire-visible shape of a queued
+/// message, with no ciphertext: planning must not require holding the body.
+#[derive(Debug, Clone)]
+pub struct ReceivingInitCarrier {
+    pub message_number: u32,
+    pub one_time_prekey_id: u32,
+    pub kem_ciphertext_bytes: u32,
+    pub pq_message_epoch: u32,
+    pub is_session_reset_init: bool,
+}
+
+/// Mirror of the UDL `ReceivingInitAttempt` dictionary — indices into the caller's own arrays.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceivingInitAttempt {
+    pub carrier_index: u32,
+    pub bundle_index: u32,
+}
+
+impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier {
+    fn from(c: &ReceivingInitCarrier) -> Self {
+        crate::orchestration::ReceivingInitCarrier {
+            message_number: c.message_number,
+            one_time_prekey_id: c.one_time_prekey_id,
+            kem_ciphertext_bytes: c.kem_ciphertext_bytes,
+            pq_message_epoch: c.pq_message_epoch,
+            is_session_reset_init: c.is_session_reset_init,
+        }
+    }
+}
+
+/// Mirror of the UDL `TeardownAction` enum (must match UDL name exactly).
+///
+/// See `orchestration::teardown_plan` for why the decision is made here rather than in a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownAction {
+    SendAndArchive,
+    SendOnly,
+    Skip,
+}
+
+/// Mirror of the UDL `TeardownDecision` dictionary.
+#[derive(Debug, Clone)]
+pub struct TeardownDecision {
+    pub device_id: String,
+    pub action: TeardownAction,
+}
+
+impl From<crate::orchestration::TeardownAction> for TeardownAction {
+    fn from(a: crate::orchestration::TeardownAction) -> Self {
+        match a {
+            crate::orchestration::TeardownAction::SendAndArchive => TeardownAction::SendAndArchive,
+            crate::orchestration::TeardownAction::SendOnly => TeardownAction::SendOnly,
+            crate::orchestration::TeardownAction::Skip => TeardownAction::Skip,
+        }
+    }
+}
+
 /// Mirror of the UDL `AckCheckResult` enum (must match UDL name exactly).
 pub enum AckCheckResult {
     InCache,
@@ -3115,9 +3243,56 @@ impl OrchestratorCore {
         orch.get_all_session_contact_ids()
     }
 
+    /// Which of `candidate_device_ids` a session teardown goes to, and what to do with each.
+    ///
+    /// The caller translates its own id space into the device set and passes the set; the decision
+    /// over it is made here, because "which sessions does this operation touch" is protocol and a
+    /// client that answers it answers it differently from the next client. See
+    /// `orchestration::teardown_plan`.
+    pub fn plan_teardown(
+        &self,
+        candidate_device_ids: Vec<String>,
+        peer_on_dead_session: bool,
+    ) -> Vec<TeardownDecision> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let active = orch.get_all_session_contact_ids();
+        crate::orchestration::plan_teardown(&candidate_device_ids, &active, peer_on_dead_session)
+            .into_iter()
+            .map(|d| TeardownDecision {
+                device_id: d.device_id,
+                action: d.action.into(),
+            })
+            .collect()
+    }
+
     pub fn has_session(&self, contact_id: String) -> bool {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.has_active_session(&contact_id)
+    }
+
+    /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
+    ///
+    /// Both dimensions vary. A caller that fixes the carrier and rotates only the bundle — which is
+    /// what the iOS client did — can only find the session if it happened to fix the right carrier,
+    /// and a wrong guess is indistinguishable from a broken bundle. See
+    /// `orchestration::receiving_init_plan`.
+    ///
+    /// Pure: no key material is touched and no state changes. The caller executes the attempts with
+    /// `init_receiving_session` and stops at the first that succeeds.
+    pub fn plan_receiving_init(
+        &self,
+        carriers: Vec<ReceivingInitCarrier>,
+        bundle_count: u32,
+    ) -> Vec<ReceivingInitAttempt> {
+        let mapped: Vec<crate::orchestration::ReceivingInitCarrier> =
+            carriers.iter().map(Into::into).collect();
+        crate::orchestration::plan_receiving_init(&mapped, bundle_count)
+            .into_iter()
+            .map(|a| ReceivingInitAttempt {
+                carrier_index: a.carrier_index,
+                bundle_index: a.bundle_index,
+            })
+            .collect()
     }
 
     pub fn init_session(
