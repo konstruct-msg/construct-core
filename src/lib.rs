@@ -8,7 +8,8 @@
 /// Which build this is, readable from the shipped library and nothing else.
 ///
 /// The Android README has told integrators to identify a build by running
-/// `strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION` since the
+/// `strings -a libconstruct_core.so | grep -o 'CONSTRUCT_CORE_VERSION=[^ ]*'`
+/// since the
 /// pipeline was written, and until this static existed that command printed
 /// nothing — an instruction whose reader had no producer.
 ///
