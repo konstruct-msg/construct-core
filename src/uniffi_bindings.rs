@@ -4146,22 +4146,61 @@ pub fn sealed_seal_sender_cert(
     cert_bytes: Vec<u8>,
     recipient_identity_key: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::seal_sender_cert(&cert_bytes, &recipient_identity_key).map_err(
-        |e| CryptoError::EncryptionFailed {
+    crate::crypto::sealed_sender::seal_to_x25519_public(&cert_bytes, &recipient_identity_key)
+        .map_err(|e| CryptoError::EncryptionFailed {
             message: e.to_string(),
-        },
-    )
+        })
 }
 
 pub fn sealed_unseal_sender_cert(
     sealed_box: Vec<u8>,
     our_identity_priv: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::unseal_sender_cert(&sealed_box, &our_identity_priv).map_err(|e| {
-        CryptoError::DecryptionFailed {
+    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
+        |e| CryptoError::DecryptionFailed {
             message: e.to_string(),
-        }
-    })
+        },
+    )
+}
+
+/// Seal a device's own metadata to one of its account's devices.
+///
+/// Same box and the same implementation as `sealed_seal_sender_cert` — deliberately, because
+/// the format is bit-compatible with the CryptoKit code on iOS and a second copy that drifted
+/// would produce boxes that open on one platform and not the other. Two names because there
+/// are two purposes, and a name that describes one of them is wrong on the other.
+///
+/// The account has no shared key: every device holds its own X25519 identity pair and nothing
+/// is established between them at link time. So a device's metadata is sealed once per sibling
+/// and the copies are stored together. That costs a copy per device — units of them — and buys
+/// the property a shared key could not: a revoked device stops being sealed to on the next
+/// re-seal, rather than keeping the ability to read until someone rotates a key.
+pub fn seal_to_device_key(
+    plaintext: Vec<u8>,
+    device_identity_key: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::seal_to_x25519_public(&plaintext, &device_identity_key).map_err(
+        |e| CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        },
+    )
+}
+
+/// Open one of those copies with this device's X25519 identity private key.
+///
+/// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying each.
+/// That is the intended use, not a fallback: the stored blob carries no recipient labels, on
+/// purpose — the server promised not to parse it, and a field that makes parsing convenient is
+/// an invitation to start.
+pub fn open_with_device_key(
+    sealed_box: Vec<u8>,
+    our_identity_priv: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
+        |e| CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

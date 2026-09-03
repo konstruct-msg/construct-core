@@ -1,8 +1,8 @@
 /// ConstructSEALED — sealed sender box + sender-certificate verification
 /// (stealth-sealed-sender-v2 Phase 5: one implementation for both platforms).
 ///
-/// Send:   seal(cert_bytes, recipient_identity_pub)  → box
-/// Recv:   unseal(box, our_identity_priv)            → cert_bytes
+/// Send:   seal_to_x25519_public(plaintext, recipient_pub) → box
+/// Recv:   open_with_x25519_secret(box, our_secret)         → plaintext
 /// Verify: Ed25519(bundle key from well-known) over the variant-0 payload
 ///
 /// Box wire format (bit-compatible with the iOS CryptoKit implementation in
@@ -50,14 +50,23 @@ fn as_key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CryptoError> {
     })
 }
 
-/// Seal `cert_bytes` (serialized SenderCertificate proto — opaque here) to the
-/// recipient's X25519 identity public key.
-pub fn seal_sender_cert(
-    cert_bytes: &[u8],
-    recipient_identity_key: &[u8],
+/// Seal arbitrary bytes to an X25519 public key, anonymously.
+///
+/// Named for what it does rather than for its first caller. It has two now — a sender
+/// certificate on its way to a recipient, and a device's own metadata on its way to that
+/// device's siblings — and neither is described by the other's name. There is one
+/// implementation and there must stay one: the box is bit-compatible with the CryptoKit
+/// code in `StealthSenderService.swift`, and a second copy of this that drifted would
+/// produce boxes that open on one platform and not the other.
+///
+/// The recipient is not authenticated, and the sender is not identified: an ephemeral key
+/// is generated per box, so nothing links two boxes to one sender. Anything that needs to
+/// know *who* sealed it carries that inside the plaintext, as the sender certificate does.
+pub fn seal_to_x25519_public(
+    plaintext: &[u8],
+    recipient_public: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let recipient_pub =
-        PublicKey::from(as_key32(recipient_identity_key, "recipient identity key")?);
+    let recipient_pub = PublicKey::from(as_key32(recipient_public, "recipient public key")?);
 
     let mut eph_seed = [0u8; 32];
     OsRng.fill_bytes(&mut eph_seed);
@@ -72,8 +81,8 @@ pub fn seal_sender_cert(
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let ct_and_tag = cipher
-        .encrypt(Nonce::from_slice(&nonce), cert_bytes)
-        .map_err(|_| CryptoError::AeadEncryptionError("sealed sender seal failed".into()))?;
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|_| CryptoError::AeadEncryptionError("sealed box seal failed".into()))?;
 
     let mut boxed = Vec::with_capacity(EPH_LEN + NONCE_LEN + ct_and_tag.len());
     boxed.extend_from_slice(ephemeral_pub.as_bytes());
@@ -82,11 +91,15 @@ pub fn seal_sender_cert(
     Ok(boxed)
 }
 
-/// Open a sealed box with our X25519 identity private key. Returns the
-/// serialized SenderCertificate bytes (caller parses the proto).
-pub fn unseal_sender_cert(
+/// Open a sealed box with our X25519 private key. Returns the plaintext.
+///
+/// A box that was not sealed to this key fails the AEAD tag and returns an error — which is
+/// also how a caller holding several boxes finds the one that is its own, by trying each.
+/// That is a supported use: an X25519 and a ChaCha20-Poly1305 open per box, over units of
+/// devices.
+pub fn open_with_x25519_secret(
     sealed_box: &[u8],
-    our_identity_priv: &[u8],
+    our_secret: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     if sealed_box.len() < EPH_LEN + NONCE_LEN + TAG_LEN {
         return Err(CryptoError::InvalidInputError(format!(
@@ -99,14 +112,14 @@ pub fn unseal_sender_cert(
     let nonce = &sealed_box[EPH_LEN..EPH_LEN + NONCE_LEN];
     let ct_and_tag = &sealed_box[EPH_LEN + NONCE_LEN..];
 
-    let our_priv = StaticSecret::from(as_key32(our_identity_priv, "identity private key")?);
+    let our_priv = StaticSecret::from(as_key32(our_secret, "private key")?);
     let shared = our_priv.diffie_hellman(&ephemeral_pub);
     let key = derive_key(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
         .decrypt(Nonce::from_slice(nonce), ct_and_tag)
-        .map_err(|_| CryptoError::AeadDecryptionError("sealed sender unseal failed".into()))
+        .map_err(|_| CryptoError::AeadDecryptionError("sealed box open failed".into()))
 }
 
 /// Variant-0 certificate sign payload (Phase 3.4 canonical format).
@@ -185,11 +198,11 @@ mod tests {
         let (recipient_priv, recipient_pub) = keypair();
         let cert = b"serialized sender certificate stand-in";
 
-        let boxed = seal_sender_cert(cert, recipient_pub.as_bytes()).unwrap();
+        let boxed = seal_to_x25519_public(cert, recipient_pub.as_bytes()).unwrap();
         assert_eq!(&boxed[..], &boxed[..]); // structural sanity
         assert!(boxed.len() >= EPH_LEN + NONCE_LEN + TAG_LEN);
 
-        let opened = unseal_sender_cert(&boxed, &recipient_priv).unwrap();
+        let opened = open_with_x25519_secret(&boxed, &recipient_priv).unwrap();
         assert_eq!(opened, cert);
     }
 
@@ -198,24 +211,25 @@ mod tests {
         let (_, recipient_pub) = keypair();
         let (other_priv, _) = keypair();
 
-        let boxed = seal_sender_cert(b"cert", recipient_pub.as_bytes()).unwrap();
-        assert!(unseal_sender_cert(&boxed, &other_priv).is_err());
+        let boxed = seal_to_x25519_public(b"cert", recipient_pub.as_bytes()).unwrap();
+        assert!(open_with_x25519_secret(&boxed, &other_priv).is_err());
     }
 
     #[test]
     fn unseal_rejects_tampered_box() {
         let (recipient_priv, recipient_pub) = keypair();
-        let mut boxed = seal_sender_cert(b"cert", recipient_pub.as_bytes()).unwrap();
+        let mut boxed = seal_to_x25519_public(b"cert", recipient_pub.as_bytes()).unwrap();
         let last = boxed.len() - 1;
         boxed[last] ^= 0x01;
-        assert!(unseal_sender_cert(&boxed, &recipient_priv).is_err());
+        assert!(open_with_x25519_secret(&boxed, &recipient_priv).is_err());
     }
 
     #[test]
     fn unseal_rejects_truncated_box() {
         let (recipient_priv, _) = keypair();
         assert!(
-            unseal_sender_cert(&[0u8; EPH_LEN + NONCE_LEN + TAG_LEN - 1], &recipient_priv).is_err()
+            open_with_x25519_secret(&[0u8; EPH_LEN + NONCE_LEN + TAG_LEN - 1], &recipient_priv)
+                .is_err()
         );
     }
 
@@ -234,7 +248,7 @@ mod tests {
              72b3475d1a9738db80c8772dd5ad864f",
         );
 
-        let opened = unseal_sender_cert(&boxed, &recipient_priv).unwrap();
+        let opened = open_with_x25519_secret(&boxed, &recipient_priv).unwrap();
         assert_eq!(
             opened,
             b"ConstructSEALED cross-impl test vector: serialized cert stand-in"
@@ -337,5 +351,66 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    // ── Sealing a device's metadata to its account's devices ──────────────────
+
+    /// **The property the per-device design was chosen for.** Every device of the account
+    /// opens its own copy, and only its own; a fourth key opens none of them. A shared
+    /// directory key would give the same reading to a device that had been revoked, until
+    /// someone rotated it — this design revokes by leaving a device out of the next re-seal.
+    #[test]
+    fn each_device_opens_its_own_copy_and_no_other() {
+        let devices: Vec<_> = (0..3).map(|_| keypair()).collect();
+        let (stranger_priv, _) = keypair();
+        let metadata = b"name=MacBook;platform=desktop";
+
+        let copies: Vec<Vec<u8>> = devices
+            .iter()
+            .map(|(_, pubk)| seal_to_x25519_public(metadata, pubk.as_bytes()).unwrap())
+            .collect();
+
+        for (i, (secret, _)) in devices.iter().enumerate() {
+            let opened: Vec<_> = copies
+                .iter()
+                .filter_map(|c| open_with_x25519_secret(c, secret).ok())
+                .collect();
+            assert_eq!(
+                opened.len(),
+                1,
+                "device {i} must open exactly one copy — it opened {}",
+                opened.len()
+            );
+            assert_eq!(opened[0], metadata);
+        }
+
+        assert!(
+            copies
+                .iter()
+                .all(|c| open_with_x25519_secret(c, &stranger_priv).is_err()),
+            "a key outside the account opened a copy"
+        );
+    }
+
+    /// Trying every copy is the intended way to find your own, so a failure to open must be
+    /// an ordinary error and never a panic — the caller runs this over every copy in the blob.
+    #[test]
+    fn a_copy_for_someone_else_fails_without_panicking() {
+        let (_, theirs) = keypair();
+        let (our_priv, _) = keypair();
+        let boxed = seal_to_x25519_public(b"not for us", theirs.as_bytes()).unwrap();
+        assert!(open_with_x25519_secret(&boxed, &our_priv).is_err());
+    }
+
+    /// Two seals of the same bytes to the same device must differ: the ephemeral key and the
+    /// nonce are fresh per box. Equal boxes would let the server see that a device's metadata
+    /// had not changed between two re-seals, which is exactly the kind of thing a blob it
+    /// promised not to parse should not tell it.
+    #[test]
+    fn two_seals_of_one_value_are_not_equal() {
+        let (_, pubk) = keypair();
+        let a = seal_to_x25519_public(b"name=iPhone", pubk.as_bytes()).unwrap();
+        let b = seal_to_x25519_public(b"name=iPhone", pubk.as_bytes()).unwrap();
+        assert_ne!(a, b);
     }
 }

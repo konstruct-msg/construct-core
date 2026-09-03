@@ -1071,6 +1071,33 @@ namespace construct_core {
         sequence<u8> our_identity_priv
     );
 
+    // ── Device metadata (sealed device directory) ────────────────────────────
+
+    /// Seal a device's own metadata to one of its account's devices.
+    ///
+    /// Same box as `sealed_seal_sender_cert` and the same implementation — two names because
+    /// there are two purposes, and a name describing one is wrong on the other.
+    ///
+    /// The account has no shared key: every device holds its own X25519 identity pair, and
+    /// linking establishes nothing between them. So metadata is sealed once per sibling and
+    /// the copies stored together — a copy per device, units of them, and in exchange a
+    /// revoked device stops being sealed to on the next re-seal instead of keeping the
+    /// ability to read until a key is rotated.
+    [Throws=CryptoError]
+    sequence<u8> seal_to_device_key(
+        sequence<u8> plaintext,
+        sequence<u8> device_identity_key
+    );
+
+    /// Open one of those copies with this device's X25519 identity private key.
+    /// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying
+    /// each — the intended use, because the stored blob carries no recipient labels.
+    [Throws=CryptoError]
+    sequence<u8> open_with_device_key(
+        sequence<u8> sealed_box,
+        sequence<u8> our_identity_priv
+    );
+
     /// Verify the server Ed25519 signature over a SenderCertificate's fields
     /// (variant-0 payload: user_id || domain || identity_key || device_id ||
     /// BE64(issued_at) || BE64(expires_at) — no separators).
