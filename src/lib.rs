@@ -5,6 +5,29 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(unsafe_attr_outside_unsafe)] // Allow UniFFI generated code
 
+/// Which build this is, readable from the shipped library and nothing else.
+///
+/// The Android README has told integrators to identify a build by running
+/// `strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION` since the
+/// pipeline was written, and until this static existed that command printed
+/// nothing — an instruction whose reader had no producer.
+///
+/// It has to be *inside* the library. The install step copies `jniLibs/` and
+/// the Kotlin file into the app and leaves the archive behind, so a README, a
+/// release note or a sibling `VERSION` file does not travel with the `.so` that
+/// ends up in a build. And the rolling `latest` release republishes one URL on
+/// every push to main, so two downloads are otherwise indistinguishable.
+///
+/// `#[used]` because nothing in this crate reads it: the reader is `strings`,
+/// and without it the linker is free to drop a static no code references.
+#[used]
+pub static CONSTRUCT_CORE_VERSION: &str = concat!(
+    "CONSTRUCT_CORE_VERSION=",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("CONSTRUCT_CORE_COMMIT")
+);
+
 // Core modules (platform-independent)
 pub mod api;
 pub mod cfe;
