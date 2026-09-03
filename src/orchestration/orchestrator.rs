@@ -19,7 +19,7 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
-use crate::orchestration::message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision};
+use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -1608,13 +1608,9 @@ impl Orchestrator {
                     }];
                 }
                 self.set_cooldown(cid.clone());
-                let role_str = match role {
-                    Role::Initiator => "Initiator",
-                    Role::Responder => "Responder",
-                };
                 vec![Action::SessionHealNeeded {
                     contact_id: cid,
-                    role: role_str.to_string(),
+                    role: role.as_wire().to_string(),
                 }]
             }
             other => self.decision_to_actions(other, &contact_id),
@@ -1702,13 +1698,9 @@ impl Orchestrator {
                     ];
                 }
                 self.set_cooldown(cid.clone());
-                let role_str = match role {
-                    Role::Initiator => "Initiator",
-                    Role::Responder => "Responder",
-                };
                 vec![Action::SessionHealNeeded {
                     contact_id: cid,
-                    role: role_str.to_string(),
+                    role: role.as_wire().to_string(),
                 }]
             }
             RoutingDecision::EndSessionNeeded {

@@ -39,6 +39,32 @@
 - When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
 - Prefer passing `bytes` (sequence<u8>) or `string` for complex data to ensure compatibility across languages.
 
+**If two clients must agree on it, this crate must export it — not describe it.** There are two
+clients now (`construct-messenger`, `construct-tui`) and Android is coming. Anything a client would
+otherwise reimplement is a decision that will diverge, and divergence here is silent: the copy is
+dropped as foreign, the message never appears, and neither side can say which one is right. The
+`content_type` split between iOS and the TUI was found by comparing tables, not by a failure.
+
+So a rule the clients must follow is not documentation — it is a missing export. If you find
+yourself writing "the client must compute X the same way", export X.
+
+**What belongs here, restated for the receiving end** (the clients carry the mirror of this in their
+own `AGENTS.md`): anything two clients must compute identically, anything that reads or writes
+ratchet/session state, and **any plan** — "which sessions does this operation touch". A plan is
+protocol, not presentation, and it is the category clients rebuild most often, because they hold the
+list the plan iterates and it feels local.
+
+**What deliberately does not belong here:** `ServerUserId`. This crate speaks `CryptoDeviceId` only
+(`contact_id` everywhere; `set_local_user_id` is the one seam), and that stays. The consequence is a
+shape to keep in mind when designing an API: **take a set of device ids, return a decision over
+it.** A client that translates `account → devices` before calling is doing its own job; a client
+that must then also decide *which* of them to act on has been handed a job this crate should have
+done, and the next client will do it differently.
+
+Before adding an API, check it is not already there under another name. `derive_device_id`,
+`tie_break_role`, `get_all_session_contact_ids` and `get_session_health` all exist, and each has
+been reimplemented or ignored client-side at least once.
+
 ### 4. Serialization
 - Use **Postcard** for internal binary storage (CFE).
 - Use **Serde JSON** only for legacy compatibility or human-readable exports.

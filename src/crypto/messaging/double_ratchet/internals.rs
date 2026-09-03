@@ -528,6 +528,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         encrypted: &EncryptedRatchetMessage,
         ad_version: u8,
     ) -> Result<Vec<u8>, String> {
+        use super::storage::id_prefix;
         use tracing::debug;
 
         // Reconstruct Associated Data: must mirror encrypt() exactly.
@@ -553,11 +554,15 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             associated_data.extend_from_slice(&encrypted.pq_message_epoch.to_be_bytes());
         }
 
-        tracing::info!(
+        // Prefixes, at debug — the failure branch below is deliberately limited to lengths, and
+        // this line used to write all three identifiers in full at info level. One function, one
+        // convention: enough to correlate a session across lines, not enough to be a record of who
+        // spoke to whom in a log the user can export from Settings.
+        debug!(
             target: "crypto::double_ratchet",
-            local_user_id = %self.local_user_id,
-            contact_id = %self.contact_id,
-            session_id = %self.session_id,
+            local_user_id = %id_prefix(&self.local_user_id),
+            contact_id = %id_prefix(&self.contact_id),
+            session_id = %id_prefix(&self.session_id),
             msg_num = %encrypted.message_number,
             ad_version = %ad_version,
             dh_pub_prefix = %hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
@@ -572,9 +577,16 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             Some(&associated_data),
         )
         .map_err(|e| {
-            // Privacy-safe diagnostic: log field lengths, not values.
-            // A local_user_id/contact_id format mismatch (e.g. 32-char device-hash
-            // vs 36-char server UUID) shows up immediately as an AD length difference.
+            // Privacy-safe diagnostic: log field lengths, not values. A local_user_id/contact_id
+            // mismatch in *kind* shows up immediately as a length difference, and the lengths are
+            // the whole diagnosis: 32 is a device id, 36 an account UUID.
+            //
+            // This advice said the opposite until 2026-08-26 — "both must be server UUIDs
+            // (36 chars); a 32-char device-hash on either side will produce a permanent AD
+            // mismatch". That was correct when it was written and was inverted by the flip to
+            // device addressing, which changed what belongs in these fields without touching this
+            // line. A stale diagnostic is worse than none: it is read exactly when someone is
+            // already lost, and it sends them the wrong way.
             tracing::error!(
                 target: "crypto::double_ratchet",
                 local_user_id_len = %self.local_user_id.len(),
@@ -582,9 +594,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 ad_total_len = %associated_data.len(),
                 ad_version = %ad_version,
                 msg_num = %encrypted.message_number,
-                "AEAD decryption failed — check that local_user_id and contact_id \
-                 are both server UUIDs (36 chars); a 32-char device-hash on either \
-                 side will produce a permanent AD mismatch"
+                "AEAD decryption failed — local_user_id and contact_id must both be crypto \
+                 device ids (32 hex chars). A 36-char account UUID on either side is a \
+                 permanent AD mismatch: the two sides are naming different pairs"
             );
             format!("Decryption failed: {}", e)
         })?;

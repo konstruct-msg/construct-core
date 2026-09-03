@@ -2425,11 +2425,26 @@ pub fn format_federated_id(device_id: String, server_hostname: String) -> String
     crate::device_id::format_federated_id(&device_id, &server_hostname)
 }
 
+/// Which side opens the session when both try at once.
+///
+/// The platform used to carry its own copy of this rule (`SessionReducer.tieBreakRole`) under a
+/// comment promising it matched the core byte-for-byte. The addressing flip broke that promise
+/// without touching either line: the core began ranking device ids while the platform still
+/// ranked account ids, so the two compared *different pairs* and agreed only by coincidence —
+/// and a disagreement here is both-initiator or both-responder, a permanent deadlock.
+///
+/// Returns the same spelling the `SessionHealNeeded` action carries.
+pub fn tie_break_role(my_id: String, peer_id: String) -> String {
+    crate::orchestration::tie_break_role(&my_id, &peer_id)
+        .as_wire()
+        .to_string()
+}
+
 /// Compute a Safety Number for two Construct devices.
 ///
 /// Returns a 60-digit string (12 groups of 5, space-separated) that both parties
 /// can compare verbally or via QR to verify no MITM has occurred.
-pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> String {
+pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> Option<String> {
     crate::crypto::recovery::compute_safety_number(&my_device_id, &their_device_id)
 }
 
@@ -2721,6 +2736,145 @@ impl RustAckStore {
     pub fn cache_len(&self) -> u64 {
         let store = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         store.cache_len() as u64
+    }
+}
+
+/// Mirror of the UDL `DeliveryAudience` enum (must match UDL name exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryAudience {
+    Recipient,
+    OwnReplica,
+}
+
+/// Mirror of the UDL `DeliveryTarget` dictionary.
+#[derive(Debug, Clone)]
+pub struct DeliveryTarget {
+    pub device_id: String,
+    pub audience: DeliveryAudience,
+}
+
+impl From<crate::orchestration::DeliveryAudience> for DeliveryAudience {
+    fn from(a: crate::orchestration::DeliveryAudience) -> Self {
+        match a {
+            crate::orchestration::DeliveryAudience::Recipient => DeliveryAudience::Recipient,
+            crate::orchestration::DeliveryAudience::OwnReplica => DeliveryAudience::OwnReplica,
+        }
+    }
+}
+
+/// Who gets a copy of an outgoing message — the one implementation every client asks.
+pub fn plan_send(
+    recipient_device_ids: Vec<String>,
+    own_device_ids: Vec<String>,
+    our_device_id: String,
+    recipient_is_self: bool,
+    primary_send_covered: String,
+) -> Vec<DeliveryTarget> {
+    crate::orchestration::plan_send(
+        &recipient_device_ids,
+        &own_device_ids,
+        &our_device_id,
+        recipient_is_self,
+        &primary_send_covered,
+    )
+    .into_iter()
+    .map(|t| DeliveryTarget {
+        device_id: t.device_id,
+        audience: t.audience.into(),
+    })
+    .collect()
+}
+
+/// Which of a peer's device sessions an incoming message is tried against, in order.
+///
+/// See `orchestration::receiving_decrypt_plan` for why this is a core decision and not a client
+/// one, and for why attempting a wrong session is safe.
+pub fn plan_receiving_decrypt(
+    session_device_ids: Vec<String>,
+    preferred_device_id: String,
+) -> Vec<String> {
+    crate::orchestration::plan_receiving_decrypt(&session_device_ids, &preferred_device_id)
+}
+
+/// Mirror of the UDL `ReceivingInitKind` enum (must match UDL name exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceivingInitKind {
+    Handshake,
+    MidRatchet,
+    MidSessionLeftover,
+}
+
+impl From<crate::orchestration::ReceivingInitKind> for ReceivingInitKind {
+    fn from(k: crate::orchestration::ReceivingInitKind) -> Self {
+        match k {
+            crate::orchestration::ReceivingInitKind::Handshake => ReceivingInitKind::Handshake,
+            crate::orchestration::ReceivingInitKind::MidRatchet => ReceivingInitKind::MidRatchet,
+            crate::orchestration::ReceivingInitKind::MidSessionLeftover => {
+                ReceivingInitKind::MidSessionLeftover
+            }
+        }
+    }
+}
+
+/// Classify a queued message — the one implementation every client asks.
+pub fn receiving_init_kind(carrier: ReceivingInitCarrier) -> ReceivingInitKind {
+    crate::orchestration::receiving_init_kind(&(&carrier).into()).into()
+}
+
+/// Mirror of the UDL `ReceivingInitCarrier` dictionary — the wire-visible shape of a queued
+/// message, with no ciphertext: planning must not require holding the body.
+#[derive(Debug, Clone)]
+pub struct ReceivingInitCarrier {
+    pub message_number: u32,
+    pub one_time_prekey_id: u32,
+    pub kem_ciphertext_bytes: u32,
+    pub pq_message_epoch: u32,
+    pub is_session_reset_init: bool,
+}
+
+/// Mirror of the UDL `ReceivingInitAttempt` dictionary — indices into the caller's own arrays.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceivingInitAttempt {
+    pub carrier_index: u32,
+    pub bundle_index: u32,
+}
+
+impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier {
+    fn from(c: &ReceivingInitCarrier) -> Self {
+        crate::orchestration::ReceivingInitCarrier {
+            message_number: c.message_number,
+            one_time_prekey_id: c.one_time_prekey_id,
+            kem_ciphertext_bytes: c.kem_ciphertext_bytes,
+            pq_message_epoch: c.pq_message_epoch,
+            is_session_reset_init: c.is_session_reset_init,
+        }
+    }
+}
+
+/// Mirror of the UDL `TeardownAction` enum (must match UDL name exactly).
+///
+/// See `orchestration::teardown_plan` for why the decision is made here rather than in a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownAction {
+    SendAndArchive,
+    SendOnly,
+    Skip,
+}
+
+/// Mirror of the UDL `TeardownDecision` dictionary.
+#[derive(Debug, Clone)]
+pub struct TeardownDecision {
+    pub device_id: String,
+    pub action: TeardownAction,
+}
+
+impl From<crate::orchestration::TeardownAction> for TeardownAction {
+    fn from(a: crate::orchestration::TeardownAction) -> Self {
+        match a {
+            crate::orchestration::TeardownAction::SendAndArchive => TeardownAction::SendAndArchive,
+            crate::orchestration::TeardownAction::SendOnly => TeardownAction::SendOnly,
+            crate::orchestration::TeardownAction::Skip => TeardownAction::Skip,
+        }
     }
 }
 
@@ -3100,9 +3254,56 @@ impl OrchestratorCore {
         orch.get_all_session_contact_ids()
     }
 
+    /// Which of `candidate_device_ids` a session teardown goes to, and what to do with each.
+    ///
+    /// The caller translates its own id space into the device set and passes the set; the decision
+    /// over it is made here, because "which sessions does this operation touch" is protocol and a
+    /// client that answers it answers it differently from the next client. See
+    /// `orchestration::teardown_plan`.
+    pub fn plan_teardown(
+        &self,
+        candidate_device_ids: Vec<String>,
+        peer_on_dead_session: bool,
+    ) -> Vec<TeardownDecision> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let active = orch.get_all_session_contact_ids();
+        crate::orchestration::plan_teardown(&candidate_device_ids, &active, peer_on_dead_session)
+            .into_iter()
+            .map(|d| TeardownDecision {
+                device_id: d.device_id,
+                action: d.action.into(),
+            })
+            .collect()
+    }
+
     pub fn has_session(&self, contact_id: String) -> bool {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.has_active_session(&contact_id)
+    }
+
+    /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
+    ///
+    /// Both dimensions vary. A caller that fixes the carrier and rotates only the bundle — which is
+    /// what the iOS client did — can only find the session if it happened to fix the right carrier,
+    /// and a wrong guess is indistinguishable from a broken bundle. See
+    /// `orchestration::receiving_init_plan`.
+    ///
+    /// Pure: no key material is touched and no state changes. The caller executes the attempts with
+    /// `init_receiving_session` and stops at the first that succeeds.
+    pub fn plan_receiving_init(
+        &self,
+        carriers: Vec<ReceivingInitCarrier>,
+        bundle_count: u32,
+    ) -> Vec<ReceivingInitAttempt> {
+        let mapped: Vec<crate::orchestration::ReceivingInitCarrier> =
+            carriers.iter().map(Into::into).collect();
+        crate::orchestration::plan_receiving_init(&mapped, bundle_count)
+            .into_iter()
+            .map(|a| ReceivingInitAttempt {
+                carrier_index: a.carrier_index,
+                bundle_index: a.bundle_index,
+            })
+            .collect()
     }
 
     pub fn init_session(
@@ -3945,22 +4146,61 @@ pub fn sealed_seal_sender_cert(
     cert_bytes: Vec<u8>,
     recipient_identity_key: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::seal_sender_cert(&cert_bytes, &recipient_identity_key).map_err(
-        |e| CryptoError::EncryptionFailed {
+    crate::crypto::sealed_sender::seal_to_x25519_public(&cert_bytes, &recipient_identity_key)
+        .map_err(|e| CryptoError::EncryptionFailed {
             message: e.to_string(),
-        },
-    )
+        })
 }
 
 pub fn sealed_unseal_sender_cert(
     sealed_box: Vec<u8>,
     our_identity_priv: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::unseal_sender_cert(&sealed_box, &our_identity_priv).map_err(|e| {
-        CryptoError::DecryptionFailed {
+    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
+        |e| CryptoError::DecryptionFailed {
             message: e.to_string(),
-        }
-    })
+        },
+    )
+}
+
+/// Seal a device's own metadata to one of its account's devices.
+///
+/// Same box and the same implementation as `sealed_seal_sender_cert` — deliberately, because
+/// the format is bit-compatible with the CryptoKit code on iOS and a second copy that drifted
+/// would produce boxes that open on one platform and not the other. Two names because there
+/// are two purposes, and a name that describes one of them is wrong on the other.
+///
+/// The account has no shared key: every device holds its own X25519 identity pair and nothing
+/// is established between them at link time. So a device's metadata is sealed once per sibling
+/// and the copies are stored together. That costs a copy per device — units of them — and buys
+/// the property a shared key could not: a revoked device stops being sealed to on the next
+/// re-seal, rather than keeping the ability to read until someone rotates a key.
+pub fn seal_to_device_key(
+    plaintext: Vec<u8>,
+    device_identity_key: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::seal_to_x25519_public(&plaintext, &device_identity_key).map_err(
+        |e| CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        },
+    )
+}
+
+/// Open one of those copies with this device's X25519 identity private key.
+///
+/// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying each.
+/// That is the intended use, not a fallback: the stored blob carries no recipient labels, on
+/// purpose — the server promised not to parse it, and a field that makes parsing convenient is
+/// an invitation to start.
+pub fn open_with_device_key(
+    sealed_box: Vec<u8>,
+    our_identity_priv: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
+        |e| CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

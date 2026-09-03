@@ -467,7 +467,10 @@ impl Drop for SerializableSession {
 
 /// First 8 characters of an identifier, for diagnostics that must not carry the whole value.
 /// Indexed by `char_indices` rather than by byte, so a non-ASCII id cannot panic the error path.
-fn id_prefix(id: &str) -> &str {
+///
+/// Shared across the module rather than re-written per call site: a second truncation helper is a
+/// second answer to "how much of an identifier may a log carry", and the two would drift.
+pub(super) fn id_prefix(id: &str) -> &str {
     let end = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
     &id[..end]
 }
