@@ -237,7 +237,7 @@ jobs:
         working-directory: android-out
         run: |
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            stamp=$(strings -a "jniLibs/$abi/libconstruct_core.so" | grep -m1 CONSTRUCT_CORE_VERSION) || {
+            stamp=$(strings -a "jniLibs/$abi/libconstruct_core.so" | grep -o -m1 'CONSTRUCT_CORE_VERSION=[0-9A-Za-z.+_-]*') || {
               echo "::error::$abi carries no CONSTRUCT_CORE_VERSION stamp — the archive cannot be identified"
               exit 1
             }
@@ -285,9 +285,13 @@ jobs:
           push to main, so the name tells you nothing. The library says:
 
           ```
-          strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION
+          strings -a libconstruct_core.so | grep -o 'CONSTRUCT_CORE_VERSION=[0-9A-Za-z.+_-]*'
           CONSTRUCT_CORE_VERSION=<crate version>+<commit>
           ```
+
+          `grep -o`, not a plain `grep`: the release profile packs `.rodata`
+          literals with no separators between them, so a whole-line match prints
+          several kilobytes of unrelated strings with the stamp buried inside.
 
           That stamp is inside the `.so`, so it still answers after the file has
           been copied into `app/src/main/jniLibs/` and this README left behind.
