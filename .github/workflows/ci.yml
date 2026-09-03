@@ -227,6 +227,23 @@ jobs:
             -o ../android-out/jniLibs \
             build --release --features "android,post-quantum"
 
+      # The README written a few steps below tells integrators to identify a
+      # build by running exactly this command. Run it here, against the .so we
+      # are about to ship, so a stamp that stops being emitted fails the build
+      # that produces it rather than the person who followed the instruction.
+      # It printed nothing at all from the day the README was written until
+      # 2026-09-04, because no static ever carried the string.
+      - name: The README's own version check must answer
+        working-directory: android-out
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            stamp=$(strings -a "jniLibs/$abi/libconstruct_core.so" | grep -m1 CONSTRUCT_CORE_VERSION) || {
+              echo "::error::$abi carries no CONSTRUCT_CORE_VERSION stamp — the archive cannot be identified"
+              exit 1
+            }
+            echo "$abi: $stamp"
+          done
+
       # UniFFI library-mode binding generation — the arm64 .so is the
       # canonical artifact (all ABIs share one UDL, so bindings are identical).
       - name: Generate Kotlin bindings
@@ -263,9 +280,17 @@ jobs:
           - `android` (UniFFI Kotlin bindings, construct-veil transport)
           - `post-quantum` (Kyber-768 OTPK, ML-DSA signing)
 
-          ## Versioning
-          The archive name includes the construct-core commit SHA.
-          Verify by running `strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION`.
+          ## Which build is this
+          The rolling `latest` release republishes one fixed filename on every
+          push to main, so the name tells you nothing. The library says:
+
+          ```
+          strings libconstruct_core.so | grep CONSTRUCT_CORE_VERSION
+          CONSTRUCT_CORE_VERSION=<crate version>+<commit>
+          ```
+
+          That stamp is inside the `.so`, so it still answers after the file has
+          been copied into `app/src/main/jniLibs/` and this README left behind.
           EOF
 
       - name: Upload Android artifact
