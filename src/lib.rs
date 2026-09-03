@@ -26,7 +26,15 @@ pub static CONSTRUCT_CORE_VERSION: &str = concat!(
     "CONSTRUCT_CORE_VERSION=",
     env!("CARGO_PKG_VERSION"),
     "+",
-    env!("CONSTRUCT_CORE_COMMIT")
+    env!("CONSTRUCT_CORE_COMMIT"),
+    // Terminator, and the reason the recipe is a plain grep rather than a
+    // grammar. `opt-level = "z"` packs `.rodata` literals with no separator
+    // between them, so without this the stamp runs straight into whichever
+    // literal the linker placed next — `…+847067fdfef7primary_send_covered…`
+    // in the archive published on 2026-09-04. `strings` ends a run at the
+    // first non-printable byte, so a NUL is what makes the value self-
+    // delimiting in the artifact instead of in whoever greps it.
+    "\0"
 );
 
 // Core modules (platform-independent)

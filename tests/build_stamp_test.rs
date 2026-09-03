@@ -13,8 +13,25 @@ use std::path::Path;
 /// has to be a deliberate edit in both places.
 const README_GREP: &str = "CONSTRUCT_CORE_VERSION=";
 
+/// The stamp without its terminator — what a reader of the artifact sees.
 fn stamp() -> &'static str {
     construct_core::CONSTRUCT_CORE_VERSION
+        .strip_suffix('\0')
+        .expect("stamp lost its NUL terminator")
+}
+
+#[test]
+fn the_stamp_ends_where_it_says_it_does() {
+    // Without the terminator the value runs into whichever literal the linker
+    // placed next to it: `opt-level = "z"` packs `.rodata` with no separators,
+    // and the archive published on 2026-09-04 came back as
+    // `…+847067fdfef7primary_send_coveredrecipient_is_self…`. `strings` ends a
+    // run at the first non-printable byte, so this is what bounds the value in
+    // the artifact rather than in the command someone runs against it.
+    assert!(
+        construct_core::CONSTRUCT_CORE_VERSION.ends_with('\0'),
+        "the stamp must be NUL-terminated to survive `strings` on a release .so"
+    );
 }
 
 #[test]
