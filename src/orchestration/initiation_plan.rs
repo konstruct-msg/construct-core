@@ -108,16 +108,21 @@ pub struct InitiationContext {
 ///    peer, seeing our init, reaches case 2.
 /// 4. **Otherwise** — wait. This is B at 12:30:11.
 ///
-/// An empty `peer_device_id` cannot be ranked and cannot be addressed; the answer is `Wait`,
-/// which is also what an unknown device deserves.
+/// An unnameable device — either id empty — blocks only the **ranking**, not the decision. First
+/// contact is exactly that case: the peer's device id comes out of the bundle we have not fetched
+/// yet, and refusing to initiate there would mean a person can never be written to for the first
+/// time. Nothing is lost, because a peer we have never addressed has no init of ours in flight to
+/// collide with. When their init *is* in flight and the pair cannot be ranked, the answer is to
+/// yield: taking the responder side is always safe, and opening a session we cannot rank against
+/// theirs guarantees a collision with no rule to settle it.
 pub fn plan_initiation(ctx: &InitiationContext) -> InitiationDecision {
-    if ctx.peer_device_id.is_empty() || ctx.my_device_id.is_empty() {
-        return InitiationDecision::Wait;
-    }
     if ctx.our_init_in_flight {
         return InitiationDecision::JoinInFlight;
     }
     if ctx.peer_init_in_flight {
+        if ctx.my_device_id.is_empty() || ctx.peer_device_id.is_empty() {
+            return InitiationDecision::YieldToPeer;
+        }
         return match tie_break_role(&ctx.my_device_id, &ctx.peer_device_id) {
             Role::Initiator => InitiationDecision::Initiate,
             Role::Responder => InitiationDecision::YieldToPeer,
@@ -228,17 +233,47 @@ mod tests {
 
     // ── Degenerate input ─────────────────────────────────────────────────────
 
-    /// A device we cannot name cannot be ranked or addressed. `Wait` rather than `Initiate`: an
-    /// unaddressable init is a spent prekey and an envelope delivered nowhere.
+    /// **First contact.** The peer's device id comes out of a bundle we have not fetched yet, so
+    /// at the moment of the decision there is nothing to rank. Refusing here would mean a person
+    /// can never be written to for the first time — found by wiring the iOS caller, which reaches
+    /// this function before the fetch precisely so the fetch (and its prekey) can be skipped.
     #[test]
-    fn an_unnameable_device_is_waited_on_not_initiated_with() {
-        let mut c = ctx(HIGH, "");
-        c.have_outbound_work = true;
-        assert_eq!(plan_initiation(&c), InitiationDecision::Wait);
+    fn a_peer_we_cannot_name_yet_is_still_written_to() {
+        for c in [ctx(HIGH, ""), ctx("", HIGH), ctx("", "")] {
+            let mut c = c;
+            c.have_outbound_work = true;
+            assert_eq!(plan_initiation(&c), InitiationDecision::Initiate);
+        }
+    }
 
-        let mut c = ctx("", HIGH);
+    /// Nothing to say and nobody nameable is still nothing to say.
+    #[test]
+    fn an_unnameable_device_with_no_work_is_waited_on() {
+        assert_eq!(plan_initiation(&ctx(HIGH, "")), InitiationDecision::Wait);
+        assert_eq!(plan_initiation(&ctx("", HIGH)), InitiationDecision::Wait);
+    }
+
+    /// Their init is in flight and the pair cannot be ranked. Yielding is always safe: their init
+    /// opens the session and our work flows into it. Initiating would guarantee a collision with
+    /// no rule available to settle it — the one outcome neither side can recover from quickly.
+    #[test]
+    fn an_unrankable_collision_yields_rather_than_racing() {
+        for c in [ctx(HIGH, ""), ctx("", HIGH), ctx("", "")] {
+            let mut c = c;
+            c.peer_init_in_flight = true;
+            c.have_outbound_work = true;
+            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
+        }
+    }
+
+    /// An init of ours in flight still outranks everything, nameable or not.
+    #[test]
+    fn our_own_init_wins_even_with_no_ids() {
+        let mut c = ctx("", "");
+        c.our_init_in_flight = true;
+        c.peer_init_in_flight = true;
         c.have_outbound_work = true;
-        assert_eq!(plan_initiation(&c), InitiationDecision::Wait);
+        assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
     }
 
     /// A device ranked against itself is not a pair. It cannot happen through the seam, but the
