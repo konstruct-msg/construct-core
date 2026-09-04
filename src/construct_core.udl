@@ -28,6 +28,14 @@ namespace construct_core {
     /// different pair.
     string tie_break_role(string my_id, string peer_id);
 
+    /// Whether to open a session with a device now, and as which side.
+    ///
+    /// Called at the moment a client wants a session and has none it can use. Answering this
+    /// locally is what produced 2026-09-04: both sides opened an INITIATOR session thirty-three
+    /// seconds apart, each alone when it decided, and the conversation stopped for thirty-two
+    /// seconds until one fell back to responder.
+    InitiationDecision plan_initiation(InitiationContext context);
+
     /// Classify a queued message: can it open a receiving session?
     /// One rule, one implementation — every client asks rather than reimplements. A
     /// `message_number == 0` with an advanced PQ epoch is shaped like an opener and is not one,
@@ -623,6 +631,37 @@ enum TeardownAction {
 dictionary TeardownDecision {
     string device_id;
     TeardownAction action;
+};
+
+/// Whether to open a session with a device right now, and as which side.
+/// See orchestration::initiation_plan. `tie_break_role` settles a collision that has happened;
+/// this settles whether to walk into one, and both peers must answer it compatibly.
+enum InitiationDecision {
+    /// Open a fresh session as INITIATOR now.
+    "Initiate",
+    /// One of ours is already in flight — join it. A second init derives a new root key, spends
+    /// another one-time prekey, and orphans the first SESSION_RESET_INIT.
+    "JoinInFlight",
+    /// The peer's init is arriving and outranks ours. Take the responder side.
+    "YieldToPeer",
+    /// Nothing to send and no init in the air. Opening spends a prekey on a session that carries
+    /// nothing and doubles the chance of colliding with the peer's next one.
+    "Wait",
+};
+
+/// What the caller knows at the moment it wants a session. Every field is something only the
+/// caller can see — the network, the outbox, the UI; the decision over them is made in the core.
+dictionary InitiationContext {
+    /// Ours and theirs in the space the session is addressed by. Anything else ranks a
+    /// different pair — see tie_break_role.
+    string my_device_id;
+    string peer_device_id;
+    /// We sent a SESSION_RESET_INIT to this device; it is neither acknowledged nor expired.
+    boolean our_init_in_flight;
+    /// We hold the peer's init — received, not yet completed.
+    boolean peer_init_in_flight;
+    /// Something is waiting to be sent to this device. Not "a warm session would be nice".
+    boolean have_outbound_work;
 };
 
 enum AckCheckResult {

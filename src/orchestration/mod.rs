@@ -13,6 +13,7 @@
 ///   session_lifecycle— Session lifecycle (Phase 3)       [TODO]
 ///   message_router   — Decision engine (Phase 4)         [TODO]
 ///   teardown_plan    — Which of a peer's devices a teardown touches
+///   initiation_plan  — Whether to open a session with a device now, and as which side
 ///   receiving_init_plan — Which queued message opens a session, against which device
 ///   send_plan        — Who gets a copy of an outgoing message
 ///   receiving_decrypt_plan — Which device session an incoming message is tried against
@@ -22,6 +23,7 @@ pub mod ack_store;
 pub mod actions;
 pub mod clock;
 pub mod healing_queue;
+pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
 pub mod platform_bridge;
@@ -36,6 +38,7 @@ pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
 pub use healing_queue::{HealDirection, HealingDecision, HealingQueue, HealingRecord};
+pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation};
 pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role};
 pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
