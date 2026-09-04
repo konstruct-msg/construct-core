@@ -78,6 +78,16 @@ jobs:
         working-directory: construct-core
         run: cargo test --features post-quantum
 
+      # `uniffi_bindings` is gated on ios/mac/android, so neither step above compiles it — and
+      # its `mod tests` went with it. 16 tests covering the surface all three platforms call
+      # through had never run here; the two `forget_contact_state` tests passed for months while
+      # the function was absent from the UDL and unreachable from every client. `cargo check
+      # --features mac` further down catches compile errors only, which is exactly why the gap
+      # was invisible: the module built, so nothing looked missing.
+      - name: Run tests (exported UniFFI surface)
+        working-directory: construct-core
+        run: cargo test --features mac
+
   # ── 2. iOS cross-compilation + Swift bindings (macOS) ────────────────────
   build-ios:
     name: iOS Cross-compile + Swift bindings

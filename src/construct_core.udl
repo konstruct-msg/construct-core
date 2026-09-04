@@ -950,6 +950,21 @@ interface OrchestratorCore {
 
     boolean remove_session(string contact_id);
 
+    /// Drop every piece of local orchestration state this core holds about `contact_id`:
+    /// the ratchet, the archive and its timestamp, the prekey counter, the heal record, the PQ
+    /// contribution, the init lock, the cooldown, the pending END_SESSION, the prewarm mark and
+    /// the active-chat mark.
+    ///
+    /// `remove_session` removes the ratchet **and nothing else**, so all of the above outlive it
+    /// and steer the next add for the same device — a contact the platform has already forgotten.
+    /// None of them is reachable from outside this crate, which is why "the platform deleted this
+    /// contact" had no expression here until now.
+    ///
+    /// Silent on the wire on purpose: a local deletion boundary, not a protocol reset. It archives
+    /// nothing and emits no END_SESSION. A caller that wants the peer told does that first, with
+    /// `plan_teardown`, and forgets afterwards.
+    void forget_contact_state(string contact_id);
+
     u32 prekeys_available_count();
 
     [Throws=CryptoError]

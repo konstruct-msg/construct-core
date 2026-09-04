@@ -1679,6 +1679,80 @@ mod tests {
         create_orchestrator_core_from_keys(keys, user_id.to_string()).unwrap()
     }
 
+    /// The orchestrator's queued-carrier count for `contact_id`. Read through the inner lock
+    /// rather than a new UDL method: the leftover state this test is about is private to the
+    /// crate on purpose, and widening the exported surface to observe it would be the opposite
+    /// of the point.
+    fn pending_for(core: &OrchestratorCore, contact_id: &str) -> usize {
+        let orch = core.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.pending_message_count(contact_id)
+    }
+
+    /// A msgNum=0 carrier from `from`, the shape that opens a receiving session.
+    fn queued_first_message(id: &str, from: &str) -> CfeIncomingEvent {
+        CfeIncomingEvent::MessageReceived {
+            message_id: id.to_string(),
+            from: from.to_string(),
+            data: crate::wire_payload::pack(
+                &[7u8; 32], 0, 0, 0, 0, 1, None,
+                &[0u8; 32], // sealed box — never decrypted here
+                0, None,
+            )
+            .unwrap(),
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: false,
+            content_type: 0,
+        }
+    }
+
+    /// Deleting a contact must be expressible **through the exported surface**.
+    ///
+    /// `forget_contact_state` was implemented, unit-tested at two levels, and absent from the
+    /// UDL — so the only deletion a platform could reach was `remove_session`, which drops the
+    /// ratchet and leaves the queue, the init lock, the archive, the heal record, the prekey
+    /// counter and the PQ contribution behind. iOS shipped that for months: "delete this
+    /// contact" removed the session and the next add was steered by the deleted contact's
+    /// leftovers.
+    ///
+    /// The assertion is the *difference* between the two calls, not that either one runs. A test
+    /// that only called `forget_contact_state` would pass just as well against `remove_session`
+    /// and would not have caught the export gap that produced this.
+    #[test]
+    fn forget_contact_state_is_reachable_and_outlives_remove_session() {
+        let core = make_orchestrator("alice");
+
+        // A backlog carrier lands with no session: queued, and a bundle fetch requested.
+        let actions = core
+            .handle_event(queued_first_message("backlog-1", "bob"))
+            .unwrap();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                CfeAction::FetchPublicKeyBundle { user_id } if user_id == "bob"
+            )),
+            "a first message with no session must ask for bob's bundle"
+        );
+
+        // `remove_session` drops the ratchet only. The queued carrier survives it — which is the
+        // whole defect: a re-add is still steered by the forgotten contact's backlog.
+        core.remove_session("bob".to_string());
+        assert_eq!(
+            pending_for(&core, "bob"),
+            1,
+            "remove_session must NOT be mistaken for a local delete — it leaves the queue"
+        );
+
+        // The deletion boundary clears it.
+        core.forget_contact_state("bob".to_string());
+        assert_eq!(
+            pending_for(&core, "bob"),
+            0,
+            "forget_contact_state must clear what remove_session leaves behind"
+        );
+    }
+
     /// Phase 2 of key-store consolidation: the Kyber SPK lives in the core key-state and
     /// must survive the full uniffi persistence path (set_kyber_spk → export_private_keys →
     /// create_orchestrator_core_from_keys → kyber_spk), exactly like the X25519 SPK.
@@ -3496,6 +3570,22 @@ impl OrchestratorCore {
     pub fn remove_session(&self, contact_id: String) -> bool {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.remove_session_by_contact(&contact_id)
+    }
+
+    /// Drop every piece of local orchestration state this core holds about `contact_id`.
+    ///
+    /// `remove_session` is not this. It removes the ratchet and nothing else, so an archive, a
+    /// heal record, a prekey counter, a PQ contribution and a cooldown all outlive it — and the
+    /// next add for the same device is then steered by state describing a contact the platform
+    /// has already forgotten. The platform has no way to reach any of them: they are private to
+    /// this crate, which is why "delete the contact" could not be expressed until now.
+    ///
+    /// Deliberately silent on the wire. This is a local deletion boundary, not a protocol reset:
+    /// it archives nothing and sends no END_SESSION, because the caller that wants a peer told
+    /// has already told them (`plan_teardown`) before forgetting them.
+    pub fn forget_contact_state(&self, contact_id: String) {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.forget_contact_state(&contact_id);
     }
 
     pub fn prekeys_available_count(&self) -> u32 {
