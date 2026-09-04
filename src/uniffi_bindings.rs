@@ -2440,6 +2440,14 @@ pub fn tie_break_role(my_id: String, peer_id: String) -> String {
         .to_string()
 }
 
+/// Whether to open a session with a device now, and as which side.
+///
+/// Delegates; the reasoning and the run it was written from are in
+/// `orchestration::initiation_plan`.
+pub fn plan_initiation(context: InitiationContext) -> InitiationDecision {
+    crate::orchestration::plan_initiation(&context)
+}
+
 /// Compute a Safety Number for two Construct devices.
 ///
 /// Returns a 60-digit string (12 groups of 5, space-separated) that both parties
@@ -2877,6 +2885,14 @@ impl From<crate::orchestration::TeardownAction> for TeardownAction {
         }
     }
 }
+
+/// The UDL `InitiationDecision` / `InitiationContext` types, re-exported rather than mirrored.
+///
+/// The neighbours above define a second copy of an orchestration type and convert between them.
+/// That is two carriers of one meaning, and this crate's own rule against it applies to its own
+/// FFI layer: a mirror drifts by an added variant that nobody adds on the other side, and the UDL
+/// only needs the names to resolve at the crate root — which a re-export does.
+pub use crate::orchestration::initiation_plan::{InitiationContext, InitiationDecision};
 
 /// Mirror of the UDL `AckCheckResult` enum (must match UDL name exactly).
 pub enum AckCheckResult {
