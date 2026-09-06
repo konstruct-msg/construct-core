@@ -705,10 +705,32 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Consume (burn) a one-time prekey by key_id. Returns the private key if found.
     /// The key is removed from storage — it cannot be reused.
+    ///
+    /// Call this **after** a handshake built on the key has succeeded, not before it is tried.
+    /// See `peek_one_time_prekey`.
     pub fn consume_one_time_prekey(&mut self, key_id: u32) -> Option<P::KemPrivateKey> {
         self.one_time_prekeys
             .remove(&key_id)
             .map(|(private, _)| private)
+    }
+
+    /// Read a one-time prekey without burning it.
+    ///
+    /// The pair to `consume_one_time_prekey`, and the reason the two are separate: an attempt is
+    /// not a use. A responder init can be attempted several times against one carrier — the peer
+    /// is a set of devices and only one of their identity keys makes the 4-DH close — and burning
+    /// on the first attempt destroys the key for the attempt that would have succeeded. Observed
+    /// 2026-09-06 with two devices on one account: OTPK 1000702, attempt one against the wrong
+    /// device failed AEAD, attempt two against the right one reported the key missing, and the
+    /// message was unreadable from then on.
+    ///
+    /// Burning only on success is also the weaker capability to hand a stranger. Anyone able to
+    /// deliver a malformed handshake naming id N could otherwise destroy that prekey permanently
+    /// without proving anything about themselves.
+    pub fn peek_one_time_prekey(&self, key_id: u32) -> Option<P::KemPrivateKey> {
+        self.one_time_prekeys
+            .get(&key_id)
+            .map(|(private, _)| private.clone())
     }
 
     /// How many OTPKs are currently stored locally (not yet consumed).
