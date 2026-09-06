@@ -620,14 +620,23 @@ where
             "Initializing session as responder (with ephemeral)"
         );
 
-        // Consume the OTPK (burn-on-use) BEFORE borrowing identity key.
+        // Read the OTPK; burn it only once a handshake has actually been built on it.
+        //
         // If the sender specified an OTPK ID but we no longer hold that key
         // (device reset, reinstall, key exhaustion) the 4-DH and 3-DH root keys
         // will diverge — silently falling back would cause every subsequent
         // message to fail AEAD. We return an explicit error so the caller can
         // trigger session healing rather than creating a permanently broken session.
+        //
+        // This used to consume before the attempt, which is correct only while a carrier is
+        // tried once. It is not: an account is a set of devices, the caller does not always know
+        // which of them wrote the message, and `plan_receiving_init` hands us the same carrier
+        // once per candidate. Burning up front meant the first wrong candidate destroyed the key
+        // the right one needed, and the message became permanently unreadable — with two devices
+        // on one account, whether it arrived depended on which device sent it. See
+        // `KeyManager::peek_one_time_prekey`.
         let consumed_otpk = if one_time_prekey_id != 0 {
-            let key = self.key_manager.consume_one_time_prekey(one_time_prekey_id);
+            let key = self.key_manager.peek_one_time_prekey(one_time_prekey_id);
             if key.is_none() {
                 return Err(format!(
                     "OTPK id={} not found — sender used 4-DH but we cannot reproduce it; \
@@ -640,10 +649,13 @@ where
             None
         };
 
+        // Cloned rather than borrowed so the immutable borrow of `key_manager` ends here: the
+        // success branch below needs it mutably to burn the OTPK.
         let local_identity = self
             .key_manager
             .identity_secret_key()
-            .map_err(|e| format!("Failed to get identity key: {:?}", e))?;
+            .map_err(|e| format!("Failed to get identity key: {:?}", e))?
+            .clone();
 
         // Try current prekey first, then fall back to older prekeys (in case the
         // sender encrypted using a prekey that predates our last rotation).
@@ -655,7 +667,7 @@ where
         let mut last_err = String::from("No prekeys tried");
         for (idx, prekey) in candidate_prekeys.iter().enumerate() {
             match Session::<P, H, M>::init_as_responder(
-                local_identity,
+                &local_identity,
                 prekey,
                 remote_identity,
                 remote_ephemeral,
@@ -667,6 +679,13 @@ where
                 Ok((session, plaintext)) => {
                     let session_id = session.session_id().to_string();
                     self.sessions.insert(contact_id.to_string(), session);
+
+                    // Burn it here and nowhere else: the handshake closed, so the key has now
+                    // genuinely been used. A replay of this same carrier will report it missing,
+                    // which is what one-time means.
+                    if one_time_prekey_id != 0 {
+                        self.key_manager.consume_one_time_prekey(one_time_prekey_id);
+                    }
 
                     if idx > 0 {
                         info!(
@@ -1077,6 +1096,116 @@ mod tests {
         // Verify both have sessions
         assert_eq!(alice.active_contacts(), vec!["bob"]);
         assert_eq!(bob.active_contacts(), vec!["alice"]);
+    }
+
+    /// A failed responder init must not destroy the one-time prekey.
+    ///
+    /// The field failure this pins (2026-09-06, three devices on two accounts): an account is a
+    /// set of devices, so `plan_receiving_init` hands the same carrier to one attempt per
+    /// candidate device. The old code burned the OTPK before the first attempt, so the wrong
+    /// candidate consumed the key the right one needed and the message was unreadable from then
+    /// on — the sender's device decided whether it arrived.
+    ///
+    /// The third attempt is not decoration: it pins that success still burns. A fix that simply
+    /// stopped consuming would pass the first two assertions and make the prekey reusable.
+    #[test]
+    fn a_failed_responder_init_leaves_the_one_time_prekey_for_the_next_attempt() {
+        let mut alice = TestClient::new().unwrap();
+        let mut bob = TestClient::new().unwrap();
+        let mut mallory = TestClient::new().unwrap();
+        alice.set_local_user_id("alice".to_string());
+        bob.set_local_user_id("bob".to_string());
+        mallory.set_local_user_id("mallory".to_string());
+
+        let bob_identity_pub = ClassicSuiteProvider::from_private_key_to_public_key(
+            bob.key_manager.identity_secret_key().unwrap(),
+        )
+        .unwrap();
+        let otpks = bob.key_manager.generate_one_time_prekeys(1).unwrap();
+        let (otpk_id, otpk_public) = otpks[0].clone();
+        let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
+
+        let bob_bundle = X3DHPublicKeyBundle {
+            identity_public: bob_identity_pub.clone(),
+            signed_prekey_public: bob_prekey.key_pair.1.clone(),
+            signature: bob_prekey.signature.clone(),
+            verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
+            suite_id: SuiteID::CLASSIC,
+            one_time_prekey_public: Some(ClassicSuiteProvider::kem_public_key_from_bytes(
+                otpk_public,
+            )),
+            one_time_prekey_id: Some(otpk_id),
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
+        };
+
+        alice
+            .init_session("bob", &bob_bundle, &bob_identity_pub, otpk_id)
+            .unwrap();
+        let first = alice.encrypt_message("bob", b"Hello Bob!").unwrap();
+        assert_eq!(
+            bob.key_manager.one_time_prekey_count(),
+            1,
+            "setup: Bob holds the prekey the carrier was built against"
+        );
+
+        let alice_ephemeral_pub =
+            ClassicSuiteProvider::kem_public_key_from_bytes(first.dh_public_key.to_vec());
+        let alice_identity_pub = ClassicSuiteProvider::from_private_key_to_public_key(
+            alice.key_manager.identity_secret_key().unwrap(),
+        )
+        .unwrap();
+        // Stands in for the peer's *other* device: a real identity key that is not the one this
+        // carrier was built against, which is exactly what the first candidate usually is.
+        let wrong_identity_pub = ClassicSuiteProvider::from_private_key_to_public_key(
+            mallory.key_manager.identity_secret_key().unwrap(),
+        )
+        .unwrap();
+
+        let wrong = bob.init_receiving_session_with_ephemeral(
+            "alice",
+            &wrong_identity_pub,
+            &alice_ephemeral_pub,
+            &first,
+            otpk_id,
+        );
+        assert!(wrong.is_err(), "the wrong device must not open the carrier");
+        assert_eq!(
+            bob.key_manager.one_time_prekey_count(),
+            1,
+            "a failed attempt is not a use — the OTPK must survive it"
+        );
+
+        let (_session_id, decrypted) = bob
+            .init_receiving_session_with_ephemeral(
+                "alice",
+                &alice_identity_pub,
+                &alice_ephemeral_pub,
+                &first,
+                otpk_id,
+            )
+            .expect("the right device must still be able to open the carrier");
+        assert_eq!(decrypted, b"Hello Bob!");
+        assert_eq!(
+            bob.key_manager.one_time_prekey_count(),
+            0,
+            "success burns it"
+        );
+
+        let replay = bob.init_receiving_session_with_ephemeral(
+            "alice",
+            &alice_identity_pub,
+            &alice_ephemeral_pub,
+            &first,
+            otpk_id,
+        );
+        assert!(
+            replay.is_err(),
+            "one-time means the same carrier cannot open a second session"
+        );
     }
 
     /// Suite negotiation: a bundle advertising `supports_pq_ratchet` yields a
