@@ -1,7 +1,13 @@
 # Rust
 /target/
 /target_host/
-/fuzz/
+# Fuzzing: targets and seeds are source and belong in review. Keeping the whole
+# directory out is why `pack()` could grow two parameters and leave
+# fuzz_wire_payload_roundtrip uncompilable without anyone noticing.
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/Cargo.lock
 /benches
 **/*.rs.bk
 # Cargo.lock IS tracked: construct-core ships inside a signed binary, so the

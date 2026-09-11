@@ -1,0 +1,49 @@
+[package]
+name = "construct-core-fuzz"
+license = "Apache-2.0"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+rmp-serde = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+
+[dependencies.construct-core]
+path = ".."
+features = ["post-quantum"]
+
+[workspace]
+members = ["."]
+
+# ── Fuzz targets ──────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "fuzz_wire_payload"
+path = "fuzz_targets/fuzz_wire_payload.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cfe_envelope"
+path = "fuzz_targets/fuzz_cfe_envelope.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wire_payload_roundtrip"
+path = "fuzz_targets/fuzz_wire_payload_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cfe_roundtrip"
+path = "fuzz_targets/fuzz_cfe_roundtrip.rs"
+doc = false
+
+[profile.release]
+opt-level = 3
+debug = true     # keep debug info for crash symbolication
