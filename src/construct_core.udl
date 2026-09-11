@@ -3,6 +3,16 @@ namespace construct_core {
     string derive_device_id(sequence<u8> identity_public_key);
     string format_federated_id(string device_id, string server_hostname);
 
+    // Intake credentials — what a sealed envelope carries instead of a Privacy Pass
+    // token when the recipient has vouched for the sender. The tag is per RECIPIENT and
+    // identical for every sender holding the key, which is what keeps it from becoming a
+    // pseudonymous sender handle. See construct-docs/decisions/
+    // contact-traffic-is-vouched-not-purchased.md.
+    sequence<u8> generate_intake_key();
+    u64 intake_epoch(u64 unix_seconds);
+    [Throws=CryptoError]
+    sequence<u8> intake_tag(sequence<u8> intake_key, string recipient_account_id, u64 epoch);
+
     // Whether this core build supports SuiteID::PQ_RATCHET (suite 3).
     // Pass as supports_pq_ratchet in UploadPreKeysRequest so peers can
     // negotiate suite-3 sessions against this device.

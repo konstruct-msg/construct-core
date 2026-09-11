@@ -2438,6 +2438,46 @@ pub fn derive_device_id(identity_public_key: Vec<u8>) -> String {
     crate::device_id::derive_device_id(&identity_public_key)
 }
 
+// ── Intake credentials ────────────────────────────────────────────────────────
+// What a sealed envelope carries instead of a Privacy Pass token when the recipient has
+// vouched for the sender. See `crate::intake` and
+// construct-docs/decisions/contact-traffic-is-vouched-not-purchased.md.
+
+/// A fresh 32-byte `intake_key` for this account.
+///
+/// One per account. Every device of the account must end up holding *this* key rather than
+/// generating its own, or half the account's contacts would present a credential the server does
+/// not recognise.
+pub fn generate_intake_key() -> Vec<u8> {
+    crate::intake::generate_intake_key()
+}
+
+/// The intake epoch containing `unix_seconds` (one UTC day per epoch).
+///
+/// Exported rather than left as `t / 86400` on each platform because the epoch is half of what the
+/// tag is bound to: a client computing yesterday's epoch attaches a tag the server will not match,
+/// and the only symptom is a token charged where none was owed.
+pub fn intake_epoch(unix_seconds: u64) -> u64 {
+    crate::intake::intake_epoch(unix_seconds)
+}
+
+/// The intake tag for one recipient account and one epoch.
+///
+/// The recipient calls this with its own account id to publish the tag; a sender calls it with the
+/// recipient's account id to attach one. Same function both ways — that symmetry is what makes the
+/// credential per-recipient rather than per-pair.
+///
+/// Throws `InvalidKeyData` when `intake_key` is not 32 bytes or the account id is empty. Both are
+/// conditions HMAC itself would accept silently, producing a tag that simply never matches.
+pub fn intake_tag(
+    intake_key: Vec<u8>,
+    recipient_account_id: String,
+    epoch: u64,
+) -> Result<Vec<u8>, CryptoError> {
+    crate::intake::intake_tag(&intake_key, &recipient_account_id, epoch)
+        .map_err(|_| CryptoError::InvalidKeyData)
+}
+
 /// Whether this core build supports `SuiteID::PQ_RATCHET` (suite 3) sessions.
 ///
 /// Platforms must pass this as `supports_pq_ratchet` in `UploadPreKeysRequest`
