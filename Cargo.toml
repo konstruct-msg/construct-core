@@ -128,3 +128,10 @@ lto = "thin"        # thin LTO: cross-crate dead-code strip without fat objects
 codegen-units = 1   # single unit = better optimization (slower compile)
 strip = "debuginfo" # strip DWARF debug info only; keep symbol table for C FFI exports
 panic = "abort"     # no unwinding machinery (~10-15% smaller)
+
+# Host-side build tooling — build scripts and proc-macro dylibs — is not what ships, and
+# `strip` above corrupts it: since the 2026-09 toolchain, a stripped proc-macro dylib fails
+# `dlopen` with "mis-aligned LINKEDIT string pool" and the crate that uses it (sqlx) cannot
+# compile at all. This only turns the stripping off for artifacts that never leave the host.
+[profile.release.build-override]
+strip = false
