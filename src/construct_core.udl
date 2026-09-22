@@ -772,6 +772,11 @@ interface CfeIncomingEvent {
     ActiveChatChanged(string contact_id, boolean is_active);
     /// A heartbeat message was received from the peer.
     HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
+    /// The platform is about to tear down the ratchet with `contact_id` and asks whether it may.
+    /// Answered with `SendEndSession` or `EndSessionSuppressed` + `ScheduleTimer`, from the same
+    /// window the core's own teardowns use. `peer_on_dead_session` is the platform's evidence
+    /// that the previous teardown never landed.
+    TeardownRequested(string contact_id, boolean peer_on_dead_session);
 };
 
 /// Which durable slot a `SaveToSecureStore` payload belongs in.

@@ -50,9 +50,12 @@ yourself writing "the client must compute X the same way", export X.
 
 **What belongs here, restated for the receiving end** (the clients carry the mirror of this in their
 own `AGENTS.md`): anything two clients must compute identically, anything that reads or writes
-ratchet/session state, and **any plan** — "which sessions does this operation touch". A plan is
-protocol, not presentation, and it is the category clients rebuild most often, because they hold the
-list the plan iterates and it feels local.
+ratchet/session state, **any plan** — "which sessions does this operation touch" — and the
+**lifecycle phase of a pair of devices** (absent / opening / established / healing / tearing
+down). A plan answers who; the machine answers what state that pair is in. Both are protocol.
+Clients rebuild the machine as a pile of cooldowns because each incident feels local. It is
+not: two clients that retry on different clocks do not error, they storm. Guide:
+`construct-docs/decisions/session-is-one-state-machine.md`.
 
 **What deliberately does not belong here:** `ServerUserId`. This crate speaks `CryptoDeviceId` only
 (`contact_id` everywhere; `set_local_user_id` is the one seam), and that stays. The consequence is a

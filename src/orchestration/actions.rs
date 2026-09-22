@@ -316,6 +316,21 @@ pub enum IncomingEvent {
         contact_id: String,
         is_active: bool,
     },
+    /// The platform is about to tear down the ratchet with `contact_id` and is asking whether
+    /// it may.
+    ///
+    /// Every other teardown in this file is the core's own conclusion from a message it routed.
+    /// This one is the platform's: an init that failed terminally, a heal that gave up, a DR
+    /// divergence noticed outside the routing path. Those are facts only the platform has, and
+    /// before this event existed it answered them with a second cooldown of its own — a 30 s
+    /// window in `SessionCoordinator` beside the core's 5 s, neither aware of the other. See
+    /// `construct-docs/decisions/session-is-one-state-machine.md`, step 2.
+    ///
+    /// `peer_on_dead_session` is the platform's evidence that the last teardown never landed.
+    TeardownRequested {
+        contact_id: String,
+        peer_on_dead_session: bool,
+    },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if decryption fails,
     /// it triggers heal proactively (before the user sends any message).

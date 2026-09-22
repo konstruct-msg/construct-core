@@ -3825,6 +3825,11 @@ pub enum CfeIncomingEvent {
         data: Vec<u8>,
         msg_num: u32,
     },
+    /// The platform asks whether it may tear down the ratchet with `contact_id`.
+    TeardownRequested {
+        contact_id: String,
+        peer_on_dead_session: bool,
+    },
 }
 
 impl CfeIncomingEvent {
@@ -3912,6 +3917,13 @@ impl CfeIncomingEvent {
                 message_id,
                 data,
                 msg_num,
+            },
+            Self::TeardownRequested {
+                contact_id,
+                peer_on_dead_session,
+            } => TeardownRequested {
+                contact_id,
+                peer_on_dead_session,
             },
         }
     }

@@ -156,6 +156,44 @@ impl Orchestrator {
                 data,
                 msg_num,
             } => self.handle_heartbeat_received(contact_id, message_id, data, msg_num),
+            IncomingEvent::TeardownRequested {
+                contact_id,
+                peer_on_dead_session,
+            } => self.handle_teardown_requested(contact_id, peer_on_dead_session),
+        }
+    }
+
+    /// Answer the platform's "may I tear this ratchet down?".
+    ///
+    /// The answer is the same one `EndSessionNeeded` gets, from the same machine and the same
+    /// window, which is the point: before this the platform held a second window of its own and
+    /// the two could not see each other. A refusal is not a drop — the debt is recorded and the
+    /// timer pays it, exactly as it does for a teardown the core concluded itself.
+    fn handle_teardown_requested(
+        &mut self,
+        contact_id: String,
+        peer_on_dead_session: bool,
+    ) -> Vec<Action> {
+        match self.sessions.handle(
+            &contact_id,
+            SessionEvent::WantToTearDown {
+                evidence: peer_on_dead_session,
+            },
+        ) {
+            SessionEffect::DeferTearDown { retry_after_ms } => vec![
+                Action::EndSessionSuppressed {
+                    contact_id: contact_id.clone(),
+                    retry_after_ms,
+                },
+                Action::ScheduleTimer {
+                    timer_id: format!("cooldown_expired:{contact_id}"),
+                    delay_ms: retry_after_ms,
+                },
+            ],
+            // No `NotifyLinkedDevicesOfSessionReset` here, unlike `EndSessionNeeded`. The caller
+            // is the platform, which reaches its own linked devices through the paths it already
+            // owns; emitting it would broadcast the same reset twice.
+            _ => vec![Action::SendEndSession { contact_id }],
         }
     }
 
@@ -1467,6 +1505,7 @@ impl Orchestrator {
                 let mut actions = self.lifecycle.gc_old_archives();
                 actions.extend(self.lifecycle.ack_store.prune_expired());
                 self.lifecycle.healing_queue.prune_expired();
+                self.sessions.prune_expired();
                 actions
             }
             _ if timer_id.starts_with("cooldown_expired:") => {
@@ -1686,7 +1725,14 @@ impl Orchestrator {
                 contact_id: cid,
                 reason: _,
             } => {
-                match self.sessions.handle(&cid, SessionEvent::WantToTearDown) {
+                // Evidence, and the decision that produced it says so: `EndSessionNeeded`
+                // arrives from a message that failed to decrypt on a ratchet we still hold a
+                // record of — the peer is demonstrably still using a session we tore down. That
+                // is what buys the fast retry instead of the full window.
+                match self
+                    .sessions
+                    .handle(&cid, SessionEvent::WantToTearDown { evidence: true })
+                {
                     SessionEffect::DeferTearDown { retry_after_ms } => {
                         // Owed, not dropped. A message that failed to decrypt at msgNum > 0 is
                         // bound to a ratchet we no longer hold and will never be readable — the
@@ -1986,6 +2032,54 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
             "the second teardown inside the window is deferred, not sent"
+        );
+    }
+
+    /// The platform's teardown and the core's own share one window. They did not: the iOS
+    /// coordinator held `endSessionSentAt` (30 s) and the core held `cooldowns` (5 s), for the
+    /// same envelope to the same device, and neither could see the other's.
+    ///
+    /// Mutation: give `TeardownRequested` its own gate instead of `self.sessions` — this reddens.
+    #[test]
+    fn a_platform_teardown_shares_the_window_with_the_cores_own() {
+        let mut o = make_orchestrator("alice");
+        let first = o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(
+            first
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. }))
+        );
+        let asked = o.handle_event(IncomingEvent::TeardownRequested {
+            contact_id: "bob".to_string(),
+            peer_on_dead_session: false,
+        });
+        assert!(
+            asked
+                .iter()
+                .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
+            "the platform's ask lands inside the window the core's own teardown opened"
+        );
+        assert!(
+            asked.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "cooldown_expired:bob")
+            ),
+            "and it is owed, so the alarm that pays it is armed"
+        );
+    }
+
+    /// The first ask of a quiet device is granted, and it is a plain `SendEndSession` — the
+    /// platform reaches its own linked devices through the paths it already owns, so the
+    /// broadcast that rides on `EndSessionNeeded` is not repeated here.
+    #[test]
+    fn a_platform_teardown_of_a_quiet_device_is_granted_alone() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::TeardownRequested {
+            contact_id: "bob".to_string(),
+            peer_on_dead_session: false,
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::SendEndSession { contact_id } if contact_id == "bob")
         );
     }
 
