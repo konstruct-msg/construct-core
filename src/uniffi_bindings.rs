@@ -3826,8 +3826,36 @@ pub enum CfeIncomingEvent {
     /// The platform asks whether it may tear down the ratchet with `contact_id`.
     TeardownRequested {
         contact_id: String,
-        peer_on_dead_session: bool,
+        cause: CfeTearDownCause,
     },
+    /// The peer tore down the ratchet with `contact_id`, and the platform has applied it.
+    PeerToreDown { contact_id: String },
+}
+
+/// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
+///
+/// Mirrors `session_machine::TearDownCause`. It is a separate type at the boundary for the same
+/// reason every other CFE type is: the UDL is a wire the platform compiles against, and a core
+/// enum that grows a variant would otherwise change it silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfeTearDownCause {
+    /// Nothing is known beyond "this ratchet will not open".
+    Blind,
+    /// A message arrived on a ratchet we no longer hold — the last teardown never landed.
+    Unacknowledged,
+    /// The teardown carries a reason the peer cannot work out for itself.
+    Explained,
+}
+
+impl From<CfeTearDownCause> for crate::orchestration::session_machine::TearDownCause {
+    fn from(cause: CfeTearDownCause) -> Self {
+        use crate::orchestration::session_machine::TearDownCause as Core;
+        match cause {
+            CfeTearDownCause::Blind => Core::Blind,
+            CfeTearDownCause::Unacknowledged => Core::Unacknowledged,
+            CfeTearDownCause::Explained => Core::Explained,
+        }
+    }
 }
 
 impl CfeIncomingEvent {
@@ -3916,13 +3944,11 @@ impl CfeIncomingEvent {
                 data,
                 msg_num,
             },
-            Self::TeardownRequested {
+            Self::TeardownRequested { contact_id, cause } => TeardownRequested {
                 contact_id,
-                peer_on_dead_session,
-            } => TeardownRequested {
-                contact_id,
-                peer_on_dead_session,
+                cause: cause.into(),
             },
+            Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
         }
     }
 }
@@ -4055,6 +4081,9 @@ pub enum CfeAction {
         contact_id: String,
         retry_after_ms: u64,
     },
+    /// A teardown was asked for and will not be sent, now or later: the peer tore this ratchet
+    /// down itself. Nothing is owed and no timer is armed — do not schedule a retry.
+    EndSessionNotNeeded { contact_id: String },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
     /// nothing required of the platform; it is drained when the init completes.
     MessageQueuedPendingInit {
@@ -4184,6 +4213,7 @@ impl CfeAction {
                 contact_id,
                 retry_after_ms,
             },
+            EndSessionNotNeeded { contact_id } => Self::EndSessionNotNeeded { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
                 queued_count,

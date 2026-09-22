@@ -3,6 +3,8 @@
 /// Rust принимает события, вычисляет решения и возвращает `Vec<Action>`.
 /// Платформенный слой исполняет каждое действие и при необходимости передаёт
 /// результат обратно через `IncomingEvent`.
+use crate::orchestration::session_machine::TearDownCause;
+
 /// Which durable slot a `SaveToSecureStore` payload belongs in.
 ///
 /// The core names *what* the bytes are; the platform names *where* they go. Until 2026-08-26 the
@@ -108,6 +110,14 @@ pub enum Action {
         contact_id: String,
         retry_after_ms: u64,
     },
+
+    /// A teardown was asked for and is **not** being sent, now or later: the peer tore this
+    /// ratchet down itself and a blind teardown back tells it what it just told us.
+    ///
+    /// Distinct from `EndSessionSuppressed`, which owes the send and arms a timer. This owes
+    /// nothing, so a platform that schedules a retry on it is scheduling the storm. It replaced
+    /// the platform's own 20 s `lastInboundEndSessionAt` grace.
+    EndSessionNotNeeded { contact_id: String },
 
     /// A message arrived while session init for this contact was already in flight. It is
     /// **queued inside the core** (`pending_queues`) and drained on `SessionInitCompleted` —
@@ -326,11 +336,21 @@ pub enum IncomingEvent {
     /// window in `SessionCoordinator` beside the core's 5 s, neither aware of the other. See
     /// `construct-docs/decisions/session-is-one-state-machine.md`, step 2.
     ///
-    /// `peer_on_dead_session` is the platform's evidence that the last teardown never landed.
+    /// `cause` says what this teardown knows, which is what decides how soon it may go — and
+    /// whether the peer's own teardown silences it. It replaced a `peer_on_dead_session: bool`
+    /// that the platform also fed to `plan_teardown`, where it answers a different question; one
+    /// value carrying two meanings is how the blind and the explained teardown ended up
+    /// indistinguishable here.
     TeardownRequested {
         contact_id: String,
-        peer_on_dead_session: bool,
+        cause: TearDownCause,
     },
+    /// The **peer** tore down the ratchet with `contact_id`, and the platform has applied it.
+    ///
+    /// A report, not a request: nothing is asked and nothing is returned but the phase. It opens
+    /// the same window a teardown of ours opens, which is what folds the platform's 20 s inbound
+    /// grace into the machine — the third of step 2's five timers.
+    PeerToreDown { contact_id: String },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if decryption fails,
     /// it triggers heal proactively (before the user sends any message).

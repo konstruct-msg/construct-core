@@ -22,7 +22,7 @@ use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
-    Effect as SessionEffect, Event as SessionEvent, SessionMachine,
+    Effect as SessionEffect, Event as SessionEvent, SessionMachine, TearDownCause,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -156,10 +156,13 @@ impl Orchestrator {
                 data,
                 msg_num,
             } => self.handle_heartbeat_received(contact_id, message_id, data, msg_num),
-            IncomingEvent::TeardownRequested {
-                contact_id,
-                peer_on_dead_session,
-            } => self.handle_teardown_requested(contact_id, peer_on_dead_session),
+            IncomingEvent::TeardownRequested { contact_id, cause } => {
+                self.handle_teardown_requested(contact_id, cause)
+            }
+            IncomingEvent::PeerToreDown { contact_id } => {
+                self.sessions.handle(&contact_id, SessionEvent::PeerToreDown);
+                Vec::new()
+            }
         }
     }
 
@@ -169,17 +172,11 @@ impl Orchestrator {
     /// window, which is the point: before this the platform held a second window of its own and
     /// the two could not see each other. A refusal is not a drop — the debt is recorded and the
     /// timer pays it, exactly as it does for a teardown the core concluded itself.
-    fn handle_teardown_requested(
-        &mut self,
-        contact_id: String,
-        peer_on_dead_session: bool,
-    ) -> Vec<Action> {
-        match self.sessions.handle(
-            &contact_id,
-            SessionEvent::WantToTearDown {
-                evidence: peer_on_dead_session,
-            },
-        ) {
+    fn handle_teardown_requested(&mut self, contact_id: String, cause: TearDownCause) -> Vec<Action> {
+        match self
+            .sessions
+            .handle(&contact_id, SessionEvent::WantToTearDown { cause })
+        {
             SessionEffect::DeferTearDown { retry_after_ms } => vec![
                 Action::EndSessionSuppressed {
                     contact_id: contact_id.clone(),
@@ -190,6 +187,12 @@ impl Orchestrator {
                     delay_ms: retry_after_ms,
                 },
             ],
+            // No timer: nothing is owed. The peer tore this ratchet down and knows it is gone,
+            // so the ask is answered rather than postponed — arming a retry here would be the
+            // 20 s grace's opposite, a guaranteed teardown back at a peer that already reset.
+            SessionEffect::TearDownNotNeeded => {
+                vec![Action::EndSessionNotNeeded { contact_id }]
+            }
             // No `NotifyLinkedDevicesOfSessionReset` here, unlike `EndSessionNeeded`. The caller
             // is the platform, which reaches its own linked devices through the paths it already
             // owns; emitting it would broadcast the same reset twice.
@@ -1729,10 +1732,12 @@ impl Orchestrator {
                 // arrives from a message that failed to decrypt on a ratchet we still hold a
                 // record of — the peer is demonstrably still using a session we tore down. That
                 // is what buys the fast retry instead of the full window.
-                match self
-                    .sessions
-                    .handle(&cid, SessionEvent::WantToTearDown { evidence: true })
-                {
+                match self.sessions.handle(
+                    &cid,
+                    SessionEvent::WantToTearDown {
+                        cause: TearDownCause::Unacknowledged,
+                    },
+                ) {
                     SessionEffect::DeferTearDown { retry_after_ms } => {
                         // Owed, not dropped. A message that failed to decrypt at msgNum > 0 is
                         // bound to a ratchet we no longer hold and will never be readable — the
@@ -2051,7 +2056,7 @@ mod tests {
         );
         let asked = o.handle_event(IncomingEvent::TeardownRequested {
             contact_id: "bob".to_string(),
-            peer_on_dead_session: false,
+            cause: TearDownCause::Blind,
         });
         assert!(
             asked
@@ -2067,6 +2072,57 @@ mod tests {
         );
     }
 
+    /// The peer's own teardown answers a blind ask of ours, and answers it **finally**: no
+    /// suppression action, no timer. This is the iOS 20 s `lastInboundEndSessionAt` grace, folded
+    /// into the one window that already decides whether a teardown may go out.
+    #[test]
+    fn the_peers_teardown_answers_a_blind_ask_without_owing_one() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::TeardownRequested {
+            contact_id: "bob".to_string(),
+            cause: TearDownCause::Blind,
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::EndSessionNotNeeded { contact_id } if contact_id == "bob")
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleTimer { .. })),
+            "nothing is owed, so nothing may arm a retry — a timer here is the grace inverted"
+        );
+    }
+
+    /// An explained teardown survives it. The peer cannot work out for itself that the one-time
+    /// pre-key it chose is unreproducible, so silence is the retry loop continuing.
+    #[test]
+    fn the_peers_teardown_does_not_answer_an_explained_ask() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::TeardownRequested {
+            contact_id: "bob".to_string(),
+            cause: TearDownCause::Explained,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::EndSessionNotNeeded { .. })),
+            "an explained teardown is never answered away"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
+            "it is held to the ordinary window, and owed"
+        );
+    }
+
     /// The first ask of a quiet device is granted, and it is a plain `SendEndSession` — the
     /// platform reaches its own linked devices through the paths it already owns, so the
     /// broadcast that rides on `EndSessionNeeded` is not repeated here.
@@ -2075,7 +2131,7 @@ mod tests {
         let mut o = make_orchestrator("alice");
         let actions = o.handle_event(IncomingEvent::TeardownRequested {
             contact_id: "bob".to_string(),
-            peer_on_dead_session: false,
+            cause: TearDownCause::Blind,
         });
         assert_eq!(actions.len(), 1);
         assert!(

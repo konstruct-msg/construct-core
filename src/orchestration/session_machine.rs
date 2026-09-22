@@ -76,6 +76,19 @@ pub const UNACKED_BUDGET_TTL_MS: u64 = END_SESSION_COOLDOWN_MS * 2;
 /// every later message behind a lock nothing releases. Unchanged from `INIT_LOCK_TTL_MS`.
 pub const OPENING_TTL_MS: u64 = 30_000;
 
+/// How long the peer's own teardown keeps ours quiet (ms).
+///
+/// The same number as `END_SESSION_COOLDOWN_MS`, and that is the change: iOS held 20 s here
+/// while the core held 30 s for a teardown of its own, to the same device, answering the same
+/// question — may an END_SESSION envelope go out now. Two numbers for one question is the shape
+/// step 2 exists to remove, and this is the second of the five timers it removes.
+///
+/// Lengthening the quiet from 20 s to 30 s is safe against the thing that ends it: the responder
+/// fallback overrides the natural ordering at 60 s, so a peer whose rebuild never comes is still
+/// picked up with 30 s to spare. Shortening the *other* number instead would have loosened the
+/// window that was chosen against observed storms.
+pub const PEER_TEARDOWN_QUIET_MS: u64 = END_SESSION_COOLDOWN_MS;
+
 /// What the machine believes about one ratchet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -91,11 +104,47 @@ pub enum Phase {
     /// `unacked` counts the teardowns sent on evidence that the previous one never arrived. It is
     /// spent, not measured: only an evidence-driven send consumes it, and a session that comes
     /// back returns it whole.
+    ///
+    /// `peer_asked` records who started this. The distinction is one rule and it is the whole of
+    /// the inbound grace: **a teardown is owed only when we are the only side that knows.** If we
+    /// sent it, the peer may not have received it, so a suppressed ask is a debt the timer pays.
+    /// If the peer sent it, they know — a blind repeat back at them says nothing and doubles the
+    /// storm (device logs: AEAD fail → session_init_failed → SRI → success, with our END_SESSION
+    /// in the middle of it).
     TearingDown {
         since_ms: u64,
         owed: bool,
         unacked: u32,
+        peer_asked: bool,
     },
+}
+
+/// Why a teardown is being asked for — which is what decides how soon it may go.
+///
+/// This replaced a `bool` named `evidence`, and the bool was carrying two meanings at once. On
+/// the client the same flag also told `plan_teardown` "the peer is talking on a session we hold
+/// nothing for, so do not skip that device" — a different fact, true on branches where the
+/// machine's answer should differ. Naming the three cases separates them; `plan_teardown` keeps
+/// its own flag, because it is asking its own question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TearDownCause {
+    /// This ratchet will not open, and nothing more is known.
+    ///
+    /// The storm-prone ask, and the only one the peer's own teardown silences: right after they
+    /// tore down, a blind teardown back tells them what they just told us.
+    Blind,
+    /// A message arrived on a ratchet we no longer hold — proof our last teardown never landed.
+    ///
+    /// Buys the short window, while the budget lasts. Not silenced by the peer's teardown: a peer
+    /// still sending on a dead ratchet has not applied anything.
+    Unacknowledged,
+    /// The teardown carries a reason the peer cannot work out for itself — today, that the
+    /// one-time pre-key it chose could not be reproduced, so the next attempt must go without one.
+    ///
+    /// Held to the ordinary window (it is not evidence of anything lost) but never silenced.
+    /// Silence here is not "they already know" — it is the 4-DH retry loop continuing, which is
+    /// the loop this reason was introduced to break.
+    Explained,
 }
 
 /// What a client of the machine wants to happen.
@@ -108,10 +157,14 @@ pub enum Event {
     OpenFinished,
     /// This ratchet cannot decrypt and the peer must be told to rebuild it.
     ///
-    /// `evidence` is the caller saying it has proof the previous teardown did not land — today
-    /// that means a message arrived on a session we no longer hold. It is a fact only the caller
-    /// has; what it buys is the machine's to decide.
-    WantToTearDown { evidence: bool },
+    /// The cause is a fact only the caller has; what it buys is the machine's to decide.
+    WantToTearDown { cause: TearDownCause },
+    /// The **peer** tore this ratchet down and we have applied it.
+    ///
+    /// Not a request — a report. It opens the same phase a teardown of ours opens, so one window
+    /// covers "may an END_SESSION go to this device", however the ratchet died. What it does not
+    /// do is create a debt: see `peer_asked`.
+    PeerToreDown,
     /// This ratchet cannot decrypt and we intend to heal rather than tear down.
     WantToHeal,
     /// The timer the machine asked for has fired.
@@ -132,6 +185,10 @@ pub enum Effect {
     TearDown,
     /// Too soon. Tell the caller when to come back; the teardown is remembered and paid then.
     DeferTearDown { retry_after_ms: u64 },
+    /// Do not send, and do not come back: the peer tore this ratchet down itself, so a blind
+    /// teardown carries nothing. Unlike `DeferTearDown` this owes nothing and arms no timer —
+    /// the ask is answered, not postponed.
+    TearDownNotNeeded,
     /// Go ahead: heal.
     Heal,
     /// Too soon, and unlike a teardown a heal is **not** owed — the condition that produced it
@@ -139,6 +196,18 @@ pub enum Effect {
     DeferHeal { retry_after_ms: u64 },
     /// Nothing to do.
     Nothing,
+}
+
+/// What the machine has stored about a teardown, with the budget rule already applied.
+///
+/// A struct rather than a tuple since it grew a fourth field: `(u64, bool, u32, bool)` at a call
+/// site says nothing, and the two bools are one typo apart.
+#[derive(Debug, Clone, Copy)]
+struct TearDownRecord {
+    since_ms: u64,
+    owed: bool,
+    unacked: u32,
+    peer_asked: bool,
 }
 
 /// One phase per device, and the transitions between them.
@@ -176,11 +245,21 @@ impl SessionMachine {
                 since_ms,
                 owed,
                 unacked,
-            }) if now.saturating_sub(*since_ms) < END_SESSION_COOLDOWN_MS => Phase::TearingDown {
-                since_ms: *since_ms,
-                owed: *owed,
-                unacked: *unacked,
-            },
+                peer_asked,
+            }) if now.saturating_sub(*since_ms)
+                < if *peer_asked {
+                    PEER_TEARDOWN_QUIET_MS
+                } else {
+                    END_SESSION_COOLDOWN_MS
+                } =>
+            {
+                Phase::TearingDown {
+                    since_ms: *since_ms,
+                    owed: *owed,
+                    unacked: *unacked,
+                    peer_asked: *peer_asked,
+                }
+            }
             // An expired `Opening` or a `TearingDown` whose window has passed is `Absent` as far
             // as any decision is concerned. The entry is left in place so `Timeout` can still
             // find an owed teardown and so the retry budget outlives its window; `handle` is what
@@ -189,20 +268,26 @@ impl SessionMachine {
         }
     }
 
-    /// The stored teardown record, whatever its window says: `(since_ms, owed, unacked)`.
+    /// The stored teardown record, whatever its window says.
     ///
     /// The budget is read through here rather than through `phase()` on purpose. A budget that
     /// expired with its window would be a fresh allowance every window, which is a bound per
     /// window and not per storm — see `UNACKED_BUDGET_TTL_MS`.
-    fn teardown_record(&self, device_id: &str, now: u64) -> Option<(u64, bool, u32)> {
+    fn teardown_record(&self, device_id: &str, now: u64) -> Option<TearDownRecord> {
         match self.phases.get(device_id) {
             Some(Phase::TearingDown {
                 since_ms,
                 owed,
                 unacked,
+                peer_asked,
             }) => {
                 let forgotten = now.saturating_sub(*since_ms) >= UNACKED_BUDGET_TTL_MS;
-                Some((*since_ms, *owed, if forgotten { 0 } else { *unacked }))
+                Some(TearDownRecord {
+                    since_ms: *since_ms,
+                    owed: *owed,
+                    unacked: if forgotten { 0 } else { *unacked },
+                    peer_asked: *peer_asked,
+                })
             }
             _ => None,
         }
@@ -233,9 +318,10 @@ impl SessionMachine {
                 Effect::Nothing
             }
 
-            Event::WantToTearDown { evidence } => {
-                let (since_ms, unacked) = match self.teardown_record(device_id, now) {
-                    Some((since_ms, _, unacked)) => (since_ms, unacked),
+            Event::WantToTearDown { cause } => {
+                let evidence = cause == TearDownCause::Unacknowledged;
+                let record = match self.teardown_record(device_id, now) {
+                    Some(record) => record,
                     None => {
                         // Nothing in flight: send, and charge the budget only if this send is
                         // itself a re-notification.
@@ -245,15 +331,24 @@ impl SessionMachine {
                                 since_ms: now,
                                 owed: false,
                                 unacked: u32::from(evidence),
+                                peer_asked: false,
                             },
                         );
                         return Effect::TearDown;
                     }
                 };
-                let elapsed = now.saturating_sub(since_ms);
+                let elapsed = now.saturating_sub(record.since_ms);
+                // The peer tore this down itself and is still inside its quiet: a blind ask says
+                // nothing they do not know. Answered, not postponed — no debt, no timer, and the
+                // record is left exactly as it was so the quiet keeps running from *their*
+                // teardown rather than restarting on each of our suppressed asks.
+                if record.peer_asked && cause == TearDownCause::Blind && elapsed < PEER_TEARDOWN_QUIET_MS
+                {
+                    return Effect::TearDownNotNeeded;
+                }
                 // Which window this ask is held to. Evidence shortens it, and only while the
                 // budget lasts; after that the ordinary window returns, budget and all.
-                let on_evidence = evidence && unacked < END_SESSION_MAX_UNACKED_RETRIES;
+                let on_evidence = evidence && record.unacked < END_SESSION_MAX_UNACKED_RETRIES;
                 let window = if on_evidence {
                     END_SESSION_EVIDENCE_RETRY_MS
                 } else {
@@ -265,7 +360,10 @@ impl SessionMachine {
                         Phase::TearingDown {
                             since_ms: now,
                             owed: false,
-                            unacked: unacked + u32::from(evidence),
+                            unacked: record.unacked + u32::from(evidence),
+                            // Ours now: we are the side that sent, so a later suppression is a
+                            // debt again.
+                            peer_asked: false,
                         },
                     );
                     return Effect::TearDown;
@@ -273,33 +371,59 @@ impl SessionMachine {
                 self.phases.insert(
                     device_id.to_string(),
                     Phase::TearingDown {
-                        since_ms,
+                        since_ms: record.since_ms,
                         owed: true,
-                        unacked,
+                        unacked: record.unacked,
+                        peer_asked: record.peer_asked,
                     },
                 );
                 Effect::DeferTearDown {
-                    retry_after_ms: Self::remaining(now, since_ms, window),
+                    retry_after_ms: Self::remaining(now, record.since_ms, window),
                 }
             }
 
+            Event::PeerToreDown => {
+                // Restarts the quiet whoever opened the phase: the last teardown either side
+                // knows about is this one, and it is the one the window is about. The retry
+                // budget carries — a storm does not stop being a storm because the other side
+                // took a turn — and any debt is discharged, because the peer has now said the
+                // thing our deferred teardown was going to say.
+                let unacked = self
+                    .teardown_record(device_id, now)
+                    .map_or(0, |record| record.unacked);
+                self.phases.insert(
+                    device_id.to_string(),
+                    Phase::TearingDown {
+                        since_ms: now,
+                        owed: false,
+                        unacked,
+                        peer_asked: true,
+                    },
+                );
+                Effect::Nothing
+            }
+
             Event::WantToHeal => match self.teardown_record(device_id, now) {
-                Some((since_ms, _, _)) if now.saturating_sub(since_ms) < HEAL_COOLDOWN_MS => {
+                Some(record) if now.saturating_sub(record.since_ms) < HEAL_COOLDOWN_MS => {
                     Effect::DeferHeal {
-                        retry_after_ms: Self::remaining(now, since_ms, HEAL_COOLDOWN_MS),
+                        retry_after_ms: Self::remaining(now, record.since_ms, HEAL_COOLDOWN_MS),
                     }
                 }
                 record => {
                     // A heal shares the phase with a teardown deliberately: both ask the peer to
                     // rebuild, and two of them inside one window is the storm this cools. It does
-                    // not spend the teardown budget — nothing was sent to the peer.
-                    let (owed, unacked) = record.map_or((false, 0), |(_, owed, u)| (owed, u));
+                    // not spend the teardown budget — nothing was sent to the peer. Nor does it
+                    // claim the phase for us: a heal is local, so it does not make a peer-asked
+                    // quiet into our own window.
+                    let (owed, unacked, peer_asked) = record
+                        .map_or((false, 0, false), |r| (r.owed, r.unacked, r.peer_asked));
                     self.phases.insert(
                         device_id.to_string(),
                         Phase::TearingDown {
                             since_ms: now,
                             owed,
                             unacked,
+                            peer_asked,
                         },
                     );
                     Effect::Heal
@@ -307,11 +431,11 @@ impl SessionMachine {
             },
 
             Event::Timeout => {
-                let Some((_, owed, unacked)) = self.teardown_record(device_id, now) else {
+                let Some(record) = self.teardown_record(device_id, now) else {
                     return Effect::Nothing;
                 };
                 // The window has passed either way, so the phase goes whatever the debt was.
-                if owed {
+                if record.owed {
                     // Paid exactly once, and as a fresh teardown — which re-enters the cooldown,
                     // so N suppressions inside one window still produce one send. The budget
                     // carries: the debt was incurred by asks that had their own evidence.
@@ -320,7 +444,8 @@ impl SessionMachine {
                         Phase::TearingDown {
                             since_ms: now,
                             owed: false,
-                            unacked,
+                            unacked: record.unacked,
+                            peer_asked: false,
                         },
                     );
                     Effect::TearDown
@@ -446,10 +571,10 @@ mod tests {
     fn a_second_teardown_in_the_window_is_owed_not_dropped() {
         let (mut m, _) = machine(1_000);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: false }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
             Effect::TearDown
         );
-        match m.handle("dev", Event::WantToTearDown { evidence: false }) {
+        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
             Effect::DeferTearDown { retry_after_ms } => {
                 assert!(retry_after_ms > 0 && retry_after_ms <= END_SESSION_COOLDOWN_MS + 100)
             }
@@ -463,9 +588,9 @@ mod tests {
     #[test]
     fn many_suppressions_pay_one_teardown() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         for _ in 0..5 {
-            m.handle("dev", Event::WantToTearDown { evidence: false });
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         }
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::Timeout), Effect::TearDown);
@@ -481,8 +606,8 @@ mod tests {
     #[test]
     fn an_owed_teardown_is_void_once_the_session_is_rebuilt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         assert!(m.owes_teardown("dev"));
 
         m.handle("dev", Event::WantToOpen);
@@ -506,7 +631,7 @@ mod tests {
     #[test]
     fn a_heal_inside_a_teardown_window_is_deferred() {
         let (mut m, _) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         match m.handle("dev", Event::WantToHeal) {
             Effect::DeferHeal { retry_after_ms } => assert!(retry_after_ms > 0),
             other => panic!("expected a deferral, got {other:?}"),
@@ -519,7 +644,7 @@ mod tests {
     #[test]
     fn a_deferred_heal_leaves_no_debt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         m.handle("dev", Event::WantToHeal);
         assert!(!m.owes_teardown("dev"));
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
@@ -535,11 +660,11 @@ mod tests {
     fn devices_do_not_share_a_phase() {
         let (mut m, _) = machine(1_000);
         assert_eq!(
-            m.handle("dev-a", Event::WantToTearDown { evidence: false }),
+            m.handle("dev-a", Event::WantToTearDown { cause: TearDownCause::Blind }),
             Effect::TearDown
         );
         assert_eq!(
-            m.handle("dev-b", Event::WantToTearDown { evidence: false }),
+            m.handle("dev-b", Event::WantToTearDown { cause: TearDownCause::Blind }),
             Effect::TearDown
         );
         assert_eq!(m.handle("dev-a", Event::WantToOpen), Effect::Open);
@@ -582,12 +707,12 @@ mod tests {
     fn evidence_buys_a_faster_retry_than_the_window() {
         let (mut m, clock) = machine(1_000);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
     }
@@ -597,9 +722,9 @@ mod tests {
     #[test]
     fn the_fast_retry_is_not_available_without_evidence() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { evidence: false }) {
+        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected a deferral, got {other:?}"),
         }
@@ -612,16 +737,16 @@ mod tests {
     #[test]
     fn the_budget_runs_out_and_the_window_returns() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
             assert_eq!(
-                m.handle("dev", Event::WantToTearDown { evidence: true }),
+                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
                 Effect::TearDown
             );
         }
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { evidence: true }) {
+        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }) {
             Effect::DeferTearDown { retry_after_ms } => {
                 assert!(retry_after_ms > END_SESSION_EVIDENCE_RETRY_MS)
             }
@@ -637,20 +762,20 @@ mod tests {
     #[test]
     fn a_spent_budget_survives_the_window_that_spent_it() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { evidence: true });
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         }
         // The long window passes and one ordinary teardown goes out.
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
         // It must not have come with a new allowance.
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { evidence: true }) {
+        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected the budget to still be spent, got {other:?}"),
         }
@@ -660,19 +785,19 @@ mod tests {
     #[test]
     fn a_long_quiet_returns_the_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { evidence: true });
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         }
         clock.advance_ms(UNACKED_BUDGET_TTL_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
     }
@@ -682,19 +807,19 @@ mod tests {
     #[test]
     fn a_rebuilt_session_returns_the_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { evidence: true });
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         }
         m.handle("dev", Event::OpenFinished);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
         );
     }
@@ -707,11 +832,11 @@ mod tests {
     #[test]
     fn a_heal_waits_its_own_window_not_the_teardowns() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         clock.advance_ms(HEAL_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
         // …and the teardown it shares the phase with is still held.
-        match m.handle("dev", Event::WantToTearDown { evidence: false }) {
+        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected the teardown to still be held, got {other:?}"),
         }
@@ -722,15 +847,156 @@ mod tests {
     #[test]
     fn healing_does_not_spend_the_teardown_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: true });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
         for _ in 0..3 {
             clock.advance_ms(HEAL_COOLDOWN_MS + 1);
             assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
         }
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { evidence: true }),
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
             Effect::TearDown
+        );
+    }
+
+    // ── The peer's own teardown ────────────────────────────────────────────────
+
+    /// The case the iOS 20 s grace existed for: the peer tears down, our first post-reset msg0
+    /// fails AEAD, and the blind teardown that used to go back at them is answered instead.
+    ///
+    /// Answered, not deferred: nothing is owed and no timer is armed. A `DeferTearDown` here
+    /// would be the grace's opposite — a guaranteed teardown at a peer that already reset.
+    #[test]
+    fn the_peers_teardown_answers_a_blind_ask_of_ours() {
+        let (mut m, _clock) = machine(1_000);
+        assert_eq!(m.handle("dev", Event::PeerToreDown), Effect::Nothing);
+        assert_eq!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            Effect::TearDownNotNeeded
+        );
+        assert!(!m.owes_teardown("dev"), "nothing is owed — the peer already knows");
+    }
+
+    /// Evidence is not silenced by it — only delayed by the short window, and owed.
+    ///
+    /// The delay is right rather than incidental: a message arriving microseconds after the
+    /// peer's teardown was in flight before it, so it is ordering and not proof they ignored us.
+    /// Three seconds later it is proof, and the debt is paid. The difference from a blind ask is
+    /// the whole point — that one is answered and this one is owed.
+    #[test]
+    fn the_peers_teardown_delays_evidence_but_still_owes_it() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert!(matches!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            Effect::DeferTearDown { .. }
+        ));
+        assert!(m.owes_teardown("dev"));
+        clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
+        assert_eq!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            Effect::TearDown,
+            "the short window applies inside the peer's quiet; only the blind ask is silenced"
+        );
+    }
+
+    /// Nor an explained one. Silence here is the 4-DH retry loop continuing: the peer cannot
+    /// work out by itself that the one-time pre-key it chose is the problem.
+    ///
+    /// Held to the ordinary window rather than sent at once — it is not evidence of anything
+    /// lost — so inside the quiet it is deferred and owed, and the timer pays it.
+    #[test]
+    fn the_peers_teardown_does_not_silence_an_explained_one() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert!(matches!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Explained }),
+            Effect::DeferTearDown { .. }
+        ));
+        assert!(m.owes_teardown("dev"));
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::TearDown);
+    }
+
+    /// The quiet ends, and then a blind teardown is ordinary again.
+    #[test]
+    fn a_blind_teardown_returns_once_the_quiet_passes() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        clock.advance_ms(PEER_TEARDOWN_QUIET_MS + 1);
+        assert_eq!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            Effect::TearDown
+        );
+    }
+
+    /// A suppressed ask does not restart the quiet. The window is about the peer's teardown, so
+    /// N failing decrypts inside it must not push its end further away each time — which is how
+    /// a cooldown becomes a mute.
+    #[test]
+    fn suppressed_asks_do_not_extend_the_peers_quiet() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        for _ in 0..5 {
+            clock.advance_ms(PEER_TEARDOWN_QUIET_MS / 6);
+            assert_eq!(
+                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+                Effect::TearDownNotNeeded
+            );
+        }
+        clock.advance_ms(PEER_TEARDOWN_QUIET_MS);
+        assert_eq!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            Effect::TearDown
+        );
+    }
+
+    /// A debt we owed is discharged by the peer's teardown: they have now said the thing our
+    /// deferred teardown was going to say. Paying it afterwards would be a teardown sent into a
+    /// reset already under way — the crossing-teardown defect arriving by its own timer.
+    #[test]
+    fn the_peers_teardown_discharges_our_debt() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        assert!(m.owes_teardown("dev"), "pre-condition: the second ask is owed");
+        m.handle("dev", Event::PeerToreDown);
+        assert!(!m.owes_teardown("dev"));
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+    }
+
+    /// The retry budget survives it. A storm does not stop being a storm because the other side
+    /// took a turn, and the budget is what bounds it.
+    #[test]
+    fn the_peers_teardown_keeps_the_retry_budget() {
+        let (mut m, clock) = machine(1_000);
+        for _ in 0..END_SESSION_MAX_UNACKED_RETRIES {
+            assert_eq!(
+                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+                Effect::TearDown
+            );
+            clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
+        }
+        m.handle("dev", Event::PeerToreDown);
+        // Budget spent: evidence no longer buys the short window, so this is held to the full one.
+        assert!(matches!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            Effect::DeferTearDown { .. }
+        ));
+    }
+
+    /// A heal inside the peer's quiet stays local and does not claim the window for us — so a
+    /// blind teardown after it is still answered rather than owed.
+    #[test]
+    fn healing_does_not_turn_the_peers_quiet_into_ours() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        clock.advance_ms(HEAL_COOLDOWN_MS + 1);
+        assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
+        assert_eq!(
+            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            Effect::TearDownNotNeeded
         );
     }
 
@@ -739,8 +1005,8 @@ mod tests {
     #[test]
     fn forgetting_a_device_forgets_its_debt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { evidence: false });
-        m.handle("dev", Event::WantToTearDown { evidence: false });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
         m.handle("dev", Event::Forget);
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
