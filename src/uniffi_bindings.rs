@@ -2890,14 +2890,12 @@ pub fn plan_send(
     own_device_ids: Vec<String>,
     our_device_id: String,
     recipient_is_self: bool,
-    primary_send_covered: String,
 ) -> Vec<DeliveryTarget> {
     crate::orchestration::plan_send(
         &recipient_device_ids,
         &own_device_ids,
         &our_device_id,
         recipient_is_self,
-        &primary_send_covered,
     )
     .into_iter()
     .map(|t| DeliveryTarget {

@@ -47,10 +47,14 @@ pub struct DeliveryTarget {
 /// * `recipient_is_self` — a note to self. Then the recipient's devices *are* our devices, and
 ///   planning both audiences would send every replica two copies of one message. This is an
 ///   account-space comparison, which is why it is an argument and not a derivation.
-/// * `primary_send_covered` — the recipient device an ordinary (non-fan-out) send already reached.
-///   Empty means none. Planning a copy for it would put two ciphertexts of one message through one
-///   ratchet and the peer would render it twice. This argument disappears when the primary send
-///   does — see §D in the multi-device plan; until then it is how the two paths avoid colliding.
+///
+/// There was a sixth argument, `primary_send_covered`: the one recipient device that an ordinary
+/// send had already reached, to be skipped here. It existed because a message went out twice — an
+/// account-addressed send to one device, then a fan-out to the rest — and the two paths had to
+/// agree on which device not to collide over. Both clients stopped sending that way
+/// (`construct-messenger@4a74c013`, `construct-android@5850ce8`), so there is no longer a copy
+/// that could already be covered, and a parameter whose only correct value is "none" is a way for
+/// a future caller to be wrong. §B item 1 of `a-peer-is-a-set-of-devices`.
 ///
 /// Recipient devices first, then own replicas — the caller's order preserved within each group. A
 /// plan whose order changes between runs makes a failure reproduce on one launch and not the next.
@@ -62,7 +66,6 @@ pub fn plan_send(
     own_device_ids: &[String],
     our_device_id: &str,
     recipient_is_self: bool,
-    primary_send_covered: &str,
 ) -> Vec<DeliveryTarget> {
     let mut out: Vec<DeliveryTarget> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -80,9 +83,6 @@ pub fn plan_send(
 
     if !recipient_is_self {
         for id in recipient_device_ids {
-            if !primary_send_covered.is_empty() && id == primary_send_covered {
-                continue;
-            }
             push(id, DeliveryAudience::Recipient, &mut out);
         }
     }
@@ -113,9 +113,12 @@ mod tests {
             .collect()
     }
 
-    /// The ordinary case: a peer with two devices, one already covered by the primary send, and one
-    /// replica of ours. Asserted as a full sequence — the grouping and the order are both part of
-    /// what this function decides.
+    /// The ordinary case: a peer with two devices and one replica of ours. Asserted as a full
+    /// sequence — the grouping and the order are both part of what this function decides.
+    ///
+    /// Both of the peer's devices are here. Until 2026-09-22 one of them would have been missing,
+    /// because an account-addressed send had already reached it and `primary_send_covered` named
+    /// it; that send no longer exists on either client.
     #[test]
     fn recipients_first_then_replicas() {
         let targets = plan_send(
@@ -123,11 +126,11 @@ mod tests {
             &ids(&["me", "mine2"]),
             "me",
             false,
-            "them1",
         );
         assert_eq!(
             plan(&targets),
             vec![
+                ("them1", DeliveryAudience::Recipient),
                 ("them2", DeliveryAudience::Recipient),
                 ("mine2", DeliveryAudience::OwnReplica),
             ]
@@ -139,7 +142,7 @@ mod tests {
     /// like a decryption failure, not like a planning mistake.
     #[test]
     fn our_own_device_is_never_a_target() {
-        let targets = plan_send(&[], &ids(&["me", "mine2"]), "me", true, "");
+        let targets = plan_send(&[], &ids(&["me", "mine2"]), "me", true);
         assert_eq!(
             plan(&targets),
             vec![("mine2", DeliveryAudience::OwnReplica)]
@@ -150,7 +153,7 @@ mod tests {
     /// device would include one addressed to this one. Refusing beats guessing.
     #[test]
     fn an_unknown_own_device_plans_no_replicas() {
-        let targets = plan_send(&ids(&["them1"]), &ids(&["a", "b"]), "", false, "");
+        let targets = plan_send(&ids(&["them1"]), &ids(&["a", "b"]), "", false);
         assert_eq!(plan(&targets), vec![("them1", DeliveryAudience::Recipient)]);
     }
 
@@ -158,39 +161,10 @@ mod tests {
     /// send every replica two copies of one message.
     #[test]
     fn a_note_to_self_plans_replicas_only() {
-        let targets = plan_send(
-            &ids(&["me", "mine2"]),
-            &ids(&["me", "mine2"]),
-            "me",
-            true,
-            "",
-        );
+        let targets = plan_send(&ids(&["me", "mine2"]), &ids(&["me", "mine2"]), "me", true);
         assert_eq!(
             plan(&targets),
             vec![("mine2", DeliveryAudience::OwnReplica)]
-        );
-    }
-
-    /// The device the primary send already reached gets no copy. Both share one ratchet since the
-    /// addressing flip, so a second ciphertext of the same message would render twice on the peer.
-    #[test]
-    fn the_primary_send_target_is_not_copied() {
-        let targets = plan_send(&ids(&["them1", "them2"]), &[], "", false, "them1");
-        assert_eq!(plan(&targets), vec![("them2", DeliveryAudience::Recipient)]);
-    }
-
-    /// An empty `primary_send_covered` means "nothing covered", not "cover nothing" — the
-    /// distinction matters because an unresolved translation on the client produces exactly that
-    /// empty string, and reading it as a device id would silently drop a real target.
-    #[test]
-    fn an_empty_primary_send_marker_covers_nothing() {
-        let targets = plan_send(&ids(&["them1", "them2"]), &[], "", false, "");
-        assert_eq!(
-            plan(&targets),
-            vec![
-                ("them1", DeliveryAudience::Recipient),
-                ("them2", DeliveryAudience::Recipient),
-            ]
         );
     }
 
@@ -198,7 +172,7 @@ mod tests {
     /// the *recipient* side so the surviving entry proves which audience won.
     #[test]
     fn a_device_is_planned_once() {
-        let targets = plan_send(&ids(&["x"]), &ids(&["x", "me"]), "me", false, "");
+        let targets = plan_send(&ids(&["x"]), &ids(&["x", "me"]), "me", false);
         assert_eq!(plan(&targets), vec![("x", DeliveryAudience::Recipient)]);
     }
 
@@ -210,7 +184,6 @@ mod tests {
             &ids(&["", "mine2", "me"]),
             "me",
             false,
-            "",
         );
         assert_eq!(
             plan(&targets),
@@ -221,10 +194,10 @@ mod tests {
         );
     }
 
-    /// Nothing to send to is an empty plan, not an error. A single-device peer with no replicas of
-    /// ours is the overwhelmingly common case once the primary send has covered them.
+    /// Nothing to send to is an empty plan, not an error — a contact whose devices we do not know
+    /// yet, and no replicas of ours.
     #[test]
     fn nothing_to_copy_is_an_empty_plan() {
-        assert!(plan_send(&ids(&["them1"]), &ids(&["me"]), "me", false, "them1").is_empty());
+        assert!(plan_send(&[], &ids(&["me"]), "me", false).is_empty());
     }
 }
