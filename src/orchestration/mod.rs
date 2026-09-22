@@ -11,6 +11,7 @@
 ///   healing_queue    — Session healing queue (Phase 1b)
 ///   pq_contribution  — PQ contribution manager (Phase 2)
 ///   session_lifecycle— Session lifecycle (Phase 3)       [TODO]
+///   session_machine  — What phase a ratchet is in, and what may happen to it next
 ///   message_router   — Decision engine (Phase 4)         [TODO]
 ///   teardown_plan    — Which of a peer's devices a teardown touches
 ///   initiation_plan  — Whether to open a session with a device now, and as which side
@@ -32,6 +33,7 @@ pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
 pub mod send_plan;
 pub mod session_lifecycle;
+pub mod session_machine;
 pub mod teardown_plan;
 
 pub use ack_store::{AckCheckResult, AckStore};
@@ -52,4 +54,8 @@ pub use receiving_init_plan::{
 };
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
 pub use session_lifecycle::{DecryptResult, EncryptResult, SessionLifecycleManager};
+pub use session_machine::{
+    END_SESSION_COOLDOWN_MS, Effect as SessionEffect, Event as SessionEvent, OPENING_TTL_MS, Phase,
+    SessionMachine,
+};
 pub use teardown_plan::{TeardownAction, TeardownDecision, plan_teardown};
