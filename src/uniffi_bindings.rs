@@ -3832,6 +3832,10 @@ pub enum CfeIncomingEvent {
     PeerToreDown {
         contact_id: String,
     },
+    /// The platform needs a session with `contact_id` and there is none.
+    ReopenRequested {
+        contact_id: String,
+    },
 }
 
 /// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
@@ -3951,6 +3955,7 @@ impl CfeIncomingEvent {
                 cause: cause.into(),
             },
             Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
+            Self::ReopenRequested { contact_id } => ReopenRequested { contact_id },
         }
     }
 }
@@ -4088,6 +4093,21 @@ pub enum CfeAction {
     EndSessionNotNeeded {
         contact_id: String,
     },
+    /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
+    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told.
+    OpenSession {
+        contact_id: String,
+    },
+    /// Too soon to open: the peer tore this ratchet down and its rebuild is probably in the same
+    /// flush. The core arms the retry itself — do not schedule one here.
+    OpenDeferred {
+        contact_id: String,
+        retry_after_ms: u64,
+    },
+    /// The quiet passed and the session is already back. Nothing to open.
+    OpenNotNeeded {
+        contact_id: String,
+    },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
     /// nothing required of the platform; it is drained when the init completes.
     MessageQueuedPendingInit {
@@ -4218,6 +4238,15 @@ impl CfeAction {
                 retry_after_ms,
             },
             EndSessionNotNeeded { contact_id } => Self::EndSessionNotNeeded { contact_id },
+            OpenSession { contact_id } => Self::OpenSession { contact_id },
+            OpenDeferred {
+                contact_id,
+                retry_after_ms,
+            } => Self::OpenDeferred {
+                contact_id,
+                retry_after_ms,
+            },
+            OpenNotNeeded { contact_id } => Self::OpenNotNeeded { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
                 queued_count,

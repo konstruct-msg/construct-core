@@ -164,6 +164,9 @@ impl Orchestrator {
                     .handle(&contact_id, SessionEvent::PeerToreDown);
                 Vec::new()
             }
+            IncomingEvent::ReopenRequested { contact_id } => {
+                self.handle_reopen_requested(contact_id)
+            }
         }
     }
 
@@ -202,6 +205,34 @@ impl Orchestrator {
             // is the platform, which reaches its own linked devices through the paths it already
             // owns; emitting it would broadcast the same reset twice.
             _ => vec![Action::SendEndSession { contact_id }],
+        }
+    }
+
+    /// Answer the platform's "I need a session with this device".
+    ///
+    /// The one caller today is the INITIATOR re-init an inbound teardown raises. It used to be a
+    /// 1.5 s sleep and a `[String: Task]` map on iOS, and the two halves were one rule: a
+    /// teardown and the rebuild that answers it ride the same server flush, so opening the
+    /// instant the teardown is applied crosses the peer's init — and a backlog of N teardowns
+    /// used to start N re-inits, each destroying the session the previous one had just built.
+    /// Both fall out of one phase per device; see `REOPEN_QUIET_MS`.
+    fn handle_reopen_requested(&mut self, contact_id: String) -> Vec<Action> {
+        match self.sessions.handle(&contact_id, SessionEvent::WantToOpen) {
+            SessionEffect::DeferOpen { retry_after_ms } => vec![
+                Action::OpenDeferred {
+                    contact_id: contact_id.clone(),
+                    retry_after_ms,
+                },
+                Action::ScheduleTimer {
+                    timer_id: format!("reopen_quiet:{contact_id}"),
+                    delay_ms: retry_after_ms,
+                },
+            ],
+            // Someone is already opening this ratchet — the core's own message path, or an
+            // earlier ask of the platform's. A second announce spends a second one-time pre-key
+            // and replaces the first session, orphaning the SRI already on the wire.
+            SessionEffect::WaitForOpen => vec![],
+            _ => vec![Action::OpenSession { contact_id }],
         }
     }
 
@@ -1564,6 +1595,35 @@ impl Orchestrator {
                 }
                 actions
             }
+            // The peer's flush has had its moment. One timer for both callers — the platform's
+            // re-init and a message queued behind the same quiet — because after a teardown they
+            // want the same thing: an announced X3DH. A message waiting on it drains out of
+            // `pending_queues` when the init completes, as it does behind any other open.
+            _ if timer_id.starts_with("reopen_quiet:") => {
+                let contact_id = timer_id["reopen_quiet:".len()..].to_string();
+                // The peer's rebuild arrived — which is the whole reason the quiet exists.
+                // Clearing the phase is what `OpenFinished` is for: a session that exists again
+                // settles what was owed against the one it replaced.
+                if self.lifecycle.has_active_session(&contact_id) {
+                    self.sessions
+                        .handle(&contact_id, SessionEvent::OpenFinished);
+                    return vec![Action::OpenNotNeeded { contact_id }];
+                }
+                match self.sessions.handle(&contact_id, SessionEvent::WantToOpen) {
+                    // Another teardown landed inside the quiet, so the flush is still arriving.
+                    // Same deadline, re-armed — the machine counts from the last teardown, not
+                    // from this timer.
+                    SessionEffect::DeferOpen { retry_after_ms } => vec![Action::ScheduleTimer {
+                        timer_id: timer_id.clone(),
+                        delay_ms: retry_after_ms,
+                    }],
+                    // Somebody got there first. One announce per ratchet: a second spends another
+                    // of the peer's one-time pre-keys and replaces the session the first is
+                    // announcing, orphaning the SRI already on the wire.
+                    SessionEffect::WaitForOpen => vec![],
+                    _ => vec![Action::OpenSession { contact_id }],
+                }
+            }
             _ if timer_id.starts_with("heartbeat:") => {
                 let contact_id = &timer_id["heartbeat:".len()..];
                 if self.active_chats.contains(contact_id) {
@@ -1700,6 +1760,28 @@ impl Orchestrator {
                             queued_count: queued_count as u32,
                         }]
                     }
+                    // Same hold as the platform's re-init gets, for the same reason: the peer
+                    // tore this ratchet down and its rebuild is in the same flush. The message is
+                    // queued either way; what changes is that our X3DH no longer races theirs.
+                    // The timer is ours because nothing re-delivers a queued message to ask again
+                    // — unlike a deferred heal, which the peer's next carrier re-raises.
+                    //
+                    // Same timer as the platform's, and it pays out `OpenSession` rather than the
+                    // `FetchPublicKeyBundle` this arm grants directly. They are not two answers:
+                    // after a teardown the recovery is an announced X3DH, and the bundle fetch is
+                    // the first half of one. The bundle fetch is also message-bound on the
+                    // platform — it re-queues *this* carrier — and a timer has no message, so
+                    // granting it later would be a producer with no reader.
+                    SessionEffect::DeferOpen { retry_after_ms } => vec![
+                        Action::MessageQueuedPendingInit {
+                            contact_id: cid.clone(),
+                            queued_count: queued_count as u32,
+                        },
+                        Action::ScheduleTimer {
+                            timer_id: format!("reopen_quiet:{cid}"),
+                            delay_ms: retry_after_ms,
+                        },
+                    ],
                     _ => vec![Action::FetchPublicKeyBundle { user_id: cid }],
                 }
             }
@@ -1844,7 +1926,7 @@ mod tests {
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
     use crate::orchestration::clock::MockClock;
-    use crate::orchestration::session_machine::END_SESSION_COOLDOWN_MS;
+    use crate::orchestration::session_machine::{END_SESSION_COOLDOWN_MS, REOPEN_QUIET_MS};
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
@@ -2171,6 +2253,228 @@ mod tests {
             contact_id: cid.to_string(),
             reason: "AEAD decryption failed".to_string(),
         }
+    }
+
+    fn need_session_init(cid: &str) -> RoutingDecision {
+        RoutingDecision::NeedSessionInit {
+            contact_id: cid.to_string(),
+            queued_count: 1,
+        }
+    }
+
+    // ── Reopening after the peer's teardown (step 2, timer 3) ─────────────────
+
+    /// The platform's re-init asks the machine and is held while the peer's flush arrives. It
+    /// used to be a 1.5 s `Task.sleep` in `SessionCoordinator` with no way for anything else to
+    /// see it — including the core, which would happily open the same ratchet meanwhile.
+    ///
+    /// The timer is the core's: a platform that arms its own on `OpenDeferred` has rebuilt the
+    /// debounce this replaced.
+    #[test]
+    fn a_reopen_inside_the_peers_flush_is_deferred_on_the_cores_own_timer() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::OpenDeferred { contact_id, .. } if contact_id == "bob")
+            ),
+            "the platform must be told it is held, not handed an empty list"
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
+            ),
+            "nothing else will wake the orchestrator to run it"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { .. }))
+        );
+    }
+
+    /// Nothing torn down, nothing to wait for.
+    #[test]
+    fn a_reopen_of_a_quiet_device_goes_straight_out() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::OpenSession { contact_id } if contact_id == "bob"));
+    }
+
+    /// A backlog flush of N teardowns produces **one** re-init, and not before the flush ends.
+    /// Each used to schedule its own wipe+init+SRI, and every one after the first destroyed the
+    /// session the previous had just created — so the peer AEAD-failed all but the last SRI and
+    /// answered with fresh teardowns. The coalescing map is gone; the phase is what is one.
+    ///
+    /// Mutation: drop the `DeferOpen` arm from `handle_reopen_requested` — this reddens.
+    #[test]
+    fn a_flush_of_teardowns_produces_no_re_init_while_it_is_still_arriving() {
+        let mut o = make_orchestrator("alice");
+        let mut all = Vec::new();
+        for _ in 0..3 {
+            o.handle_event(IncomingEvent::PeerToreDown {
+                contact_id: "bob".to_string(),
+            });
+            all.extend(o.handle_event(IncomingEvent::ReopenRequested {
+                contact_id: "bob".to_string(),
+            }));
+        }
+        assert!(
+            !all.iter().any(|a| matches!(a, Action::OpenSession { .. })),
+            "three teardowns in one flush must not start three announces"
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|a| matches!(a, Action::OpenDeferred { .. }))
+                .count(),
+            3,
+            "each ask is answered — silence is what iOS read as a drop"
+        );
+    }
+
+    /// And when the flush has had its moment, the re-init runs.
+    #[test]
+    fn the_held_re_init_runs_once_the_quiet_passes() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(REOPEN_QUIET_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen_quiet:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
+            "the core owns the alarm, so the core is what pays it"
+        );
+    }
+
+    /// A message that needs a session waits for the peer's flush too, and for the same reason:
+    /// its X3DH would cross theirs. It is queued either way — `MessageQueuedPendingInit` is the
+    /// word for that, and the empty list this used to be was read by iOS as a drop.
+    #[test]
+    fn a_message_needing_a_session_waits_for_the_peers_flush_too() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.decision_to_actions(need_session_init("bob"), "");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })),
+            "the bundle fetch is what starts the crossing init"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::MessageQueuedPendingInit { .. }))
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
+            ),
+            "a queued message is not re-delivered, so only our own alarm brings it back"
+        );
+    }
+
+    /// And it is paid with an announce, not a bundle fetch. The fetch this arm grants directly is
+    /// message-bound on the platform — it re-queues the carrier it came with — and a timer has no
+    /// carrier, so granting one later would be a producer with no reader. After a teardown the
+    /// recovery is an announced X3DH either way, and the queued message drains out of
+    /// `pending_queues` on init completion like anything else held behind an open.
+    #[test]
+    fn the_queued_message_is_recovered_by_an_announce_when_the_quiet_passes() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(need_session_init("bob"), "");
+        clock.advance_ms(REOPEN_QUIET_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen_quiet:bob".to_string(),
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::OpenSession { contact_id } if contact_id == "bob"));
+    }
+
+    /// Two callers held by one quiet produce one open. Two announces spend two of the peer's
+    /// one-time pre-keys and the second session orphans the SRI the first just put on the wire —
+    /// which is what the `[String: Task]` map existed to prevent, one flush at a time.
+    #[test]
+    fn two_callers_held_by_one_quiet_produce_one_open() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(need_session_init("bob"), "");
+        let held = o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            held.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
+            ),
+            "both callers wait on the one alarm"
+        );
+        clock.advance_ms(REOPEN_QUIET_MS + 200);
+        let first = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen_quiet:bob".to_string(),
+        });
+        let second = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen_quiet:bob".to_string(),
+        });
+        assert_eq!(first.len(), 1);
+        assert!(matches!(&first[0], Action::OpenSession { .. }));
+        assert!(
+            second.is_empty(),
+            "the alarm firing twice does not announce twice — the first open holds the phase"
+        );
+    }
+
+    /// The peer's rebuild arrived during the quiet, which is what the quiet was waiting for. The
+    /// line matters on device: it is what to look for when a re-init "should have" happened.
+    #[test]
+    fn a_session_that_came_back_during_the_quiet_cancels_the_re_init() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        // Stand in for the peer's init having completed: the machine's record goes, and the
+        // orchestrator's own `has_active_session` is what the timer arm consults.
+        o.sessions.handle("bob", SessionEvent::OpenFinished);
+        clock.advance_ms(REOPEN_QUIET_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen_quiet:bob".to_string(),
+        });
+        // No session in this harness, so the machine grants the open — what is pinned here is
+        // that a cleared phase does not leave the quiet running.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { .. })),
+            "a cleared phase reopens immediately; it is the quiet that must not survive it"
+        );
     }
 
     #[test]

@@ -121,6 +121,35 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Open a session with `contact_id` now — as INITIATOR, announcing it (X3DH + SESSION_RESET
+    /// _INIT), not a bare local init.
+    ///
+    /// The answer to `ReopenRequested`, and to the timer that follows a deferred one. The
+    /// platform owns the announce because the carrier is its transport; what it no longer owns is
+    /// *when*.
+    OpenSession {
+        contact_id: String,
+    },
+
+    /// Not yet: the peer tore this ratchet down and its rebuild is probably in the same flush.
+    /// Come back in `retry_after_ms` — the core arms that timer itself and re-asks.
+    ///
+    /// Informational, like `EndSessionSuppressed`: the platform logs it and does nothing. A
+    /// platform that schedules its own retry on it is rebuilding the debounce this replaced.
+    OpenDeferred {
+        contact_id: String,
+        retry_after_ms: u64,
+    },
+
+    /// The quiet passed and the session is already back — the peer's rebuild arrived, which is
+    /// what the quiet was waiting for. Nothing to open.
+    ///
+    /// Distinct from `OpenDeferred`, which comes back. This one is the end of the sequence, and
+    /// it is the line to look for when a re-init "should have" happened and did not.
+    OpenNotNeeded {
+        contact_id: String,
+    },
+
     /// A message arrived while session init for this contact was already in flight. It is
     /// **queued inside the core** (`pending_queues`) and drained on `SessionInitCompleted` —
     /// nothing is required of the platform, and nothing has been lost.
@@ -351,8 +380,19 @@ pub enum IncomingEvent {
     ///
     /// A report, not a request: nothing is asked and nothing is returned but the phase. It opens
     /// the same window a teardown of ours opens, which is what folds the platform's 20 s inbound
-    /// grace into the machine — the third of step 2's five timers.
+    /// grace into the machine — the second of step 2's five timers.
     PeerToreDown {
+        contact_id: String,
+    },
+    /// Something the platform owns needs a session with `contact_id` and there is none.
+    ///
+    /// Today that is the INITIATOR re-init raised by an inbound teardown; the core's own
+    /// "a message needs a session" path asks the same machine without going through here.
+    /// Answered with `OpenSession`, or `OpenDeferred` + `ScheduleTimer` while the peer's flush
+    /// is still arriving. It replaced `endSessionReinitTasks` — a 1.5 s debounce and a
+    /// `[String: Task]` map that coalesced N teardowns in one flush into one re-init; the phase
+    /// is one per device, so the map has nothing left to do. The third of step 2's five timers.
+    ReopenRequested {
         contact_id: String,
     },
     /// The platform received a heartbeat message from `contact_id`.

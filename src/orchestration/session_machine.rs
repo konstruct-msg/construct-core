@@ -89,6 +89,30 @@ pub const OPENING_TTL_MS: u64 = 30_000;
 /// window that was chosen against observed storms.
 pub const PEER_TEARDOWN_QUIET_MS: u64 = END_SESSION_COOLDOWN_MS;
 
+/// How long the peer's own teardown holds our **reopen** (ms).
+///
+/// A teardown and the rebuild that answers it travel in the same server flush, in either order.
+/// Opening the moment the teardown is applied means our X3DH crosses theirs: two inits, two
+/// one-time pre-keys, and the second session replaces the first — so every carrier already
+/// dispatched references a ratchet neither side still holds. The quiet is the flush's length,
+/// not the peer's: long enough for the rest of that batch to be processed, short enough that a
+/// peer who sends no rebuild costs a second and a half.
+///
+/// This is the third of step 2's five timers. On iOS it was `endSessionReinitDebounceNanos`
+/// beside a `[String: Task]` map, and the map was the coalescing half — a backlog flush of N
+/// END_SESSIONs used to schedule N wipe+init+SRI runs, each destroying the session the previous
+/// one had just built. Coalescing is not a second mechanism here: the phase is one per device, so
+/// N asks inside the quiet are one deferral, and the last of them is what the quiet runs from.
+///
+/// What ends a quiet that keeps restarting is a session, which is the thing the peer's teardown
+/// is asking for; a peer that tears down forever and rebuilds never is already refusing to talk.
+pub const REOPEN_QUIET_MS: u64 = 1_500;
+
+/// The reopen quiet is a fraction of the teardown quiet that carries it, and must stay one: the
+/// peer's teardown keeps our *teardown* quiet for half a minute, and holding the session that
+/// answers it down for half a minute would be the storm with extra steps.
+const _: () = assert!(REOPEN_QUIET_MS < PEER_TEARDOWN_QUIET_MS);
+
 /// What the machine believes about one ratchet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -181,6 +205,11 @@ pub enum Effect {
     Open,
     /// An init is already in flight. The message waits behind it rather than starting a second.
     WaitForOpen,
+    /// Too soon to open: the peer tore this ratchet down and its rebuild is probably in the same
+    /// flush. Like a deferred heal this owes nothing — whoever wanted the session still wants it
+    /// and comes back — but unlike a heal the caller is told when, because nothing re-delivers a
+    /// teardown to ask again.
+    DeferOpen { retry_after_ms: u64 },
     /// Go ahead: send the teardown.
     TearDown,
     /// Too soon. Tell the caller when to come back; the teardown is remembered and paid then.
@@ -299,6 +328,17 @@ impl SessionMachine {
         match event {
             Event::WantToOpen => match self.phase(device_id) {
                 Phase::Opening { .. } => Effect::WaitForOpen,
+                // The peer tore this down, so their rebuild is very likely already on the way in
+                // the same flush. Hold ours for its length rather than race it — see
+                // `REOPEN_QUIET_MS`. Only `peer_asked`: after a teardown of *ours* nobody else is
+                // opening, and the side that asked for the rebuild is the side that does it.
+                Phase::TearingDown {
+                    since_ms,
+                    peer_asked: true,
+                    ..
+                } if now.saturating_sub(since_ms) < REOPEN_QUIET_MS => Effect::DeferOpen {
+                    retry_after_ms: Self::remaining(now, since_ms, REOPEN_QUIET_MS),
+                },
                 // Opening during a teardown is not a contradiction: the teardown asked the peer
                 // to rebuild, and rebuilding is what this is. The cooldown governs how often we
                 // *ask*, not whether we may answer.
@@ -562,6 +602,118 @@ mod tests {
         m.handle("dev", Event::OpenFinished);
         assert_eq!(m.phase("dev"), Phase::Absent);
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    // ── Reopening after the peer's teardown ───────────────────────────────────
+
+    /// The peer tore down; their rebuild is in the same flush. Opening now crosses it — two
+    /// inits, two of the peer's one-time pre-keys, and the second session orphans every carrier
+    /// already dispatched against the first.
+    ///
+    /// Mutation: drop the `peer_asked` arm from `WantToOpen` — this reddens.
+    #[test]
+    fn an_open_right_after_the_peers_teardown_waits_for_their_flush() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert_eq!(
+            m.handle("dev", Event::WantToOpen),
+            Effect::DeferOpen {
+                retry_after_ms: REOPEN_QUIET_MS + 100
+            }
+        );
+    }
+
+    /// And it is a hold, not a refusal: once the flush has had its moment the open goes.
+    #[test]
+    fn the_open_goes_once_the_flush_has_had_its_moment() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        clock.advance_ms(REOPEN_QUIET_MS);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// The quiet is far shorter than the phase that carries it. A peer's teardown keeps our own
+    /// *teardown* quiet for 30 s; it must not keep the session that answers it down for 30 s too.
+    #[test]
+    fn the_open_quiet_ends_long_before_the_teardown_quiet_does() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        clock.advance_ms(REOPEN_QUIET_MS + 1);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// N teardowns in one backlog flush are one deferral, not N. This is the whole of the map the
+    /// quiet replaces: each END_SESSION used to schedule its own wipe+init+SRI, and every re-init
+    /// after the first destroyed the session the previous one had just created — so the peer
+    /// AEAD-failed all but the last SRI and answered with fresh teardowns.
+    ///
+    /// The quiet runs from the **last** of them, because its job is to let the flush finish.
+    #[test]
+    fn a_flush_of_teardowns_is_one_deferral_run_from_the_last() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert!(matches!(
+            m.handle("dev", Event::WantToOpen),
+            Effect::DeferOpen { .. }
+        ));
+        clock.advance_ms(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        // Not 500 ms left over from the first: the flush is still arriving.
+        assert_eq!(
+            m.handle("dev", Event::WantToOpen),
+            Effect::DeferOpen {
+                retry_after_ms: REOPEN_QUIET_MS + 100
+            }
+        );
+    }
+
+    /// A session established during the quiet ends it. Nothing here re-opens over a working
+    /// session — that is the peer's rebuild having arrived, which is what the quiet was for.
+    #[test]
+    fn a_session_arriving_during_the_quiet_ends_it() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        m.handle("dev", Event::OpenFinished);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// Our own teardown holds nothing back. We are the side that asked the peer to rebuild, so
+    /// there is no crossing init to wait for — and the message that provoked the teardown is
+    /// waiting on exactly this session.
+    ///
+    /// Mutation: drop `peer_asked: true` from the arm — this reddens.
+    #[test]
+    fn our_own_teardown_does_not_hold_the_reopen() {
+        let (mut m, _) = machine(1_000);
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// The peer's teardown lands while we are opening: the quiet takes over from the in-flight
+    /// lock. The init we had started was against a ratchet the peer has just declared dead, so
+    /// waiting for their rebuild is the right answer and `WaitForOpen` would be the wrong one.
+    ///
+    /// The lock is lost with it, though, and that is a real gap: after the quiet a second open
+    /// may start while the first is still fetching. It is `initiatorReinitInFlight` on the client
+    /// today and it closes in step 3, where `Opening` grows the epoch that tells the two apart.
+    /// Named here so the behaviour is pinned rather than assumed.
+    #[test]
+    fn the_peers_teardown_during_an_open_takes_over_the_wait() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+        m.handle("dev", Event::PeerToreDown);
+        assert_eq!(
+            m.handle("dev", Event::WantToOpen),
+            Effect::DeferOpen {
+                retry_after_ms: REOPEN_QUIET_MS + 100
+            }
+        );
     }
 
     // ── Tearing down ──────────────────────────────────────────────────────────

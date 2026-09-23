@@ -782,6 +782,10 @@ interface CfeIncomingEvent {
     /// report, not a request: it opens the window that keeps our own teardown quiet, and returns
     /// no actions.
     PeerToreDown(string contact_id);
+    /// The platform needs a session with `contact_id` and there is none — today, the INITIATOR
+    /// re-init an inbound teardown raises. Answered with `OpenSession`, or `OpenDeferred` +
+    /// `ScheduleTimer` while the peer's own rebuild may still be in the same flush.
+    ReopenRequested(string contact_id);
 };
 
 /// Why a teardown is being asked for.
@@ -837,6 +841,14 @@ interface CfeAction {
     /// A teardown was asked for and will not be sent, now or later — the peer tore this ratchet
     /// down itself. Nothing is owed; do NOT schedule a retry.
     EndSessionNotNeeded(string contact_id);
+    /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
+    /// SESSION_RESET_INIT) — not a bare local init.
+    OpenSession(string contact_id);
+    /// Too soon to open: the peer tore this ratchet down and its rebuild may be in the same
+    /// flush. The core arms the retry itself; do NOT schedule one.
+    OpenDeferred(string contact_id, u64 retry_after_ms);
+    /// The quiet passed and the session is already back — nothing to open.
+    OpenNotNeeded(string contact_id);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
     /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
