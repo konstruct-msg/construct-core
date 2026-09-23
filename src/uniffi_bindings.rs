@@ -3013,146 +3013,17 @@ pub enum AckCheckResult {
     NotProcessed,
 }
 
-// ── Orchestration — RustHealingQueue (Phase 1b) ───────────────────────────────
-
-pub struct RustHealingQueue {
-    inner: std::sync::Mutex<crate::orchestration::HealingQueue>,
-}
-
-impl Default for RustHealingQueue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RustHealingQueue {
-    pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(crate::orchestration::HealingQueue::default()),
-        }
-    }
-
-    pub fn can_heal(&self, msg_number: u32) -> bool {
-        crate::orchestration::HealingQueue::can_heal(msg_number)
-    }
-
-    pub fn enqueue(&self, contact_id: String, message_json: String) {
-        use crate::orchestration::HealDirection;
-        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.enqueue(
-            &contact_id,
-            message_json.into_bytes(),
-            HealDirection::Outgoing,
-        );
-    }
-
-    pub fn record_attempt(&self, contact_id: String) -> HealingAttemptResult {
-        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        match queue.record_attempt(&contact_id) {
-            crate::orchestration::HealingDecision::RetryAllowed {
-                attempt,
-                retry_after_ms,
-            } => HealingAttemptResult {
-                decision: "retry_allowed".to_string(),
-                attempt,
-                retry_after_ms,
-            },
-            crate::orchestration::HealingDecision::MaxAttemptsReached => HealingAttemptResult {
-                decision: "max_attempts_reached".to_string(),
-                attempt: 0,
-                retry_after_ms: 0,
-            },
-            crate::orchestration::HealingDecision::NotFound => HealingAttemptResult {
-                decision: "not_found".to_string(),
-                attempt: 0,
-                retry_after_ms: 0,
-            },
-        }
-    }
-
-    pub fn remove_record(&self, contact_id: String) -> bool {
-        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.remove(&contact_id)
-    }
-
-    pub fn prune_expired(&self) {
-        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.prune_expired();
-    }
-
-    pub fn len(&self) -> u64 {
-        let queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.len() as u64
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Serialize the queue state to a CFE blob for Keychain persistence.
-    /// Reuses `CfeOrchestratorStateV1` format (only `healing_records` is populated).
-    /// Returns an empty `Vec` on serialisation failure — callers should treat this
-    /// as a non-fatal error and skip the save.
-    pub fn export_state(&self) -> Vec<u8> {
-        use crate::cfe::{CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1};
-        let queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let state = CfeOrchestratorStateV1 {
-            ver: 1,
-            my_user_id: String::new(),
-            processed_ids: Vec::new(),
-            healing_records: queue
-                .snapshot_records()
-                .into_iter()
-                .map(|r| CfeHealingRecordV1 {
-                    contact_id: r.contact_id.clone(),
-                    message_bytes: r.message_payload.clone(),
-                    attempts: r.attempts,
-                    incoming_triggers: r.incoming_triggers,
-                    created_at: r.created_at,
-                })
-                .collect(),
-            init_locks: Vec::new(),
-            archives: Vec::new(),
-            archive_timestamps: Vec::new(),
-            prekey_tracker: Vec::new(),
-        };
-        crate::cfe::encode(CfeMessageType::OrchestratorState, &state).unwrap_or_default()
-    }
-
-    /// Restore queue state from a CFE blob previously produced by `export_state`.
-    /// Silently no-ops on decode failure (e.g., corrupted blob or format mismatch).
-    pub fn import_state(&self, data: Vec<u8>) {
-        use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
-        use crate::orchestration::healing_queue::HealingRecord;
-        let Ok(state) = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
-            &data,
-            CfeMessageType::OrchestratorState,
-        ) else {
-            return;
-        };
-        let mut queue = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        queue.restore_records(
-            state
-                .healing_records
-                .into_iter()
-                .map(|r| HealingRecord {
-                    contact_id: r.contact_id,
-                    message_payload: r.message_bytes,
-                    attempts: r.attempts,
-                    incoming_triggers: r.incoming_triggers,
-                    created_at: r.created_at,
-                })
-                .collect(),
-        );
-    }
-}
-
-/// Mirror of UDL `HealingAttemptResult` dictionary.
-pub struct HealingAttemptResult {
-    pub decision: String,
-    pub attempt: u32,
-    pub retry_after_ms: u64,
-}
+// `RustHealingQueue` and `HealingAttemptResult` stood here until 2026-09-23.
+//
+// The object was a **second** `HealingQueue`, constructed by the platform for itself, keyed by
+// account and fed a JSON `ChatMessage` — beside the one inside `Orchestrator.lifecycle`, keyed by
+// device and holding the wire payload. The platform's was the one that decided whether a heal
+// could retry; this one's `attempts` was never incremented at all. Two records of one episode, in
+// two identity spaces, with nothing holding them in step. Step 4 of
+// `construct-docs/decisions/session-is-one-state-machine.md`.
+//
+// The question is `IncomingEvent::HealAttempted` now, answered by `HealAttemptAllowed` /
+// `HealExhausted` against the queue that already holds the carrier.
 
 // ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
 
@@ -3289,10 +3160,6 @@ impl OrchestratorCore {
     pub fn ack_mark_processed(&self, message_id: String) {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let _ = orch.ack_mark_processed(&message_id);
-    }
-
-    pub fn healing_can_heal(&self, msg_number: u32) -> bool {
-        crate::orchestration::HealingQueue::can_heal(msg_number)
     }
 
     // ── Session crypto delegates ──────────────────────────────────────────────
@@ -3843,6 +3710,11 @@ pub enum CfeIncomingEvent {
     ReopenRequested {
         contact_id: String,
     },
+    /// The platform is about to attempt one heal of `contact_id` and asks whether the budget
+    /// allows it. Answered with `HealAttemptAllowed` or `HealExhausted`.
+    HealAttempted {
+        contact_id: String,
+    },
     /// A SESSION_RESET_INIT has gone out to `contact_id` — starts the confirm window.
     SriAnnounced {
         contact_id: String,
@@ -3970,6 +3842,7 @@ impl CfeIncomingEvent {
                 cause: cause.into(),
             },
             Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
+            Self::HealAttempted { contact_id } => HealAttempted { contact_id },
             Self::ReopenRequested { contact_id } => ReopenRequested { contact_id },
             Self::SriAnnounced { contact_id } => SriAnnounced { contact_id },
             Self::PeerAcked { contact_id } => PeerAcked { contact_id },
@@ -4098,6 +3971,17 @@ pub enum CfeAction {
     HealSuppressed {
         contact_id: String,
         retry_after_ms: u64,
+    },
+    /// The heal budget allows this attempt — `attempt` is its 1-based index. The answer to
+    /// `HealAttempted`, and the only permission to retry: an empty list is not one.
+    HealAttemptAllowed {
+        contact_id: String,
+        attempt: u32,
+    },
+    /// The heal budget for `contact_id` is spent, or nothing is queued to spend it from. Give up
+    /// on the carrier and tear the ratchet down instead.
+    HealExhausted {
+        contact_id: String,
     },
     /// Hold this message: our own SESSION_RESET_INIT to `contact_id` is unacknowledged, so a
     /// message that will not open is our re-init's own consequence and not evidence about the
@@ -4259,6 +4143,14 @@ impl CfeAction {
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
             HeldPendingAck { contact_id } => Self::HeldPendingAck { contact_id },
+            HealAttemptAllowed {
+                contact_id,
+                attempt,
+            } => Self::HealAttemptAllowed {
+                contact_id,
+                attempt,
+            },
+            HealExhausted { contact_id } => Self::HealExhausted { contact_id },
             HealSuppressed {
                 contact_id,
                 retry_after_ms,

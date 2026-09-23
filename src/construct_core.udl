@@ -703,51 +703,11 @@ interface RustAckStore {
     u64 cache_len();
 };
 
-// ── HealingDecision ───────────────────────────────────────────────────────────
-
-/// Packed result of `RustHealingQueue.record_attempt`.
-dictionary HealingAttemptResult {
-    /// "retry_allowed" | "max_attempts_reached" | "not_found"
-    string decision;
-    /// 1-based attempt number (valid when decision == "retry_allowed").
-    u32 attempt;
-    /// Minimum delay before the next retry in ms (exponential backoff: 2s/4s/8s).
-    u64 retry_after_ms;
-};
-
-/// Thread-safe session healing queue.
-///
-/// Replaces Swift `SessionHealingService`.
-interface RustHealingQueue {
-    constructor();
-
-    /// `true` iff `msg_number == 0` — the only case eligible for healing.
-    boolean can_heal(u32 msg_number);
-
-    /// Enqueue `message_json` for `contact_id` (idempotent).
-    /// Persistence is handled by the orchestrator CFE state export.
-    void enqueue(string contact_id, string message_json);
-
-    /// Increment attempt counter for `contact_id`.
-    HealingAttemptResult record_attempt(string contact_id);
-
-    /// Remove the healing record after successful re-key.
-    boolean remove_record(string contact_id);
-
-    /// Remove expired healing records. Persistence handled by orchestrator CFE.
-    void prune_expired();
-
-    /// Number of pending healing records.
-    u64 len();
-
-    /// Serialise the queue state to a CFE blob for Keychain persistence.
-    /// Returns an empty sequence on serialisation failure.
-    sequence<u8> export_state();
-
-    /// Restore queue state from a CFE blob produced by `export_state`.
-    /// Silently no-ops on decode failure.
-    void import_state(sequence<u8> data);
-};
+// `HealingAttemptResult` and `interface RustHealingQueue` stood here until 2026-09-23. The
+// object let the platform construct a second healing queue of its own, in the account space,
+// beside the one the orchestrator keeps in the device space — and it was the platform's that
+// decided. The question is `HealAttempted` now. Step 4 of
+// decisions/session-is-one-state-machine.md.
 
 // ── OrchestratorCore ──────────────────────────────────────────────────────────
 
@@ -786,6 +746,10 @@ interface CfeIncomingEvent {
     /// re-init an inbound teardown raises. Answered with `OpenSession`, or `OpenDeferred` +
     /// `ScheduleTimer` while the peer's own rebuild may still be in the same flush.
     ReopenRequested(string contact_id);
+    /// The platform is about to attempt one heal of `contact_id` and asks whether the budget
+    /// allows it. Answered with `HealAttemptAllowed` or `HealExhausted` — never an empty list,
+    /// because silence read as permission is an unbounded heal loop.
+    HealAttempted(string contact_id);
     /// A SESSION_RESET_INIT has gone out to `contact_id`. A report, not a request: it starts the
     /// confirm window and arms the retry the core owns.
     SriAnnounced(string contact_id);
@@ -844,6 +808,11 @@ interface CfeAction {
     /// Our own SESSION_RESET_INIT to this device is unacknowledged, so neither heal nor tear
     /// down on the message that provoked this: buffer it and replay it when the wait ends.
     HeldPendingAck(string contact_id);
+    /// The heal budget allows this attempt; `attempt` is its 1-based index.
+    HealAttemptAllowed(string contact_id, u32 attempt);
+    /// The heal budget for this device is spent, or nothing is queued to spend it from — give up
+    /// on the carrier and tear the ratchet down instead.
+    HealExhausted(string contact_id);
     /// END_SESSION suppressed by cooldown — the core owes it and sends it in retry_after_ms.
     /// Platform must NOT ACK.
     EndSessionSuppressed(string contact_id, u64 retry_after_ms);
@@ -929,8 +898,6 @@ interface OrchestratorCore {
     /// Mark a message as processed in the ACK cache.
     void ack_mark_processed(string message_id);
 
-    /// `true` iff `msg_number == 0` (healing-eligible message).
-    boolean healing_can_heal(u32 msg_number);
 
     // ── Session crypto (delegation from ClassicCryptoCore) ───────────────────
 

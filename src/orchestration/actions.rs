@@ -97,6 +97,24 @@ pub enum Action {
         retry_after_ms: u64,
     },
 
+    /// The heal budget allows this attempt; `attempt` is its 1-based index.
+    ///
+    /// Not an instruction to heal — the platform asked, and this is the answer. What it must not
+    /// do is treat the absence of an answer as permission, which is why an exhausted budget is
+    /// its own action rather than an empty list.
+    HealAttemptAllowed {
+        contact_id: String,
+        attempt: u32,
+    },
+    /// The heal budget for this device is spent, or there is no record to spend it from.
+    ///
+    /// The platform gives up on the queued carrier and tears the ratchet down instead. Both
+    /// cases answer the same way: with no record there is nothing to bound the retries with, and
+    /// an unbounded heal loop is what the budget exists to prevent.
+    HealExhausted {
+        contact_id: String,
+    },
+
     /// The decision — heal or tear down — is held because our own SESSION_RESET_INIT to this
     /// device has not been acknowledged yet.
     ///
@@ -421,6 +439,16 @@ pub enum IncomingEvent {
     /// the same window a teardown of ours opens, which is what folds the platform's 20 s inbound
     /// grace into the machine — the second of step 2's five timers.
     PeerToreDown {
+        contact_id: String,
+    },
+    /// The platform is about to make one attempt at healing the ratchet with `contact_id`, and
+    /// asks whether the budget allows it.
+    ///
+    /// A request, and the only one about healing the platform still makes. The count it used to
+    /// keep — a second `HealingQueue` of its own, keyed by account and fed a JSON `ChatMessage`,
+    /// plus a Core Data column nothing read — is the record this queue already holds beside the
+    /// carrier. Answered with `HealAttemptAllowed` or `HealExhausted`.
+    HealAttempted {
         contact_id: String,
     },
     /// Something the platform owns needs a session with `contact_id` and there is none.

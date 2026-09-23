@@ -6,7 +6,11 @@
 ///
 /// Rules:
 /// - Only `msg_number == 0` can trigger healing.
-/// - Maximum 3 retry attempts per contact before giving up.
+/// - `max_attempts` is the attempt at which the budget is **refused**, so the default 3 allows
+///   two (`record_attempt` compares `>=` after incrementing). The count was unobservable until
+///   2026-09-23 — nothing called `record_attempt` on this queue — so the off-by-one against the
+///   older wording never showed up anywhere. Stated rather than changed: widening a retry budget
+///   is a policy decision and does not belong in a change that collapses carriers.
 /// - Records expire after 24 hours (TTL).
 /// - Enqueue is idempotent: a second call for the same contact replaces the
 ///   existing record rather than creating a duplicate.
@@ -208,9 +212,31 @@ impl HealingQueue {
         }
     }
 
-    /// Remove the healing record for `contact_id` (call after successful re-key).
+    /// Remove the healing record for `contact_id` — a **local forget**, not a protocol event.
+    ///
+    /// This drops `incoming_triggers` with everything else, so it is only correct where the
+    /// contact itself is being forgotten. Use `settle` when the ratchet dies but the contact
+    /// stays: an attacker who can make us forget the trigger count can spend it again.
     pub fn remove(&mut self, contact_id: &str) -> bool {
         self.records.remove(contact_id).is_some()
+    }
+
+    /// The ratchet this record was queued against no longer exists — it was replaced by a
+    /// session that opened, or torn down by either side.
+    ///
+    /// The queued carrier is spent either way (it was an X3DH for a ratchet nobody holds now) and
+    /// the retry budget belongs to the episode that ended, so both go. `incoming_triggers` does
+    /// **not**: it is the cap on how often a peer may make us start an episode at all, and a peer
+    /// who can reset it by tearing down has the exhaustion attack back
+    /// (`MAX_INCOMING_TRIGGERS`). `created_at` stays for the same reason — it is what the TTL
+    /// measures, and restamping it would extend the cap's life on every teardown.
+    ///
+    /// The record stays rather than being removed, so the cap has something to count against.
+    pub fn settle(&mut self, contact_id: &str) {
+        if let Some(record) = self.records.get_mut(contact_id) {
+            record.message_payload.clear();
+            record.attempts = 0;
+        }
     }
 
     // ── Maintenance ───────────────────────────────────────────────────────────

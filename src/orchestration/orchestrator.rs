@@ -164,7 +164,14 @@ impl Orchestrator {
             IncomingEvent::PeerToreDown { contact_id } => {
                 self.sessions
                     .handle(&contact_id, SessionEvent::PeerToreDown);
+                // The ratchet a heal was queued against is gone, so the carrier is spent and the
+                // retry budget belongs to an episode that ended. `settle`, not `remove`: the
+                // incoming-trigger cap must not be resettable by tearing down.
+                self.lifecycle.healing_queue.settle(&contact_id);
                 Vec::new()
+            }
+            IncomingEvent::HealAttempted { contact_id } => {
+                self.handle_heal_attempted(contact_id)
             }
             IncomingEvent::ReopenRequested { contact_id } => {
                 self.handle_reopen_requested(contact_id)
@@ -280,6 +287,33 @@ impl Orchestrator {
             // and replaces the first session, orphaning the SRI already on the wire.
             SessionEffect::WaitForOpen => vec![],
             _ => vec![Action::OpenSession { contact_id }],
+        }
+    }
+
+    /// One heal attempt, counted where the queued carrier already lives.
+    ///
+    /// The count had three carriers until 2026-09-23 and the one that decided was the wrong one:
+    /// a **second** `HealingQueue` instance the platform built for itself, keyed by account and
+    /// fed a JSON `ChatMessage`, beside this one, keyed by device and holding the wire payload.
+    /// This one's `attempts` was never incremented at all — `record_attempt` had no caller — so
+    /// the field the `MAX_INCOMING_TRIGGERS` throttle sits next to was permanently zero. The
+    /// third was a Core Data column written and read by nothing.
+    ///
+    /// `NotFound` answers `HealExhausted` rather than "go ahead". There is no record, so there is
+    /// nothing to count against, and an unbounded retry is what the budget exists to prevent —
+    /// it is also what the platform did before, by way of a Core Data lookup that missed.
+    fn handle_heal_attempted(&mut self, contact_id: String) -> Vec<Action> {
+        use crate::orchestration::healing_queue::HealingDecision;
+        match self.lifecycle.healing_queue.record_attempt(&contact_id) {
+            HealingDecision::RetryAllowed { attempt, .. } => {
+                vec![Action::HealAttemptAllowed {
+                    contact_id,
+                    attempt,
+                }]
+            }
+            HealingDecision::MaxAttemptsReached | HealingDecision::NotFound => {
+                vec![Action::HealExhausted { contact_id }]
+            }
         }
     }
 
@@ -1491,6 +1525,9 @@ impl Orchestrator {
         //
         self.sessions
             .handle(&contact_id, SessionEvent::OpenFinished);
+        // And settles the heal episode for the same reason the phase is released: a session that
+        // exists again is the thing every retry in that episode was trying to produce.
+        self.lifecycle.healing_queue.settle(&contact_id);
 
         let mut actions: Vec<Action> = Vec::new();
 
@@ -2432,6 +2469,137 @@ mod tests {
             !actions
                 .iter()
                 .any(|a| matches!(a, Action::OpenSession { .. }))
+        );
+    }
+
+    // ── One heal record (step 4) ─────────────────────────────────────────────
+
+    /// The budget is counted where the queued carrier already is. Until 2026-09-23 this queue's
+    /// `attempts` was permanently zero — `record_attempt` had no caller — while the decision was
+    /// made by a second `HealingQueue` the platform built for itself, keyed by account and fed a
+    /// JSON `ChatMessage`.
+    ///
+    /// Mutation: return `HealAttemptAllowed` unconditionally — this reddens.
+    #[test]
+    fn the_heal_budget_runs_out_where_the_carrier_is_queued() {
+        let mut o = make_orchestrator("alice");
+        o.enqueue_heal("bob", b"x3dh".to_vec());
+        // Two, not three: `max_attempts` is the attempt that is refused. See `HealingQueue`.
+        for expected in 1..=2u32 {
+            let actions = o.handle_event(IncomingEvent::HealAttempted {
+                contact_id: "bob".to_string(),
+            });
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::HealAttemptAllowed { contact_id, attempt }
+                        if contact_id == "bob" && *attempt == expected
+                )),
+                "attempt {expected} must be allowed"
+            );
+        }
+        let actions = o.handle_event(IncomingEvent::HealAttempted {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::HealExhausted { contact_id } if contact_id == "bob"))
+        );
+    }
+
+    /// No record means nothing to count against, so the answer is "stop" rather than "go ahead".
+    /// An empty list would be worse than either: the platform read silence as permission before
+    /// this action existed, by way of a Core Data lookup that missed.
+    #[test]
+    fn a_heal_with_nothing_queued_is_not_permission() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::HealAttempted {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::HealExhausted { .. })),
+            "an unbounded retry is what the budget exists to prevent"
+        );
+        assert!(!actions.is_empty(), "silence is not an answer");
+    }
+
+    /// A session that exists again settles the episode — the same rule that releases the phase.
+    /// Without it a peer that needed three attempts once would start its next episode exhausted,
+    /// for the TTL's whole twenty-four hours.
+    #[test]
+    fn a_session_that_came_back_settles_the_heal_budget() {
+        let mut o = make_orchestrator("alice");
+        o.enqueue_heal("bob", b"x3dh".to_vec());
+        for _ in 0..3 {
+            o.handle_event(IncomingEvent::HealAttempted {
+                contact_id: "bob".to_string(),
+            });
+        }
+        o.handle_event(IncomingEvent::SessionInitCompleted {
+            contact_id: "bob".to_string(),
+            session_data: Vec::new(),
+        });
+        let actions = o.handle_event(IncomingEvent::HealAttempted {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
+            )),
+            "the next episode starts with its own budget"
+        );
+    }
+
+    /// And the peer's teardown settles it too, for the same reason: the ratchet the carrier was
+    /// queued against is gone.
+    #[test]
+    fn the_peers_teardown_settles_the_heal_budget() {
+        let mut o = make_orchestrator("alice");
+        o.enqueue_heal("bob", b"x3dh".to_vec());
+        for _ in 0..3 {
+            o.handle_event(IncomingEvent::HealAttempted {
+                contact_id: "bob".to_string(),
+            });
+        }
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::HealAttempted {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
+            ))
+        );
+    }
+
+    /// But settling is not forgetting. The incoming-trigger cap is what stops a peer from making
+    /// us start heal episodes at will, and a peer who can reset it by tearing down has the
+    /// exhaustion attack back.
+    ///
+    /// Mutation: call `remove` instead of `settle` — this reddens.
+    #[test]
+    fn a_teardown_does_not_hand_back_the_incoming_trigger_budget() {
+        let mut o = make_orchestrator("alice");
+        for _ in 0..12 {
+            o.enqueue_heal("bob", b"x3dh".to_vec());
+        }
+        assert!(
+            o.lifecycle.healing_queue.is_incoming_throttled("bob"),
+            "twelve incoming triggers is past MAX_INCOMING_TRIGGERS"
+        );
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            o.lifecycle.healing_queue.is_incoming_throttled("bob"),
+            "the cap is per record lifetime, not per episode"
         );
     }
 
