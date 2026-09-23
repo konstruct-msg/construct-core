@@ -12,7 +12,8 @@
 //!
 //! See `construct-docs/decisions/session-is-one-state-machine.md`. This module is step 2, and
 //! step 2 is the teardown/reopen half: the core's own three maps become one machine, keyed by
-//! device, with one timer.
+//! device, with one timer. All five of the client's are in it now — the last, the responder
+//! fallback, as `RESPONDER_OVERRIDE_MS`.
 //!
 //! # What is deliberately not here yet
 //!
@@ -107,10 +108,11 @@ const _: () = assert!(SRI_RETRY_MS < OPENING_CONFIRM_WINDOW_MS);
 /// question — may an END_SESSION envelope go out now. Two numbers for one question is the shape
 /// step 2 exists to remove, and this is the second of the five timers it removes.
 ///
-/// Lengthening the quiet from 20 s to 30 s is safe against the thing that ends it: the responder
-/// fallback overrides the natural ordering at 60 s, so a peer whose rebuild never comes is still
-/// picked up with 30 s to spare. Shortening the *other* number instead would have loosened the
-/// window that was chosen against observed storms.
+/// Lengthening the quiet from 20 s to 30 s is safe against the thing that ends it: the peer's
+/// turn runs out at `RESPONDER_OVERRIDE_MS`, so a peer whose rebuild never comes is still picked
+/// up with 30 s to spare — a relation the compiler now checks rather than this sentence.
+/// Shortening the *other* number instead would have loosened the window that was chosen against
+/// observed storms.
 pub const PEER_TEARDOWN_QUIET_MS: u64 = END_SESSION_COOLDOWN_MS;
 
 /// How long the peer's own teardown holds our **reopen** (ms).
@@ -136,6 +138,28 @@ pub const REOPEN_QUIET_MS: u64 = 1_500;
 /// peer's teardown keeps our *teardown* quiet for half a minute, and holding the session that
 /// answers it down for half a minute would be the storm with extra steps.
 const _: () = assert!(REOPEN_QUIET_MS < PEER_TEARDOWN_QUIET_MS);
+
+/// How long the natural RESPONDER waits for the peer's rebuild before taking the role (ms).
+///
+/// The fifth and last of step 2's client timers, and the mirror half of `SRI_RETRY_MS`: one
+/// liveness guarantee, split by role. The INITIATOR announces and re-announces into its own
+/// silence; the RESPONDER has nothing to announce, so its half is to wait — and then to stop
+/// waiting. Without that second half, a peer that tears a ratchet down and never rebuilds it
+/// leaves the conversation stopped with nothing on either side that would say so.
+///
+/// `responderFallbackTimeout` on iOS, unchanged. What does change is the key: the
+/// `[String: Task]` beside it was keyed by **account**, so one device's teardown armed the wait
+/// for the person, and the first sibling to answer stood it down for a ratchet still dead.
+///
+/// Asked once, when the ratchet dies, and not again: the alarm re-asks `WantToOpen`, which
+/// defers to nobody. A turn the peer can extend by tearing down again is not a bound.
+pub const RESPONDER_OVERRIDE_MS: u64 = 60_000;
+
+/// The peer's turn must outlast the quiet that protects their flush — otherwise the flush quiet
+/// would be the whole of it and the ordering would mean nothing — and must outlast the teardown
+/// window, which is what makes taking the role safe: by the time we do, our own teardown is free
+/// to go again if the rebuild fails.
+const _: () = assert!(PEER_TEARDOWN_QUIET_MS < RESPONDER_OVERRIDE_MS);
 
 /// What the machine believes about one ratchet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +236,22 @@ pub enum TearDownCause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// Something needs a session with this device and there is none.
+    ///
+    /// Something is *waiting*: a typed message, a queued one. This ask never yields the turn to
+    /// the peer — a send held behind a minute-long wait is a person watching nothing happen —
+    /// and the only thing it waits out is the flush quiet, which is measured in seconds.
     WantToOpen,
+    /// The ratchet just died and should come back. Nobody is waiting on it.
+    ///
+    /// That is the whole difference from `WantToOpen`, and it is what makes yielding affordable:
+    /// with nothing behind the ask, the side the ordering names can go first.
+    ///
+    /// `peer_rebuilds` is the tie-break, ranked by the caller against our own device id — one
+    /// spelling of it, `tie_break_role`, over the ids the session is addressed by. The natural
+    /// INITIATOR rebuilds now; the natural RESPONDER waits `RESPONDER_OVERRIDE_MS` and then goes
+    /// anyway. Ranked at this moment because it is the one both sides can see the same two ids
+    /// and the same dead ratchet; the alarm that ends the wait does not ask again.
+    WantToReopen { peer_rebuilds: bool },
     /// The init finished, either way. The machine does not care which: a failed init leaves no
     /// session, and a successful one is visible in the lifecycle manager.
     OpenFinished,
@@ -267,10 +306,16 @@ pub enum Effect {
     /// Not a failure — a bound. A gate nothing can release is a conversation that stops sending,
     /// and that is what a single-shot watchdog left behind before 2026-08-04.
     GiveUpOpening,
-    /// Too soon to open: the peer tore this ratchet down and its rebuild is probably in the same
-    /// flush. Like a deferred heal this owes nothing — whoever wanted the session still wants it
-    /// and comes back — but unlike a heal the caller is told when, because nothing re-delivers a
-    /// teardown to ask again.
+    /// Not now: come back in `retry_after_ms` and ask again.
+    ///
+    /// Two reasons reach this one effect, and the difference between them is only how long. The
+    /// peer tore this ratchet down and its rebuild is probably in the same flush, so ours waits
+    /// the flush out (`REOPEN_QUIET_MS`); or the ordering says the rebuild is theirs to make at
+    /// all, so ours waits their turn out (`RESPONDER_OVERRIDE_MS`). Either way the caller is told
+    /// when, because nothing re-delivers a teardown to ask again.
+    ///
+    /// Like a deferred heal this owes nothing — whoever wanted the session still wants it and
+    /// comes back.
     DeferOpen { retry_after_ms: u64 },
     /// Go ahead: send the teardown.
     TearDown,
@@ -401,35 +446,9 @@ impl SessionMachine {
     pub fn handle(&mut self, device_id: &str, event: Event) -> Effect {
         let now = self.clock.now_ms();
         match event {
-            Event::WantToOpen => match self.phase(device_id) {
-                Phase::Opening { .. } => Effect::WaitForOpen,
-                // The peer tore this down, so their rebuild is very likely already on the way in
-                // the same flush. Hold ours for its length rather than race it — see
-                // `REOPEN_QUIET_MS`. Only `peer_asked`: after a teardown of *ours* nobody else is
-                // opening, and the side that asked for the rebuild is the side that does it.
-                Phase::TearingDown {
-                    since_ms,
-                    peer_asked: true,
-                    ..
-                } if now.saturating_sub(since_ms) < REOPEN_QUIET_MS => Effect::DeferOpen {
-                    retry_after_ms: Self::remaining(now, since_ms, REOPEN_QUIET_MS),
-                },
-                // Opening during a teardown is not a contradiction: the teardown asked the peer
-                // to rebuild, and rebuilding is what this is. The cooldown governs how often we
-                // *ask*, not whether we may answer.
-                _ => {
-                    self.phases.insert(
-                        device_id.to_string(),
-                        Phase::Opening {
-                            since_ms: now,
-                            // Nothing announced yet. The init has to run first, and the carrier
-                            // it produces is what `SriAnnounced` reports.
-                            unacked_sri: 0,
-                        },
-                    );
-                    Effect::Open
-                }
-            },
+            Event::WantToOpen => self.open_ask(device_id, now, false),
+
+            Event::WantToReopen { peer_rebuilds } => self.open_ask(device_id, now, peer_rebuilds),
 
             Event::SriAnnounced => {
                 // The window runs from the announcement, not from the bundle fetch that preceded
@@ -673,6 +692,55 @@ impl SessionMachine {
                 Effect::Nothing
             }
         }
+    }
+
+    /// Open this ratchet, or say when to ask again.
+    ///
+    /// `peer_rebuilds` is the whole difference between the two asks that reach here. It is only
+    /// ever true for a reopen, because yielding the turn costs a minute and only an ask with
+    /// nobody behind it can afford one.
+    ///
+    /// The teardown record is read directly rather than through `phase()`. The turn a reopen
+    /// yields outlasts the teardown window, and `phase()` reports a window that has passed as
+    /// `Absent` — which would answer "open" in the middle of the peer's turn.
+    fn open_ask(&mut self, device_id: &str, now: u64, peer_rebuilds: bool) -> Effect {
+        if matches!(self.phase(device_id), Phase::Opening { .. }) {
+            return Effect::WaitForOpen;
+        }
+        if let Some(record) = self.teardown_record(device_id, now) {
+            // Whose turn it is, and how long the turn lasts. The peer's turn subsumes the flush
+            // quiet rather than adding to it — it is the longer of the two by construction, and
+            // both run from the same teardown.
+            let quiet = if peer_rebuilds {
+                RESPONDER_OVERRIDE_MS
+            } else if record.peer_asked {
+                // The peer tore this down, so their rebuild is very likely already on the way in
+                // the same flush. Hold ours for its length rather than race it — see
+                // `REOPEN_QUIET_MS`. Only `peer_asked`: after a teardown of *ours* nobody else is
+                // opening, and the side that asked for the rebuild is the side that does it.
+                REOPEN_QUIET_MS
+            } else {
+                0
+            };
+            if now.saturating_sub(record.since_ms) < quiet {
+                return Effect::DeferOpen {
+                    retry_after_ms: Self::remaining(now, record.since_ms, quiet),
+                };
+            }
+        }
+        // Opening during a teardown is not a contradiction: the teardown asked the peer to
+        // rebuild, and rebuilding is what this is. The cooldown governs how often we *ask*, not
+        // whether we may answer.
+        self.phases.insert(
+            device_id.to_string(),
+            Phase::Opening {
+                since_ms: now,
+                // Nothing announced yet. The init has to run first, and the carrier it produces
+                // is what `SriAnnounced` reports.
+                unacked_sri: 0,
+            },
+        );
+        Effect::Open
     }
 
     /// Whether this device's ratchet was announced and the peer has not answered yet.
@@ -1078,6 +1146,159 @@ mod tests {
             },
         );
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    // ── Whose turn it is to rebuild ───────────────────────────────────────────
+
+    /// The ordering says the peer rebuilds, so our reopen waits their turn out and not merely
+    /// their flush. This was `startResponderFallback` on iOS: a 60 s `Task.sleep` keyed by
+    /// account, the last of the five timers the coordinator held.
+    ///
+    /// Mutation: ignore `peer_rebuilds` in `open_ask` — this reddens, because the wait collapses
+    /// to the flush quiet and both sides then announce.
+    #[test]
+    fn a_reopen_the_peer_should_make_waits_their_turn_out() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert_eq!(
+            m.handle(
+                "dev",
+                Event::WantToReopen {
+                    peer_rebuilds: true
+                }
+            ),
+            Effect::DeferOpen {
+                retry_after_ms: RESPONDER_OVERRIDE_MS + 100
+            }
+        );
+    }
+
+    /// And the turn runs out. A wait with no end is the conversation stopping for good: the peer
+    /// that was supposed to rebuild may be gone, and nothing else on either side is going to say
+    /// so.
+    #[test]
+    fn the_peers_turn_runs_out_and_we_take_the_role() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        m.handle(
+            "dev",
+            Event::WantToReopen {
+                peer_rebuilds: true,
+            },
+        );
+        clock.advance_ms(RESPONDER_OVERRIDE_MS);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// When the ordering names us, a reopen waits only the flush out — the same 1.5 s any other
+    /// caller gets. The two halves are mutually exclusive by role, which is what stops them
+    /// announcing at each other.
+    #[test]
+    fn a_reopen_we_should_make_waits_only_the_flush() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        assert_eq!(
+            m.handle(
+                "dev",
+                Event::WantToReopen {
+                    peer_rebuilds: false
+                }
+            ),
+            Effect::DeferOpen {
+                retry_after_ms: REOPEN_QUIET_MS + 100
+            }
+        );
+    }
+
+    /// A send never waits the peer's turn out. `WantToOpen` has a person behind it, and holding
+    /// one for a minute to save a one-time pre-key is the wrong trade — the core says as much in
+    /// `plan_initiation`, where outbound work outranks prekey economy.
+    ///
+    /// Mutation: pass `true` for `WantToOpen` in `handle` — this reddens.
+    #[test]
+    fn a_send_does_not_wait_the_peers_turn_out() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        m.handle(
+            "dev",
+            Event::WantToReopen {
+                peer_rebuilds: true,
+            },
+        );
+        clock.advance_ms(REOPEN_QUIET_MS);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// Our own teardown yields to nobody either, whatever the ranking says. The peer is not
+    /// rebuilding a ratchet they have not been told about yet — the END_SESSION is the telling,
+    /// and it has only just gone out.
+    #[test]
+    fn our_own_teardown_does_not_start_the_peers_turn() {
+        let (mut m, _) = machine(1_000);
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        assert_eq!(
+            m.handle(
+                "dev",
+                Event::WantToReopen {
+                    peer_rebuilds: false
+                }
+            ),
+            Effect::Open
+        );
+    }
+
+    /// An opening already in flight outranks the turn, whichever side is waiting on it. A second
+    /// announce spends another of the peer's one-time pre-keys and replaces the session the first
+    /// is still announcing.
+    #[test]
+    fn an_opening_in_flight_outranks_the_turn() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+        assert_eq!(
+            m.handle(
+                "dev",
+                Event::WantToReopen {
+                    peer_rebuilds: true
+                }
+            ),
+            Effect::WaitForOpen
+        );
+    }
+
+    /// The peer's rebuild arriving ends the turn — the stand-down that was
+    /// `shouldResponderOverride(hasSession:isInitializing:)` on iOS, asked from inside the timer
+    /// against two values the coordinator kept. Here it is not asked at all: the acknowledgement
+    /// clears the phase, so there is nothing left for the alarm to find.
+    #[test]
+    fn the_peers_rebuild_ends_the_turn() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::PeerToreDown);
+        m.handle(
+            "dev",
+            Event::WantToReopen {
+                peer_rebuilds: true,
+            },
+        );
+        m.handle("dev", Event::PeerAcked);
+        clock.advance_ms(RESPONDER_OVERRIDE_MS);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+        assert!(!m.owes_teardown("dev"));
+    }
+
+    /// The turn outlasts the teardown window it is measured against — otherwise taking the role
+    /// would happen while our own teardown is still gated, and a failed rebuild could not be
+    /// answered. Stated as a constant relation in the module; read here so the numbers are not
+    /// only asserted against themselves.
+    #[test]
+    fn the_turn_outlasts_the_windows_inside_it() {
+        assert!(RESPONDER_OVERRIDE_MS > PEER_TEARDOWN_QUIET_MS);
+        assert!(RESPONDER_OVERRIDE_MS > REOPEN_QUIET_MS);
+        assert!(RESPONDER_OVERRIDE_MS > OPENING_TTL_MS);
     }
 
     // ── Tearing down ──────────────────────────────────────────────────────────

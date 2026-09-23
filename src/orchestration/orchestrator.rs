@@ -19,7 +19,9 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
-use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
+use crate::orchestration::message_router::{
+    IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role,
+};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
     Effect as SessionEffect, Event as SessionEvent, SessionMachine, TearDownCause,
@@ -238,21 +240,38 @@ impl Orchestrator {
 
     /// Answer the platform's "I need a session with this device".
     ///
-    /// The one caller today is the INITIATOR re-init an inbound teardown raises. It used to be a
-    /// 1.5 s sleep and a `[String: Task]` map on iOS, and the two halves were one rule: a
-    /// teardown and the rebuild that answers it ride the same server flush, so opening the
-    /// instant the teardown is applied crosses the peer's init — and a backlog of N teardowns
-    /// used to start N re-inits, each destroying the session the previous one had just built.
-    /// Both fall out of one phase per device; see `REOPEN_QUIET_MS`.
+    /// The caller is the platform, on a teardown it has just applied — the peer's, or its own
+    /// after a divergence. It used to be a 1.5 s sleep and a `[String: Task]` map on iOS, and the
+    /// two halves were one rule: a teardown and the rebuild that answers it ride the same server
+    /// flush, so opening the instant the teardown is applied crosses the peer's init — and a
+    /// backlog of N teardowns used to start N re-inits, each destroying the session the previous
+    /// one had just built. Both fall out of one phase per device; see `REOPEN_QUIET_MS`.
+    ///
+    /// **Who rebuilds is ranked here.** On iOS it was `SessionReducer.endSessionReceiptAction`
+    /// over `SessionAddressing.isNaturalInitiator`, which already asked `tie_break_role` — so the
+    /// ranking was never a second copy. The *consequence* was: the RESPONDER arm armed a 60 s
+    /// `[String: Task]` keyed by account, beside the phase the core kept per device, and its
+    /// stand-down condition ("no session, none in flight") was a third reading of what the phase
+    /// already says. See `RESPONDER_OVERRIDE_MS`.
     fn handle_reopen_requested(&mut self, contact_id: String) -> Vec<Action> {
-        match self.sessions.handle(&contact_id, SessionEvent::WantToOpen) {
+        // An unset local id ranks as RESPONDER, and that is the direction to fail in: waiting
+        // costs a minute, while an init raised on a role we guessed costs one of the peer's
+        // one-time pre-keys and builds a session the winner will never read.
+        let peer_rebuilds = matches!(
+            tie_break_role(self.lifecycle.client.local_user_id(), &contact_id),
+            Role::Responder
+        );
+        match self
+            .sessions
+            .handle(&contact_id, SessionEvent::WantToReopen { peer_rebuilds })
+        {
             SessionEffect::DeferOpen { retry_after_ms } => vec![
                 Action::OpenDeferred {
                     contact_id: contact_id.clone(),
                     retry_after_ms,
                 },
                 Action::ScheduleTimer {
-                    timer_id: format!("reopen_quiet:{contact_id}"),
+                    timer_id: format!("reopen:{contact_id}"),
                     delay_ms: retry_after_ms,
                 },
             ],
@@ -1630,12 +1649,17 @@ impl Orchestrator {
                 }
                 actions
             }
-            // The peer's flush has had its moment. One timer for both callers — the platform's
-            // re-init and a message queued behind the same quiet — because after a teardown they
-            // want the same thing: an announced X3DH. A message waiting on it drains out of
-            // `pending_queues` when the init completes, as it does behind any other open.
-            _ if timer_id.starts_with("reopen_quiet:") => {
-                let contact_id = timer_id["reopen_quiet:".len()..].to_string();
+            // The wait has had its moment — the peer's flush, or the peer's whole turn. One timer
+            // for both callers — the platform's re-init and a message queued behind the same
+            // quiet — because after a teardown they want the same thing: an announced X3DH. A
+            // message waiting on it drains out of `pending_queues` when the init completes, as it
+            // does behind any other open.
+            //
+            // It re-asks `WantToOpen` and not `WantToReopen`, which is what bounds the peer's
+            // turn: the ordering was ranked once, when the ratchet died, and this alarm yields to
+            // nobody. Re-ranking here would let a peer who keeps tearing down keep its turn.
+            _ if timer_id.starts_with("reopen:") => {
+                let contact_id = timer_id["reopen:".len()..].to_string();
                 // The peer's rebuild arrived — which is the whole reason the quiet exists.
                 // Clearing the phase is what `OpenFinished` is for: a session that exists again
                 // settles what was owed against the one it replaced.
@@ -1834,7 +1858,7 @@ impl Orchestrator {
                             queued_count: queued_count as u32,
                         },
                         Action::ScheduleTimer {
-                            timer_id: format!("reopen_quiet:{cid}"),
+                            timer_id: format!("reopen:{cid}"),
                             delay_ms: retry_after_ms,
                         },
                     ],
@@ -1983,7 +2007,8 @@ mod tests {
     use crate::crypto::suites::classic::ClassicSuiteProvider;
     use crate::orchestration::clock::MockClock;
     use crate::orchestration::session_machine::{
-        END_SESSION_COOLDOWN_MS, OPENING_CONFIRM_WINDOW_MS, REOPEN_QUIET_MS, SRI_RETRY_MS,
+        END_SESSION_COOLDOWN_MS, OPENING_CONFIRM_WINDOW_MS, PEER_TEARDOWN_QUIET_MS,
+        REOPEN_QUIET_MS, RESPONDER_OVERRIDE_MS, SRI_RETRY_MS,
     };
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
@@ -2323,6 +2348,13 @@ mod tests {
         }
     }
 
+    /// A local id that outranks `bob`, so `tie_break_role` makes **us** the natural INITIATOR: a
+    /// reopen is ours to make, and waits only the peer's flush out.
+    const WE_REBUILD: &str = "zoe";
+    /// And one `bob` outranks, so the rebuild is the peer's to make and our reopen waits their
+    /// turn. Which of the two a test uses is what it is testing.
+    const PEER_REBUILDS: &str = "alice";
+
     // ── Reopening after the peer's teardown (step 2, timer 3) ─────────────────
 
     /// The platform's re-init asks the machine and is held while the peer's flush arrives. It
@@ -2333,7 +2365,7 @@ mod tests {
     /// debounce this replaced.
     #[test]
     fn a_reopen_inside_the_peers_flush_is_deferred_on_the_cores_own_timer() {
-        let mut o = make_orchestrator("alice");
+        let mut o = make_orchestrator(WE_REBUILD);
         o.handle_event(IncomingEvent::PeerToreDown {
             contact_id: "bob".to_string(),
         });
@@ -2347,10 +2379,12 @@ mod tests {
             "the platform must be told it is held, not handed an empty list"
         );
         assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
-            ),
-            "nothing else will wake the orchestrator to run it"
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ScheduleTimer { timer_id, delay_ms }
+                    if timer_id == "reopen:bob" && *delay_ms <= REOPEN_QUIET_MS + 100
+            )),
+            "nothing else will wake the orchestrator to run it, and the flush is all it waits for"
         );
         assert!(
             !actions
@@ -2359,10 +2393,122 @@ mod tests {
         );
     }
 
-    /// Nothing torn down, nothing to wait for.
+    // ── Whose turn it is to rebuild (step 2, timer 5) ─────────────────────────
+
+    /// Ranked in the core, over the two device ids, at the one moment both sides see the same
+    /// dead ratchet. The natural RESPONDER's reopen waits the peer's whole turn — not the flush.
+    ///
+    /// Mutation: pass `peer_rebuilds: false` unconditionally — this reddens, and on device it is
+    /// two clients announcing at each other, which is the dueling-initiator deadlock.
+    #[test]
+    fn the_reopen_of_the_side_that_should_not_rebuild_waits_the_peers_turn() {
+        let mut o = make_orchestrator(PEER_REBUILDS);
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ScheduleTimer { timer_id, delay_ms }
+                    if timer_id == "reopen:bob" && *delay_ms > PEER_TEARDOWN_QUIET_MS
+            )),
+            "the turn must outlast the teardown window, or taking the role finds our own \
+             teardown still gated"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { .. }))
+        );
+    }
+
+    /// And the turn ends. `startResponderFallback` was a 60 s `Task.sleep` keyed by account; what
+    /// pays it now is the core's own alarm, which is the same one the flush quiet uses.
+    #[test]
+    fn the_role_is_taken_when_the_peers_rebuild_never_comes() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(RESPONDER_OVERRIDE_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
+            "a wait with no end is the conversation stopping for good"
+        );
+    }
+
+    /// A peer that keeps tearing down does not keep its turn. The alarm re-asks `WantToOpen`,
+    /// which yields to nobody: the ordering was ranked once, when the ratchet died.
+    ///
+    /// Mutation: make the timer arm ask `WantToReopen` — this reddens.
+    #[test]
+    fn the_peers_turn_is_not_extended_by_tearing_down_again() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.handle_event(IncomingEvent::ReopenRequested {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(RESPONDER_OVERRIDE_MS / 2);
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(RESPONDER_OVERRIDE_MS / 2 + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
+            "the turn is bounded from the ratchet's death, not from the peer's last word"
+        );
+    }
+
+    /// A message needing a session never waits the peer's turn out, on either side of the
+    /// ranking. It waits the flush, like any other send — `plan_initiation` says the same thing
+    /// in its own words: outbound work outranks prekey economy.
+    ///
+    /// Mutation: rank `NeedSessionInit` too — this reddens, and on device it is a typed message
+    /// sitting for a minute with nothing on screen to say why.
+    #[test]
+    fn a_queued_message_does_not_wait_the_peers_turn_out() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
+        o.handle_event(IncomingEvent::PeerToreDown {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(need_session_init("bob"), "");
+        clock.advance_ms(REOPEN_QUIET_MS + 200);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "reopen:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob"))
+        );
+    }
+
+    /// Nothing torn down, nothing to wait for — including no turn to yield, because a turn is
+    /// measured from a teardown and there has not been one.
     #[test]
     fn a_reopen_of_a_quiet_device_goes_straight_out() {
-        let mut o = make_orchestrator("alice");
+        let mut o = make_orchestrator(PEER_REBUILDS);
         let actions = o.handle_event(IncomingEvent::ReopenRequested {
             contact_id: "bob".to_string(),
         });
@@ -2405,7 +2551,7 @@ mod tests {
     #[test]
     fn the_held_re_init_runs_once_the_quiet_passes() {
         let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
         o.handle_event(IncomingEvent::PeerToreDown {
             contact_id: "bob".to_string(),
         });
@@ -2414,7 +2560,7 @@ mod tests {
         });
         clock.advance_ms(REOPEN_QUIET_MS + 200);
         let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen_quiet:bob".to_string(),
+            timer_id: "reopen:bob".to_string(),
         });
         assert!(
             actions
@@ -2447,7 +2593,7 @@ mod tests {
         );
         assert!(
             actions.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen:bob")
             ),
             "a queued message is not re-delivered, so only our own alarm brings it back"
         );
@@ -2468,7 +2614,7 @@ mod tests {
         o.decision_to_actions(need_session_init("bob"), "");
         clock.advance_ms(REOPEN_QUIET_MS + 200);
         let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen_quiet:bob".to_string(),
+            timer_id: "reopen:bob".to_string(),
         });
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], Action::OpenSession { contact_id } if contact_id == "bob"));
@@ -2480,7 +2626,7 @@ mod tests {
     #[test]
     fn two_callers_held_by_one_quiet_produce_one_open() {
         let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
         o.handle_event(IncomingEvent::PeerToreDown {
             contact_id: "bob".to_string(),
         });
@@ -2490,16 +2636,16 @@ mod tests {
         });
         assert!(
             held.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen_quiet:bob")
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen:bob")
             ),
             "both callers wait on the one alarm"
         );
         clock.advance_ms(REOPEN_QUIET_MS + 200);
         let first = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen_quiet:bob".to_string(),
+            timer_id: "reopen:bob".to_string(),
         });
         let second = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen_quiet:bob".to_string(),
+            timer_id: "reopen:bob".to_string(),
         });
         assert_eq!(first.len(), 1);
         assert!(matches!(&first[0], Action::OpenSession { .. }));
@@ -2514,7 +2660,7 @@ mod tests {
     #[test]
     fn a_session_that_came_back_during_the_quiet_cancels_the_re_init() {
         let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
         o.handle_event(IncomingEvent::PeerToreDown {
             contact_id: "bob".to_string(),
         });
@@ -2526,7 +2672,7 @@ mod tests {
         o.sessions.handle("bob", SessionEvent::OpenFinished);
         clock.advance_ms(REOPEN_QUIET_MS + 200);
         let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen_quiet:bob".to_string(),
+            timer_id: "reopen:bob".to_string(),
         });
         // No session in this harness, so the machine grants the open — what is pinned here is
         // that a cleared phase does not leave the quiet running.
