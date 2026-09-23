@@ -150,6 +150,27 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Send the SESSION_RESET_INIT to `contact_id` again: the last one has gone unacknowledged
+    /// for a retry interval and the confirm window has not run out.
+    ///
+    /// The core arms the next alarm itself, so a platform that schedules its own retry here has
+    /// rebuilt `tieBreakWatchdogs` outside the machine. There is no acknowledgement for an SRI
+    /// other than the peer's, so a lost carrier and a silent peer look the same from here — which
+    /// is why this is bounded rather than endless.
+    ResendSri {
+        contact_id: String,
+    },
+
+    /// Stop waiting for `contact_id` to acknowledge: the confirm window has run out.
+    ///
+    /// Release whatever was held behind the opening — buffered sends, held incoming carriers —
+    /// and let the ordinary decrypt/heal path decide on what arrives next. Not an error, a bound:
+    /// before 2026-08-04 the watchdog was single-shot, so a lost SRI left the gate raised and the
+    /// conversation stopped sending until the app restarted.
+    OpeningGaveUp {
+        contact_id: String,
+    },
+
     /// A message arrived while session init for this contact was already in flight. It is
     /// **queued inside the core** (`pending_queues`) and drained on `SessionInitCompleted` —
     /// nothing is required of the platform, and nothing has been lost.
@@ -393,6 +414,25 @@ pub enum IncomingEvent {
     /// `[String: Task]` map that coalesced N teardowns in one flush into one re-init; the phase
     /// is one per device, so the map has nothing left to do. The third of step 2's five timers.
     ReopenRequested {
+        contact_id: String,
+    },
+    /// A SESSION_RESET_INIT has gone out to `contact_id`.
+    ///
+    /// A report, not a request: it is the one fact about an opening only the sender has, because
+    /// an SRI carries no acknowledgement other than the peer's own next carrier. It starts the
+    /// confirm window and arms the retry, and it replaced
+    /// `SessionConfirmationTracker.markPending` plus the `tieBreakWatchdogs` task beside it —
+    /// the fourth of step 2's five timers.
+    SriAnnounced {
+        contact_id: String,
+    },
+    /// The peer acknowledged the session we opened with `contact_id` — `session_ready`, a ping,
+    /// or its own init carrier arriving on the ratchet we announced.
+    ///
+    /// Whatever carried it, it proves the peer holds that ratchet, which is the only thing the
+    /// confirm window waits for. It replaced `SessionConfirmationTracker.markConfirmed`, a gate
+    /// the platform raised and dropped beside a phase the core kept, neither aware of the other.
+    PeerAcked {
         contact_id: String,
     },
     /// The platform received a heartbeat message from `contact_id`.

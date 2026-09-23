@@ -167,6 +167,13 @@ impl Orchestrator {
             IncomingEvent::ReopenRequested { contact_id } => {
                 self.handle_reopen_requested(contact_id)
             }
+            IncomingEvent::SriAnnounced { contact_id } => self.handle_sri_announced(contact_id),
+            IncomingEvent::PeerAcked { contact_id } => {
+                self.sessions.handle(&contact_id, SessionEvent::PeerAcked);
+                vec![Action::CancelTimer {
+                    timer_id: format!("open_confirm:{contact_id}"),
+                }]
+            }
         }
     }
 
@@ -208,6 +215,27 @@ impl Orchestrator {
         }
     }
 
+    /// Record that a SESSION_RESET_INIT went out, and arm the only thing that ever ends the wait
+    /// for an answer to it.
+    ///
+    /// The platform reports this because it is the one fact about an opening that only the sender
+    /// has: an SRI has no acknowledgement other than the peer's own next carrier, so nothing
+    /// downstream can infer that one was sent. It replaced
+    /// `SessionConfirmationTracker.markPending` — a map of unanswered ratchets kept beside this
+    /// phase, and a `tieBreakWatchdogs` task per account kept beside that.
+    fn handle_sri_announced(&mut self, contact_id: String) -> Vec<Action> {
+        match self
+            .sessions
+            .handle(&contact_id, SessionEvent::SriAnnounced)
+        {
+            SessionEffect::AwaitAck { retry_after_ms } => vec![Action::ScheduleTimer {
+                timer_id: format!("open_confirm:{contact_id}"),
+                delay_ms: retry_after_ms,
+            }],
+            _ => vec![],
+        }
+    }
+
     /// Answer the platform's "I need a session with this device".
     ///
     /// The one caller today is the INITIATOR re-init an inbound teardown raises. It used to be a
@@ -240,6 +268,10 @@ impl Orchestrator {
 
     pub fn my_user_id(&self) -> &str {
         self.lifecycle.my_user_id()
+    }
+
+    pub fn awaits_acknowledgement(&self, contact_id: &str) -> bool {
+        self.sessions.awaits_acknowledgement(contact_id)
     }
 
     pub fn has_active_session(&self, contact_id: &str) -> bool {
@@ -1437,8 +1469,11 @@ impl Orchestrator {
     ) -> Vec<Action> {
         // Releases the `Opening` phase and voids any teardown owed from before this session was
         // built — sending it would tear down the session that just replaced the broken one.
+        //
         self.sessions
             .handle(&contact_id, SessionEvent::OpenFinished);
+
+        let mut actions: Vec<Action> = Vec::new();
 
         // Import the newly created session from CFE binary (or JSON legacy fallback).
         // If import fails, emit an error action and abort — do not drain the queue
@@ -1454,14 +1489,14 @@ impl Orchestrator {
                 error = %e,
                 "SessionInitCompleted: import_session_bytes failed — aborting session init"
             );
-            return vec![Action::NotifyError {
+            actions.push(Action::NotifyError {
                 code: "session_import_failed".to_string(),
                 message: format!("contact={}: {}", contact_id, e),
-            }];
+            });
+            return actions;
         }
 
         // Save the session to secure store.
-        let mut actions = vec![];
         if let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
             actions.push(Action::SaveToSecureStore {
                 slot: SecureStoreSlot::Session {
@@ -1622,6 +1657,27 @@ impl Orchestrator {
                     // announcing, orphaning the SRI already on the wire.
                     SessionEffect::WaitForOpen => vec![],
                     _ => vec![Action::OpenSession { contact_id }],
+                }
+            }
+            // The announcement has gone unanswered for a retry interval, or for the whole
+            // window. Which of the two is the machine's to say — this only carries the alarm.
+            _ if timer_id.starts_with("open_confirm:") => {
+                let contact_id = timer_id["open_confirm:".len()..].to_string();
+                match self.sessions.handle(&contact_id, SessionEvent::Timeout) {
+                    SessionEffect::ResendSri { retry_after_ms } => vec![
+                        Action::ResendSri {
+                            contact_id: contact_id.clone(),
+                        },
+                        Action::ScheduleTimer {
+                            timer_id: timer_id.clone(),
+                            delay_ms: retry_after_ms,
+                        },
+                    ],
+                    // No re-arm: the wait is over, and that is the whole point of the bound.
+                    SessionEffect::GiveUpOpening => vec![Action::OpeningGaveUp { contact_id }],
+                    // The peer answered, or the session was torn down, between the alarm being
+                    // armed and firing. Timers outlive their reason.
+                    _ => vec![],
                 }
             }
             _ if timer_id.starts_with("heartbeat:") => {
@@ -1926,7 +1982,9 @@ mod tests {
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
     use crate::orchestration::clock::MockClock;
-    use crate::orchestration::session_machine::{END_SESSION_COOLDOWN_MS, REOPEN_QUIET_MS};
+    use crate::orchestration::session_machine::{
+        END_SESSION_COOLDOWN_MS, OPENING_CONFIRM_WINDOW_MS, REOPEN_QUIET_MS, SRI_RETRY_MS,
+    };
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
@@ -2089,6 +2147,9 @@ mod tests {
         );
     }
 
+    /// The init-in-flight lock is released by the completion — for a responder outright, and for
+    /// an initiator into the wait for the peer's acknowledgement, which is the confirm gate the
+    /// platform used to hold separately.
     #[test]
     fn test_session_init_completed_clears_lock() {
         let mut o = make_orchestrator("alice");
@@ -2475,6 +2536,104 @@ mod tests {
                 .any(|a| matches!(a, Action::OpenSession { .. })),
             "a cleared phase reopens immediately; it is the quiet that must not survive it"
         );
+    }
+
+    // ── Waiting for the peer's acknowledgement (step 3) ──────────────────────
+
+    /// An announcement arms the confirm alarm. Nothing else ever does, so a missing one is a gate
+    /// that never opens — which is what the single-shot watchdog left behind.
+    ///
+    /// Mutation: return `vec![]` from `handle_sri_announced` — this reddens.
+    #[test]
+    fn an_announcement_arms_the_confirm_alarm() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::ScheduleTimer { timer_id, .. } if timer_id == "open_confirm:bob"),
+            "nothing else wakes the orchestrator to re-send an unacknowledged SRI"
+        );
+        assert!(o.awaits_acknowledgement("bob"));
+    }
+
+    /// A finished init does not: a responder announces nothing, so there is nothing to wait for,
+    /// and an initiator's wait starts from the carrier rather than from the init behind it.
+    #[test]
+    fn a_finished_init_alone_arms_no_confirm_alarm() {
+        let mut o = make_orchestrator("alice");
+        o.sessions.handle("bob", SessionEvent::WantToOpen);
+        let actions = o.handle_event(IncomingEvent::SessionInitCompleted {
+            contact_id: "bob".to_string(),
+            session_data: vec![],
+        });
+        assert!(
+            !actions.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id.starts_with("open_confirm:"))
+            )
+        );
+        assert!(!o.awaits_acknowledgement("bob"));
+    }
+
+    /// The alarm re-sends and re-arms itself. Re-arming is the whole fix: the watchdog was
+    /// single-shot until 2026-08-04, fired once, went silent, and left the gate raised.
+    #[test]
+    fn the_confirm_alarm_re_sends_and_re_arms() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(SRI_RETRY_MS);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "open_confirm:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ResendSri { contact_id } if contact_id == "bob"))
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "open_confirm:bob")
+            ),
+            "a retry that does not re-arm is the single-shot watchdog again"
+        );
+    }
+
+    /// And it stops. Past the window the opening is given up, with no re-arm — the platform
+    /// releases what it held and the ordinary decrypt/heal path decides on what arrives next.
+    #[test]
+    fn the_confirm_alarm_gives_up_at_the_window_and_does_not_re_arm() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        clock.advance_ms(OPENING_CONFIRM_WINDOW_MS + 1);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "open_confirm:bob".to_string(),
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::OpeningGaveUp { contact_id } if contact_id == "bob"));
+    }
+
+    /// The peer's acknowledgement ends the wait and cancels the alarm. Leaving it armed means an
+    /// SRI re-sent at a peer that already answered — a fresh X3DH over a working ratchet.
+    #[test]
+    fn the_peers_acknowledgement_ends_the_wait_and_the_alarm() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(o.sessions.phase("bob"), crate::orchestration::Phase::Absent);
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::CancelTimer { timer_id } if timer_id == "open_confirm:bob")
+        ));
     }
 
     #[test]

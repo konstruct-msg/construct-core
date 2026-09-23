@@ -3409,6 +3409,13 @@ impl OrchestratorCore {
         orch.has_active_session(&contact_id)
     }
 
+    /// Whether this device's ratchet was announced and is still unacknowledged — the confirm
+    /// gate, asked of one device. The platform folds it over a peer's device set.
+    pub fn awaits_acknowledgement(&self, contact_id: String) -> bool {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.awaits_acknowledgement(&contact_id)
+    }
+
     /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
     ///
     /// Both dimensions vary. A caller that fixes the carrier and rotates only the bundle — which is
@@ -3836,6 +3843,14 @@ pub enum CfeIncomingEvent {
     ReopenRequested {
         contact_id: String,
     },
+    /// A SESSION_RESET_INIT has gone out to `contact_id` — starts the confirm window.
+    SriAnnounced {
+        contact_id: String,
+    },
+    /// The peer acknowledged the session we opened with `contact_id`.
+    PeerAcked {
+        contact_id: String,
+    },
 }
 
 /// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
@@ -3956,6 +3971,8 @@ impl CfeIncomingEvent {
             },
             Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
             Self::ReopenRequested { contact_id } => ReopenRequested { contact_id },
+            Self::SriAnnounced { contact_id } => SriAnnounced { contact_id },
+            Self::PeerAcked { contact_id } => PeerAcked { contact_id },
         }
     }
 }
@@ -4108,6 +4125,16 @@ pub enum CfeAction {
     OpenNotNeeded {
         contact_id: String,
     },
+    /// Send the SESSION_RESET_INIT again — unacknowledged for a retry interval, window not yet
+    /// out. The core arms the next alarm itself; do NOT schedule one.
+    ResendSri {
+        contact_id: String,
+    },
+    /// Stop waiting for an acknowledgement: the confirm window ran out. Release whatever was
+    /// held behind the opening — buffered sends and held incoming carriers.
+    OpeningGaveUp {
+        contact_id: String,
+    },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
     /// nothing required of the platform; it is drained when the init completes.
     MessageQueuedPendingInit {
@@ -4247,6 +4274,8 @@ impl CfeAction {
                 retry_after_ms,
             },
             OpenNotNeeded { contact_id } => Self::OpenNotNeeded { contact_id },
+            ResendSri { contact_id } => Self::ResendSri { contact_id },
+            OpeningGaveUp { contact_id } => Self::OpeningGaveUp { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
                 queued_count,

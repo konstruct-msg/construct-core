@@ -786,6 +786,12 @@ interface CfeIncomingEvent {
     /// re-init an inbound teardown raises. Answered with `OpenSession`, or `OpenDeferred` +
     /// `ScheduleTimer` while the peer's own rebuild may still be in the same flush.
     ReopenRequested(string contact_id);
+    /// A SESSION_RESET_INIT has gone out to `contact_id`. A report, not a request: it starts the
+    /// confirm window and arms the retry the core owns.
+    SriAnnounced(string contact_id);
+    /// The peer acknowledged the session we opened with `contact_id` — `session_ready`, a ping,
+    /// or its own init carrier on the ratchet we announced. Ends the confirm window.
+    PeerAcked(string contact_id);
 };
 
 /// Why a teardown is being asked for.
@@ -849,6 +855,11 @@ interface CfeAction {
     OpenDeferred(string contact_id, u64 retry_after_ms);
     /// The quiet passed and the session is already back — nothing to open.
     OpenNotNeeded(string contact_id);
+    /// Re-send the SESSION_RESET_INIT — unacknowledged for a retry interval, window not out.
+    /// The core arms the next alarm; do NOT schedule one.
+    ResendSri(string contact_id);
+    /// The confirm window ran out. Release what was held behind the opening, both directions.
+    OpeningGaveUp(string contact_id);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
     /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
@@ -969,6 +980,11 @@ interface OrchestratorCore {
     sequence<ReceivingInitAttempt> plan_receiving_init(sequence<ReceivingInitCarrier> carriers, u32 bundle_count);
 
     boolean has_session(string contact_id);
+
+    /// Whether the ratchet with this **device** was announced (SESSION_RESET_INIT sent) and the
+    /// peer has not acknowledged it yet. The confirm gate; fold it over a peer's device set for
+    /// the account-shaped question, since one message becomes a copy per device.
+    boolean awaits_acknowledgement(string contact_id);
 
     SessionHealthReport? get_session_health(string contact_id);
 

@@ -76,6 +76,30 @@ pub const UNACKED_BUDGET_TTL_MS: u64 = END_SESSION_COOLDOWN_MS * 2;
 /// every later message behind a lock nothing releases. Unchanged from `INIT_LOCK_TTL_MS`.
 pub const OPENING_TTL_MS: u64 = 30_000;
 
+/// How long an **announced** opening waits for the peer's acknowledgement (ms).
+///
+/// The other half of `Opening`, and a different question from the TTL above. That one asks how
+/// long to believe an init that is still running — a bundle fetch the network may have taken.
+/// This one starts where that ends: the X3DH is built, the SESSION_RESET_INIT is on the wire, and
+/// nothing more will happen locally until the peer answers. `unacked_sri` is what tells the two
+/// apart.
+///
+/// 75 s is `SessionConfirmationTracker.confirmWindow` on iOS, unchanged. It is sized to span one
+/// SRI retry plus another round trip: below that, a single lost carrier ends the opening while
+/// the peer is still answering it.
+pub const OPENING_CONFIRM_WINDOW_MS: u64 = 75_000;
+
+/// How often an unacknowledged SESSION_RESET_INIT is re-sent inside that window (ms).
+///
+/// `tieBreakWatchdogRetryInterval` on iOS, unchanged, and the fourth of step 2's five timers. The
+/// watchdog it replaces was single-shot until 2026-08-04: it fired once, went silent, and left
+/// the confirm gate raised forever — the confirm-deadlock root. Re-arming is the fix, and the
+/// window above is what bounds it.
+pub const SRI_RETRY_MS: u64 = 30_000;
+
+/// An opening must not outlive its own retry cadence, or the retry never happens.
+const _: () = assert!(SRI_RETRY_MS < OPENING_CONFIRM_WINDOW_MS);
+
 /// How long the peer's own teardown keeps ours quiet (ms).
 ///
 /// The same number as `END_SESSION_COOLDOWN_MS`, and that is the change: iOS held 20 s here
@@ -121,7 +145,20 @@ pub enum Phase {
     /// A session is being opened. Nothing else may start a second one: two inits spend two of
     /// the peer's one-time pre-keys and the second replaces the first, so the carriers already
     /// dispatched reference a ratchet we no longer hold.
-    Opening { since_ms: u64 },
+    ///
+    /// `unacked_sri` counts the announcements the peer has not answered, and it is what splits
+    /// this phase in two. `0` is an init still running — a bundle fetch the network may have
+    /// taken — and is believed for `OPENING_TTL_MS`. Above `0` a SESSION_RESET_INIT is on the
+    /// wire, nothing else may go out on this ratchet until the peer answers, and the bound is
+    /// `OPENING_CONFIRM_WINDOW_MS`. That second half is the `SessionConfirmationTracker`
+    /// entry, moved: a gate the client raised beside a phase the core kept, each unaware the
+    /// other existed.
+    ///
+    /// There is no `role` field. A responder has nothing to wait for — the peer already holds the
+    /// ratchet its own carrier built — so it simply never reaches the announced half, and every
+    /// transition that asks reads `unacked_sri`. A role recorded beside it would be a second
+    /// spelling of the same fact, read by nothing.
+    Opening { since_ms: u64, unacked_sri: u32 },
     /// A teardown has gone out and the peer has not yet acted on it. Inside this phase another
     /// teardown is not sent — it is **owed**, which is not the same as dropped.
     ///
@@ -179,6 +216,18 @@ pub enum Event {
     /// The init finished, either way. The machine does not care which: a failed init leaves no
     /// session, and a successful one is visible in the lifecycle manager.
     OpenFinished,
+    /// A SESSION_RESET_INIT has gone out to this device.
+    ///
+    /// A report of something the platform did, not a request — it is the one fact about an
+    /// opening that only the sender has, because there is no acknowledgement for an SRI other
+    /// than the peer's own next carrier. It starts the confirm window, and it is where
+    /// `SessionConfirmationTracker.markPending` used to put an entry in a map of its own.
+    SriAnnounced,
+    /// The peer acknowledged our opening — `session_ready`, or a ping, or its own init carrier.
+    ///
+    /// Whatever the carrier, it proves the peer holds the ratchet our SESSION_RESET_INIT built,
+    /// which is the only thing the confirm window was waiting for.
+    PeerAcked,
     /// This ratchet cannot decrypt and the peer must be told to rebuild it.
     ///
     /// The cause is a fact only the caller has; what it buys is the machine's to decide.
@@ -205,6 +254,19 @@ pub enum Effect {
     Open,
     /// An init is already in flight. The message waits behind it rather than starting a second.
     WaitForOpen,
+    /// The announcement is out and the peer has not answered yet. Hold everything else on this
+    /// ratchet and come back in `retry_after_ms` — the confirm gate, as an effect.
+    AwaitAck { retry_after_ms: u64 },
+    /// Send the SESSION_RESET_INIT again: it has gone unacknowledged for a retry interval and the
+    /// confirm window has not run out. There is no acknowledgement to wait for other than the
+    /// peer's, and a lost carrier is indistinguishable from a silent peer.
+    ResendSri { retry_after_ms: u64 },
+    /// The confirm window ran out. Stop waiting: release whatever was held behind this opening
+    /// and let the ordinary decrypt/heal path run on what comes next.
+    ///
+    /// Not a failure — a bound. A gate nothing can release is a conversation that stops sending,
+    /// and that is what a single-shot watchdog left behind before 2026-08-04.
+    GiveUpOpening,
     /// Too soon to open: the peer tore this ratchet down and its rebuild is probably in the same
     /// flush. Like a deferred heal this owes nothing — whoever wanted the session still wants it
     /// and comes back — but unlike a heal the caller is told when, because nothing re-delivers a
@@ -265,9 +327,22 @@ impl SessionMachine {
     pub fn phase(&self, device_id: &str) -> Phase {
         let now = self.clock.now_ms();
         match self.phases.get(device_id) {
-            Some(Phase::Opening { since_ms }) if now.saturating_sub(*since_ms) < OPENING_TTL_MS => {
+            // Two lifetimes, one phase: an init still running is believed for `OPENING_TTL_MS`,
+            // an announced one for as long as the peer has to answer it. `unacked_sri` is the
+            // only thing that tells them apart, so it is what chooses the bound.
+            Some(Phase::Opening {
+                since_ms,
+                unacked_sri,
+            }) if now.saturating_sub(*since_ms)
+                < if *unacked_sri > 0 {
+                    OPENING_CONFIRM_WINDOW_MS
+                } else {
+                    OPENING_TTL_MS
+                } =>
+            {
                 Phase::Opening {
                     since_ms: *since_ms,
+                    unacked_sri: *unacked_sri,
                 }
             }
             Some(Phase::TearingDown {
@@ -343,17 +418,47 @@ impl SessionMachine {
                 // to rebuild, and rebuilding is what this is. The cooldown governs how often we
                 // *ask*, not whether we may answer.
                 _ => {
-                    self.phases
-                        .insert(device_id.to_string(), Phase::Opening { since_ms: now });
+                    self.phases.insert(
+                        device_id.to_string(),
+                        Phase::Opening {
+                            since_ms: now,
+                            // Nothing announced yet. The init has to run first, and the carrier
+                            // it produces is what `SriAnnounced` reports.
+                            unacked_sri: 0,
+                        },
+                    );
                     Effect::Open
                 }
             },
+
+            Event::SriAnnounced => {
+                // The window runs from the announcement, not from the bundle fetch that preceded
+                // it: what it measures is the peer's silence, not ours. Re-announcing restamps —
+                // a fresh carrier is a fresh wait for an answer to *it*.
+                self.phases.insert(
+                    device_id.to_string(),
+                    Phase::Opening {
+                        since_ms: now,
+                        unacked_sri: 1,
+                    },
+                );
+                Effect::AwaitAck {
+                    retry_after_ms: Self::next_open_alarm(now, now, 1),
+                }
+            }
 
             Event::OpenFinished => {
                 // The whole record goes, not just the `Opening`: a session that exists again
                 // settles the debt against the one it replaced *and* returns the retry budget.
                 // Paying the debt afterwards would tear down the session that fixed the problem
                 // — the crossing-teardown defect, arriving by its own timer.
+                self.phases.remove(device_id);
+                Effect::Nothing
+            }
+
+            Event::PeerAcked => {
+                // The only thing the confirm window waits for. It settles a teardown record too:
+                // a peer talking on this ratchet is a peer that holds it.
                 self.phases.remove(device_id);
                 Effect::Nothing
             }
@@ -425,6 +530,22 @@ impl SessionMachine {
             }
 
             Event::PeerToreDown => {
+                // Not while our own announcement is still unanswered. A teardown arriving then is
+                // about the ratchet the SESSION_RESET_INIT replaces — the peer cannot be tearing
+                // down the new one, because holding it is what acknowledging it means, and a peer
+                // that holds it answers rather than tears down. Overwriting `Opening` here is the
+                // gap step 2 left open and pinned with a test: the
+                // in-flight lock went with it, and a second announce could start beside the first.
+                // If the SRI genuinely never opened on their side, the retry below re-sends it.
+                if matches!(
+                    self.phase(device_id),
+                    Phase::Opening {
+                        unacked_sri: 1..,
+                        ..
+                    }
+                ) {
+                    return Effect::Nothing;
+                }
                 // Restarts the quiet whoever opened the phase: the last teardown either side
                 // knows about is this one, and it is the one the window is about. The retry
                 // budget carries — a storm does not stop being a storm because the other side
@@ -473,6 +594,56 @@ impl SessionMachine {
             },
 
             Event::Timeout => {
+                // One event, several alarms. Which one it is, is the phase's to say — the client
+                // holds several `Task.sleep`s and the machine holds no clock of its own, so the
+                // id that woke it is bookkeeping and the phase is the answer.
+                //
+                // Read from the map rather than through `phase()`, for the same reason the
+                // teardown record is: `phase()` reports a lapsed opening as `Absent`, and a
+                // give-up that nobody is told about is the deadlock this bounds. The alarm is
+                // exactly the caller that has to hear it.
+                if let Some(Phase::Opening {
+                    since_ms,
+                    unacked_sri,
+                }) = self.phases.get(device_id).cloned()
+                {
+                    let elapsed = now.saturating_sub(since_ms);
+                    if unacked_sri == 0 {
+                        // Nothing was announced: the init is still running. There is no carrier
+                        // to re-send and nobody waiting on an answer, so the only thing owed here
+                        // is not to leak the entry.
+                        if elapsed >= OPENING_TTL_MS {
+                            self.phases.remove(device_id);
+                        }
+                        return Effect::Nothing;
+                    }
+                    if elapsed >= OPENING_CONFIRM_WINDOW_MS {
+                        self.phases.remove(device_id);
+                        return Effect::GiveUpOpening;
+                    }
+                    // Not every alarm is this one. A device can have a teardown debt pending at
+                    // the same time, and its timer fires here too; without this the cadence would
+                    // be "whenever anything wakes us" rather than `SRI_RETRY_MS`. The n-th retry
+                    // is due at `since_ms + n * SRI_RETRY_MS`, which needs no field of its own —
+                    // a second timestamp beside `since_ms` would be the same instant written
+                    // twice.
+                    if elapsed < u64::from(unacked_sri) * SRI_RETRY_MS {
+                        return Effect::Nothing;
+                    }
+                    // Still inside the window: announce again. `since_ms` is deliberately left
+                    // alone — the window measures the peer's silence from the first announcement,
+                    // and restarting it on our own retry is a window that never ends.
+                    self.phases.insert(
+                        device_id.to_string(),
+                        Phase::Opening {
+                            since_ms,
+                            unacked_sri: unacked_sri + 1,
+                        },
+                    );
+                    return Effect::ResendSri {
+                        retry_after_ms: Self::next_open_alarm(now, since_ms, unacked_sri + 1),
+                    };
+                }
                 let Some(record) = self.teardown_record(device_id, now) else {
                     return Effect::Nothing;
                 };
@@ -504,6 +675,26 @@ impl SessionMachine {
         }
     }
 
+    /// Whether this device's ratchet was announced and the peer has not answered yet.
+    ///
+    /// The confirm gate, asked of one device. It was `SessionConfirmationTracker.isPending` on a
+    /// map the core could not see, and the platform folds it over a peer's device set for the
+    /// account-shaped question its send path actually asks: one message becomes a copy per
+    /// device, so a single unanswered ratchet is enough to hold the send.
+    ///
+    /// The window is applied, so a lapsed opening answers `false` here. What the lapse does *not*
+    /// do is release anything the platform held — only `GiveUpOpening` off the alarm does that,
+    /// which is why the alarm exists.
+    pub fn awaits_acknowledgement(&self, device_id: &str) -> bool {
+        matches!(
+            self.phase(device_id),
+            Phase::Opening {
+                unacked_sri: 1..,
+                ..
+            }
+        )
+    }
+
     /// Whether a teardown is owed to this device — the debt the cooldown deferred.
     pub fn owes_teardown(&self, device_id: &str) -> bool {
         matches!(
@@ -526,12 +717,24 @@ impl SessionMachine {
     ///
     /// Restored **as of now**, not as of when they were acquired: the stored set carries ids and
     /// not timestamps, and dating them to the restore is what makes the TTL still bound them.
+    ///
+    /// And restored as an init still running (`unacked_sri: 0`), not as one awaiting an answer.
+    /// The set says which devices were mid-open and nothing else; claiming an announcement went
+    /// out would start a 75 s confirm window over a SESSION_RESET_INIT that may never have been
+    /// sent, and the retry would re-send one for a ratchet the peer never saw. The shorter TTL is
+    /// the honest bound for what is actually known.
     pub fn restore_opening(&mut self, device_ids: impl IntoIterator<Item = String>) {
         let now = self.clock.now_ms();
         self.phases
             .retain(|_, phase| !matches!(phase, Phase::Opening { .. }));
         for id in device_ids {
-            self.phases.insert(id, Phase::Opening { since_ms: now });
+            self.phases.insert(
+                id,
+                Phase::Opening {
+                    since_ms: now,
+                    unacked_sri: 0,
+                },
+            );
         }
     }
 
@@ -553,6 +756,17 @@ impl SessionMachine {
         });
     }
 
+    /// When to wake next for an opening announced at `since_ms` whose `n`-th announcement has
+    /// just gone out.
+    ///
+    /// The earlier of the next retry and the end of the window, so the give-up lands at the
+    /// window rather than a whole retry interval past it. Both are measured from the first
+    /// announcement: the cadence and the bound are two readings of one timestamp, not two.
+    fn next_open_alarm(now: u64, since_ms: u64, sent: u32) -> u64 {
+        let next_retry = u64::from(sent) * SRI_RETRY_MS;
+        Self::remaining(now, since_ms, next_retry.min(OPENING_CONFIRM_WINDOW_MS))
+    }
+
     /// Milliseconds left in a window that started at `since_ms`, plus a small margin so a timer
     /// armed for it lands *after* the window rather than on its edge.
     fn remaining(now: u64, since_ms: u64, window: u64) -> u64 {
@@ -565,6 +779,7 @@ mod tests {
     use super::*;
     use crate::orchestration::clock::MockClock;
 
+    /// Most of these tests only need "somebody opened it"; the ones that care name the role.
     fn machine(start: u64) -> (SessionMachine, Arc<MockClock>) {
         let clock = Arc::new(MockClock::new(start));
         (SessionMachine::new(clock.clone()), clock)
@@ -595,13 +810,183 @@ mod tests {
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
     }
 
+    /// A finished init releases the in-flight lock. For a responder that is the whole of it: the
+    /// peer already holds the ratchet its own carrier built, so nothing was announced and nothing
+    /// is awaited.
     #[test]
-    fn a_finished_open_releases_the_phase() {
+    fn a_finished_open_releases_the_in_flight_lock() {
         let (mut m, _) = machine(1_000);
         m.handle("dev", Event::WantToOpen);
         m.handle("dev", Event::OpenFinished);
         assert_eq!(m.phase("dev"), Phase::Absent);
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// Announcing does not. The SESSION_RESET_INIT is on the wire and nothing else goes out on
+    /// this ratchet until the peer answers — the confirm gate, which lived in
+    /// `SessionConfirmationTracker` beside this phase and invisible to it.
+    ///
+    /// Mutation: make `SriAnnounced` leave `unacked_sri` at 0 — this reddens.
+    #[test]
+    fn an_announced_opening_waits_to_be_acknowledged() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::WantToOpen);
+        m.handle("dev", Event::OpenFinished);
+        assert_eq!(m.phase("dev"), Phase::Absent, "the init itself is done");
+        m.handle("dev", Event::SriAnnounced);
+        assert_eq!(
+            m.phase("dev"),
+            Phase::Opening {
+                since_ms: 1_000,
+                unacked_sri: 1
+            }
+        );
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::WaitForOpen);
+    }
+
+    /// And the peer's answer ends it, whatever carried the answer.
+    #[test]
+    fn the_peers_acknowledgement_ends_the_wait() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        m.handle("dev", Event::PeerAcked);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+    }
+
+    // ── The announcement, and waiting for it ──────────────────────────────────
+
+    /// An unanswered announcement is re-sent on the retry cadence, and the window does not
+    /// restart when it is. A window that restarts on our own retry is a window that never ends —
+    /// which is what a gate nobody could release looked like before 2026-08-04.
+    ///
+    /// Mutation: restamp `since_ms` on `ResendSri` — the give-up test below reddens.
+    #[test]
+    fn an_unanswered_announcement_is_re_sent_on_the_retry_cadence() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        clock.advance_ms(SRI_RETRY_MS);
+        assert!(matches!(
+            m.handle("dev", Event::Timeout),
+            Effect::ResendSri { .. }
+        ));
+        clock.advance_ms(SRI_RETRY_MS);
+        assert!(matches!(
+            m.handle("dev", Event::Timeout),
+            Effect::ResendSri { .. }
+        ));
+    }
+
+    /// And an alarm that is not this one does not advance it. A device can owe a teardown at the
+    /// same time, and that timer fires into the same `Timeout`; without the cadence check the
+    /// retry would be "whenever anything wakes us".
+    #[test]
+    fn another_alarm_does_not_bring_the_retry_forward() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        clock.advance_ms(SRI_RETRY_MS / 2);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+    }
+
+    /// The last retry inside the window is armed for the window's end, not a whole interval past
+    /// it. Retries at 30 s and 60 s, then the give-up is due at 75 s — the bound is what the
+    /// alarm lands on, otherwise a 75 s window gives up at 90 s.
+    #[test]
+    fn the_last_retry_is_armed_for_the_end_of_the_window() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        clock.advance_ms(SRI_RETRY_MS);
+        assert!(matches!(
+            m.handle("dev", Event::Timeout),
+            Effect::ResendSri { .. }
+        ));
+        clock.advance_ms(SRI_RETRY_MS);
+        // Third announcement would be due at 90 s, past the 75 s bound — so the alarm is the
+        // bound.
+        assert_eq!(
+            m.handle("dev", Event::Timeout),
+            Effect::ResendSri {
+                retry_after_ms: OPENING_CONFIRM_WINDOW_MS - 2 * SRI_RETRY_MS + 100
+            }
+        );
+    }
+
+    /// The wait is bounded. Past the window the opening is given up and whatever was held behind
+    /// it is released — the single-shot watchdog that fired once and went silent left the gate
+    /// raised forever, and the conversation stopped sending.
+    ///
+    /// Mutation: drop the `GiveUpOpening` arm — this reddens.
+    #[test]
+    fn the_wait_is_given_up_when_the_window_runs_out() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        clock.advance_ms(OPENING_CONFIRM_WINDOW_MS);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::GiveUpOpening);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// An init still running has nothing announced to retry. The two halves of `Opening` are told
+    /// apart by `unacked_sri` and nothing else, so this is what stops a bundle fetch in progress
+    /// from being answered with a re-send of a carrier that was never sent.
+    #[test]
+    fn an_init_still_running_has_nothing_to_re_send() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::WantToOpen);
+        clock.advance_ms(SRI_RETRY_MS);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+    }
+
+    /// An opening that announced nothing waits for nothing. A responder never announces — the
+    /// peer's own carrier built the ratchet — so its finished init ends the phase and its
+    /// `Timeout` is nobody's retry.
+    #[test]
+    fn an_opening_that_announced_nothing_has_no_retry() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::WantToOpen);
+        m.handle("dev", Event::OpenFinished);
+        clock.advance_ms(SRI_RETRY_MS);
+        assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+        assert!(!m.awaits_acknowledgement("dev"));
+    }
+
+    /// The peer's teardown does not take over an announcement it cannot have seen.
+    ///
+    /// A teardown arriving while our SESSION_RESET_INIT is unanswered is about the ratchet that
+    /// SRI replaces: a peer holding the new one answers it rather than tears it down. Overwriting
+    /// `Opening` here loses the in-flight lock with it, and a second announce starts beside the
+    /// first — two of the peer's one-time pre-keys, and the second session orphans the first's
+    /// carrier. This is the gap step 2 left open and step 3 closes.
+    ///
+    /// Mutation: delete the `Opening { role: Initiator }` guard in `PeerToreDown` — this reddens.
+    #[test]
+    fn the_peers_teardown_does_not_take_over_an_unanswered_announcement() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::SriAnnounced);
+        assert_eq!(m.handle("dev", Event::PeerToreDown), Effect::Nothing);
+        assert_eq!(
+            m.phase("dev"),
+            Phase::Opening {
+                since_ms: 1_000,
+                unacked_sri: 1
+            },
+            "the announcement survives; the retry is what re-sends it if it never opened"
+        );
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::WaitForOpen);
+    }
+
+    /// But an init still *running* is not an announcement, so a teardown during one still takes
+    /// the phase: nothing has been put on the wire for the peer to be answering.
+    #[test]
+    fn the_peers_teardown_still_takes_over_an_init_in_flight() {
+        let (mut m, _) = machine(1_000);
+        m.handle("dev", Event::WantToOpen);
+        m.handle("dev", Event::PeerToreDown);
+        assert_eq!(
+            m.handle("dev", Event::WantToOpen),
+            Effect::DeferOpen {
+                retry_after_ms: REOPEN_QUIET_MS + 100
+            }
+        );
     }
 
     // ── Reopening after the peer's teardown ───────────────────────────────────
@@ -695,27 +1080,6 @@ mod tests {
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
     }
 
-    /// The peer's teardown lands while we are opening: the quiet takes over from the in-flight
-    /// lock. The init we had started was against a ratchet the peer has just declared dead, so
-    /// waiting for their rebuild is the right answer and `WaitForOpen` would be the wrong one.
-    ///
-    /// The lock is lost with it, though, and that is a real gap: after the quiet a second open
-    /// may start while the first is still fetching. It is `initiatorReinitInFlight` on the client
-    /// today and it closes in step 3, where `Opening` grows the epoch that tells the two apart.
-    /// Named here so the behaviour is pinned rather than assumed.
-    #[test]
-    fn the_peers_teardown_during_an_open_takes_over_the_wait() {
-        let (mut m, _) = machine(1_000);
-        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
-        m.handle("dev", Event::PeerToreDown);
-        assert_eq!(
-            m.handle("dev", Event::WantToOpen),
-            Effect::DeferOpen {
-                retry_after_ms: REOPEN_QUIET_MS + 100
-            }
-        );
-    }
-
     // ── Tearing down ──────────────────────────────────────────────────────────
 
     /// The first teardown goes; the second inside the window is deferred and **owed**. Dropping
@@ -798,7 +1162,11 @@ mod tests {
         m.handle("dev", Event::OpenFinished);
 
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
-        assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+        assert!(!m.owes_teardown("dev"), "the rebuild settled it");
+        // The alarm finds the rebuild's own unacknowledged announcement instead — the cooldown
+        // and the SRI retry are both 30 s, so they come due together. What must not happen is the
+        // teardown: paying it here destroys the session that fixed the problem.
+        assert_ne!(m.handle("dev", Event::Timeout), Effect::TearDown);
     }
 
     /// A timer for a device with no debt sends nothing. Timers outlive their reason.
