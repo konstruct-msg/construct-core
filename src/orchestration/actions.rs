@@ -117,7 +117,9 @@ pub enum Action {
     /// Distinct from `EndSessionSuppressed`, which owes the send and arms a timer. This owes
     /// nothing, so a platform that schedules a retry on it is scheduling the storm. It replaced
     /// the platform's own 20 s `lastInboundEndSessionAt` grace.
-    EndSessionNotNeeded { contact_id: String },
+    EndSessionNotNeeded {
+        contact_id: String,
+    },
 
     /// A message arrived while session init for this contact was already in flight. It is
     /// **queued inside the core** (`pending_queues`) and drained on `SessionInitCompleted` —
@@ -350,7 +352,9 @@ pub enum IncomingEvent {
     /// A report, not a request: nothing is asked and nothing is returned but the phase. It opens
     /// the same window a teardown of ours opens, which is what folds the platform's 20 s inbound
     /// grace into the machine — the third of step 2's five timers.
-    PeerToreDown { contact_id: String },
+    PeerToreDown {
+        contact_id: String,
+    },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if decryption fails,
     /// it triggers heal proactively (before the user sends any message).

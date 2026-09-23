@@ -3829,7 +3829,9 @@ pub enum CfeIncomingEvent {
         cause: CfeTearDownCause,
     },
     /// The peer tore down the ratchet with `contact_id`, and the platform has applied it.
-    PeerToreDown { contact_id: String },
+    PeerToreDown {
+        contact_id: String,
+    },
 }
 
 /// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
@@ -4083,7 +4085,9 @@ pub enum CfeAction {
     },
     /// A teardown was asked for and will not be sent, now or later: the peer tore this ratchet
     /// down itself. Nothing is owed and no timer is armed — do not schedule a retry.
-    EndSessionNotNeeded { contact_id: String },
+    EndSessionNotNeeded {
+        contact_id: String,
+    },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
     /// nothing required of the platform; it is drained when the init completes.
     MessageQueuedPendingInit {

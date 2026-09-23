@@ -160,7 +160,8 @@ impl Orchestrator {
                 self.handle_teardown_requested(contact_id, cause)
             }
             IncomingEvent::PeerToreDown { contact_id } => {
-                self.sessions.handle(&contact_id, SessionEvent::PeerToreDown);
+                self.sessions
+                    .handle(&contact_id, SessionEvent::PeerToreDown);
                 Vec::new()
             }
         }
@@ -172,7 +173,11 @@ impl Orchestrator {
     /// window, which is the point: before this the platform held a second window of its own and
     /// the two could not see each other. A refusal is not a drop — the debt is recorded and the
     /// timer pays it, exactly as it does for a teardown the core concluded itself.
-    fn handle_teardown_requested(&mut self, contact_id: String, cause: TearDownCause) -> Vec<Action> {
+    fn handle_teardown_requested(
+        &mut self,
+        contact_id: String,
+        cause: TearDownCause,
+    ) -> Vec<Action> {
         match self
             .sessions
             .handle(&contact_id, SessionEvent::WantToTearDown { cause })

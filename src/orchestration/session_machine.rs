@@ -342,7 +342,9 @@ impl SessionMachine {
                 // nothing they do not know. Answered, not postponed — no debt, no timer, and the
                 // record is left exactly as it was so the quiet keeps running from *their*
                 // teardown rather than restarting on each of our suppressed asks.
-                if record.peer_asked && cause == TearDownCause::Blind && elapsed < PEER_TEARDOWN_QUIET_MS
+                if record.peer_asked
+                    && cause == TearDownCause::Blind
+                    && elapsed < PEER_TEARDOWN_QUIET_MS
                 {
                     return Effect::TearDownNotNeeded;
                 }
@@ -415,8 +417,8 @@ impl SessionMachine {
                     // not spend the teardown budget — nothing was sent to the peer. Nor does it
                     // claim the phase for us: a heal is local, so it does not make a peer-asked
                     // quiet into our own window.
-                    let (owed, unacked, peer_asked) = record
-                        .map_or((false, 0, false), |r| (r.owed, r.unacked, r.peer_asked));
+                    let (owed, unacked, peer_asked) =
+                        record.map_or((false, 0, false), |r| (r.owed, r.unacked, r.peer_asked));
                     self.phases.insert(
                         device_id.to_string(),
                         Phase::TearingDown {
@@ -571,10 +573,20 @@ mod tests {
     fn a_second_teardown_in_the_window_is_owed_not_dropped() {
         let (mut m, _) = machine(1_000);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDown
         );
-        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
+        match m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        ) {
             Effect::DeferTearDown { retry_after_ms } => {
                 assert!(retry_after_ms > 0 && retry_after_ms <= END_SESSION_COOLDOWN_MS + 100)
             }
@@ -588,9 +600,19 @@ mod tests {
     #[test]
     fn many_suppressions_pay_one_teardown() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         for _ in 0..5 {
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind,
+                },
+            );
         }
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::Timeout), Effect::TearDown);
@@ -606,8 +628,18 @@ mod tests {
     #[test]
     fn an_owed_teardown_is_void_once_the_session_is_rebuilt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         assert!(m.owes_teardown("dev"));
 
         m.handle("dev", Event::WantToOpen);
@@ -631,7 +663,12 @@ mod tests {
     #[test]
     fn a_heal_inside_a_teardown_window_is_deferred() {
         let (mut m, _) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         match m.handle("dev", Event::WantToHeal) {
             Effect::DeferHeal { retry_after_ms } => assert!(retry_after_ms > 0),
             other => panic!("expected a deferral, got {other:?}"),
@@ -644,7 +681,12 @@ mod tests {
     #[test]
     fn a_deferred_heal_leaves_no_debt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         m.handle("dev", Event::WantToHeal);
         assert!(!m.owes_teardown("dev"));
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
@@ -660,11 +702,21 @@ mod tests {
     fn devices_do_not_share_a_phase() {
         let (mut m, _) = machine(1_000);
         assert_eq!(
-            m.handle("dev-a", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev-a",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDown
         );
         assert_eq!(
-            m.handle("dev-b", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev-b",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDown
         );
         assert_eq!(m.handle("dev-a", Event::WantToOpen), Effect::Open);
@@ -707,12 +759,22 @@ mod tests {
     fn evidence_buys_a_faster_retry_than_the_window() {
         let (mut m, clock) = machine(1_000);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -722,9 +784,19 @@ mod tests {
     #[test]
     fn the_fast_retry_is_not_available_without_evidence() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
+        match m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        ) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected a deferral, got {other:?}"),
         }
@@ -737,16 +809,31 @@ mod tests {
     #[test]
     fn the_budget_runs_out_and_the_window_returns() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
             assert_eq!(
-                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+                m.handle(
+                    "dev",
+                    Event::WantToTearDown {
+                        cause: TearDownCause::Unacknowledged
+                    }
+                ),
                 Effect::TearDown
             );
         }
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }) {
+        match m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        ) {
             Effect::DeferTearDown { retry_after_ms } => {
                 assert!(retry_after_ms > END_SESSION_EVIDENCE_RETRY_MS)
             }
@@ -762,20 +849,40 @@ mod tests {
     #[test]
     fn a_spent_budget_survives_the_window_that_spent_it() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged,
+                },
+            );
         }
         // The long window passes and one ordinary teardown goes out.
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
         // It must not have come with a new allowance.
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }) {
+        match m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        ) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected the budget to still be spent, got {other:?}"),
         }
@@ -785,19 +892,39 @@ mod tests {
     #[test]
     fn a_long_quiet_returns_the_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged,
+                },
+            );
         }
         clock.advance_ms(UNACKED_BUDGET_TTL_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -807,19 +934,39 @@ mod tests {
     #[test]
     fn a_rebuilt_session_returns_the_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         for _ in 0..(END_SESSION_MAX_UNACKED_RETRIES - 1) {
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged,
+                },
+            );
         }
         m.handle("dev", Event::OpenFinished);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -832,11 +979,21 @@ mod tests {
     #[test]
     fn a_heal_waits_its_own_window_not_the_teardowns() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         clock.advance_ms(HEAL_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
         // …and the teardown it shares the phase with is still held.
-        match m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }) {
+        match m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        ) {
             Effect::DeferTearDown { .. } => {}
             other => panic!("expected the teardown to still be held, got {other:?}"),
         }
@@ -847,14 +1004,24 @@ mod tests {
     #[test]
     fn healing_does_not_spend_the_teardown_budget() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Unacknowledged,
+            },
+        );
         for _ in 0..3 {
             clock.advance_ms(HEAL_COOLDOWN_MS + 1);
             assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
         }
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -871,10 +1038,18 @@ mod tests {
         let (mut m, _clock) = machine(1_000);
         assert_eq!(m.handle("dev", Event::PeerToreDown), Effect::Nothing);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDownNotNeeded
         );
-        assert!(!m.owes_teardown("dev"), "nothing is owed — the peer already knows");
+        assert!(
+            !m.owes_teardown("dev"),
+            "nothing is owed — the peer already knows"
+        );
     }
 
     /// Evidence is not silenced by it — only delayed by the short window, and owed.
@@ -888,13 +1063,23 @@ mod tests {
         let (mut m, clock) = machine(1_000);
         m.handle("dev", Event::PeerToreDown);
         assert!(matches!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::DeferTearDown { .. }
         ));
         assert!(m.owes_teardown("dev"));
         clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::TearDown,
             "the short window applies inside the peer's quiet; only the blind ask is silenced"
         );
@@ -910,7 +1095,12 @@ mod tests {
         let (mut m, clock) = machine(1_000);
         m.handle("dev", Event::PeerToreDown);
         assert!(matches!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Explained }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Explained
+                }
+            ),
             Effect::DeferTearDown { .. }
         ));
         assert!(m.owes_teardown("dev"));
@@ -925,7 +1115,12 @@ mod tests {
         m.handle("dev", Event::PeerToreDown);
         clock.advance_ms(PEER_TEARDOWN_QUIET_MS + 1);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -940,13 +1135,23 @@ mod tests {
         for _ in 0..5 {
             clock.advance_ms(PEER_TEARDOWN_QUIET_MS / 6);
             assert_eq!(
-                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+                m.handle(
+                    "dev",
+                    Event::WantToTearDown {
+                        cause: TearDownCause::Blind
+                    }
+                ),
                 Effect::TearDownNotNeeded
             );
         }
         clock.advance_ms(PEER_TEARDOWN_QUIET_MS);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDown
         );
     }
@@ -957,9 +1162,22 @@ mod tests {
     #[test]
     fn the_peers_teardown_discharges_our_debt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
-        assert!(m.owes_teardown("dev"), "pre-condition: the second ask is owed");
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        assert!(
+            m.owes_teardown("dev"),
+            "pre-condition: the second ask is owed"
+        );
         m.handle("dev", Event::PeerToreDown);
         assert!(!m.owes_teardown("dev"));
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
@@ -973,7 +1191,12 @@ mod tests {
         let (mut m, clock) = machine(1_000);
         for _ in 0..END_SESSION_MAX_UNACKED_RETRIES {
             assert_eq!(
-                m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+                m.handle(
+                    "dev",
+                    Event::WantToTearDown {
+                        cause: TearDownCause::Unacknowledged
+                    }
+                ),
                 Effect::TearDown
             );
             clock.advance_ms(END_SESSION_EVIDENCE_RETRY_MS + 1);
@@ -981,7 +1204,12 @@ mod tests {
         m.handle("dev", Event::PeerToreDown);
         // Budget spent: evidence no longer buys the short window, so this is held to the full one.
         assert!(matches!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Unacknowledged }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Unacknowledged
+                }
+            ),
             Effect::DeferTearDown { .. }
         ));
     }
@@ -995,7 +1223,12 @@ mod tests {
         clock.advance_ms(HEAL_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::WantToHeal), Effect::Heal);
         assert_eq!(
-            m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind }),
+            m.handle(
+                "dev",
+                Event::WantToTearDown {
+                    cause: TearDownCause::Blind
+                }
+            ),
             Effect::TearDownNotNeeded
         );
     }
@@ -1005,8 +1238,18 @@ mod tests {
     #[test]
     fn forgetting_a_device_forgets_its_debt() {
         let (mut m, clock) = machine(1_000);
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
-        m.handle("dev", Event::WantToTearDown { cause: TearDownCause::Blind });
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
         m.handle("dev", Event::Forget);
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
