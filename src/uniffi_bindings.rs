@@ -4099,6 +4099,14 @@ pub enum CfeAction {
         contact_id: String,
         retry_after_ms: u64,
     },
+    /// Hold this message: our own SESSION_RESET_INIT to `contact_id` is unacknowledged, so a
+    /// message that will not open is our re-init's own consequence and not evidence about the
+    /// peer. Buffer it and replay it when the wait ends — the platform's buffer, not the
+    /// server's redelivery, because the wait can outlast what the server will re-send. Neither
+    /// heal nor tear down on it.
+    HeldPendingAck {
+        contact_id: String,
+    },
     /// END_SESSION suppressed by cooldown — the core owes it and will send it in
     /// `retry_after_ms`. Platform must NOT ACK.
     EndSessionSuppressed {
@@ -4250,6 +4258,7 @@ impl CfeAction {
                 proto_bytes,
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
+            HeldPendingAck { contact_id } => Self::HeldPendingAck { contact_id },
             HealSuppressed {
                 contact_id,
                 retry_after_ms,

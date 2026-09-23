@@ -40,6 +40,20 @@ const MAX_PENDING_PER_USER: usize = 100;
 #[allow(dead_code)]
 const END_SESSION_MARKER: &str = "__END_SESSION__";
 
+/// Content types that carry a handshake rather than a payload.
+///
+/// Readable without the ratchet — both are `sealed_inner_content_type` in
+/// `construct-protos/conformance/knst_content_types.json`, so the type survives the unseal that
+/// precedes the decrypt this module is reacting to the failure of.
+///
+/// They matter here for one reason: a handshake is what *ends* the wait for an acknowledgement,
+/// so it is the one thing that must not be held behind that wait. `SESSION_RESET` is listed for
+/// completeness — a control frame is short-circuited above before any decrypt is attempted — and
+/// listing it costs nothing next to the alternative of a reader wondering which of the two is
+/// meant.
+const CT_SESSION_RESET: u8 = 21;
+const CT_SESSION_RESET_INIT: u8 = 24;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Role in a tie-break scenario (HIGHER id = INITIATOR — see `tie_break_role`).
@@ -100,7 +114,17 @@ pub enum RoutingDecision {
         queued_count: usize,
     },
     /// Decryption failed on message 0 — session healing required.
-    SessionHealNeeded { contact_id: String, role: Role },
+    SessionHealNeeded {
+        contact_id: String,
+        role: Role,
+        /// The carrier that failed to open was itself a handshake.
+        ///
+        /// `msg_number == 0` does not say this: a DH sending chain restarts at 0 on every
+        /// ratchet turn, so a peer's first message under a fresh chain reaches this decision
+        /// looking exactly like an init. The content type is the only thing that tells them
+        /// apart, and it is the fact the confirm gate needs — see `Action::HeldPendingAck`.
+        is_handshake: bool,
+    },
     /// Session is irrecoverably broken — send END_SESSION.
     EndSessionNeeded { contact_id: String, reason: String },
     /// Message already processed — discard.
@@ -390,6 +414,10 @@ impl MessageRouter {
                     RoutingDecision::SessionHealNeeded {
                         contact_id: msg.contact_id.clone(),
                         role,
+                        is_handshake: matches!(
+                            msg.content_type,
+                            CT_SESSION_RESET | CT_SESSION_RESET_INIT
+                        ),
                     }
                 } else {
                     RoutingDecision::EndSessionNeeded {

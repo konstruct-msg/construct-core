@@ -1767,8 +1767,15 @@ impl Orchestrator {
             RoutingDecision::SessionHealNeeded {
                 contact_id: cid,
                 role,
+                // A heartbeat is a payload, never a handshake, so the gate below applies to it
+                // in full — and the field is destructured rather than ignored so a future
+                // heartbeat carrying something else has to come back through here.
+                is_handshake: false,
             } => {
                 // Decrypt failed on heartbeat msgNum=0 — proactively trigger heal.
+                if self.sessions.awaits_acknowledgement(&cid) {
+                    return vec![Action::HeldPendingAck { contact_id: cid }];
+                }
                 match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
                     SessionEffect::DeferHeal { retry_after_ms } => vec![Action::HealSuppressed {
                         contact_id: cid,
@@ -1868,7 +1875,25 @@ impl Orchestrator {
             RoutingDecision::SessionHealNeeded {
                 contact_id: cid,
                 role,
+                is_handshake,
             } => {
+                // Our own announcement to this device is still unanswered, so this failure is
+                // our re-init's own consequence. Healing on it archives the session we built in
+                // answer to it — see `Action::HeldPendingAck`.
+                //
+                // A handshake carrier is exempt, and that exemption is the whole of it: it is
+                // what the wait is waiting for, so holding it would make the gate wait on
+                // itself. The heal is what applies the peer's X3DH, and when it completes the
+                // phase clears by `OpenFinished` — which is the acknowledgement, arriving as an
+                // event rather than as a byte we could not read.
+                //
+                // Asked of **this device**. iOS folded it over the peer's whole device set
+                // (`awaitsAcknowledgementFromAnyDevice`), so an unanswered announcement to one
+                // device held a genuine heal for its sibling; a ratchet is between two devices
+                // and our SRI to one says nothing about the other.
+                if !is_handshake && self.sessions.awaits_acknowledgement(&cid) {
+                    return vec![Action::HeldPendingAck { contact_id: cid }];
+                }
                 match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
                     SessionEffect::DeferHeal { retry_after_ms } => {
                         // `HealSuppressed` so the platform knows NOT to ACK: the message is
@@ -1895,6 +1920,15 @@ impl Orchestrator {
                 contact_id: cid,
                 reason: _,
             } => {
+                // The same hold as the heal above, and there is no exemption to make here: a
+                // real END_SESSION is short-circuited as a control frame before any decrypt is
+                // attempted, so nothing reaching this arm is an acknowledgement. A handshake
+                // that arrives with its heal budget exhausted reaches it, and holding that one
+                // is the improvement — tearing down on it crosses our own unanswered SRI, which
+                // is the defect the gate exists for.
+                if self.sessions.awaits_acknowledgement(&cid) {
+                    return vec![Action::HeldPendingAck { contact_id: cid }];
+                }
                 // Evidence, and the decision that produced it says so: `EndSessionNeeded`
                 // arrives from a message that failed to decrypt on a ratchet we still hold a
                 // record of — the peer is demonstrably still using a session we tore down. That
@@ -2341,6 +2375,14 @@ mod tests {
         }
     }
 
+    fn heal_needed(cid: &str, is_handshake: bool) -> RoutingDecision {
+        RoutingDecision::SessionHealNeeded {
+            contact_id: cid.to_string(),
+            role: crate::orchestration::message_router::Role::Responder,
+            is_handshake,
+        }
+    }
+
     fn need_session_init(cid: &str) -> RoutingDecision {
         RoutingDecision::NeedSessionInit {
             contact_id: cid.to_string(),
@@ -2390,6 +2432,127 @@ mod tests {
             !actions
                 .iter()
                 .any(|a| matches!(a, Action::OpenSession { .. }))
+        );
+    }
+
+    // ── Held behind our own announcement (step 3) ────────────────────────────
+
+    /// A message that will not open while our own SESSION_RESET_INIT is unanswered is held, not
+    /// answered. Tearing down there answers our own reset with another reset and takes the
+    /// message with it — 2026-08-04, a user's first message after a re-init.
+    ///
+    /// This was `SessionReducer.confirmGateAction` on iOS, asked at two call sites in
+    /// `MessageRouter` against a gate the core could not see.
+    ///
+    /// Mutation: drop the `awaits_acknowledgement` guard from the `EndSessionNeeded` arm — this
+    /// reddens.
+    #[test]
+    fn a_teardown_is_held_while_our_own_announcement_is_unanswered() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::HeldPendingAck { contact_id } if contact_id == "bob")),
+            "the platform must be told to buffer it — silence here is the message dropped"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. })),
+        );
+    }
+
+    /// And a heal is held for the sharper version of the same reason: healing as RESPONDER runs
+    /// `archiveSession`, which destroys the session we built two seconds ago in answer to the
+    /// very message that will not open.
+    #[test]
+    fn a_heal_is_held_while_our_own_announcement_is_unanswered() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.decision_to_actions(heal_needed("bob", false), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::HeldPendingAck { contact_id } if contact_id == "bob"))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SessionHealNeeded { .. }))
+        );
+    }
+
+    /// A handshake carrier is the one thing the wait is waiting for, so holding it would make
+    /// the gate wait on itself. `msg_number == 0` cannot answer this — a DH sending chain
+    /// restarts at 0 on every ratchet turn — which is why the content type rides on the
+    /// decision.
+    ///
+    /// Mutation: ignore `is_handshake` in the heal arm — this reddens, and on device it is the
+    /// 2026-08-21 log: 16 of the peer's 19 `session_ready` sitting in the buffer of the gate
+    /// waiting for them.
+    #[test]
+    fn a_handshake_carrier_is_not_held_behind_the_wait_it_ends() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.decision_to_actions(heal_needed("bob", true), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SessionHealNeeded { .. })),
+            "their X3DH is what resolves the wait; the heal is what applies it"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::HeldPendingAck { .. }))
+        );
+    }
+
+    /// The gate is asked of **one device**. iOS folded it over the peer's device set, so an
+    /// unanswered announcement to one device held a genuine teardown for its sibling — and a
+    /// ratchet is between two devices, so our SRI to one says nothing about the other.
+    ///
+    /// Mutation: fold the question over the peer's devices — this reddens.
+    #[test]
+    fn the_hold_is_asked_of_one_device_not_of_its_sibling() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob-phone".to_string(),
+        });
+        let actions = o.decision_to_actions(end_session_needed("bob-laptop"), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. })),
+            "the sibling's ratchet is not waiting on anything"
+        );
+    }
+
+    /// And the hold ends where the wait does. Both ends work: the peer's acknowledgement here,
+    /// and `OpeningGaveUp` off the `open_confirm:` alarm — which is why that alarm exists.
+    #[test]
+    fn the_hold_ends_when_the_peer_acknowledges() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        let actions = o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendEndSession { .. })),
+            "a genuine divergence still tears down, one confirm window later"
         );
     }
 

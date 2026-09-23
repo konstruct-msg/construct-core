@@ -841,6 +841,9 @@ interface CfeAction {
     SessionHealNeeded(string contact_id, string role);
     /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
     HealSuppressed(string contact_id, u64 retry_after_ms);
+    /// Our own SESSION_RESET_INIT to this device is unacknowledged, so neither heal nor tear
+    /// down on the message that provoked this: buffer it and replay it when the wait ends.
+    HeldPendingAck(string contact_id);
     /// END_SESSION suppressed by cooldown — the core owes it and sends it in retry_after_ms.
     /// Platform must NOT ACK.
     EndSessionSuppressed(string contact_id, u64 retry_after_ms);

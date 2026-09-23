@@ -97,6 +97,24 @@ pub enum Action {
         retry_after_ms: u64,
     },
 
+    /// The decision — heal or tear down — is held because our own SESSION_RESET_INIT to this
+    /// device has not been acknowledged yet.
+    ///
+    /// Inside that window we are the side that replaced the ratchet, so a message that will not
+    /// open is a consequence of our own re-init and not evidence about the peer. Acting on it
+    /// answers our own reset with another reset and takes the message with it: on 2026-08-04 a
+    /// user's first message after a re-init died exactly there, and healing as RESPONDER is
+    /// worse still — `archiveSession` destroys the session created two seconds earlier in answer
+    /// to a message that is unreadable *because* it was created.
+    ///
+    /// Unlike `HealSuppressed` / `EndSessionSuppressed` this does **not** rely on redelivery: the
+    /// platform buffers the message and replays it when the wait ends, whether it ends with the
+    /// peer's acknowledgement or with the window running out. A gate that expires with nothing to
+    /// replay is the 2026-08-04 defect in its other form.
+    HeldPendingAck {
+        contact_id: String,
+    },
+
     /// An `EndSessionNeeded` decision was suppressed by the per-contact cooldown, and the
     /// orchestrator has taken ownership of sending it once the cooldown clears (in
     /// `retry_after_ms`). The platform must NOT acknowledge the message.
