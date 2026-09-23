@@ -170,9 +170,7 @@ impl Orchestrator {
                 self.lifecycle.healing_queue.settle(&contact_id);
                 Vec::new()
             }
-            IncomingEvent::HealAttempted { contact_id } => {
-                self.handle_heal_attempted(contact_id)
-            }
+            IncomingEvent::HealAttempted { contact_id } => self.handle_heal_attempted(contact_id),
             IncomingEvent::ReopenRequested { contact_id } => {
                 self.handle_reopen_requested(contact_id)
             }
@@ -2571,12 +2569,10 @@ mod tests {
         let actions = o.handle_event(IncomingEvent::HealAttempted {
             contact_id: "bob".to_string(),
         });
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
-            ))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
+        )));
     }
 
     /// But settling is not forgetting. The incoming-trigger cap is what stops a peer from making
