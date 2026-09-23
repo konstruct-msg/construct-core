@@ -161,6 +161,11 @@ pub const RESPONDER_OVERRIDE_MS: u64 = 60_000;
 /// to go again if the rebuild fails.
 const _: () = assert!(PEER_TEARDOWN_QUIET_MS < RESPONDER_OVERRIDE_MS);
 
+/// And it outlasts an init that is merely running: a peer whose own rebuild is still fetching a
+/// bundle has not failed to take its turn, and taking the role out from under it would be the
+/// crossing init the turn exists to prevent.
+const _: () = assert!(OPENING_TTL_MS < RESPONDER_OVERRIDE_MS);
+
 /// What the machine believes about one ratchet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -1290,16 +1295,11 @@ mod tests {
         assert!(!m.owes_teardown("dev"));
     }
 
-    /// The turn outlasts the teardown window it is measured against — otherwise taking the role
-    /// would happen while our own teardown is still gated, and a failed rebuild could not be
-    /// answered. Stated as a constant relation in the module; read here so the numbers are not
-    /// only asserted against themselves.
-    #[test]
-    fn the_turn_outlasts_the_windows_inside_it() {
-        assert!(RESPONDER_OVERRIDE_MS > PEER_TEARDOWN_QUIET_MS);
-        assert!(RESPONDER_OVERRIDE_MS > REOPEN_QUIET_MS);
-        assert!(RESPONDER_OVERRIDE_MS > OPENING_TTL_MS);
-    }
+    // `the_turn_outlasts_the_windows_inside_it` stood here until 2026-09-23. Every line of it
+    // compared two constants, which is a `const _: () = assert!(...)` written as a test — the
+    // module has those, and clippy rejects the runtime spelling (`assertions_on_constants`). The
+    // relation that matters, `PEER_TEARDOWN_QUIET_MS < RESPONDER_OVERRIDE_MS`, is checked where
+    // the constants are declared and so cannot be broken by an edit that skips the test suite.
 
     // ── Tearing down ──────────────────────────────────────────────────────────
 
