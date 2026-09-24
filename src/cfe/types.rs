@@ -590,7 +590,7 @@ pub struct CfeOrchestratorStateV1 {
     pub init_locks: Vec<String>,
     /// contactId → archived session CFE binary (latest archive per contact).
     #[serde(rename = "arcs")]
-    pub archives: Vec<(String, serde_bytes::ByteBuf)>,
+    pub archives: Vec<(String, SecretBytes)>,
     /// contactId → Unix timestamp of the archive (for GC).
     #[serde(rename = "arc_ts")]
     pub archive_timestamps: Vec<(String, u64)>,

@@ -339,7 +339,8 @@ pub enum Action {
     ///   Android can implement the identical behaviour against Android Keystore.
     SessionTerminated {
         contact_id: String,
-        archive_bytes: Vec<u8>,
+        /// The archived session record — root and chain keys included, so `SecretBytes`.
+        archive_bytes: crate::crypto::SecretBytes,
     },
 }
 

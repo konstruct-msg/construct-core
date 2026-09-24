@@ -1,3 +1,4 @@
+use crate::crypto::SecretBytes;
 use crate::crypto::provider::CryptoProvider;
 use crate::error::CryptoError;
 use chacha20poly1305::{
@@ -10,22 +11,23 @@ use rand::rngs::OsRng;
 use rand_core::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as KemPublicKeyDalek, StaticSecret};
+use zeroize::Zeroizing;
 
 /// Concrete implementation of `CryptoProvider` for the classic suite.
 pub struct ClassicSuiteProvider;
 
 impl CryptoProvider for ClassicSuiteProvider {
     type KemPublicKey = Vec<u8>;
-    type KemPrivateKey = Vec<u8>;
+    type KemPrivateKey = crate::crypto::SecretBytes;
     type SignaturePublicKey = Vec<u8>;
-    type SignaturePrivateKey = Vec<u8>;
-    type AeadKey = Vec<u8>;
+    type SignaturePrivateKey = crate::crypto::SecretBytes;
+    type AeadKey = crate::crypto::SecretBytes;
 
     fn generate_kem_keys() -> Result<(Self::KemPrivateKey, Self::KemPublicKey), CryptoError> {
         let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = KemPublicKeyDalek::from(&private_key);
         Ok((
-            private_key.to_bytes().to_vec(),
+            SecretBytes::from_slice(&private_key.to_bytes()),
             public_key.to_bytes().to_vec(),
         ))
     }
@@ -48,13 +50,11 @@ impl CryptoProvider for ClassicSuiteProvider {
     }
 
     fn kem_private_key_from_bytes(bytes: Vec<u8>) -> Self::KemPrivateKey {
-        // For ClassicSuiteProvider, KemPrivateKey is Vec<u8>, so just return it
-        bytes
+        bytes.into()
     }
 
     fn aead_key_from_bytes(bytes: Vec<u8>) -> Self::AeadKey {
-        // For ClassicSuiteProvider, AeadKey is Vec<u8>, so just return it
-        bytes
+        bytes.into()
     }
 
     fn signature_public_key_from_bytes(bytes: Vec<u8>) -> Self::SignaturePublicKey {
@@ -63,8 +63,7 @@ impl CryptoProvider for ClassicSuiteProvider {
     }
 
     fn signature_private_key_from_bytes(bytes: Vec<u8>) -> Self::SignaturePrivateKey {
-        // For ClassicSuiteProvider, SignaturePrivateKey is Vec<u8>, so just return it
-        bytes
+        bytes.into()
     }
 
     fn generate_signature_keys()
@@ -72,7 +71,7 @@ impl CryptoProvider for ClassicSuiteProvider {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         Ok((
-            signing_key.to_bytes().to_vec(),
+            SecretBytes::from_slice(&signing_key.to_bytes()),
             verifying_key.to_bytes().to_vec(),
         ))
     }
@@ -169,7 +168,7 @@ impl CryptoProvider for ClassicSuiteProvider {
         plaintext: &[u8],
         associated_data: Option<&[u8]>,
     ) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new(AeadKeyChacha::from_slice(key));
+        let cipher = ChaCha20Poly1305::new(AeadKeyChacha::from_slice(key.expose()));
         let nonce_ref = Nonce::from_slice(nonce);
 
         let payload = if let Some(aad) = associated_data {
@@ -196,7 +195,7 @@ impl CryptoProvider for ClassicSuiteProvider {
         ciphertext: &[u8],
         associated_data: Option<&[u8]>,
     ) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new(AeadKeyChacha::from_slice(key));
+        let cipher = ChaCha20Poly1305::new(AeadKeyChacha::from_slice(key.expose()));
         let nonce_ref = Nonce::from_slice(nonce);
 
         let payload = if let Some(aad) = associated_data {
@@ -235,24 +234,24 @@ impl CryptoProvider for ClassicSuiteProvider {
         dh_output: &[u8],
     ) -> Result<(Self::AeadKey, Self::AeadKey), CryptoError> {
         let hkdf = Hkdf::<Sha256>::new(Some(root_key.as_ref()), dh_output);
-        let mut output = vec![0u8; 64];
-        hkdf.expand(b"Double-Ratchet-Root-Key-Expansion", &mut output)
+        let mut output = Zeroizing::new([0u8; 64]);
+        hkdf.expand(b"Double-Ratchet-Root-Key-Expansion", output.as_mut())
             .map_err(|e| CryptoError::KeyDerivationError(e.to_string()))?;
 
-        let new_root_key = output[..32].to_vec();
-        let chain_key = output[32..].to_vec();
+        let new_root_key = SecretBytes::from_slice(&output[..32]);
+        let chain_key = SecretBytes::from_slice(&output[32..]);
 
         Ok((new_root_key, chain_key))
     }
 
     fn kdf_ck(chain_key: &Self::AeadKey) -> Result<(Self::AeadKey, Self::AeadKey), CryptoError> {
         let hkdf = Hkdf::<Sha256>::new(Some(chain_key.as_ref()), b"");
-        let mut output = vec![0u8; 64];
-        hkdf.expand(b"Double-Ratchet-Chain-Key-Expansion", &mut output)
+        let mut output = Zeroizing::new([0u8; 64]);
+        hkdf.expand(b"Double-Ratchet-Chain-Key-Expansion", output.as_mut())
             .map_err(|e| CryptoError::KeyDerivationError(e.to_string()))?;
 
-        let message_key = output[..32].to_vec();
-        let next_chain = output[32..].to_vec();
+        let message_key = SecretBytes::from_slice(&output[..32]);
+        let next_chain = SecretBytes::from_slice(&output[32..]);
 
         Ok((message_key, next_chain))
     }
@@ -265,5 +264,24 @@ impl CryptoProvider for ClassicSuiteProvider {
 
     fn suite_id() -> u16 {
         crate::config::Config::global().classic_suite_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The provider's secret types are what the ratchet holds in memory (root, chain and
+    /// skipped message keys, DH and identity privates) and what `InitiatorState` derives
+    /// `Debug` over. They used to be `Vec<u8>`: never wiped, printed in full.
+    #[test]
+    fn secret_types_do_not_print_their_bytes() {
+        let (kem_priv, _) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let (sig_priv, _) = ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let (root, chain) =
+            ClassicSuiteProvider::kdf_rk(&SecretBytes::new(vec![1; 32]), &[2; 32]).unwrap();
+        for secret in [&kem_priv, &sig_priv, &root, &chain] {
+            assert_eq!(format!("{secret:?}"), "SecretBytes(<32 bytes redacted>)");
+        }
     }
 }

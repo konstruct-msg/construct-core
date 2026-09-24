@@ -2668,7 +2668,7 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
     let (sk, pk) = HybridSuiteProvider::generate_signature_keys()
         .map_err(|_| CryptoError::InitializationFailed)?;
     Ok(HybridSignatureKeyPair {
-        private_key: sk,
+        private_key: sk.into_vec(),
         public_key: pk,
     })
 }
@@ -2683,9 +2683,11 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
 pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
-    HybridSuiteProvider::sign(&private_key, &message).map_err(|e| CryptoError::EncryptionFailed {
-        message: format!("Hybrid sign failed: {e}"),
-    })
+    HybridSuiteProvider::sign(&crate::crypto::SecretBytes::new(private_key), &message).map_err(
+        |e| CryptoError::EncryptionFailed {
+            message: format!("Hybrid sign failed: {e}"),
+        },
+    )
 }
 
 #[cfg(not(feature = "post-quantum"))]
@@ -2722,8 +2724,10 @@ pub fn hybrid_verify(
 pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
-    HybridSuiteProvider::from_signature_private_to_public(&private_key)
-        .map_err(|_e| CryptoError::InvalidKeyData)
+    HybridSuiteProvider::from_signature_private_to_public(&crate::crypto::SecretBytes::new(
+        private_key,
+    ))
+    .map_err(|_e| CryptoError::InvalidKeyData)
 }
 
 #[cfg(not(feature = "post-quantum"))]
@@ -4168,7 +4172,7 @@ impl CfeAction {
                 archive_bytes,
             } => Self::SessionTerminated {
                 contact_id,
-                archive_bytes,
+                archive_bytes: archive_bytes.into_vec(),
             },
         }
     }

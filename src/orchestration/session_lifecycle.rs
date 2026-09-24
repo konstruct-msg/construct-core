@@ -107,7 +107,7 @@ pub struct SessionLifecycleManager {
     pub healing_queue: HealingQueue,
     pub pq_manager: PQContributionManager,
     /// contactId → archived session CFE binary (latest archive only).
-    archives: HashMap<String, Vec<u8>>,
+    archives: HashMap<String, crate::crypto::SecretBytes>,
     /// contactId → Unix timestamp of the archive (for GC).
     archive_timestamps: HashMap<String, u64>,
     /// contactId → last seen OTPK ID (used to detect reinstall).
@@ -345,14 +345,14 @@ impl SessionLifecycleManager {
         };
 
         self.archives
-            .insert(contact_id.to_string(), cfe_bytes.clone());
+            .insert(contact_id.to_string(), cfe_bytes.clone().into());
         self.archive_timestamps
             .insert(contact_id.to_string(), self.clock.now_secs());
         self.client.remove_session(contact_id);
 
         vec![Action::SessionTerminated {
             contact_id: contact_id.to_string(),
-            archive_bytes: cfe_bytes,
+            archive_bytes: cfe_bytes.into(),
         }]
     }
 
@@ -366,7 +366,7 @@ impl SessionLifecycleManager {
             .get(contact_id)
             .cloned()
             .ok_or_else(|| format!("No archive for {}", contact_id))?;
-        self.import_session_bytes(contact_id, &cfe_bytes)
+        self.import_session_bytes(contact_id, cfe_bytes.expose())
     }
 
     /// Garbage-collect archives older than 24 h.
@@ -545,7 +545,7 @@ impl SessionLifecycleManager {
             archives: self
                 .archives
                 .iter()
-                .map(|(k, v)| (k.clone(), serde_bytes::ByteBuf::from(v.clone())))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             archive_timestamps: self
                 .archive_timestamps
@@ -605,11 +605,7 @@ impl SessionLifecycleManager {
         );
 
         // Restore archive index and prekey tracker.
-        self.archives = state
-            .archives
-            .into_iter()
-            .map(|(k, v)| (k, v.into_vec()))
-            .collect();
+        self.archives = state.archives.into_iter().collect();
         self.archive_timestamps = state.archive_timestamps.into_iter().collect();
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
         self.signed_kyber_devices = state.signed_kyber_devices.into_iter().collect();
@@ -745,7 +741,7 @@ mod tests {
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
         // Inject an archive with a stale timestamp.
         mgr.archives
-            .insert("bob".to_string(), b"placeholder".to_vec());
+            .insert("bob".to_string(), b"placeholder".to_vec().into());
         mgr.archive_timestamps.insert("bob".to_string(), 0);
 
         let actions = mgr.gc_old_archives();
@@ -758,7 +754,7 @@ mod tests {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
         mgr.archives
-            .insert("bob".to_string(), b"placeholder".to_vec());
+            .insert("bob".to_string(), b"placeholder".to_vec().into());
         mgr.archive_timestamps.insert("bob".to_string(), unix_now());
 
         mgr.gc_old_archives();
@@ -779,7 +775,8 @@ mod tests {
     fn forget_contact_state_clears_archive_heal_prekey_and_pq_state() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.archives.insert("bob".to_string(), b"archive".to_vec());
+        mgr.archives
+            .insert("bob".to_string(), b"archive".to_vec().into());
         mgr.archive_timestamps.insert("bob".to_string(), unix_now());
         mgr.track_prekey("bob", 42);
         mgr.healing_queue.enqueue(

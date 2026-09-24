@@ -191,7 +191,7 @@ mod tests {
     use crate::crypto::suites::classic::ClassicSuiteProvider;
 
     struct Peer {
-        sk: Vec<u8>,
+        sk: crate::crypto::SecretBytes,
         vk: Vec<u8>,
     }
 
