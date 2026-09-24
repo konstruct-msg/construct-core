@@ -142,7 +142,8 @@ Names follow NIST FIPS; informal names in parens.
 | `desktop`       | Desktop testing support (Tokio runtime)                        |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
-features pull in `construct-veil` (path dependency) and `openmls`.
+features pull in `construct-veil` and `openmls`. `construct-veil` is a git dependency pinned
+by commit (`rev` in `Cargo.toml`) — no sibling checkout is needed for any build.
 
 ## Testing
 
@@ -154,8 +155,27 @@ cargo test --features post-quantum
 cargo audit
 ```
 
-> `--all-features` requires the sibling `construct-veil` crate checked out at `../construct-veil`
-> (pulled in by `ios`/`mac`/`android`).
+### Working on construct-veil at the same time
+
+`Cargo.toml` pins `construct-veil` by commit. To build against a local checkout instead, patch it
+from outside the repository — for one command:
+
+```bash
+cargo --config 'patch."https://github.com/konstruct-msg/construct-veil".construct-veil.path="../construct-veil"' \
+  test --features mac,post-quantum
+```
+
+or persistently in your own `~/.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/konstruct-msg/construct-veil"]
+construct-veil = { path = "/path/to/construct-veil" }
+```
+
+While patched, cargo rewrites `Cargo.lock` to the local path — **do not commit that lock**; CI's
+`cargo metadata --locked` step rejects it. To take a veil change for real: push it to
+construct-veil, set `rev` in `Cargo.toml` to that commit, run `cargo update -p construct-veil`,
+and commit both files.
 
 ### Pre-push
 
