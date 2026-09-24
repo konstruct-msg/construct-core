@@ -400,86 +400,13 @@ impl ClassicCryptoCore {
 
     /// Export private keys in CFE binary format (MessagePack + header).
     pub fn export_private_keys(&self) -> Result<Vec<u8>, CryptoError> {
-        use crate::crypto::provider::CryptoProvider;
-        use serde_bytes::ByteBuf;
-
         let client = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let identity_secret = client
-            .key_manager()
-            .identity_secret_key()
+        let payload = client
+            .to_private_keys_cfe()
             .map_err(|_| CryptoError::InvalidKeyData)?;
-        let signing_secret = client
-            .key_manager()
-            .signing_secret_key()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let prekey = client
-            .key_manager()
-            .current_signed_prekey()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
-        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
-        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
-        let spk_sig: Vec<u8> = prekey.signature.clone();
-
-        let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let vk_pub = ClassicSuiteProvider::from_signature_private_to_public(&sk_priv)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-        let spk_pub = ClassicSuiteProvider::from_private_key_to_public_key(&spk_priv)
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        let spk_id = client.key_manager().current_signed_prekey_id().unwrap_or(0);
-
-        // Persist old signed-prekeys so that after an app restart the RESPONDER
-        // can still decrypt sessions that the INITIATOR opened using a cached
-        // pre-rotation bundle (the root cause of the AEAD loop).
-        let old_spks: Vec<crate::cfe::CfeOldSpkV1> = client
-            .key_manager()
-            .old_prekeys_iter()
-            .map(|store| {
-                let priv_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec();
-                crate::cfe::CfeOldSpkV1 {
-                    spk_priv: ByteBuf::from(priv_bytes),
-                    spk_sig: ByteBuf::from(store.signature.clone()),
-                    spk_id: store.key_id,
-                    created_at: store.created_at,
-                }
-            })
-            .collect();
-
-        let hybrid_sig_priv = client
-            .key_manager()
-            .hybrid_signature_private_bytes()
-            .map(ByteBuf::from);
-        let kyber_spk = client
-            .key_manager()
-            .kyber_spk_bytes()
-            .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
-                key_id,
-                kyber_priv: ByteBuf::from(priv_b),
-                kyber_pub: ByteBuf::from(pub_b),
-            });
-
-        let payload = crate::cfe::CfePrivateKeysV1 {
-            suite_id: 1,
-            ik_priv: ByteBuf::from(ik_priv),
-            sk_priv: ByteBuf::from(sk_priv),
-            spk_priv: ByteBuf::from(spk_priv),
-            spk_sig: ByteBuf::from(spk_sig),
-            spk_id,
-            ik_pub: ByteBuf::from(ik_pub),
-            vk_pub: ByteBuf::from(vk_pub),
-            spk_pub: ByteBuf::from(spk_pub),
-            old_spks,
-            hybrid_sig_priv,
-            kyber_spk,
-        };
-
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
             .map_err(|e| serialization_failed("classic export_private_keys/encode", e))
     }
@@ -499,36 +426,8 @@ impl ClassicCryptoCore {
 
         let local_uid = client.local_user_id().to_string();
 
-        let old_spks_history: Vec<(Vec<u8>, Vec<u8>, u32, i64)> = keys
-            .old_spks
-            .into_iter()
-            .map(|e| {
-                (
-                    e.spk_priv.into_vec(),
-                    e.spk_sig.into_vec(),
-                    e.spk_id,
-                    e.created_at,
-                )
-            })
-            .collect();
-
-        let hybrid_priv: Option<Vec<u8>> = keys.hybrid_sig_priv.map(|b| b.into_vec());
-
-        let mut new_client =
-            ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
-                keys.ik_priv.into_vec(),
-                keys.sk_priv.into_vec(),
-                keys.spk_priv.into_vec(),
-                keys.spk_sig.into_vec(),
-                keys.spk_id,
-                old_spks_history,
-                hybrid_priv,
-            )
+        let new_client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(keys)
             .map_err(|_| CryptoError::InitializationFailed)?;
-
-        if let Some(k) = keys.kyber_spk {
-            new_client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
-        }
 
         *client = new_client;
         if !local_uid.is_empty() {
@@ -1150,21 +1049,8 @@ pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCo
     )
     .map_err(|e| serialization_failed("create_crypto_core_from_keys/decode", e))?;
 
-    let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
-    let mut client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
-        decoded.ik_priv.into_vec(),
-        decoded.sk_priv.into_vec(),
-        decoded.spk_priv.into_vec(),
-        decoded.spk_sig.into_vec(),
-        decoded.spk_id,
-        vec![],
-        hybrid,
-    )
-    .map_err(|_| CryptoError::InitializationFailed)?;
-
-    if let Some(k) = decoded.kyber_spk {
-        client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
-    }
+    let client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded)
+        .map_err(|_| CryptoError::InitializationFailed)?;
 
     Ok(Arc::new(ClassicCryptoCore {
         inner: Mutex::new(client),
@@ -1184,21 +1070,8 @@ pub fn create_orchestrator_core_from_keys(
     )
     .map_err(|e| serialization_failed("create_orchestrator_core_from_keys/decode", e))?;
 
-    let hybrid = decoded.hybrid_sig_priv.map(|b| b.into_vec());
-    let mut client = ClassicClient::<ClassicSuiteProvider>::from_keys_with_history_and_hybrid(
-        decoded.ik_priv.into_vec(),
-        decoded.sk_priv.into_vec(),
-        decoded.spk_priv.into_vec(),
-        decoded.spk_sig.into_vec(),
-        decoded.spk_id,
-        vec![],
-        hybrid,
-    )
-    .map_err(|_| CryptoError::InitializationFailed)?;
-
-    if let Some(k) = decoded.kyber_spk {
-        client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
-    }
+    let client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded)
+        .map_err(|_| CryptoError::InitializationFailed)?;
 
     let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
     Ok(Arc::new(OrchestratorCore {
@@ -2403,6 +2276,54 @@ mod tests {
 
         let (_session_id, decrypted1) = result.unwrap();
         assert_eq!(decrypted1, plaintext1);
+    }
+
+    /// Every constructor that restores from the private-key record keeps the pre-rotation
+    /// signed prekeys. `create_orchestrator_core_from_keys` and `create_crypto_core_from_keys`
+    /// passed an empty history, so a responder restarted after a rotation could not open a
+    /// session an initiator had started from a cached bundle.
+    ///
+    /// Mutation: pass `vec![]` for `old_spks` in `from_private_keys_cfe` — this reddens.
+    #[test]
+    fn restoring_from_the_key_record_keeps_old_spks() {
+        let mut client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        client.rotate_prekey().unwrap();
+        let record = client.to_private_keys_cfe().unwrap();
+        assert!(
+            !record.old_spks.is_empty(),
+            "the premise: a rotation leaves history"
+        );
+        let blob = crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &record).unwrap();
+
+        let decode = |bytes: Vec<u8>| {
+            crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+                &bytes,
+                crate::cfe::CfeMessageType::PrivateKeys,
+            )
+            .unwrap()
+        };
+
+        let orch = create_orchestrator_core_from_keys(blob.clone(), "alice".to_string()).unwrap();
+        assert_eq!(
+            decode(orch.export_private_keys().unwrap()),
+            record,
+            "create_orchestrator_core_from_keys"
+        );
+
+        let core = create_crypto_core_from_keys(blob.clone()).unwrap();
+        assert_eq!(
+            decode(core.export_private_keys().unwrap()),
+            record,
+            "create_crypto_core_from_keys"
+        );
+
+        let fresh = create_crypto_core().unwrap();
+        fresh.import_private_keys(blob).unwrap();
+        assert_eq!(
+            decode(fresh.export_private_keys().unwrap()),
+            record,
+            "import_private_keys"
+        );
     }
 }
 

@@ -998,6 +998,106 @@ where
 /// Convenience type alias для X3DH + Double Ratchet с Classic Suite
 pub type ClassicClient<P> = Client<P, X3DHProtocol<P>, DoubleRatchetSession<P>>;
 
+/// The one mapping between a client's long-term keys and `CfePrivateKeysV1`, both ways.
+///
+/// It was written out five times — `export_private_keys` on `ClassicCryptoCore` and on the
+/// orchestrator, and three restores — and two of the three restores (`create_crypto_core_from_keys`,
+/// `create_orchestrator_core_from_keys`) passed an empty list where the record had `old_spks`.
+/// The exporters wrote the pre-rotation signed prekeys precisely so that a responder restarted
+/// after a rotation can still open a session an initiator started from a cached bundle; those two
+/// constructors threw them away. One pair of functions cannot disagree with itself.
+impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
+    /// The key record `from_private_keys_cfe` restores. Contact sessions are not part of it.
+    pub fn to_private_keys_cfe(&self) -> Result<crate::cfe::CfePrivateKeysV1, String> {
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        use serde_bytes::ByteBuf;
+
+        let km = &self.key_manager;
+        let identity_secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
+        let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
+
+        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
+        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
+        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
+        let spk_sig: Vec<u8> = prekey.signature.clone();
+
+        let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
+            .map_err(|e| e.to_string())?;
+        let vk_pub = ClassicSuiteProvider::from_signature_private_to_public(&sk_priv)
+            .map_err(|e| e.to_string())?;
+        let spk_pub = ClassicSuiteProvider::from_private_key_to_public_key(&spk_priv)
+            .map_err(|e| e.to_string())?;
+
+        // Sorted: the key manager keeps them in a HashMap, and one state should write one
+        // record, not a different byte string per process.
+        let mut old_spks: Vec<crate::cfe::CfeOldSpkV1> = km
+            .old_prekeys_iter()
+            .map(|store| crate::cfe::CfeOldSpkV1 {
+                spk_priv: ByteBuf::from(<_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec()),
+                spk_sig: ByteBuf::from(store.signature.clone()),
+                spk_id: store.key_id,
+                created_at: store.created_at,
+            })
+            .collect();
+        old_spks.sort_by_key(|e| e.spk_id);
+
+        Ok(crate::cfe::CfePrivateKeysV1 {
+            suite_id: 1,
+            ik_priv: ByteBuf::from(ik_priv),
+            sk_priv: ByteBuf::from(sk_priv),
+            spk_priv: ByteBuf::from(spk_priv),
+            spk_sig: ByteBuf::from(spk_sig),
+            spk_id: km.current_signed_prekey_id().unwrap_or(0),
+            ik_pub: ByteBuf::from(ik_pub),
+            vk_pub: ByteBuf::from(vk_pub),
+            spk_pub: ByteBuf::from(spk_pub),
+            old_spks,
+            hybrid_sig_priv: km.hybrid_signature_private_bytes().map(ByteBuf::from),
+            kyber_spk: km.kyber_spk_bytes().map(|(key_id, priv_b, pub_b)| {
+                crate::cfe::CfeKyberSpkV1 {
+                    key_id,
+                    kyber_priv: ByteBuf::from(priv_b),
+                    kyber_pub: ByteBuf::from(pub_b),
+                }
+            }),
+        })
+    }
+
+    /// A client holding exactly the keys `to_private_keys_cfe` recorded: identity, signing,
+    /// current and pre-rotation signed prekeys, hybrid signature key, Kyber SPK.
+    /// `local_user_id` is not part of the record; the caller sets it.
+    pub fn from_private_keys_cfe(keys: crate::cfe::CfePrivateKeysV1) -> Result<Self, String> {
+        let old_spks = keys
+            .old_spks
+            .into_iter()
+            .map(|e| {
+                (
+                    e.spk_priv.into_vec(),
+                    e.spk_sig.into_vec(),
+                    e.spk_id,
+                    e.created_at,
+                )
+            })
+            .collect();
+
+        let mut client = Self::from_keys_with_history_and_hybrid(
+            keys.ik_priv.into_vec(),
+            keys.sk_priv.into_vec(),
+            keys.spk_priv.into_vec(),
+            keys.spk_sig.into_vec(),
+            keys.spk_id,
+            old_spks,
+            keys.hybrid_sig_priv.map(|b| b.into_vec()),
+        )?;
+
+        if let Some(k) = keys.kyber_spk {
+            client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
+        }
+        Ok(client)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,5 +1742,25 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Device ID mismatch"));
+    }
+
+    /// The private-key record restores what it recorded — the pre-rotation signed prekeys
+    /// included. Two of the three restores built on it used to pass an empty history.
+    #[test]
+    fn test_private_keys_cfe_roundtrip_keeps_old_spks() {
+        let mut client = TestClient::new().unwrap();
+        client.rotate_prekey().unwrap();
+        client.rotate_prekey().unwrap();
+
+        let record = client.to_private_keys_cfe().unwrap();
+        let old_ids: Vec<u32> = record.old_spks.iter().map(|e| e.spk_id).collect();
+        assert!(
+            !old_ids.is_empty(),
+            "the premise: a rotation leaves history"
+        );
+
+        let restored = TestClient::from_private_keys_cfe(record.clone()).unwrap();
+        let again = restored.to_private_keys_cfe().unwrap();
+        assert_eq!(again, record, "restore → export is the identity");
     }
 }
