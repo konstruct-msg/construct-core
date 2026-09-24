@@ -13,15 +13,21 @@ end-to-end encrypted messenger.**
 macOS, and Android run the *same* code via UniFFI rather than reimplementing crypto
 per platform. It provides:
 
-- **X3DH + PQXDH** asynchronous key agreement (classical and post-quantum hybrid)
-- **Double Ratchet** for forward secrecy & post-compromise security
-- **Crypto-agility** — pluggable cipher suites negotiated per session (`suite_id`)
-- **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204)
-- **MLS (RFC 9420)** group primitives via `openmls`
-- **Account recovery** — BIP39 mnemonic + SLIP-39 social (Shamir) recovery
-- **Key transparency** — RFC 6962-style append-only Merkle log for identity-key auditing
-- **Privacy Pass** — OPRF blind-token primitives (Ristretto255)
-- **Binary session state** — CFE envelopes (no JSON/base64 in the crypto path)
+- **X3DH** asynchronous key agreement, with an **ML-KEM-768 contribution** mixed into the root
+  key when the peer publishes a Kyber prekey (see [Cryptography](#cryptography) for exactly how)
+- **Double Ratchet** for forward secrecy & post-compromise security, optionally with a sparse
+  continuous **ML-KEM-768 ratchet** (suite 3)
+- **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204) primitives
+- **MLS (RFC 9420)** group primitives via `openmls` (`ios` / `mac` / `android` features)
+- **Account recovery** — BIP39 mnemonic, and social recovery by Shamir secret sharing over
+  GF(2⁸) encoded with the SLIP-39 *word list* (not the SLIP-39 share format — see below)
+- **Key transparency** — client-side verification of an RFC 6962-style Merkle log
+  (leaf/node hashing, inclusion and consistency proofs)
+- **Privacy Pass** — blind-token OPRF over Ristretto255 with batched DLEQ proof verification
+  (Construct-specific token derivation; not wire-compatible with RFC 9497)
+- **Session orchestration** — a pure state machine (`OrchestratorCore`) that turns incoming events
+  into actions for the platform; the core does no I/O itself
+- **Binary persistence** — CFE envelopes (16-byte header with length and CRC32, MessagePack payload)
 
 Platforms: **iOS / macOS** (UniFFI Swift) and **Android** (UniFFI Kotlin). No WASM/Web
 target — a cryptographically secure messenger can't be done as a PWA, so that path was
@@ -32,25 +38,35 @@ dropped long ago.
 ```
 construct-core/
 ├── src/
-│   ├── crypto/                 # cryptographic primitives
-│   │   ├── handshake/          # X3DH key agreement
-│   │   ├── messaging/          # Double Ratchet
-│   │   ├── suites/             # cipher suites (classic, PQ-hybrid) + provider trait
-│   │   ├── privacy_pass/       # OPRF blind tokens (Ristretto255)
-│   │   ├── pq_x3dh.rs          # ML-KEM-768 post-quantum key agreement
-│   │   ├── recovery.rs         # BIP39 account recovery
-│   │   ├── social_recovery.rs  # SLIP-39 Shamir social recovery
-│   │   ├── key_transparency.rs # RFC 6962 Merkle log
-│   │   └── provider.rs         # CryptoProvider trait (crypto-agility)
-│   ├── group/                  # MLS (RFC 9420) group messaging
-│   ├── orchestration/          # session orchestration (OrchestratorCore)
-│   ├── cfe/                    # CFE binary session-state envelopes
-│   ├── traffic_protection/     # cover traffic, message padding, timing obfuscation
-│   ├── storage/                # storage traits + in-memory store
-│   ├── uniffi_bindings.rs      # UniFFI FFI surface (iOS/Android)
-│   ├── construct_core.udl      # UniFFI interface definition
-│   ├── pow.rs                  # Argon2id proof-of-work
-│   └── device_id.rs            # device-id derivation
+│   ├── crypto/                    # cryptographic primitives
+│   │   ├── handshake/             # X3DH key agreement
+│   │   ├── messaging/             # Double Ratchet (+ sparse PQ ratchet, suite 3)
+│   │   ├── suites/                # classic and hybrid CryptoProvider implementations
+│   │   ├── provider.rs            # CryptoProvider trait
+│   │   ├── suite_id.rs            # suite ids 1 / 2 / 3
+│   │   ├── pq_x3dh.rs             # ML-KEM-768 keygen / encapsulate / decapsulate
+│   │   ├── kyber_prekey_auth.rs   # Kyber prekey signature check + PQ-authentication label
+│   │   ├── sealed_sender/         # sealed-sender box + sender certificates
+│   │   ├── device_copy_tag.rs     # per-message tag naming the device a copy is for
+│   │   ├── invite_crypto.rs       # contact invites with ephemeral keys
+│   │   ├── master_key.rs          # key backup / restore
+│   │   ├── recovery.rs            # BIP39 account recovery
+│   │   ├── social_recovery.rs     # Shamir social recovery (SLIP-39 word list)
+│   │   ├── key_transparency.rs    # RFC 6962-style Merkle proof verification
+│   │   ├── privacy_pass/          # OPRF blind tokens (Ristretto255)
+│   │   ├── secret_bytes.rs        # SecretBytes: zeroed on drop, redacted in Debug
+│   │   └── log_fingerprint.rs     # log-safe fingerprints of secrets
+│   ├── orchestration/             # OrchestratorCore: session state machine, plans, actions
+│   ├── group/                     # MLS (RFC 9420) group state store
+│   ├── cfe/                       # CFE binary envelopes + record types
+│   ├── wire_payload.rs, intake.rs # message wire format and intake
+│   ├── traffic_protection/        # padding, cover-traffic and timing helpers
+│   ├── storage/                   # storage models (its traits + in-memory store are unused)
+│   ├── uniffi_bindings.rs         # UniFFI FFI surface (iOS/macOS/Android)
+│   ├── construct_core.udl         # UniFFI interface definition
+│   ├── pow.rs                     # Argon2id proof-of-work
+│   ├── device_id.rs               # device-id derivation
+│   └── proofs/                    # Kani proofs (compiled only under `cargo kani`)
 └── Cargo.toml
 ```
 
@@ -118,18 +134,60 @@ Names follow NIST FIPS; informal names in parens.
 | AEAD          | **ChaCha20-Poly1305** |
 | KDF           | **HKDF-SHA256**       |
 
-### Post-quantum (`suite_id = 2`) — hybrid
+### Suite ids
 
-| Component     | Algorithm                                       | Status |
-|---------------|-------------------------------------------------|--------|
-| Key agreement | **X25519 ⊕ ML-KEM-768** (FIPS 203, Kyber-768)   | ✅ Implemented — PQXDH mixes a Kyber OTPK into the root key |
-| Signatures    | **Ed25519 + ML-DSA-65** (FIPS 204, Dilithium-3) | 🚧 Implemented (RustCrypto `ml-dsa`, seed-based), **not yet activated on the wire** |
-| AEAD / KDF    | ChaCha20-Poly1305 / HKDF-SHA256                 | unchanged |
+| `suite_id` | Name | What a session with it is |
+|---|---|---|
+| 1 | `CLASSIC` | The table above. |
+| 2 | `PQ_HYBRID` | **Reserved.** No session negotiates it; the hybrid-signature primitives below live under this name. |
+| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. Chosen only when this build has `post-quantum` and the peer's bundle advertises `supports_pq_ratchet`. |
 
-> **Hybrid = classical AND post-quantum** — both must verify, and an attacker must break
-> both to forge. The ML-DSA-65 path uses RustCrypto `ml-dsa` (seed-based), identical to the
-> Konstruct server, so hybrid signatures cross-verify byte-for-byte (pinned by an interop
-> test). Older docs claiming "Kyber-1024" or "Dilithium deployed" are wrong.
+### ML-KEM-768 at session start (independent of `suite_id`)
+
+When the peer's bundle carries a Kyber prekey, the initiator encapsulates to it (ML-KEM-768,
+FIPS 203) and mixes the shared secret into the X3DH root key when it sends the first message:
+`root = HKDF(salt = rk, ikm = kem_ss, info = "construct-pqxdh-v1")`; the ciphertext travels in
+that message, and the responder derives the same root. The secret is applied before message 0 is
+encrypted, so from the first message on the root depends on both the X25519 and the ML-KEM
+secret. This is *not* Signal's PQXDH: the KEM secret is mixed in after X3DH rather than into its
+initial derivation, and the KEM ciphertext is not bound into the KDF.
+
+The Kyber prekey's Ed25519 signature is verified by the core
+(`"KonstruktX3DH-v1" || 0x00 0x10 || kyber_public`, key-service field 12), and the session is
+labelled accordingly — `SessionHealthReport.pq_authentication`:
+
+| Bundle | Result |
+|---|---|
+| signature verifies | `Authenticated` — and the device is remembered as one that signs |
+| no signature | `Unauthenticated` — protects against a passive recorder, not against whoever served the bundle |
+| signature present and wrong | classical session, logged as a security event |
+| no verifiable Kyber key from a device that signed before | session **refused** (`PQ_DOWNGRADE_REFUSED`) |
+
+An unsigned Kyber OTPK is never preferred over a verified SPK (the server bundle does not carry
+OTPK signatures yet).
+
+### Hybrid signatures
+
+**Ed25519 + ML-DSA-65** (FIPS 204) — both must verify. RustCrypto `ml-dsa`, seed-based, the same
+implementation as the Konstruct server (cross-verification pinned by an interop test). The core
+exposes them as primitives; iOS signs the Kyber SPK with them (key-service field 23) and checks
+that signature itself — **the core does not verify hybrid signatures yet**. Older docs claiming
+"Kyber-1024" or "Dilithium deployed" are wrong.
+
+### Social recovery
+
+A 32-byte vault key is split with Shamir secret sharing over GF(2⁸) (threshold and share count
+2–10). Each share is `index || 32 bytes || 2-byte SHA-256 checksum`, written as **28 words from the
+SLIP-39 word list**. That is the word list only: no RS1024 checksum, identifier, groups or
+passphrase encryption — shares are **not** interchangeable with SLIP-39 wallets. The share does
+not record the threshold; too few shares reconstruct a wrong key, which the AEAD over the recovery
+bundle then rejects.
+
+### Traffic protection
+
+PKCS#7-style padding to fixed blocks is applied inside the ratchet. Cover traffic and timing
+helpers are exported for the platform to schedule. Dummy messages carry a plaintext marker so the
+server can drop them — they hide patterns from a network observer, not from the server.
 
 ## Features
 
@@ -139,10 +197,11 @@ Names follow NIST FIPS; informal names in parens.
 | `mac`           | Native macOS build (same surface as `ios`)                     |
 | `android`       | Android JNI/Kotlin bindings via UniFFI                         |
 | `post-quantum`  | ML-KEM-768 + ML-DSA-65 post-quantum cryptography               |
-| `desktop`       | Desktop testing support (Tokio runtime)                        |
+| `desktop`       | Enables the `tokio` dependency — nothing in the crate uses it yet |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
-features pull in `construct-veil` (path dependency) and `openmls`.
+features pull in `construct-veil` and `openmls`. `construct-veil` is a git dependency pinned
+by commit (`rev` in `Cargo.toml`) — no sibling checkout is needed for any build.
 
 ## Testing
 
@@ -150,12 +209,34 @@ features pull in `construct-veil` (path dependency) and `openmls`.
 # Core crypto, including the PQ suites
 cargo test --features post-quantum
 
+# The exported UniFFI surface (compiled only with a platform feature)
+cargo test --features mac,post-quantum
+
 # Security audit (advisory policy in .cargo/audit.toml)
 cargo audit
 ```
 
-> `--all-features` requires the sibling `construct-veil` crate checked out at `../construct-veil`
-> (pulled in by `ios`/`mac`/`android`).
+### Working on construct-veil at the same time
+
+`Cargo.toml` pins `construct-veil` by commit. To build against a local checkout instead, patch it
+from outside the repository — for one command:
+
+```bash
+cargo --config 'patch."https://github.com/konstruct-msg/construct-veil".construct-veil.path="../construct-veil"' \
+  test --features mac,post-quantum
+```
+
+or persistently in your own `~/.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/konstruct-msg/construct-veil"]
+construct-veil = { path = "/path/to/construct-veil" }
+```
+
+While patched, cargo rewrites `Cargo.lock` to the local path — **do not commit that lock**; CI's
+`cargo metadata --locked` step rejects it. To take a veil change for real: push it to
+construct-veil, set `rev` in `Cargo.toml` to that commit, run `cargo update -p construct-veil`,
+and commit both files.
 
 ### Pre-push
 

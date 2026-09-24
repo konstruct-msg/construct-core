@@ -23,18 +23,6 @@ jobs:
     name: Lint + Tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      # construct-core has a path dependency on construct-veil
-      # (`construct-veil = { path = "../construct-veil", optional = true }`).
-      # Even when the `ios`/`mac`/`android` features are off, `cargo metadata`
-      # (used by `cargo fmt`, `cargo clippy`, etc.) still reads
-      # `../construct-veil/Cargo.toml` to validate the dependency graph.
-      # Without this sibling checkout, the very first lint step fails.
-      - name: Checkout construct-veil (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/construct-veil
-          path: construct-veil
-
       - name: Checkout construct-core
         uses: actions/checkout@v4
         with:
@@ -55,8 +43,16 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             construct-core/target/
-          key: linux-cargo-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
+          key: linux-cargo-${{ hashFiles('construct-core/Cargo.lock') }}
           restore-keys: linux-cargo-
+
+      # construct-veil is a git dependency pinned by `rev`; its checkout comes from
+      # Cargo.lock like any other crate. `--locked` fails when the lock does not match the
+      # manifest — a `rev` bumped without `cargo update`, or a lock committed while a local
+      # `[patch]` pointed construct-veil at a sibling path.
+      - name: Cargo.lock matches Cargo.toml
+        working-directory: construct-core
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Check formatting
         working-directory: construct-core
@@ -98,14 +94,6 @@ jobs:
     runs-on: macos-14 # Apple Silicon runner — faster Rust compilation
     needs: test
     steps:
-      # construct-core's `ios`/`mac` features depend on construct-veil via a
-      # path = "../construct-veil" dependency, so we check it out as a sibling.
-      - name: Checkout construct-veil (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/construct-veil
-          path: construct-veil
-
       - name: Checkout construct-core
         uses: actions/checkout@v4
         with:
@@ -127,7 +115,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             construct-core/target/
-          key: macos-cargo-ios-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
+          key: macos-cargo-ios-${{ hashFiles('construct-core/Cargo.lock') }}
           restore-keys: macos-cargo-ios-
 
       # The `uniffi-bindgen` binary ships with the `uniffi` crate behind its
@@ -184,12 +172,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - name: Checkout construct-veil (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/construct-veil
-          path: construct-veil
-
       - name: Checkout construct-core
         uses: actions/checkout@v4
         with:
@@ -208,7 +190,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             construct-core/target/
-          key: linux-cargo-android-${{ hashFiles('construct-core/Cargo.lock', 'construct-veil/Cargo.lock') }}
+          key: linux-cargo-android-${{ hashFiles('construct-core/Cargo.lock') }}
           restore-keys: linux-cargo-android-
 
       # Ubuntu GitHub runners ship the Android NDK pre-installed; cargo-ndk

@@ -95,7 +95,15 @@ openmls_basic_credential = { version = "0.5", optional = true }
 uniffi = { version = "0.30", features = ["build"], optional = true }
 
 # Traffic obfuscation — VEIL (obfs4 + WebTunnel pluggable transports)
-construct-veil = { path = "../construct-veil", features = ["ffi"], optional = true }
+#
+# Pinned by commit, not `path = "../construct-veil"`. A path dependency made every build —
+# default features included, since cargo reads optional manifests to resolve — fail without a
+# sibling checkout, broke the README's own git-dependency quick start, and let a construct-core
+# commit build against whatever construct-veil `main` happened to be when CI ran.
+#
+# Bump `rev` to take a veil change. To build against a local checkout while working on both,
+# patch it outside this file (see README, "Working on construct-veil at the same time").
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b", features = ["ffi"], optional = true }
 
 # Async runtime (optional, для desktop)
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }

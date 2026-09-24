@@ -1,7 +1,6 @@
-# Pinned toolchain. Bumping in lockstep with construct-veil's
-# rust-toolchain.toml keeps `cargo metadata` resolution deterministic across
-# the workspace (construct-core depends on construct-veil via
-# `path = "../construct-veil"`).
+# Pinned toolchain. Bump in lockstep with construct-veil's rust-toolchain.toml:
+# construct-core compiles construct-veil (a git dependency pinned by `rev`) with
+# this toolchain, so a veil change that needs a newer compiler needs it here too.
 #
 # `targets =` is listed here so `rustup` (and `rustup show`) auto-install the
 # cross-compile std libs on first invocation — both locally and in CI. This

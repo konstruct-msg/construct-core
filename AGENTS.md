@@ -4,25 +4,25 @@
 
 ## Architecture & Core Concepts
 
-- **I/O-Free Core**: The library is designed to be pure and deterministic. All side effects (storage, networking, logging) are delegated to the host platform via the `PlatformBridge` callback interface and the `Action` system.
+- **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. `PlatformBridge` is exported over UniFFI but the orchestrator does not call it; logging goes through `tracing`.
 - **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
-- **Crypto-Agility**: Implemented via the `CryptoProvider` trait, supporting both **Classic** (X25519, Ed25519) and **Post-Quantum Hybrid** (ML-KEM/Kyber) suites.
-- **CFE (Construct Format Envelope)**: A custom binary format (using Postcard) used for state persistence and migration from legacy JSON formats.
+- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from the ML-KEM-768 contribution at session start and the suite-3 sparse PQ ratchet, not from swapping the provider.
+- **CFE (Construct Format Envelope)**: A custom binary format — 16-byte header (magic, version, type, flags, payload length, CRC32) around a MessagePack payload (`rmp_serde::to_vec_named`) — used for state persistence and migration from legacy JSON formats.
 - **UniFFI Bindings**: Cross-platform bindings are defined in `src/construct_core.udl` and implemented in `src/uniffi_bindings.rs`.
 
 ## Building and Running
 
 ### Key Commands
 - **Build**: `cargo build`
-- **Test**: `cargo test --all-features` (Required for full coverage including PQ schemes)
+- **Test**: `cargo test --features post-quantum` for the core; `cargo test --features mac,post-quantum` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
 - **Benchmarks**: `cargo bench --bench crypto_bench`
-- **Desktop Target**: `cargo build --features desktop` (Enables Tokio runtime)
-- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo fmt --check` then clippy default + `post-quantum` (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
+- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default + `post-quantum` (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
 
 ### Feature Flags
-- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support.
+- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
+- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
 - `post-quantum`: Enables ML-KEM-768 and ML-DSA support.
-- `desktop`: Enables `tokio` runtime for desktop-specific use cases.
+- `desktop`: Enables the `tokio` dependency; nothing in the crate uses it yet.
 
 ## Development Conventions
 
@@ -69,7 +69,7 @@ Before adding an API, check it is not already there under another name. `derive_
 been reimplemented or ignored client-side at least once.
 
 ### 4. Serialization
-- Use **Postcard** for internal binary storage (CFE).
+- CFE payloads are **MessagePack** (named fields, so fields can be added with `#[serde(default)]`). `utils::serialization` and the contact store use Postcard; JSON is for legacy migration only. Do not add another format.
 - Use **Serde JSON** only for legacy compatibility or human-readable exports.
 - All persistent state should be versioned.
 
