@@ -166,6 +166,31 @@ const _: () = assert!(PEER_TEARDOWN_QUIET_MS < RESPONDER_OVERRIDE_MS);
 /// crossing init the turn exists to prevent.
 const _: () = assert!(OPENING_TTL_MS < RESPONDER_OVERRIDE_MS);
 
+/// How many SESSION_RESET_INITs back a redelivery is still recognised, per device. A backlog
+/// replay arrives within a reconnect, so this only has to outlast the re-inits that can happen
+/// inside one; eight is far past that and costs 256 bytes per device.
+pub const APPLIED_INIT_CAPACITY: usize = 8;
+
+/// Seconds of the peer's clock an init may trail our establishment by and still be applied.
+///
+/// The one comparison the init's identity cannot answer — whether an init we have *never*
+/// applied pre-dates the session we now hold — has no ordering primitive before decryption but
+/// the sender's clock. The fudge errs toward applying: a redundant re-init is cheap and
+/// self-limiting, a dropped live one strands the peer on a dead ratchet.
+pub const RESET_INIT_STALE_FUDGE_S: u64 = 5;
+
+/// What to do with an arriving SESSION_RESET_INIT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetInitVerdict {
+    /// A live re-init: archive and apply it, even over an active session — the peer has
+    /// ratcheted onto it and its next message only opens against the new one.
+    Apply,
+    /// This exact init — same X3DH ephemeral key — has already been applied. Acknowledge only.
+    Redelivery,
+    /// Never applied, but sent before the session we hold was established: a backlog replay.
+    PredatesSession,
+}
+
 /// What the machine believes about one ratchet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -367,6 +392,14 @@ struct TearDownRecord {
 /// devices of one person are two ratchets, and a teardown of one is not a teardown of the other.
 pub struct SessionMachine {
     phases: HashMap<String, Phase>,
+    /// The SESSION_RESET_INITs applied per device, by X3DH ephemeral public key, most recent
+    /// first. Beside the phases rather than in `Opening`: a redelivery arrives after the opening
+    /// it belongs to has ended, and a ledger that ended with it would apply the copy twice.
+    ///
+    /// In memory only. After a restart the establishment time the caller supplies covers the
+    /// same duplicate, whereas a persisted ledger that went stale would coalesce a live re-init
+    /// forever — the failure this whole decision exists to prevent.
+    applied_inits: HashMap<String, Vec<Vec<u8>>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -374,6 +407,7 @@ impl SessionMachine {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             phases: HashMap::new(),
+            applied_inits: HashMap::new(),
             clock,
         }
     }
@@ -717,6 +751,7 @@ impl SessionMachine {
 
             Event::Forget => {
                 self.phases.remove(device_id);
+                self.applied_inits.remove(device_id);
                 Effect::Nothing
             }
         }
@@ -858,6 +893,49 @@ impl SessionMachine {
                 },
             );
         }
+    }
+
+    /// Judge an arriving SESSION_RESET_INIT from this device, and record it when it is applied.
+    ///
+    /// Recorded here, at the decision, and not where the re-init finishes: the caller applies
+    /// every `Apply`, so "decided to apply" and "applied" are one event from this side, and the
+    /// lag between them is what let a copy arriving a second later be applied again (build 579,
+    /// 2026-08-05: the second application archived the session the first had just rebuilt).
+    ///
+    /// Identity first. Two copies of one init carry one ephemeral key and a genuine peer retry
+    /// generates a new one, so a redelivery is recognised without asking when anything happened.
+    /// An empty key identifies nothing, so it is never recorded and therefore never matches —
+    /// coalescing an init on a guess is the dropped live re-init.
+    ///
+    /// Time second, for an init never applied: `sent_at_s` is the peer's clock and
+    /// `established_at_s` is when the session we hold was established, both Unix seconds; `None`
+    /// means no record, and an init with nothing to pre-date is applied.
+    ///
+    /// Why not `SessionEpoch`: the decision is made before anything the init carries can be
+    /// decrypted, and the only pre-decryption surface is the envelope. Naming the replaced epoch
+    /// there would hand the server a stable pairwise identifier; the ephemeral key is already on
+    /// the envelope and already unique per init.
+    pub fn judge_reset_init(
+        &mut self,
+        device_id: &str,
+        ephemeral: &[u8],
+        sent_at_s: u64,
+        established_at_s: Option<u64>,
+    ) -> ResetInitVerdict {
+        let applied = self.applied_inits.entry(device_id.to_string()).or_default();
+        if applied.iter().any(|k| k == ephemeral) {
+            return ResetInitVerdict::Redelivery;
+        }
+        if established_at_s
+            .is_some_and(|established| sent_at_s + RESET_INIT_STALE_FUDGE_S <= established)
+        {
+            return ResetInitVerdict::PredatesSession;
+        }
+        if !ephemeral.is_empty() {
+            applied.insert(0, ephemeral.to_vec());
+            applied.truncate(APPLIED_INIT_CAPACITY);
+        }
+        ResetInitVerdict::Apply
     }
 
     /// Drop teardown records nothing will ask about again.
@@ -2043,5 +2121,142 @@ mod tests {
         m.handle("dev", Event::Forget);
         clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
         assert_eq!(m.handle("dev", Event::Timeout), Effect::Nothing);
+    }
+
+    // ── SESSION_RESET_INIT ledger ───────────────────────────────────────────
+
+    const K1: &[u8] = &[1; 32];
+    const K2: &[u8] = &[2; 32];
+
+    /// Build 579: one init delivered twice a second apart, both applied, the second archiving the
+    /// session the first had built. Mutation that reddens it: drop the identity check.
+    #[test]
+    fn a_redelivered_init_is_recognised_by_its_key() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(
+            m.judge_reset_init("dev", K1, 100, Some(90)),
+            ResetInitVerdict::Apply
+        );
+        // The copy carries the same time, which is newer than the establishment the first one
+        // has not yet stamped — only the key tells them apart.
+        assert_eq!(
+            m.judge_reset_init("dev", K1, 100, Some(90)),
+            ResetInitVerdict::Redelivery
+        );
+    }
+
+    /// A genuine peer retry generates a new key and must be applied over the session the last
+    /// one built. Mutation that reddens it: match on anything but the exact key.
+    #[test]
+    fn a_new_init_is_applied_over_an_active_session() {
+        let (mut m, _) = machine(1_000);
+        m.judge_reset_init("dev", K1, 100, None);
+        assert_eq!(
+            m.judge_reset_init("dev", K2, 130, Some(101)),
+            ResetInitVerdict::Apply
+        );
+    }
+
+    /// Mutation that reddens it: remove the fudge, or compare with `<` in place of `<=`.
+    #[test]
+    fn an_unapplied_init_older_than_the_session_is_a_replay_and_the_fudge_applies_near_ones() {
+        let (mut m, _) = machine(1_000);
+        let established = 1_000;
+        assert_eq!(
+            m.judge_reset_init(
+                "dev",
+                K1,
+                established - RESET_INIT_STALE_FUDGE_S,
+                Some(established)
+            ),
+            ResetInitVerdict::PredatesSession
+        );
+        assert_eq!(
+            m.judge_reset_init(
+                "dev",
+                K2,
+                established - RESET_INIT_STALE_FUDGE_S + 1,
+                Some(established)
+            ),
+            ResetInitVerdict::Apply,
+            "inside the fudge the init is applied — a dropped live re-init strands the peer"
+        );
+        assert_eq!(
+            m.judge_reset_init("dev", &[3; 32], 0, None),
+            ResetInitVerdict::Apply,
+            "no record → apply"
+        );
+    }
+
+    /// A replay that was refused is not recorded as applied. Mutation that reddens it: record
+    /// before the time check.
+    #[test]
+    fn a_refused_replay_is_not_recorded() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(
+            m.judge_reset_init("dev", K1, 10, Some(1_000)),
+            ResetInitVerdict::PredatesSession
+        );
+        assert_eq!(
+            m.judge_reset_init("dev", K1, 10, None),
+            ResetInitVerdict::Apply
+        );
+    }
+
+    /// An init we cannot identify is never coalesced on a guess. Mutation that reddens it: drop
+    /// the `is_empty` guard on the record.
+    #[test]
+    fn an_empty_key_never_matches() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(
+            m.judge_reset_init("dev", &[], 100, None),
+            ResetInitVerdict::Apply
+        );
+        assert_eq!(
+            m.judge_reset_init("dev", &[], 100, None),
+            ResetInitVerdict::Apply
+        );
+    }
+
+    /// Two devices of one person are two ratchets; the iOS ledger it replaces was account-keyed.
+    /// Mutation that reddens it: key the ledger by anything coarser than the device.
+    #[test]
+    fn the_ledger_is_per_device() {
+        let (mut m, _) = machine(1_000);
+        m.judge_reset_init("phone", K1, 100, None);
+        assert_eq!(
+            m.judge_reset_init("laptop", K1, 100, None),
+            ResetInitVerdict::Apply
+        );
+    }
+
+    /// Mutation that reddens it: drop the ledger from `Forget`.
+    #[test]
+    fn forgetting_a_device_forgets_its_inits() {
+        let (mut m, _) = machine(1_000);
+        m.judge_reset_init("dev", K1, 100, None);
+        m.handle("dev", Event::Forget);
+        assert_eq!(
+            m.judge_reset_init("dev", K1, 100, None),
+            ResetInitVerdict::Apply
+        );
+    }
+
+    /// Bounded, and the oldest goes first. Mutation that reddens it: truncate from the front.
+    #[test]
+    fn the_ledger_keeps_the_most_recent_inits() {
+        let (mut m, _) = machine(1_000);
+        for i in 0..=APPLIED_INIT_CAPACITY as u8 {
+            m.judge_reset_init("dev", &[i; 32], 100, None);
+        }
+        assert_eq!(
+            m.judge_reset_init("dev", &[APPLIED_INIT_CAPACITY as u8; 32], 100, None),
+            ResetInitVerdict::Redelivery
+        );
+        assert_eq!(
+            m.judge_reset_init("dev", &[0; 32], 100, None),
+            ResetInitVerdict::Apply,
+            "the oldest was evicted"
+        );
     }
 }

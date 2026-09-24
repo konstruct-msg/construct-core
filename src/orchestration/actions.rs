@@ -157,6 +157,21 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Apply the SESSION_RESET_INIT that just arrived from `contact_id`: archive the ratchet it
+    /// replaces and open the receiving side. The answer to `ResetInitArrived` for a live re-init,
+    /// and it holds even over an active session — the peer has ratcheted onto the new one.
+    ApplyResetInit {
+        contact_id: String,
+    },
+
+    /// Do not apply the SESSION_RESET_INIT that just arrived from `contact_id`; acknowledge it
+    /// only. `redelivery` is true when this exact init was already applied, false when it was
+    /// never applied but pre-dates the session we hold (a backlog replay).
+    ResetInitSuperseded {
+        contact_id: String,
+        redelivery: bool,
+    },
+
     /// Open a session with `contact_id` now — as INITIATOR, announcing it (X3DH + SESSION_RESET
     /// _INIT), not a bare local init.
     ///
@@ -480,6 +495,21 @@ pub enum IncomingEvent {
     /// the platform raised and dropped beside a phase the core kept, neither aware of the other.
     PeerAcked {
         contact_id: String,
+    },
+    /// A SESSION_RESET_INIT arrived from `contact_id` and the platform asks whether to apply it.
+    /// Answered with `ApplyResetInit` or `ResetInitSuperseded` — the ledger of inits already
+    /// applied lives with the phase it belongs to, not in a platform map beside it.
+    ///
+    /// `init_ephemeral` is the X3DH ephemeral public key from the envelope, the init's identity.
+    /// `sent_at_s` is the envelope timestamp and `established_at_s` the platform's record of when
+    /// the session it holds with this device was established, both Unix seconds. The second is
+    /// supplied, not kept here, because the core has no establishment record yet; it moves in
+    /// with the END_SESSION staleness check that reads the same record.
+    ResetInitArrived {
+        contact_id: String,
+        init_ephemeral: Vec<u8>,
+        sent_at_s: u64,
+        established_at_s: Option<u64>,
     },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if decryption fails,

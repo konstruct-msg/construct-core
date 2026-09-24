@@ -3723,6 +3723,13 @@ pub enum CfeIncomingEvent {
     PeerAcked {
         contact_id: String,
     },
+    /// A SESSION_RESET_INIT arrived from `contact_id`; the platform asks whether to apply it.
+    ResetInitArrived {
+        contact_id: String,
+        init_ephemeral: Vec<u8>,
+        sent_at_s: u64,
+        established_at_s: Option<u64>,
+    },
 }
 
 /// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
@@ -3846,6 +3853,17 @@ impl CfeIncomingEvent {
             Self::ReopenRequested { contact_id } => ReopenRequested { contact_id },
             Self::SriAnnounced { contact_id } => SriAnnounced { contact_id },
             Self::PeerAcked { contact_id } => PeerAcked { contact_id },
+            Self::ResetInitArrived {
+                contact_id,
+                init_ephemeral,
+                sent_at_s,
+                established_at_s,
+            } => ResetInitArrived {
+                contact_id,
+                init_ephemeral,
+                sent_at_s,
+                established_at_s,
+            },
         }
     }
 }
@@ -4001,6 +4019,17 @@ pub enum CfeAction {
     /// down itself. Nothing is owed and no timer is armed — do not schedule a retry.
     EndSessionNotNeeded {
         contact_id: String,
+    },
+    /// Apply the SESSION_RESET_INIT that just arrived from `contact_id` — archive and open the
+    /// receiving side, even over an active session.
+    ApplyResetInit {
+        contact_id: String,
+    },
+    /// Do not apply the SESSION_RESET_INIT that just arrived; acknowledge it only. `redelivery`:
+    /// this exact init was already applied (true), or it pre-dates the session held (false).
+    ResetInitSuperseded {
+        contact_id: String,
+        redelivery: bool,
     },
     /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
     /// SESSION_RESET_INIT). Not a bare local init — the peer must be told.
@@ -4166,6 +4195,14 @@ impl CfeAction {
                 retry_after_ms,
             },
             EndSessionNotNeeded { contact_id } => Self::EndSessionNotNeeded { contact_id },
+            ApplyResetInit { contact_id } => Self::ApplyResetInit { contact_id },
+            ResetInitSuperseded {
+                contact_id,
+                redelivery,
+            } => Self::ResetInitSuperseded {
+                contact_id,
+                redelivery,
+            },
             OpenSession { contact_id } => Self::OpenSession { contact_id },
             OpenDeferred {
                 contact_id,

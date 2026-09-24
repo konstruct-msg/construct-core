@@ -24,7 +24,7 @@ use crate::orchestration::message_router::{
 };
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
-    Effect as SessionEffect, Event as SessionEvent, SessionMachine, TearDownCause,
+    Effect as SessionEffect, Event as SessionEvent, ResetInitVerdict, SessionMachine, TearDownCause,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -175,6 +175,30 @@ impl Orchestrator {
                 self.handle_reopen_requested(contact_id)
             }
             IncomingEvent::SriAnnounced { contact_id } => self.handle_sri_announced(contact_id),
+            IncomingEvent::ResetInitArrived {
+                contact_id,
+                init_ephemeral,
+                sent_at_s,
+                established_at_s,
+            } => {
+                let verdict = self.sessions.judge_reset_init(
+                    &contact_id,
+                    &init_ephemeral,
+                    sent_at_s,
+                    established_at_s,
+                );
+                vec![match verdict {
+                    ResetInitVerdict::Apply => Action::ApplyResetInit { contact_id },
+                    ResetInitVerdict::Redelivery => Action::ResetInitSuperseded {
+                        contact_id,
+                        redelivery: true,
+                    },
+                    ResetInitVerdict::PredatesSession => Action::ResetInitSuperseded {
+                        contact_id,
+                        redelivery: false,
+                    },
+                }]
+            }
             IncomingEvent::PeerAcked { contact_id } => {
                 self.sessions.handle(&contact_id, SessionEvent::PeerAcked);
                 vec![Action::CancelTimer {
@@ -3467,6 +3491,36 @@ mod tests {
     /// message answered with END_SESSION and nothing on what the ratchet objected to.
     ///
     /// Mutation: drop the `NotifyError` push in `decision_to_actions` — this reddens.
+    /// The platform's question gets the machine's answer, one action, naming the device.
+    /// Mutation that reddens it: map `Redelivery` or `PredatesSession` onto `ApplyResetInit`.
+    #[test]
+    fn an_arriving_reset_init_is_answered_apply_or_superseded() {
+        let mut o = make_orchestrator("alice");
+        let arrive = |o: &mut Orchestrator, key: u8, sent: u64, est: Option<u64>| {
+            o.handle_event(IncomingEvent::ResetInitArrived {
+                contact_id: "bob".into(),
+                init_ephemeral: vec![key; 32],
+                sent_at_s: sent,
+                established_at_s: est,
+            })
+        };
+        assert!(matches!(
+            arrive(&mut o, 1, 100, None).as_slice(),
+            [Action::ApplyResetInit { contact_id }] if contact_id == "bob"
+        ));
+        assert!(matches!(
+            arrive(&mut o, 1, 100, None).as_slice(),
+            [Action::ResetInitSuperseded { contact_id, redelivery: true }] if contact_id == "bob"
+        ));
+        assert!(matches!(
+            arrive(&mut o, 2, 10, Some(1_000)).as_slice(),
+            [Action::ResetInitSuperseded {
+                redelivery: false,
+                ..
+            }]
+        ));
+    }
+
     #[test]
     fn a_refused_decrypt_reports_its_cause_on_both_paths() {
         let mut o = make_orchestrator("alice");
