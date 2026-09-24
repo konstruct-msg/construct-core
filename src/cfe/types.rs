@@ -456,6 +456,16 @@ pub struct CfeKyberDeferredEntryV1 {
     /// 32-byte ML-KEM-768 shared secret, pending `apply_pq_contribution`.
     #[serde(rename = "ss", with = "serde_bytes")]
     pub shared_secret: ByteBuf,
+    /// INITIATOR only: the ML-KEM ciphertext that must travel in the first message with
+    /// this shared secret. The two are one contribution — the sender mixes `ss` into its
+    /// root key when it packs message 0, and the responder can only derive the same root
+    /// from `ct`. A snapshot that kept `ss` and dropped `ct` restored a sender that
+    /// applied the secret and sent nothing to decapsulate (2026-09-24).
+    ///
+    /// Absent for RESPONDER entries (the ciphertext was received, not sent) and in
+    /// snapshots written before the field existed; old readers ignore it.
+    #[serde(rename = "ct", default, skip_serializing_if = "Option::is_none")]
+    pub kem_ciphertext: Option<ByteBuf>,
 }
 
 /// Full CFE snapshot of the `PQContributionManager` — all deferred Kyber
