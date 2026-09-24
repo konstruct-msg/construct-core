@@ -22,7 +22,6 @@
 - `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
 - `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
 - `post-quantum`: Enables ML-KEM-768 and ML-DSA support.
-- `desktop`: Enables the `tokio` dependency; nothing in the crate uses it yet.
 
 ## Development Conventions
 
@@ -38,6 +37,11 @@
 ### 3. Cross-Platform Boundary (UniFFI)
 - When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
 - Prefer passing `bytes` (sequence<u8>) or `string` for complex data to ensure compatibility across languages.
+- **The UDL is not the only API.** `construct-tui` depends on this crate by path and uses its `pub`
+  Rust modules directly (`orchestration`, `cfe`, `crypto::{sealed_sender, handshake, suites,
+  client_api, keys}`, `wire_payload`, `pow`, `device_id`). Changing a `pub` type or signature there
+  breaks it even when the UDL is untouched — check it builds (`cargo check` in construct-tui with
+  this crate at `../construct-core`) and say in the PR what it has to change.
 
 **If two clients must agree on it, this crate must export it — not describe it.** There are two
 clients now (`construct-messenger`, `construct-tui`) and Android is coming. Anything a client would
@@ -69,7 +73,7 @@ Before adding an API, check it is not already there under another name. `derive_
 been reimplemented or ignored client-side at least once.
 
 ### 4. Serialization
-- CFE payloads are **MessagePack** (named fields, so fields can be added with `#[serde(default)]`). `utils::serialization` and the contact store use Postcard; JSON is for legacy migration only. Do not add another format.
+- CFE payloads are **MessagePack** (named fields, so fields can be added with `#[serde(default)]`). JSON is for legacy migration only. Do not add another format.
 - Use **Serde JSON** only for legacy compatibility or human-readable exports.
 - All persistent state should be versioned.
 

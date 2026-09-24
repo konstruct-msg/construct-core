@@ -61,7 +61,7 @@ construct-core/
 │   ├── cfe/                       # CFE binary envelopes + record types
 │   ├── wire_payload.rs, intake.rs # message wire format and intake
 │   ├── traffic_protection/        # padding, cover-traffic and timing helpers
-│   ├── storage/                   # storage models (its traits + in-memory store are unused)
+│   ├── storage/                   # models persisted by master_key
 │   ├── uniffi_bindings.rs         # UniFFI FFI surface (iOS/macOS/Android)
 │   ├── construct_core.udl         # UniFFI interface definition
 │   ├── pow.rs                     # Argon2id proof-of-work
@@ -197,7 +197,6 @@ server can drop them — they hide patterns from a network observer, not from th
 | `mac`           | Native macOS build (same surface as `ios`)                     |
 | `android`       | Android JNI/Kotlin bindings via UniFFI                         |
 | `post-quantum`  | ML-KEM-768 + ML-DSA-65 post-quantum cryptography               |
-| `desktop`       | Enables the `tokio` dependency — nothing in the crate uses it yet |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
 features pull in `construct-veil` and `openmls`. `construct-veil` is a git dependency pinned

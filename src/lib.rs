@@ -38,7 +38,6 @@ pub static CONSTRUCT_CORE_VERSION: &str = concat!(
 );
 
 // Core modules (platform-independent)
-pub mod api;
 pub mod cfe;
 pub mod config;
 pub mod crypto;

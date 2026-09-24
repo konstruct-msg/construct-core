@@ -1,11 +1,7 @@
-// Storage module
+// Storage models — the shapes `master_key` persists. Where they are stored is the platform's
+// business (see `Action::SaveToSecureStore`); the storage traits and in-memory store that used
+// to sit here had no implementor and no caller, and were removed.
 
-pub mod memory;
 pub mod models;
-pub mod traits;
 
-// Re-export traits
-pub use traits::{AuthTokens, CombinedStorage, DataStorage, SecureStorage};
-
-// Re-export models
 pub use models::*;

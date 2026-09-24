@@ -101,7 +101,7 @@ mod tests {
     }
 
     /// A field moved from `ByteBuf` to `SecretBytes` must read what the old field wrote, and
-    /// write what the old field read — in both encodings the crate persists with.
+    /// write what the old field read — in MessagePack, the CFE payload encoding.
     #[test]
     fn serde_is_byte_identical_to_bytebuf() {
         let raw = vec![1u8, 2, 3, 250];
@@ -111,11 +111,6 @@ mod tests {
         let old_mp = rmp_serde::to_vec_named(&old).unwrap();
         assert_eq!(rmp_serde::to_vec_named(&new).unwrap(), old_mp);
         let back: SecretBytes = rmp_serde::from_slice(&old_mp).unwrap();
-        assert_eq!(back.expose(), &raw[..]);
-
-        let old_pc = postcard::to_allocvec(&old).unwrap();
-        assert_eq!(postcard::to_allocvec(&new).unwrap(), old_pc);
-        let back: SecretBytes = postcard::from_bytes(&old_pc).unwrap();
         assert_eq!(back.expose(), &raw[..]);
     }
 
