@@ -35,6 +35,21 @@ const PREWARM_COOLDOWN_MS: u64 = 30_000;
 
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
+/// The Kyber half of a fetched prekey bundle, as the server served it.
+///
+/// The signatures are Ed25519 by the bundle's `verifying_key` over
+/// `build_x3dh_sign_message(0x10, key)`. `one_time_prekey_signature` has no source yet — the
+/// server's `DevicePreKeyBundle` does not carry the OTPK signature — and is here so that a verified
+/// OTPK is used the moment it does.
+#[derive(Debug, Clone, Default)]
+pub struct KyberBundleKeys {
+    pub pre_key_public: Option<Vec<u8>>,
+    pub pre_key_signature: Option<Vec<u8>>,
+    pub one_time_prekey_public: Option<Vec<u8>>,
+    pub one_time_prekey_id: Option<u32>,
+    pub one_time_prekey_signature: Option<Vec<u8>>,
+}
+
 /// Binary first message for RESPONDER path — replaces JSON-encoded `&[u8]`.
 pub struct IncomingFirstMessage {
     pub ephemeral_public_key: Vec<u8>,
@@ -413,11 +428,48 @@ impl Orchestrator {
         &mut self,
         contact_id: &str,
         public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
-        kyber_pre_key_public: Option<Vec<u8>>,
-        kyber_one_time_prekey_public: Option<Vec<u8>>,
-        kyber_one_time_prekey_id: Option<u32>,
+        kyber: KyberBundleKeys,
         allow_stale: bool,
     ) -> Result<String, String> {
+        use crate::crypto::kyber_prekey_auth::PqAuthentication;
+        use crate::orchestration::pq_prekey_plan::{
+            ClassicReason, KyberPrekeyContext, KyberPrekeyDecision, KyberPrekeyOffer,
+            plan_kyber_prekey,
+        };
+
+        // Decided before anything is created: a refusal must leave no session behind.
+        let plan = plan_kyber_prekey(
+            KyberPrekeyOffer {
+                verifying_key: &public_bundle.verifying_key,
+                spk_public: kyber.pre_key_public.as_deref(),
+                spk_signature: kyber.pre_key_signature.as_deref(),
+                otpk_public: kyber.one_time_prekey_public.as_deref(),
+                otpk_id: kyber.one_time_prekey_id,
+                otpk_signature: kyber.one_time_prekey_signature.as_deref(),
+            },
+            KyberPrekeyContext {
+                local_pq_available: cfg!(feature = "post-quantum"),
+                presented_signed_spk_before: self.lifecycle.has_presented_signed_kyber(contact_id),
+            },
+        );
+        let presented_signed_spk = plan.presented_signed_spk;
+        let decision = match plan.decision {
+            KyberPrekeyDecision::Refuse { reason } => {
+                tracing::error!(
+                target: "crypto::security",
+                contact_id = %contact_id,
+                reason = ?reason,
+                "PQ downgrade refused: this device presented a signed Kyber SPK before, and \
+                 this bundle has none that verifies"
+                );
+                return Err(format!(
+                    "PQ_DOWNGRADE_REFUSED: {reason:?} — device {contact_id} presented a signed \
+                     Kyber prekey before; the bundle has none that verifies"
+                ));
+            }
+            decision => decision,
+        };
+
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
         let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
@@ -452,26 +504,72 @@ impl Orchestrator {
                 .map_err(|e| e.to_string())?;
         }
 
-        // PQXDH: encapsulate to recipient's Kyber public key and defer SS application.
-        // Prefer one-time pre-key (consumed once) over the signed pre-key.
-        // `recipient_otpk_id` is 0 when Kyber SPK is used (no OTPK available).
-        let (kyber_public, recipient_otpk_id) = if let Some(pk) = kyber_one_time_prekey_public {
-            (Some(pk), kyber_one_time_prekey_id.unwrap_or(0))
-        } else {
-            (kyber_pre_key_public, 0)
+        // The classical X3DH above verified the bundle; only now is its Kyber SPK signature
+        // worth remembering.
+        if presented_signed_spk {
+            self.lifecycle.record_signed_kyber(contact_id);
+        }
+
+        // PQXDH: encapsulate to the planned Kyber key and defer applying the secret to the
+        // first outgoing message.
+        let authentication = match decision {
+            KyberPrekeyDecision::Encapsulate {
+                kyber_public,
+                otpk_id,
+                authentication,
+            } => match self.lifecycle.pq_manager.encapsulate_and_defer(
+                contact_id,
+                &kyber_public,
+                otpk_id,
+            ) {
+                Ok(_) => {
+                    if authentication == PqAuthentication::Unauthenticated {
+                        tracing::warn!(
+                            target: "crypto::orchestrator",
+                            contact_id = %contact_id,
+                            kyber_otpk_id = otpk_id,
+                            "PQ unauthenticated: the Kyber key carried no signature — protects \
+                             against a passive recorder, not against whoever served the bundle"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "crypto::orchestrator",
+                            contact_id = %contact_id,
+                            kyber_otpk_id = otpk_id,
+                            "PQ authenticated: Kyber key signature verified, ciphertext deferred"
+                        );
+                    }
+                    authentication
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "crypto::orchestrator",
+                        contact_id = %contact_id,
+                        error = %e,
+                        "ML-KEM encapsulation failed — session is classical"
+                    );
+                    PqAuthentication::Classic
+                }
+            },
+            KyberPrekeyDecision::Classic { reason } => {
+                if reason == ClassicReason::InvalidSignature {
+                    tracing::error!(
+                        target: "crypto::security",
+                        contact_id = %contact_id,
+                        "Kyber prekey signature does not verify — this bundle's Kyber keys are \
+                         not used; session is classical"
+                    );
+                }
+                PqAuthentication::Classic
+            }
+            // Returned above; nothing to encapsulate.
+            KyberPrekeyDecision::Refuse { .. } => PqAuthentication::Classic,
         };
-        if let Some(kem_pk) = kyber_public
-            && let Ok((_result, _persist_actions)) = self
-                .lifecycle
-                .pq_manager
-                .encapsulate_and_defer(contact_id, &kem_pk, recipient_otpk_id)
-        {
-            tracing::debug!(
-                target: "crypto::orchestrator",
-                contact_id = %contact_id,
-                kyber_otpk_id = _result.otpk_id,
-                "init_session_with_bundle: PQXDH encapsulated, ciphertext deferred"
-            );
+
+        if let Some(session) = self.lifecycle.client.get_session_mut(contact_id) {
+            session
+                .messaging_session_mut()
+                .set_pq_authentication(authentication);
         }
 
         Ok(contact_id.to_string())
@@ -3484,5 +3582,215 @@ mod tests {
                 "the {path} path lost the ratchet's reason: {actions:?}"
             );
         }
+    }
+}
+
+/// The Kyber-prekey plan as the orchestrator carries it out: what gets encapsulated, what the
+/// session is called, what is remembered, and what is refused.
+#[cfg(all(test, feature = "post-quantum"))]
+mod kyber_prekey_auth_tests {
+    use super::*;
+    use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+    use crate::crypto::keys::KeyManager;
+    use crate::crypto::kyber_prekey_auth::PqAuthentication;
+    use crate::device_id::derive_device_id;
+
+    struct Peer {
+        client: ClassicClient<ClassicSuiteProvider>,
+        kyber_public: Vec<u8>,
+    }
+
+    impl Peer {
+        fn new() -> Self {
+            Self {
+                client: ClassicClient::<ClassicSuiteProvider>::new().unwrap(),
+                kyber_public: crate::crypto::pq_x3dh::mlkem768_keygen()
+                    .unwrap()
+                    .public_key,
+            }
+        }
+
+        fn device(&self) -> String {
+            derive_device_id(
+                &self
+                    .client
+                    .get_registration_bundle()
+                    .unwrap()
+                    .identity_public,
+            )
+        }
+
+        fn bundle(&self) -> X3DHPublicKeyBundle {
+            let b = self.client.get_registration_bundle().unwrap();
+            X3DHPublicKeyBundle {
+                identity_public: b.identity_public,
+                signed_prekey_public: b.signed_prekey_public,
+                signature: b.signature,
+                verifying_key: b.verifying_key,
+                suite_id: b.suite_id,
+                one_time_prekey_public: None,
+                one_time_prekey_id: None,
+                spk_uploaded_at: 0,
+                spk_rotation_epoch: 0,
+                kyber_spk_uploaded_at: 0,
+                kyber_spk_rotation_epoch: 0,
+                supports_pq_ratchet: false,
+            }
+        }
+
+        /// What iOS `PQCKeyManager.signKyberKey` produces.
+        fn kyber_signature(&self) -> Vec<u8> {
+            let sk = self.client.key_manager().signing_secret_key().unwrap();
+            let msg = KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(
+                0x10,
+                &self.kyber_public,
+            );
+            ClassicSuiteProvider::sign(sk, &msg).unwrap()
+        }
+
+        fn signed(&self) -> KyberBundleKeys {
+            KyberBundleKeys {
+                pre_key_public: Some(self.kyber_public.clone()),
+                pre_key_signature: Some(self.kyber_signature()),
+                ..Default::default()
+            }
+        }
+
+        fn unsigned(&self) -> KyberBundleKeys {
+            KyberBundleKeys {
+                pre_key_public: Some(self.kyber_public.clone()),
+                ..Default::default()
+            }
+        }
+    }
+
+    fn orchestrator() -> Orchestrator {
+        Orchestrator::new(
+            ClassicClient::<ClassicSuiteProvider>::new().unwrap(),
+            "alice".to_string(),
+        )
+    }
+
+    fn label(o: &Orchestrator, device: &str) -> PqAuthentication {
+        o.get_session_health(device).unwrap().pq_authentication
+    }
+
+    #[test]
+    fn a_signed_kyber_spk_makes_an_authenticated_session_and_is_remembered() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+
+        o.init_session_with_bundle(&device, peer.bundle(), peer.signed(), false)
+            .unwrap();
+
+        assert_eq!(label(&o, &device), PqAuthentication::Authenticated);
+        assert!(o.lifecycle.pq_manager.has_pending(&device), "encapsulated");
+        assert!(o.lifecycle.has_presented_signed_kyber(&device));
+
+        // Remembered across a restart of the orchestrator state.
+        let state = o.export_orchestrator_state_cfe().unwrap();
+        let mut restarted = orchestrator();
+        restarted.import_orchestrator_state_cfe(&state).unwrap();
+        assert!(restarted.lifecycle.has_presented_signed_kyber(&device));
+    }
+
+    #[test]
+    fn an_unsigned_kyber_key_is_used_and_labelled_unauthenticated() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+
+        o.init_session_with_bundle(&device, peer.bundle(), peer.unsigned(), false)
+            .unwrap();
+
+        assert_eq!(label(&o, &device), PqAuthentication::Unauthenticated);
+        assert!(
+            o.lifecycle.pq_manager.has_pending(&device),
+            "still encapsulated"
+        );
+        assert!(!o.lifecycle.has_presented_signed_kyber(&device));
+    }
+
+    /// The transition-period attack: a device known to sign arrives with its Kyber signature
+    /// stripped. Mutation: skip the `Refuse` early return — this reddens.
+    #[test]
+    fn a_stripped_signature_from_a_remembered_device_is_refused_before_any_session() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+        o.init_session_with_bundle(&device, peer.bundle(), peer.signed(), false)
+            .unwrap();
+        o.lifecycle.client.remove_session(&device);
+        o.lifecycle.pq_manager.discard_for_contact(&device);
+
+        for stripped in [peer.unsigned(), KyberBundleKeys::default()] {
+            let err = o
+                .init_session_with_bundle(&device, peer.bundle(), stripped, false)
+                .unwrap_err();
+            assert!(err.starts_with("PQ_DOWNGRADE_REFUSED"), "{err}");
+            assert!(
+                !o.has_active_session(&device),
+                "a refusal leaves no session"
+            );
+            assert!(!o.lifecycle.pq_manager.has_pending(&device));
+        }
+    }
+
+    #[test]
+    fn a_wrong_signature_from_a_new_device_is_classic_and_not_encapsulated() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let impostor = Peer::new();
+        let device = peer.device();
+        let forged = KyberBundleKeys {
+            pre_key_public: Some(impostor.kyber_public.clone()),
+            pre_key_signature: Some(impostor.kyber_signature()),
+            ..Default::default()
+        };
+
+        o.init_session_with_bundle(&device, peer.bundle(), forged, false)
+            .unwrap();
+
+        assert_eq!(label(&o, &device), PqAuthentication::Classic);
+        assert!(!o.lifecycle.pq_manager.has_pending(&device));
+        assert!(!o.lifecycle.has_presented_signed_kyber(&device));
+    }
+
+    /// `is_pq_strengthened` used to be `pre_pq_root_key.is_none()`, which only the responder
+    /// sets — every initiator session, classical ones included, reported "strengthened".
+    #[test]
+    fn strengthened_means_a_secret_was_mixed_in_and_the_label_survives_export() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+
+        o.init_session_with_bundle(&device, peer.bundle(), KyberBundleKeys::default(), false)
+            .unwrap();
+        let classic = o.get_session_health(&device).unwrap();
+        assert_eq!(classic.pq_authentication, PqAuthentication::Classic);
+        assert!(!classic.is_pq_strengthened, "a classical initiator session");
+
+        let pq_peer = Peer::new();
+        let pq_device = pq_peer.device();
+        o.init_session_with_bundle(&pq_device, pq_peer.bundle(), pq_peer.signed(), false)
+            .unwrap();
+        assert!(
+            !o.get_session_health(&pq_device).unwrap().is_pq_strengthened,
+            "encapsulated but not mixed in until the first message"
+        );
+        let _ = o.handle_outgoing_message(pq_device.clone(), "m1".into(), b"hi".to_vec(), 0);
+        let health = o.get_session_health(&pq_device).unwrap();
+        assert!(health.is_pq_strengthened);
+        assert_eq!(health.pq_authentication, PqAuthentication::Authenticated);
+
+        let bytes = o.lifecycle.export_session_bytes_for(&pq_device).unwrap();
+        o.lifecycle.client.remove_session(&pq_device);
+        o.lifecycle
+            .import_session_bytes(&pq_device, &bytes)
+            .unwrap();
+        let restored = o.get_session_health(&pq_device).unwrap();
+        assert!(restored.is_pq_strengthened);
+        assert_eq!(restored.pq_authentication, PqAuthentication::Authenticated);
     }
 }

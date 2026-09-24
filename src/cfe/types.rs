@@ -317,6 +317,16 @@ pub struct CfeSessionStateV1 {
     #[serde(default)]
     pub last_ratchet_at: u64,
 
+    /// `PqAuthentication::as_u8` — whose Kyber key the PQ layer came from. Absent (0,
+    /// `Unknown`) on blobs written before 2026-09-24.
+    #[serde(rename = "pqa")]
+    #[serde(default)]
+    pub pq_authentication: u8,
+    /// A KEM secret has been mixed into the root key. Absent on older blobs: unknown.
+    #[serde(rename = "pqap")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_applied: Option<bool>,
+
     // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
     // History: a pre-SPQR-redesign layout briefly used flat fields here
     // (`pqt`, `pq_pend_pk`/`sk`/`ct`, `pq_pend_ts`). They were removed rather
@@ -587,4 +597,8 @@ pub struct CfeOrchestratorStateV1 {
     /// contactId → last seen OTPK ID (reinstall detection).
     #[serde(rename = "ptk")]
     pub prekey_tracker: Vec<(String, u32)>,
+    /// Devices that have presented a Kyber SPK with a verifying signature (sorted). Absent on
+    /// blobs written before 2026-09-24: nothing remembered, which is where every device starts.
+    #[serde(rename = "skd", default, skip_serializing_if = "Vec::is_empty")]
+    pub signed_kyber_devices: Vec<String>,
 }

@@ -45,6 +45,7 @@
 //! ```
 
 use crate::crypto::SuiteID;
+use crate::crypto::kyber_prekey_auth::PqAuthentication;
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -95,8 +96,11 @@ pub struct DrHealthSnapshot {
     pub messages_received: u32,
     /// Number of out-of-order message keys currently buffered.
     pub skipped_keys_count: usize,
-    /// `true` once the Kyber OTPK contribution has been mixed into the root key.
+    /// `true` once a Kyber contribution has been mixed into the root key. Says nothing about
+    /// whose key it was — that is `pq_authentication`.
     pub is_pq_strengthened: bool,
+    /// Whose Kyber key the PQ layer came from; see `PqAuthentication`.
+    pub pq_authentication: PqAuthentication,
     /// Unix timestamp of the last DH ratchet step (init counts as first ratchet).
     pub last_ratchet_at: u64,
     /// Shared session identifier (hex).
@@ -319,6 +323,14 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// Unix timestamp of the last DH ratchet step (or session creation).
     /// Updated by `perform_dh_ratchet` and set in `new_initiator_session` / `new_responder_session`.
     last_ratchet_at: u64,
+
+    /// Whose Kyber key this session's PQ layer came from. New sessions start `Classic`; the
+    /// orchestrator sets the initiator's label from its Kyber-prekey plan, and applying a
+    /// contribution as responder makes it `Received`.
+    pq_authentication: PqAuthentication,
+    /// A KEM secret has been mixed into the root key. `None` for a session recorded before this
+    /// was tracked — which claims nothing.
+    pq_applied: Option<bool>,
 }
 
 /// Snapshot of mutable session fields captured before a DH ratchet in `decrypt()`.

@@ -104,13 +104,17 @@ pub struct SessionHealthReport {
     pub messages_received: u32,
     /// Number of out-of-order message keys currently buffered.
     pub skipped_keys_count: u32,
-    /// `true` once the Kyber OTPK contribution has been mixed into the root key.
+    /// `true` once a Kyber contribution has been mixed into the root key.
     pub is_pq_strengthened: bool,
     /// Unix timestamp of the last DH ratchet step (0 = unknown / legacy session).
     pub last_ratchet_at: u64,
     /// Shared session identifier (hex).
     pub session_id: String,
+    /// Whose Kyber key the PQ layer came from.
+    pub pq_authentication: PqAuthentication,
 }
+
+pub use crate::crypto::kyber_prekey_auth::PqAuthentication;
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
@@ -212,6 +216,10 @@ pub struct BinaryKeyBundle {
     /// Peer capability from the server's PreKeyBundle (key-service field 24,
     /// migration 063): initiators use it to negotiate `SuiteID::PQ_RATCHET`.
     pub supports_pq_ratchet: bool,
+    /// Ed25519 over `build_x3dh_sign_message(0x10, kyber_pre_key_public)` (key-service field 12).
+    pub kyber_pre_key_signature: Option<Vec<u8>>,
+    /// The same over the Kyber OTPK; the bundle does not carry it yet.
+    pub kyber_one_time_prekey_signature: Option<Vec<u8>>,
 }
 
 /// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
@@ -521,6 +529,7 @@ impl ClassicCryptoCore {
                 is_pq_strengthened: snap.is_pq_strengthened,
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
+                pq_authentication: snap.pq_authentication,
             })
     }
 
@@ -1505,6 +1514,8 @@ mod tests {
             kyber_one_time_prekey_public: None,
             kyber_one_time_prekey_id: None,
             supports_pq_ratchet: false,
+            kyber_pre_key_signature: None,
+            kyber_one_time_prekey_signature: None,
         }
     }
 
@@ -3038,6 +3049,7 @@ impl OrchestratorCore {
                 is_pq_strengthened: snap.is_pq_strengthened,
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
+                pq_authentication: snap.pq_authentication,
             })
     }
 
@@ -3267,9 +3279,13 @@ impl OrchestratorCore {
         orch.init_session_with_bundle(
             &contact_id,
             public_bundle,
-            recipient_bundle.kyber_pre_key_public,
-            recipient_bundle.kyber_one_time_prekey_public,
-            recipient_bundle.kyber_one_time_prekey_id,
+            crate::orchestration::orchestrator::KyberBundleKeys {
+                pre_key_public: recipient_bundle.kyber_pre_key_public,
+                pre_key_signature: recipient_bundle.kyber_pre_key_signature,
+                one_time_prekey_public: recipient_bundle.kyber_one_time_prekey_public,
+                one_time_prekey_id: recipient_bundle.kyber_one_time_prekey_id,
+                one_time_prekey_signature: recipient_bundle.kyber_one_time_prekey_signature,
+            },
             allow_stale,
         )
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })

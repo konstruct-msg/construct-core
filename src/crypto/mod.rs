@@ -125,6 +125,9 @@ pub mod sealed_sender;
 /// Per-message tag naming which device a copy is for, readable only by the two devices
 pub mod device_copy_tag;
 
+/// Kyber prekey signature check and the PQ-authentication label of a session
+pub mod kyber_prekey_auth;
+
 /// SLIP-39 social recovery — vault key Shamir Secret Sharing + bundle encryption
 pub mod social_recovery;
 

@@ -45,6 +45,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
+            pq_authentication: self.pq_authentication.as_u8(),
+            pq_applied: self.pq_applied,
             pq_ratchet: if self.suite_id.is_pq_ratchet() {
                 Some(SerializablePqRatchetState {
                     is_initiator: self.is_pq_initiator,
@@ -144,6 +146,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
             last_ratchet_at: data.last_ratchet_at,
+            pq_authentication: PqAuthentication::from_u8(data.pq_authentication),
+            pq_applied: data.pq_applied,
         };
 
         session.restore_pq_ratchet_state(&data);
@@ -387,6 +391,11 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
+    /// `PqAuthentication::as_u8`; 0 (`Unknown`) for sessions recorded before it existed.
+    #[serde(default)]
+    pq_authentication: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_applied: Option<bool>,
     /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
     /// message-key mixing design. Present only for suite-3 sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
@@ -588,6 +597,8 @@ impl SerializableSession {
                 .clone()
                 .map(crate::crypto::SecretBytes::from),
             last_ratchet_at: self.last_ratchet_at,
+            pq_authentication: self.pq_authentication,
+            pq_applied: self.pq_applied,
             pqr: self
                 .pq_ratchet
                 .as_ref()
@@ -656,6 +667,8 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
+            pq_authentication: data.pq_authentication,
+            pq_applied: data.pq_applied,
             // Secrets leave `SecretBytes` here: `SerializableSession` still holds plain `Vec`s.
             pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {
                 is_initiator: pq.is_initiator,

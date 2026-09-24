@@ -112,6 +112,9 @@ pub struct SessionLifecycleManager {
     archive_timestamps: HashMap<String, u64>,
     /// contactId → last seen OTPK ID (used to detect reinstall).
     prekey_tracker: HashMap<String, u32>,
+    /// Devices that have presented a Kyber SPK whose signature verified. From then on a bundle of
+    /// theirs without one is a stripped bundle, not a transition — see `pq_prekey_plan`.
+    signed_kyber_devices: std::collections::BTreeSet<String>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
 }
@@ -142,6 +145,7 @@ impl SessionLifecycleManager {
             archives: HashMap::new(),
             archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
+            signed_kyber_devices: std::collections::BTreeSet::new(),
             my_user_id,
             clock,
         }
@@ -180,6 +184,18 @@ impl SessionLifecycleManager {
         self.prekey_tracker.remove(contact_id);
         self.healing_queue.remove(contact_id);
         self.pq_manager.discard_for_contact(contact_id);
+        // Forgetting a contact is the person's decision to start over with it, and this is
+        // local state about that contact like the rest.
+        self.signed_kyber_devices.remove(contact_id);
+    }
+
+    /// `true` once `device_id` has presented a Kyber SPK whose signature verified.
+    pub fn has_presented_signed_kyber(&self, device_id: &str) -> bool {
+        self.signed_kyber_devices.contains(device_id)
+    }
+
+    pub fn record_signed_kyber(&mut self, device_id: &str) {
+        self.signed_kyber_devices.insert(device_id.to_string());
     }
 
     /// Update the local user-id on both the lifecycle manager and the
@@ -541,6 +557,7 @@ impl SessionLifecycleManager {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            signed_kyber_devices: self.signed_kyber_devices.iter().cloned().collect(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -595,6 +612,7 @@ impl SessionLifecycleManager {
             .collect();
         self.archive_timestamps = state.archive_timestamps.into_iter().collect();
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
+        self.signed_kyber_devices = state.signed_kyber_devices.into_iter().collect();
 
         // Return init_locks for the caller to restore.
         Ok(state.init_locks.into_iter().collect())
@@ -1152,6 +1170,7 @@ mod tests {
             archives: vec![],
             archive_timestamps: vec![],
             prekey_tracker: vec![],
+            signed_kyber_devices: vec![],
         };
         let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
 

@@ -16,7 +16,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             messages_sent: self.sending_chain_length,
             messages_received: self.receiving_chain_length,
             skipped_keys_count: self.skipped_message_keys.len(),
-            is_pq_strengthened: self.pre_pq_root_key.is_none(),
+            // Was `pre_pq_root_key.is_none()`, which only the responder ever sets: every
+            // initiator session — classical ones included — reported itself strengthened.
+            is_pq_strengthened: self.pq_applied.unwrap_or(false),
+            pq_authentication: self.pq_authentication,
             last_ratchet_at: self.last_ratchet_at,
             session_id: self.session_id.clone(),
         }
@@ -90,6 +93,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
                 self.root_key = new_root_key;
                 self.sending_chain_key = new_sending_chain;
+                self.pq_authentication = PqAuthentication::Received;
             }
             _ => {
                 // INITIATOR path: root_key is already RK1, apply PQ directly.
@@ -98,9 +102,28 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                     P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
                         .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
                 self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
+                // A secret that reached us without the orchestrator's Kyber-prekey plan (the
+                // platform's own ML-KEM call, `apply_pq_contribution` over FFI) came from a key
+                // nobody here verified.
+                if matches!(
+                    self.pq_authentication,
+                    PqAuthentication::Classic | PqAuthentication::Unknown
+                ) {
+                    self.pq_authentication = PqAuthentication::Unauthenticated;
+                }
             }
         }
+        self.pq_applied = Some(true);
         Ok(())
+    }
+
+    /// Label the PQ layer of a session this device initiated (the Kyber-prekey plan's verdict).
+    pub fn set_pq_authentication(&mut self, authentication: PqAuthentication) {
+        self.pq_authentication = authentication;
+    }
+
+    pub fn pq_authentication(&self) -> PqAuthentication {
+        self.pq_authentication
     }
 
     /// Restore session state from a snapshot taken before a failed decrypt attempt.
