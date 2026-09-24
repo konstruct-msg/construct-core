@@ -45,6 +45,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
+            pq_authentication: self.pq_authentication.as_u8(),
+            pq_applied: self.pq_applied,
             pq_ratchet: if self.suite_id.is_pq_ratchet() {
                 Some(SerializablePqRatchetState {
                     is_initiator: self.is_pq_initiator,
@@ -144,6 +146,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
             last_ratchet_at: data.last_ratchet_at,
+            pq_authentication: PqAuthentication::from_u8(data.pq_authentication),
+            pq_applied: data.pq_applied,
         };
 
         session.restore_pq_ratchet_state(&data);
@@ -387,6 +391,11 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
+    /// `PqAuthentication::as_u8`; 0 (`Unknown`) for sessions recorded before it existed.
+    #[serde(default)]
+    pq_authentication: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_applied: Option<bool>,
     /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
     /// message-key mixing design. Present only for suite-3 sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
@@ -561,13 +570,16 @@ impl SerializableSession {
             contact_id: self.contact_id.clone(),
             local_uid: self.local_user_id.clone(),
             session_id: ByteBuf::from(session_id_raw),
-            rk: ByteBuf::from(self.root_key.clone()),
-            sck: ByteBuf::from(self.sending_chain_key.clone()),
-            rck: ByteBuf::from(self.receiving_chain_key.clone()),
+            rk: crate::crypto::SecretBytes::from(self.root_key.clone()),
+            sck: crate::crypto::SecretBytes::from(self.sending_chain_key.clone()),
+            rck: crate::crypto::SecretBytes::from(self.receiving_chain_key.clone()),
             scl: self.sending_chain_length,
             rcl: self.receiving_chain_length,
             psl: self.previous_sending_length,
-            dh_priv: self.dh_ratchet_private.clone().map(ByteBuf::from),
+            dh_priv: self
+                .dh_ratchet_private
+                .clone()
+                .map(crate::crypto::SecretBytes::from),
             dh_pub: ByteBuf::from(self.dh_ratchet_public.clone()),
             rdh_pub: self.remote_dh_public.clone().map(ByteBuf::from),
             skipped: self
@@ -576,12 +588,17 @@ impl SerializableSession {
                 .map(|e| crate::cfe::CfeSkippedKeyEntryV1 {
                     dh_pub: ByteBuf::from(e.dh_public.clone()),
                     msg_number: e.msg_number,
-                    key_bytes: ByteBuf::from(e.key_bytes.clone()),
+                    key_bytes: crate::crypto::SecretBytes::from(e.key_bytes.clone()),
                     timestamp: e.timestamp,
                 })
                 .collect(),
-            pq_rk1: self.pre_pq_root_key.clone().map(ByteBuf::from),
+            pq_rk1: self
+                .pre_pq_root_key
+                .clone()
+                .map(crate::crypto::SecretBytes::from),
             last_ratchet_at: self.last_ratchet_at,
+            pq_authentication: self.pq_authentication,
+            pq_applied: self.pq_applied,
             pqr: self
                 .pq_ratchet
                 .as_ref()
@@ -593,14 +610,14 @@ impl SerializableSession {
                         .iter()
                         .map(|(epoch, secret)| crate::cfe::CfePqEpochSecretV1 {
                             epoch: *epoch,
-                            secret: ByteBuf::from(secret.clone()),
+                            secret: crate::crypto::SecretBytes::from(secret.clone()),
                         })
                         .collect(),
                     pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
                         crate::cfe::CfePqPendingExchangeV1 {
                             epoch: ex.epoch,
                             public: ByteBuf::from(ex.public.clone()),
-                            secret: ByteBuf::from(ex.secret.clone()),
+                            secret: crate::crypto::SecretBytes::from(ex.secret.clone()),
                         }
                     }),
                     pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
@@ -608,7 +625,7 @@ impl SerializableSession {
                             epoch: p.epoch,
                             ek_hash: ByteBuf::from(p.ek_hash.clone()),
                             ciphertext: ByteBuf::from(p.ciphertext.clone()),
-                            secret: ByteBuf::from(p.secret.clone()),
+                            secret: crate::crypto::SecretBytes::from(p.secret.clone()),
                         }
                     }),
                     pending_since: pq.pending_since,
@@ -650,21 +667,22 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
-            // NB: the CFE sub-structs zeroize on drop, so fields are cloned
-            // out by reference (moving out of a Drop type is E0509).
+            pq_authentication: data.pq_authentication,
+            pq_applied: data.pq_applied,
+            // Secrets leave `SecretBytes` here: `SerializableSession` still holds plain `Vec`s.
             pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {
                 is_initiator: pq.is_initiator,
                 current_epoch: pq.current_epoch,
                 epoch_secrets: pq
                     .epoch_secrets
                     .iter()
-                    .map(|e| (e.epoch, e.secret.to_vec()))
+                    .map(|e| (e.epoch, e.secret.expose().to_vec()))
                     .collect(),
                 pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
                     SerializablePqPendingExchange {
                         epoch: ex.epoch,
                         public: ex.public.to_vec(),
-                        secret: ex.secret.to_vec(),
+                        secret: ex.secret.expose().to_vec(),
                     }
                 }),
                 pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
@@ -672,7 +690,7 @@ impl SerializableSession {
                         epoch: p.epoch,
                         ek_hash: p.ek_hash.to_vec(),
                         ciphertext: p.ciphertext.to_vec(),
-                        secret: p.secret.to_vec(),
+                        secret: p.secret.expose().to_vec(),
                     }
                 }),
                 pending_since: pq.pending_since,

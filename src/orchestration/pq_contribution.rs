@@ -21,6 +21,7 @@
 /// If the upload fails, call `rollback_spk_rotation`.
 use std::collections::HashMap;
 
+use crate::crypto::SecretBytes;
 use crate::orchestration::actions::{Action, SecureStoreSlot};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -38,7 +39,7 @@ pub struct EncapsulationResult {
 /// The deferred contribution retrieved by `consume_deferred`.
 #[derive(Debug, Clone)]
 pub struct DeferredContribution {
-    pub shared_secret: Vec<u8>,
+    pub shared_secret: SecretBytes,
     pub otpk_id: u32,
 }
 
@@ -46,7 +47,7 @@ pub struct DeferredContribution {
 #[derive(Debug, Clone)]
 pub struct SPKRotationPending {
     pub new_public: Vec<u8>,
-    pub new_secret: Vec<u8>,
+    pub new_secret: SecretBytes,
     pub new_id: u32,
 }
 
@@ -54,7 +55,7 @@ pub struct SPKRotationPending {
 
 #[derive(Debug, Clone)]
 struct PendingContribution {
-    shared_secret: Vec<u8>,
+    shared_secret: SecretBytes,
     otpk_id: u32,
 }
 
@@ -109,7 +110,7 @@ impl PQContributionManager {
         let (ciphertext, shared_secret) = pq_encapsulate(kem_public)?;
 
         let persist_action =
-            serialize_pending_action(contact_id, recipient_otpk_id, &shared_secret);
+            serialize_pending_action(contact_id, recipient_otpk_id, shared_secret.expose());
 
         self.pending.insert(
             contact_id.to_string(),
@@ -149,7 +150,7 @@ impl PQContributionManager {
         otpk_id: u32,
     ) -> Result<Vec<Action>, String> {
         let shared_secret = pq_decapsulate(kem_secret, kem_ciphertext)?;
-        let persist_action = serialize_pending_action(contact_id, otpk_id, &shared_secret);
+        let persist_action = serialize_pending_action(contact_id, otpk_id, shared_secret.expose());
         self.pending.insert(
             contact_id.to_string(),
             PendingContribution {
@@ -181,7 +182,7 @@ impl PQContributionManager {
         self.pending.insert(
             contact_id.to_string(),
             PendingContribution {
-                shared_secret: shared_secret.to_vec(),
+                shared_secret: SecretBytes::from_slice(shared_secret),
                 otpk_id,
             },
         );
@@ -225,7 +226,7 @@ impl PQContributionManager {
                 slot: SecureStoreSlot::PqDeferred {
                     contact_id: contact_id.to_string(),
                 },
-                data: vec![],
+                data: vec![].into(),
             }],
         }
     }
@@ -270,7 +271,7 @@ impl PQContributionManager {
     pub fn take_contribution_for_first_message(
         &mut self,
         contact_id: &str,
-    ) -> (Option<Vec<u8>>, u32, Option<Vec<u8>>) {
+    ) -> (Option<Vec<u8>>, u32, Option<SecretBytes>) {
         let ct = self.pending_ciphertexts.remove(contact_id);
         match self.pending.remove(contact_id) {
             None => (ct, 0, None),
@@ -371,7 +372,7 @@ impl PQContributionManager {
             .map(|(contact_id, c)| CfeKyberDeferredEntryV1 {
                 contact_id: contact_id.clone(),
                 otpk_id: c.otpk_id,
-                shared_secret: ByteBuf::from(c.shared_secret.clone()),
+                shared_secret: c.shared_secret.clone(),
                 kem_ciphertext: self
                     .pending_ciphertexts
                     .get(contact_id)
@@ -414,7 +415,7 @@ impl PQContributionManager {
             self.pending.insert(
                 entry.contact_id,
                 PendingContribution {
-                    shared_secret: entry.shared_secret.into_vec(),
+                    shared_secret: entry.shared_secret,
                     otpk_id: entry.otpk_id,
                 },
             );
@@ -442,14 +443,14 @@ fn serialize_pending_action(contact_id: &str, otpk_id: u32, shared_secret: &[u8]
         slot: SecureStoreSlot::PqDeferred {
             contact_id: contact_id.to_string(),
         },
-        data,
+        data: data.into(),
     }
 }
 
 // ── Crypto primitives (feature-gated) ─────────────────────────────────────────
 
 /// Encapsulate to `public_key`. Returns `(ciphertext, shared_secret)`.
-fn pq_encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn pq_encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, SecretBytes), String> {
     #[cfg(feature = "post-quantum")]
     {
         crate::crypto::pq_x3dh::mlkem768_encapsulate(public_key)
@@ -464,7 +465,7 @@ fn pq_encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
 }
 
 /// Decapsulate `ciphertext` using `secret_key`. Returns shared secret.
-fn pq_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+fn pq_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> Result<SecretBytes, String> {
     #[cfg(feature = "post-quantum")]
     {
         crate::crypto::pq_x3dh::mlkem768_decapsulate(secret_key, ciphertext)
@@ -477,7 +478,7 @@ fn pq_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Strin
 }
 
 /// Generate a fresh ML-KEM-768 keypair. Returns `(public_key, secret_key)`.
-fn pq_keygen() -> Result<(Vec<u8>, Vec<u8>), String> {
+fn pq_keygen() -> Result<(Vec<u8>, SecretBytes), String> {
     #[cfg(feature = "post-quantum")]
     {
         crate::crypto::pq_x3dh::mlkem768_keygen().map(|kp| (kp.public_key, kp.secret_key))
@@ -523,7 +524,7 @@ mod tests {
         // (avoids needing post-quantum feature in unit tests).
         mgr.spk_rotation = Some(SPKRotationPending {
             new_public: vec![0u8; 32],
-            new_secret: vec![1u8; 32],
+            new_secret: vec![1u8; 32].into(),
             new_id: 1,
         });
         assert!(mgr.is_rotation_pending());
@@ -536,7 +537,7 @@ mod tests {
         let mut mgr = PQContributionManager::new();
         mgr.spk_rotation = Some(SPKRotationPending {
             new_public: vec![0u8; 32],
-            new_secret: vec![2u8; 32],
+            new_secret: vec![2u8; 32].into(),
             new_id: 7,
         });
         let actions = mgr.commit_spk_rotation();
@@ -560,7 +561,7 @@ mod tests {
         let mut mgr = PQContributionManager::new();
         mgr.spk_rotation = Some(SPKRotationPending {
             new_public: vec![],
-            new_secret: vec![],
+            new_secret: vec![].into(),
             new_id: 1,
         });
         let result = mgr.begin_spk_rotation();
@@ -608,7 +609,7 @@ mod tests {
         );
 
         // Verify decapsulate produces the same shared secret.
-        let ss2 = pq_decapsulate(&kp.secret_key, &result.ciphertext).unwrap();
+        let ss2 = pq_decapsulate(kp.secret_key.expose(), &result.ciphertext).unwrap();
         assert_eq!(deferred.shared_secret, ss2);
     }
 
@@ -621,7 +622,7 @@ mod tests {
         // Build a ciphertext using the public key
         let enc = crate::crypto::pq_x3dh::mlkem768_encapsulate(&kp.public_key).unwrap();
         let actions = mgr
-            .decapsulate_and_store("alice", &enc.ciphertext, &kp.secret_key, 42)
+            .decapsulate_and_store("alice", &enc.ciphertext, kp.secret_key.expose(), 42)
             .unwrap();
         assert_eq!(actions.len(), 1);
         assert!(
@@ -662,7 +663,7 @@ mod tests {
         mgr.pending.insert(
             "test-contact".to_string(),
             PendingContribution {
-                shared_secret: vec![0xAB; 32],
+                shared_secret: vec![0xAB; 32].into(),
                 otpk_id: 42,
             },
         );
@@ -677,7 +678,7 @@ mod tests {
         let (deferred, _) = mgr2.consume_deferred("test-contact");
         let d = deferred.unwrap();
         assert_eq!(d.otpk_id, 42);
-        assert_eq!(d.shared_secret, vec![0xAB; 32]);
+        assert_eq!(d.shared_secret.expose(), &[0xAB; 32]);
     }
 
     /// The initiator's contribution is a pair: the secret it mixes into message 0 and the
@@ -692,7 +693,7 @@ mod tests {
         mgr.pending.insert(
             "bob".to_string(),
             PendingContribution {
-                shared_secret: vec![0x11; 32],
+                shared_secret: vec![0x11; 32].into(),
                 otpk_id: 7,
             },
         );
@@ -704,7 +705,7 @@ mod tests {
         restored.import_cfe(&blob).unwrap();
 
         let (ct, otpk_id, ss) = restored.take_contribution_for_first_message("bob");
-        assert_eq!(ss, Some(vec![0x11; 32]));
+        assert_eq!(ss, Some(vec![0x11; 32].into()));
         assert_eq!(otpk_id, 7);
         assert_eq!(
             ct,
@@ -753,7 +754,7 @@ mod tests {
         let mut mgr = PQContributionManager::new();
         mgr.import_cfe(&blob).unwrap();
         let (ct, otpk_id, ss) = mgr.take_contribution_for_first_message("alice");
-        assert_eq!((ct, otpk_id, ss), (None, 3, Some(vec![0x22; 32])));
+        assert_eq!((ct, otpk_id, ss), (None, 3, Some(vec![0x22; 32].into())));
     }
 
     #[test]
@@ -762,7 +763,7 @@ mod tests {
         // Simulate a rotation in progress.
         mgr.spk_rotation = Some(SPKRotationPending {
             new_public: vec![1u8; 32],
-            new_secret: vec![2u8; 32],
+            new_secret: vec![2u8; 32].into(),
             new_id: 5,
         });
         let blob = mgr.export_cfe().unwrap();
@@ -770,7 +771,7 @@ mod tests {
         let mut mgr2 = PQContributionManager::new();
         mgr2.spk_rotation = Some(SPKRotationPending {
             new_public: vec![],
-            new_secret: vec![],
+            new_secret: vec![].into(),
             new_id: 99,
         });
         mgr2.import_cfe(&blob).unwrap();

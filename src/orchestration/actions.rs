@@ -238,7 +238,9 @@ pub enum Action {
     /// says so.
     SaveToSecureStore {
         slot: SecureStoreSlot,
-        data: Vec<u8>,
+        /// Session state, key records, deferred PQ secrets: what goes here is secret, so it
+        /// is `SecretBytes` — zeroed on drop, and a `{:?}` of the action prints its length.
+        data: crate::crypto::SecretBytes,
     },
     PersistMessage {
         message_json: String,
@@ -337,7 +339,8 @@ pub enum Action {
     ///   Android can implement the identical behaviour against Android Keystore.
     SessionTerminated {
         contact_id: String,
-        archive_bytes: Vec<u8>,
+        /// The archived session record — root and chain keys included, so `SecretBytes`.
+        archive_bytes: crate::crypto::SecretBytes,
     },
 }
 
@@ -533,7 +536,7 @@ mod tests {
             slot: SecureStoreSlot::Session {
                 contact_id: "bob".to_string(),
             },
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
         };
         let s = format!("{:?}", a);
         assert!(s.contains("SaveToSecureStore"));
@@ -542,6 +545,10 @@ mod tests {
         assert!(
             !s.contains("session_bob"),
             "the core must not format a storage key: {s}"
+        );
+        assert!(
+            !s.contains("[1, 2, 3]"),
+            "the payload is secret; Debug must not print it: {s}"
         );
     }
 

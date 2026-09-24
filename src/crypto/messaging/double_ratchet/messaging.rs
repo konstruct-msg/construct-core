@@ -102,6 +102,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             contact_id,
             local_user_id,
             last_ratchet_at: unix_now(),
+            pq_authentication: PqAuthentication::Classic,
+            pq_applied: Some(false),
         })
     }
 
@@ -218,6 +220,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             contact_id: contact_id.clone(),
             local_user_id,
             last_ratchet_at: unix_now(),
+            pq_authentication: PqAuthentication::Classic,
+            pq_applied: Some(false),
         };
 
         // КРИТИЧЕСКИ ВАЖНО: Расшифровываем первое сообщение!

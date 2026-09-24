@@ -22,14 +22,14 @@ pub const MLKEM768_SS_SIZE: usize = 32;
 #[derive(Debug, Clone)]
 pub struct MLKEMKeyPair {
     pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
+    pub secret_key: crate::crypto::SecretBytes,
 }
 
 /// Result of ML-KEM encapsulation: ciphertext sent to receiver, shared secret kept locally.
 #[derive(Debug, Clone)]
 pub struct MLKEMEncapsulation {
     pub ciphertext: Vec<u8>,
-    pub shared_secret: Vec<u8>,
+    pub shared_secret: crate::crypto::SecretBytes,
 }
 
 /// Generate an ML-KEM-768 keypair.
@@ -48,7 +48,7 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
     let ek: &EncapsulationKey<MlKem768> = dk.encapsulation_key();
     let pk_bytes: Vec<u8> = ek.to_bytes().to_vec();
     #[allow(deprecated)]
-    let sk_bytes: Vec<u8> = dk.to_expanded_bytes().to_vec();
+    let sk_bytes = crate::crypto::SecretBytes::from_slice(&dk.to_expanded_bytes());
     Ok(MLKEMKeyPair {
         public_key: pk_bytes,
         secret_key: sk_bytes,
@@ -85,7 +85,7 @@ pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Strin
     let (ct, ss) = ek.encapsulate_with_rng(&mut rng);
     Ok(MLKEMEncapsulation {
         ciphertext: ct.to_vec(),
-        shared_secret: ss.to_vec(),
+        shared_secret: crate::crypto::SecretBytes::from_slice(&ss),
     })
 }
 
@@ -99,7 +99,10 @@ pub fn mlkem768_encapsulate(_pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Stri
 /// Returns the shared secret, which must match the sender's shared secret.
 #[cfg(feature = "post-quantum")]
 #[allow(deprecated)] // ExpandedKeyEncoding: key format uses expanded bytes for backward compat
-pub fn mlkem768_decapsulate(sk_bytes: &[u8], ct_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn mlkem768_decapsulate(
+    sk_bytes: &[u8],
+    ct_bytes: &[u8],
+) -> Result<crate::crypto::SecretBytes, String> {
     use ml_kem::{Decapsulate, DecapsulationKey, ExpandedKeyEncoding, MlKem768};
     if sk_bytes.len() != MLKEM768_SK_SIZE {
         return Err(format!(
@@ -123,10 +126,13 @@ pub fn mlkem768_decapsulate(sk_bytes: &[u8], ct_bytes: &[u8]) -> Result<Vec<u8>,
     let ss = dk
         .decapsulate_slice(ct_bytes)
         .map_err(|_| "ML-KEM-768 decapsulation failed (bad ciphertext size)".to_string())?;
-    Ok(ss.to_vec())
+    Ok(crate::crypto::SecretBytes::from_slice(&ss))
 }
 
 #[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_decapsulate(_sk_bytes: &[u8], _ct_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn mlkem768_decapsulate(
+    _sk_bytes: &[u8],
+    _ct_bytes: &[u8],
+) -> Result<crate::crypto::SecretBytes, String> {
     Err("post-quantum feature not enabled".to_string())
 }

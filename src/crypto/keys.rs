@@ -130,7 +130,7 @@ pub struct KeyManager<P: CryptoProvider> {
     /// Independent hybrid PQ signature private key (Ed25519+ML-DSA-65, 2016 bytes raw).
     /// Owned here for centralization: all long-term crypto keys live inside the core.
     /// Lazily initialized on first ensure_hybrid; not part of the main suite signing_key.
-    hybrid_sig_priv: Option<Vec<u8>>,
+    hybrid_sig_priv: Option<crate::crypto::SecretBytes>,
 
     /// The ML-KEM-768 signed prekey as `(key_id, private, public)` raw bytes — the PQXDH
     /// KEM leg. Plain byte storage (decapsulation happens in the PQXDH layer), kept here
@@ -585,13 +585,13 @@ impl<P: CryptoProvider> KeyManager<P> {
                 )),
             ));
         }
-        self.hybrid_sig_priv = Some(priv_bytes);
+        self.hybrid_sig_priv = Some(priv_bytes.into());
         Ok(())
     }
 
     #[cfg(feature = "post-quantum")]
     /// Export the hybrid sig private (if any) for CFE persistence.
-    pub fn hybrid_signature_private_bytes(&self) -> Option<Vec<u8>> {
+    pub fn hybrid_signature_private_bytes(&self) -> Option<crate::crypto::SecretBytes> {
         self.hybrid_sig_priv.clone()
     }
 
@@ -635,7 +635,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         Ok(())
     }
     #[cfg(not(feature = "post-quantum"))]
-    pub fn hybrid_signature_private_bytes(&self) -> Option<Vec<u8>> {
+    pub fn hybrid_signature_private_bytes(&self) -> Option<crate::crypto::SecretBytes> {
         None
     }
 

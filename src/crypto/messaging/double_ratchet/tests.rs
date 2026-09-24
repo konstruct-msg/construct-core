@@ -2517,7 +2517,8 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
 
     // Corrupt variant 1: wrong secret length.
     let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
-    cfe.pqr.as_mut().unwrap().epoch_secrets[0].secret = ByteBuf::from(vec![0u8; 5]);
+    cfe.pqr.as_mut().unwrap().epoch_secrets[0].secret =
+        crate::crypto::SecretBytes::from(vec![0u8; 5]);
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
     let restored = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
     assert_eq!(
@@ -2531,7 +2532,7 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
     cfe.pqr.as_mut().unwrap().pending_exchange = Some(crate::cfe::CfePqPendingExchangeV1 {
         epoch: 9,
         public: ByteBuf::from(vec![0u8; 1184]),
-        secret: ByteBuf::from(vec![0u8; 2400]),
+        secret: crate::crypto::SecretBytes::from(vec![0u8; 2400]),
     });
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
     let restored = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();

@@ -18,6 +18,7 @@
 ///   receiving_init_plan — Which queued message opens a session, against which device
 ///   send_plan        — Who gets a copy of an outgoing message
 ///   receiving_decrypt_plan — Which device session an incoming message is tried against
+///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, and what the session is called
 ///   orchestrator     — Top-level facade (Phase 5)        [TODO]
 /// ```
 pub mod ack_store;
@@ -29,6 +30,7 @@ pub mod message_router;
 pub mod orchestrator;
 pub mod platform_bridge;
 pub mod pq_contribution;
+pub mod pq_prekey_plan;
 pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
 pub mod send_plan;
@@ -46,6 +48,10 @@ pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
 pub use pq_contribution::{
     DeferredContribution, EncapsulationResult, PQContributionManager, SPKRotationPending,
+};
+pub use pq_prekey_plan::{
+    ClassicReason, KyberPrekeyContext, KyberPrekeyDecision, KyberPrekeyOffer, KyberPrekeyPlan,
+    RefuseReason, plan_kyber_prekey,
 };
 pub use receiving_decrypt_plan::plan_receiving_decrypt;
 pub use receiving_init_plan::{

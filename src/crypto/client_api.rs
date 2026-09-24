@@ -1017,9 +1017,9 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
         let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
         let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
 
-        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
-        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
-        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
+        let ik_priv = identity_secret.clone();
+        let sk_priv = signing_secret.clone();
+        let spk_priv = prekey.key_pair.0.clone();
         let spk_sig: Vec<u8> = prekey.signature.clone();
 
         let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
@@ -1034,7 +1034,7 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
         let mut old_spks: Vec<crate::cfe::CfeOldSpkV1> = km
             .old_prekeys_iter()
             .map(|store| crate::cfe::CfeOldSpkV1 {
-                spk_priv: ByteBuf::from(<_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec()),
+                spk_priv: store.key_pair.0.clone(),
                 spk_sig: ByteBuf::from(store.signature.clone()),
                 spk_id: store.key_id,
                 created_at: store.created_at,
@@ -1044,20 +1044,20 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
 
         Ok(crate::cfe::CfePrivateKeysV1 {
             suite_id: 1,
-            ik_priv: ByteBuf::from(ik_priv),
-            sk_priv: ByteBuf::from(sk_priv),
-            spk_priv: ByteBuf::from(spk_priv),
+            ik_priv,
+            sk_priv,
+            spk_priv,
             spk_sig: ByteBuf::from(spk_sig),
             spk_id: km.current_signed_prekey_id().unwrap_or(0),
             ik_pub: ByteBuf::from(ik_pub),
             vk_pub: ByteBuf::from(vk_pub),
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
-            hybrid_sig_priv: km.hybrid_signature_private_bytes().map(ByteBuf::from),
+            hybrid_sig_priv: km.hybrid_signature_private_bytes(),
             kyber_spk: km.kyber_spk_bytes().map(|(key_id, priv_b, pub_b)| {
                 crate::cfe::CfeKyberSpkV1 {
                     key_id,
-                    kyber_priv: ByteBuf::from(priv_b),
+                    kyber_priv: crate::crypto::SecretBytes::from(priv_b),
                     kyber_pub: ByteBuf::from(pub_b),
                 }
             }),

@@ -104,13 +104,17 @@ pub struct SessionHealthReport {
     pub messages_received: u32,
     /// Number of out-of-order message keys currently buffered.
     pub skipped_keys_count: u32,
-    /// `true` once the Kyber OTPK contribution has been mixed into the root key.
+    /// `true` once a Kyber contribution has been mixed into the root key.
     pub is_pq_strengthened: bool,
     /// Unix timestamp of the last DH ratchet step (0 = unknown / legacy session).
     pub last_ratchet_at: u64,
     /// Shared session identifier (hex).
     pub session_id: String,
+    /// Whose Kyber key the PQ layer came from.
+    pub pq_authentication: PqAuthentication,
 }
+
+pub use crate::crypto::kyber_prekey_auth::PqAuthentication;
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
@@ -212,6 +216,10 @@ pub struct BinaryKeyBundle {
     /// Peer capability from the server's PreKeyBundle (key-service field 24,
     /// migration 063): initiators use it to negotiate `SuiteID::PQ_RATCHET`.
     pub supports_pq_ratchet: bool,
+    /// Ed25519 over `build_x3dh_sign_message(0x10, kyber_pre_key_public)` (key-service field 12).
+    pub kyber_pre_key_signature: Option<Vec<u8>>,
+    /// The same over the Kyber OTPK; the bundle does not carry it yet.
+    pub kyber_one_time_prekey_signature: Option<Vec<u8>>,
 }
 
 /// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
@@ -278,7 +286,7 @@ pub struct OtpkPair {
 }
 
 /// Full OTPK record for persistence (includes private key for Keychain storage)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OtpkRecord {
     pub key_id: u32,
     pub private_key: Vec<u8>, // Base64-encoded private key bytes
@@ -296,7 +304,7 @@ pub struct KyberSpkRecord {
 }
 
 // Private keys for persistence (exported via UDL)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PrivateKeysJson {
     pub identity_secret: String,      // Base64
     pub signing_secret: String,       // Base64
@@ -315,7 +323,7 @@ pub struct PrivateKeysJson {
 
 // Invite crypto types (exported via UDL)
 // Note: These are UniFFI-compatible wrappers, actual crypto logic is in crypto::invite_crypto
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EphemeralKeyPair {
     pub secret_key: Vec<u8>, // 32 bytes
     pub public_key: Vec<u8>, // 32 bytes
@@ -327,13 +335,13 @@ pub struct InviteSignature {
 }
 
 // Post-quantum KEM types (exported via UDL)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLKEMKeyPair {
     pub public_key: Vec<u8>, // ML-KEM-768: 1184 bytes
     pub secret_key: Vec<u8>, // ML-KEM-768: 2400 bytes
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLKEMEncapsulation {
     pub ciphertext: Vec<u8>,    // ML-KEM-768: 1088 bytes
     pub shared_secret: Vec<u8>, // 32 bytes
@@ -521,6 +529,7 @@ impl ClassicCryptoCore {
                 is_pq_strengthened: snap.is_pq_strengthened,
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
+                pq_authentication: snap.pq_authentication,
             })
     }
 
@@ -916,7 +925,7 @@ impl ClassicCryptoCore {
             .into_iter()
             .map(|(id, priv_key, pub_key)| crate::cfe::CfeOtpkRecordV1 {
                 id,
-                priv_key: ByteBuf::from(priv_key),
+                priv_key: crate::crypto::SecretBytes::from(priv_key),
                 pub_key: ByteBuf::from(pub_key),
             })
             .collect();
@@ -939,7 +948,7 @@ impl ClassicCryptoCore {
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
             .iter()
-            .map(|r| (r.id, r.priv_key.to_vec(), r.pub_key.to_vec()))
+            .map(|r| (r.id, r.priv_key.expose().to_vec(), r.pub_key.to_vec()))
             .collect();
 
         let mut client = self
@@ -1090,7 +1099,7 @@ use crate::crypto::invite_crypto;
 pub fn generate_ephemeral_keypair() -> Result<EphemeralKeyPair, CryptoError> {
     let keypair = invite_crypto::generate_ephemeral_keypair()?;
     Ok(EphemeralKeyPair {
-        secret_key: keypair.secret_key,
+        secret_key: keypair.secret_key.into_vec(),
         public_key: keypair.public_key,
     })
 }
@@ -1505,6 +1514,8 @@ mod tests {
             kyber_one_time_prekey_public: None,
             kyber_one_time_prekey_id: None,
             supports_pq_ratchet: false,
+            kyber_pre_key_signature: None,
+            kyber_one_time_prekey_signature: None,
         }
     }
 
@@ -2502,7 +2513,7 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_keygen()
         .map(|kp| MLKEMKeyPair {
             public_key: kp.public_key,
-            secret_key: kp.secret_key,
+            secret_key: kp.secret_key.into_vec(),
         })
         .map_err(|_e| CryptoError::InitializationFailed)
 }
@@ -2522,7 +2533,7 @@ pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, C
     crate::crypto::pq_x3dh::mlkem768_encapsulate(&public_key)
         .map(|enc| MLKEMEncapsulation {
             ciphertext: enc.ciphertext,
-            shared_secret: enc.shared_secret,
+            shared_secret: enc.shared_secret.into_vec(),
         })
         .map_err(|e| CryptoError::EncryptionFailed { message: e })
 }
@@ -2543,6 +2554,7 @@ pub fn mlkem768_decapsulate(
     ciphertext: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
+        .map(crate::crypto::SecretBytes::into_vec)
         .map_err(|e| CryptoError::DecryptionFailed { message: e })
 }
 
@@ -2557,7 +2569,7 @@ pub fn mlkem768_decapsulate(
 // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────────
 
 /// ML-DSA-65 keypair exposed across the FFI boundary.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLDSAKeyPair {
     /// Secret key: 32-byte signing seed (RustCrypto ml-dsa; expanded key re-derived on sign)
     pub secret_key: Vec<u8>,
@@ -2566,7 +2578,7 @@ pub struct MLDSAKeyPair {
 }
 
 /// Hybrid (Ed25519 + ML-DSA-65) signature keypair.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HybridSignatureKeyPair {
     /// Hybrid private key: 2016 bytes
     /// [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
@@ -2656,7 +2668,7 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
     let (sk, pk) = HybridSuiteProvider::generate_signature_keys()
         .map_err(|_| CryptoError::InitializationFailed)?;
     Ok(HybridSignatureKeyPair {
-        private_key: sk,
+        private_key: sk.into_vec(),
         public_key: pk,
     })
 }
@@ -2671,9 +2683,11 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
 pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
-    HybridSuiteProvider::sign(&private_key, &message).map_err(|e| CryptoError::EncryptionFailed {
-        message: format!("Hybrid sign failed: {e}"),
-    })
+    HybridSuiteProvider::sign(&crate::crypto::SecretBytes::new(private_key), &message).map_err(
+        |e| CryptoError::EncryptionFailed {
+            message: format!("Hybrid sign failed: {e}"),
+        },
+    )
 }
 
 #[cfg(not(feature = "post-quantum"))]
@@ -2710,8 +2724,10 @@ pub fn hybrid_verify(
 pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
-    HybridSuiteProvider::from_signature_private_to_public(&private_key)
-        .map_err(|_e| CryptoError::InvalidKeyData)
+    HybridSuiteProvider::from_signature_private_to_public(&crate::crypto::SecretBytes::new(
+        private_key,
+    ))
+    .map_err(|_e| CryptoError::InvalidKeyData)
 }
 
 #[cfg(not(feature = "post-quantum"))]
@@ -3037,6 +3053,7 @@ impl OrchestratorCore {
                 is_pq_strengthened: snap.is_pq_strengthened,
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
+                pq_authentication: snap.pq_authentication,
             })
     }
 
@@ -3266,9 +3283,13 @@ impl OrchestratorCore {
         orch.init_session_with_bundle(
             &contact_id,
             public_bundle,
-            recipient_bundle.kyber_pre_key_public,
-            recipient_bundle.kyber_one_time_prekey_public,
-            recipient_bundle.kyber_one_time_prekey_id,
+            crate::orchestration::orchestrator::KyberBundleKeys {
+                pre_key_public: recipient_bundle.kyber_pre_key_public,
+                pre_key_signature: recipient_bundle.kyber_pre_key_signature,
+                one_time_prekey_public: recipient_bundle.kyber_one_time_prekey_public,
+                one_time_prekey_id: recipient_bundle.kyber_one_time_prekey_id,
+                one_time_prekey_signature: recipient_bundle.kyber_one_time_prekey_signature,
+            },
             allow_stale,
         )
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
@@ -4042,7 +4063,7 @@ impl CfeAction {
             SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
             SaveToSecureStore { slot, data } => Self::SaveToSecureStore {
                 slot: slot.into(),
-                data,
+                data: data.into_vec(),
             },
             PersistMessage { message_json } => Self::PersistMessage { message_json },
             PersistAck {
@@ -4151,7 +4172,7 @@ impl CfeAction {
                 archive_bytes,
             } => Self::SessionTerminated {
                 contact_id,
-                archive_bytes,
+                archive_bytes: archive_bytes.into_vec(),
             },
         }
     }
