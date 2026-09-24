@@ -359,13 +359,7 @@ impl ClassicCryptoCore {
             .key_manager()
             .export_registration_bundle()
             .map_err(|_| CryptoError::InitializationFailed)?;
-        Ok(RegistrationBundleFields {
-            identity_public: bundle.identity_public,
-            signed_prekey_public: bundle.signed_prekey_public,
-            signature: bundle.signature,
-            verifying_key: bundle.verifying_key,
-            suite_id: bundle.suite_id.as_u16(),
-        })
+        Ok(RegistrationBundleFields::from(bundle))
     }
 
     /// Raw Ed25519 signing secret key bytes (64 bytes seed+public).
@@ -1050,16 +1044,7 @@ pub fn create_crypto_core() -> Result<Arc<ClassicCryptoCore>, CryptoError> {
 
 /// Create a CryptoCore instance from existing private keys in CFE binary format.
 pub fn create_crypto_core_from_keys(keys: Vec<u8>) -> Result<Arc<ClassicCryptoCore>, CryptoError> {
-    let _ = crate::config::Config::init();
-
-    let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
-        &keys,
-        crate::cfe::CfeMessageType::PrivateKeys,
-    )
-    .map_err(|e| serialization_failed("create_crypto_core_from_keys/decode", e))?;
-
-    let client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded)
-        .map_err(|_| CryptoError::InitializationFailed)?;
+    let client = client_from_key_record(&keys, "create_crypto_core_from_keys/decode")?;
 
     Ok(Arc::new(ClassicCryptoCore {
         inner: Mutex::new(client),
@@ -1071,21 +1056,110 @@ pub fn create_orchestrator_core_from_keys(
     keys_data: Vec<u8>,
     my_user_id: String,
 ) -> Result<Arc<OrchestratorCore>, CryptoError> {
-    let _ = crate::config::Config::init();
-
-    let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
-        &keys_data,
-        crate::cfe::CfeMessageType::PrivateKeys,
-    )
-    .map_err(|e| serialization_failed("create_orchestrator_core_from_keys/decode", e))?;
-
-    let client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded)
-        .map_err(|_| CryptoError::InitializationFailed)?;
+    let client = client_from_key_record(&keys_data, "create_orchestrator_core_from_keys/decode")?;
 
     let orchestrator = crate::orchestration::Orchestrator::new(client, my_user_id);
     Ok(Arc::new(OrchestratorCore {
         inner: std::sync::Mutex::new(orchestrator),
     }))
+}
+
+// ============================================================================
+// The key record without a core object
+// ============================================================================
+//
+// Before a client knows its user id it needs its keys — to make them, register them, sign with
+// them — and nothing else. iOS and Android kept a whole `ClassicCryptoCore` alive for that phase
+// (the "bootstrap core"), and Android fell back to it for session operations whenever the
+// orchestrator was missing: two cores, two ratchet stores, whichever answered first. With these,
+// the pre-login phase holds only the key record (`CfePrivateKeysV1` bytes, what
+// `create_orchestrator_core_from_keys` takes), and after login there is one core.
+//
+// Each call restores a client from the record, answers, and drops it; secrets live in
+// `SecretBytes` meanwhile. Nothing here keeps state.
+
+impl From<crate::crypto::handshake::x3dh::X3DHPublicKeyBundle> for RegistrationBundleFields {
+    fn from(bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle) -> Self {
+        Self {
+            identity_public: bundle.identity_public,
+            signed_prekey_public: bundle.signed_prekey_public,
+            signature: bundle.signature,
+            verifying_key: bundle.verifying_key,
+            suite_id: bundle.suite_id.as_u16(),
+        }
+    }
+}
+
+/// The one way a key record becomes a client — both `create_*_from_keys` and every function below.
+fn client_from_key_record(
+    keys: &[u8],
+    context: &str,
+) -> Result<ClassicClient<ClassicSuiteProvider>, CryptoError> {
+    let _ = crate::config::Config::init();
+    let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+        keys,
+        crate::cfe::CfeMessageType::PrivateKeys,
+    )
+    .map_err(|e| serialization_failed(context, e))?;
+    ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded)
+        .map_err(|_| CryptoError::InitializationFailed)
+}
+
+/// Fresh device keys — identity, signing, a signed prekey — as a key record.
+/// Equivalent to `create_crypto_core()` followed by `export_private_keys()`.
+pub fn generate_private_keys() -> Result<Vec<u8>, CryptoError> {
+    let _ = crate::config::Config::init();
+    let client = ClassicClient::<ClassicSuiteProvider>::new()
+        .map_err(|_| CryptoError::InitializationFailed)?;
+    let record = client
+        .to_private_keys_cfe()
+        .map_err(|_| CryptoError::InvalidKeyData)?;
+    crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &record)
+        .map_err(|e| serialization_failed("generate_private_keys/encode", e))
+}
+
+/// The public registration bundle of a key record — what `get_registration_bundle_fields`
+/// returns on a core built from it.
+pub fn registration_bundle_fields_from_keys(
+    keys: Vec<u8>,
+) -> Result<RegistrationBundleFields, CryptoError> {
+    let client = client_from_key_record(&keys, "registration_bundle_fields_from_keys/decode")?;
+    client
+        .key_manager()
+        .export_registration_bundle()
+        .map(RegistrationBundleFields::from)
+        .map_err(|_| CryptoError::InitializationFailed)
+}
+
+/// The Ed25519 signing secret of a key record — `get_signing_key_bytes` on a core built from it.
+pub fn signing_key_from_keys(keys: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+    let client = client_from_key_record(&keys, "signing_key_from_keys/decode")?;
+    client
+        .key_manager()
+        .signing_secret_key_bytes()
+        .map_err(|_| CryptoError::InitializationFailed)
+}
+
+/// The X25519 identity secret of a key record — `get_identity_key_bytes` on a core built from it.
+pub fn identity_key_from_keys(keys: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+    let client = client_from_key_record(&keys, "identity_key_from_keys/decode")?;
+    client
+        .key_manager()
+        .identity_secret_key_bytes()
+        .map_err(|_| CryptoError::InitializationFailed)
+}
+
+/// Ed25519 signature over `bundle_data_json` with the key record's signing key —
+/// `sign_bundle_data` on a core built from it.
+pub fn sign_bundle_data_with_keys(
+    keys: Vec<u8>,
+    bundle_data_json: Vec<u8>,
+) -> Result<Vec<u8>, CryptoError> {
+    let client = client_from_key_record(&keys, "sign_bundle_data_with_keys/decode")?;
+    client
+        .key_manager()
+        .sign(&bundle_data_json)
+        .map_err(|_| CryptoError::InitializationFailed)
 }
 
 // ============================================================================
@@ -2289,6 +2363,66 @@ mod tests {
         assert_eq!(decrypted1, plaintext1);
     }
 
+    /// The free key-record functions answer exactly what a core built from the same record
+    /// answers — both kinds of core. They are a replacement for the bootstrap core, not a
+    /// second implementation of it.
+    #[test]
+    fn free_key_functions_match_both_cores() {
+        let keys = generate_private_keys().unwrap();
+        let classic = create_crypto_core_from_keys(keys.clone()).unwrap();
+        let orch = create_orchestrator_core_from_keys(keys.clone(), "alice".to_string()).unwrap();
+
+        let fields = registration_bundle_fields_from_keys(keys.clone()).unwrap();
+        for (name, other) in [
+            ("classic", classic.get_registration_bundle_fields().unwrap()),
+            (
+                "orchestrator",
+                orch.get_registration_bundle_fields().unwrap(),
+            ),
+        ] {
+            assert_eq!(fields.identity_public, other.identity_public, "{name}");
+            assert_eq!(
+                fields.signed_prekey_public, other.signed_prekey_public,
+                "{name}"
+            );
+            assert_eq!(fields.signature, other.signature, "{name}");
+            assert_eq!(fields.verifying_key, other.verifying_key, "{name}");
+            assert_eq!(fields.suite_id, other.suite_id, "{name}");
+        }
+
+        let signing = signing_key_from_keys(keys.clone()).unwrap();
+        assert_eq!(signing, classic.get_signing_key_bytes().unwrap());
+        assert_eq!(signing, orch.get_signing_key_bytes().unwrap());
+
+        let identity = identity_key_from_keys(keys.clone()).unwrap();
+        assert_eq!(identity, classic.get_identity_key_bytes().unwrap());
+        assert_eq!(identity, orch.get_identity_key_bytes().unwrap());
+
+        // Ed25519 is deterministic: the same key over the same bytes is the same signature.
+        let data = b"{\"bundle\":1}".to_vec();
+        let sig = sign_bundle_data_with_keys(keys.clone(), data.clone()).unwrap();
+        assert_eq!(sig, classic.sign_bundle_data(data.clone()).unwrap());
+        assert_eq!(sig, orch.sign_bundle_data(data.clone()).unwrap());
+        let vk = ClassicSuiteProvider::signature_public_key_from_bytes(fields.verifying_key);
+        ClassicSuiteProvider::verify(&vk, &data, &sig).expect("verifies under the bundle's key");
+
+        // The record a core exports is the record the functions were given.
+        assert_eq!(orch.export_private_keys().unwrap(), keys);
+    }
+
+    #[test]
+    fn generate_private_keys_makes_new_keys_and_bad_records_are_rejected() {
+        let a = registration_bundle_fields_from_keys(generate_private_keys().unwrap()).unwrap();
+        let b = registration_bundle_fields_from_keys(generate_private_keys().unwrap()).unwrap();
+        assert_ne!(a.identity_public, b.identity_public);
+
+        for bad in [vec![], vec![0u8; 40], b"not a key record".to_vec()] {
+            assert!(registration_bundle_fields_from_keys(bad.clone()).is_err());
+            assert!(signing_key_from_keys(bad.clone()).is_err());
+            assert!(sign_bundle_data_with_keys(bad, b"x".to_vec()).is_err());
+        }
+    }
+
     /// Every constructor that restores from the private-key record keeps the pre-rotation
     /// signed prekeys. `create_orchestrator_core_from_keys` and `create_crypto_core_from_keys`
     /// passed an empty history, so a responder restarted after a rotation could not open a
@@ -3063,13 +3197,7 @@ impl OrchestratorCore {
         let bundle = orch
             .get_registration_bundle_fields()
             .map_err(|_| CryptoError::InitializationFailed)?;
-        Ok(RegistrationBundleFields {
-            identity_public: bundle.identity_public,
-            signed_prekey_public: bundle.signed_prekey_public,
-            signature: bundle.signature,
-            verifying_key: bundle.verifying_key,
-            suite_id: bundle.suite_id.as_u16(),
-        })
+        Ok(RegistrationBundleFields::from(bundle))
     }
 
     /// Raw Ed25519 signing secret key bytes (64 bytes).
