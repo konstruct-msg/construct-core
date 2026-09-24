@@ -466,6 +466,34 @@ namespace construct_core {
     [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core_from_keys(sequence<u8> keys);
 
+    // ── The key record without a core object ────────────────────────────────
+    // What a client needs before it knows its user id, without holding a
+    // ClassicCryptoCore: make keys, register them, sign with them, then hand the
+    // record to create_orchestrator_core_from_keys. `keys` / the result is the
+    // CFE key record (the bytes export_private_keys returns). Types mirror the
+    // methods each one replaces (export_private_keys, get_signing_key_bytes, …),
+    // so values pass between them unconverted. Stateless.
+
+    /// Fresh device keys (identity, signing, signed prekey) as a key record.
+    [Throws=CryptoError]
+    sequence<u8> generate_private_keys();
+
+    /// The public registration bundle of a key record.
+    [Throws=CryptoError]
+    RegistrationBundleFields registration_bundle_fields_from_keys(sequence<u8> keys);
+
+    /// The Ed25519 signing secret of a key record.
+    [Throws=CryptoError]
+    bytes signing_key_from_keys(sequence<u8> keys);
+
+    /// The X25519 identity secret of a key record.
+    [Throws=CryptoError]
+    bytes identity_key_from_keys(sequence<u8> keys);
+
+    /// Ed25519 signature over bundle_data_json with the key record's signing key.
+    [Throws=CryptoError]
+    sequence<u8> sign_bundle_data_with_keys(sequence<u8> keys, sequence<u8> bundle_data_json);
+
     // Invite Crypto Functions
     [Throws=CryptoError]
     EphemeralKeyPair generate_ephemeral_keypair();
