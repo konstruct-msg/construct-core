@@ -36,7 +36,6 @@ post-quantum = [
     "dep:getrandom_pq",
     "dep:ml-dsa",
 ]
-desktop = ["tokio/rt"]
 
 [dependencies]
 # Сериализация
@@ -44,15 +43,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1.0"
 rmp-serde = "1.1"
-postcard = { version = "1", default-features = false, features = ["alloc"] }
 base64 = "0.22"
 
 # Ошибки и утилиты
 thiserror = "2"
-anyhow = "1.0"
 tracing = "0.1"
-uuid = { version = "1.0", features = ["v4", "serde"] }
-time = { version = "0.3.47", features = ["formatting", "parsing"] }
 hex = "0.4"
 bytes = "1.11.1"  # Direct dependency to ensure security fix for RUSTSEC-2026-0007
 crc32fast = "1.3"
@@ -62,7 +57,6 @@ x25519-dalek = { version = "2.0", features = ["reusable_secrets", "static_secret
 ed25519-dalek = { version = "2.0", features = ["std", "rand_core"] }
 curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
 chacha20poly1305 = { version = "0.10", features = ["std", "getrandom"] }
-aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 hkdf = "0.12"
 hmac = "0.12"
@@ -104,9 +98,6 @@ uniffi = { version = "0.30", features = ["build"], optional = true }
 # Bump `rev` to take a veil change. To build against a local checkout while working on both,
 # patch it outside this file (see README, "Working on construct-veil at the same time").
 construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b", features = ["ffi"], optional = true }
-
-# Async runtime (optional, для desktop)
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]
 # openmls `test-utils` lives here, not in [dependencies]: the MLS unit tests need
