@@ -62,6 +62,10 @@ jobs:
         working-directory: construct-core
         run: cargo fmt --all -- --check
 
+      - name: No key material in logs
+        working-directory: construct-core
+        run: .github/scripts/check-secret-logging.sh
+
       - name: Clippy (default features)
         working-directory: construct-core
         run: cargo clippy --all-targets -- -D warnings

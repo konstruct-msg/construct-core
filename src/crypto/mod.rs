@@ -98,6 +98,9 @@ pub mod client_api;
 
 pub mod keys;
 
+/// Log-safe fingerprints of secrets: equal-or-not, never the bytes
+pub(crate) mod log_fingerprint;
+
 pub mod master_key;
 
 /// Invite crypto - dynamic contact invites with ephemeral keys

@@ -773,10 +773,10 @@ impl ClassicCryptoCore {
         );
         tracing::info!(
             target: "crypto::uniffi",
-            local_ik_pub_prefix = %hex::encode(&local_bundle.identity_public[..4.min(local_bundle.identity_public.len())]),
-            local_spk_pub_prefix = %hex::encode(&local_bundle.signed_prekey_public[..4.min(local_bundle.signed_prekey_public.len())]),
-            remote_ik_pub_prefix = %hex::encode(&recipient_bundle.identity_public[..4.min(recipient_bundle.identity_public.len())]),
-            remote_ek_pub_prefix = %hex::encode(&first_message.ephemeral_public_key[..4.min(first_message.ephemeral_public_key.len())]),
+            local_ik_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&local_bundle.identity_public),
+            local_spk_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&local_bundle.signed_prekey_public),
+            remote_ik_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&recipient_bundle.identity_public),
+            remote_ek_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&first_message.ephemeral_public_key),
             otpk_id = first_message.one_time_prekey_id,
             "[RESPONDER keys] local_ik_pub, local_spk_pub, remote_ik_pub, remote_ek_pub, otpk_id"
         );
