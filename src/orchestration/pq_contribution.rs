@@ -372,6 +372,10 @@ impl PQContributionManager {
                 contact_id: contact_id.clone(),
                 otpk_id: c.otpk_id,
                 shared_secret: ByteBuf::from(c.shared_secret.clone()),
+                kem_ciphertext: self
+                    .pending_ciphertexts
+                    .get(contact_id)
+                    .map(|ct| ByteBuf::from(ct.clone())),
             })
             .collect();
 
@@ -403,6 +407,10 @@ impl PQContributionManager {
         self.spk_rotation = None;
 
         for entry in snapshot.entries {
+            if let Some(ct) = entry.kem_ciphertext {
+                self.pending_ciphertexts
+                    .insert(entry.contact_id.clone(), ct.into_vec());
+            }
             self.pending.insert(
                 entry.contact_id,
                 PendingContribution {
@@ -670,6 +678,82 @@ mod tests {
         let d = deferred.unwrap();
         assert_eq!(d.otpk_id, 42);
         assert_eq!(d.shared_secret, vec![0xAB; 32]);
+    }
+
+    /// The initiator's contribution is a pair: the secret it mixes into message 0 and the
+    /// ciphertext that lets the responder derive the same root. A restart between session
+    /// init and the first send restored the secret alone, so the sender applied it and sent
+    /// nothing to decapsulate — message 0 could never be read.
+    ///
+    /// Mutation: drop `kem_ciphertext` from `export_cfe` — this reddens.
+    #[test]
+    fn test_initiator_ciphertext_survives_export_import() {
+        let mut mgr = PQContributionManager::new();
+        mgr.pending.insert(
+            "bob".to_string(),
+            PendingContribution {
+                shared_secret: vec![0x11; 32],
+                otpk_id: 7,
+            },
+        );
+        mgr.pending_ciphertexts
+            .insert("bob".to_string(), vec![0xC7; 1088]);
+
+        let blob = mgr.export_cfe().unwrap();
+        let mut restored = PQContributionManager::new();
+        restored.import_cfe(&blob).unwrap();
+
+        let (ct, otpk_id, ss) = restored.take_contribution_for_first_message("bob");
+        assert_eq!(ss, Some(vec![0x11; 32]));
+        assert_eq!(otpk_id, 7);
+        assert_eq!(
+            ct,
+            Some(vec![0xC7; 1088]),
+            "the secret was restored without the ciphertext that has to travel with it"
+        );
+    }
+
+    /// A responder entry has no ciphertext to send, and a snapshot written before the field
+    /// existed has none either: both still import, and still yield their secret.
+    #[test]
+    fn test_entry_without_ciphertext_imports_as_before() {
+        use crate::cfe::{CfeKyberSessionStateV1, CfeMessageType};
+
+        #[derive(serde::Serialize)]
+        struct LegacyEntry {
+            cid: String,
+            id: u32,
+            #[serde(with = "serde_bytes")]
+            ss: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacySnapshot {
+            ver: u8,
+            entries: Vec<LegacyEntry>,
+            next_id: u32,
+        }
+        let legacy = LegacySnapshot {
+            ver: 1,
+            entries: vec![LegacyEntry {
+                cid: "alice".to_string(),
+                id: 3,
+                ss: vec![0x22; 32],
+            }],
+            next_id: 9,
+        };
+        let blob = crate::cfe::encode(CfeMessageType::KyberSessionState, &legacy).unwrap();
+        // The legacy layout is exactly what the current type reads with `ct` absent.
+        let decoded = crate::cfe::decode_as::<CfeKyberSessionStateV1>(
+            &blob,
+            CfeMessageType::KyberSessionState,
+        )
+        .unwrap();
+        assert!(decoded.entries[0].kem_ciphertext.is_none());
+
+        let mut mgr = PQContributionManager::new();
+        mgr.import_cfe(&blob).unwrap();
+        let (ct, otpk_id, ss) = mgr.take_contribution_for_first_message("alice");
+        assert_eq!((ct, otpk_id, ss), (None, 3, Some(vec![0x22; 32])));
     }
 
     #[test]

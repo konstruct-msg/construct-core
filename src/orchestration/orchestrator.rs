@@ -935,66 +935,7 @@ impl Orchestrator {
     }
 
     pub fn export_private_keys_cfe(&self) -> Result<Vec<u8>, String> {
-        use crate::crypto::provider::CryptoProvider as _;
-        use crate::crypto::suites::classic::ClassicSuiteProvider;
-        use serde_bytes::ByteBuf;
-
-        let km = self.lifecycle.client.key_manager();
-        let identity_secret = km.identity_secret_key().map_err(|e| e.to_string())?;
-        let signing_secret = km.signing_secret_key().map_err(|e| e.to_string())?;
-        let prekey = km.current_signed_prekey().map_err(|e| e.to_string())?;
-
-        let ik_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(identity_secret).to_vec();
-        let sk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(signing_secret).to_vec();
-        let spk_priv: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&prekey.key_pair.0).to_vec();
-        let spk_sig: Vec<u8> = prekey.signature.clone();
-
-        let ik_pub = ClassicSuiteProvider::from_private_key_to_public_key(&ik_priv)
-            .map_err(|e| e.to_string())?;
-        let vk_pub = ClassicSuiteProvider::from_signature_private_to_public(&sk_priv)
-            .map_err(|e| e.to_string())?;
-        let spk_pub = ClassicSuiteProvider::from_private_key_to_public_key(&spk_priv)
-            .map_err(|e| e.to_string())?;
-
-        let spk_id = km.current_signed_prekey_id().unwrap_or(0);
-
-        let old_spks: Vec<crate::cfe::CfeOldSpkV1> = km
-            .old_prekeys_iter()
-            .map(|store| {
-                let priv_bytes: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(&store.key_pair.0).to_vec();
-                crate::cfe::CfeOldSpkV1 {
-                    spk_priv: ByteBuf::from(priv_bytes),
-                    spk_sig: ByteBuf::from(store.signature.clone()),
-                    spk_id: store.key_id,
-                    created_at: store.created_at,
-                }
-            })
-            .collect();
-
-        let hybrid_sig_priv = km.hybrid_signature_private_bytes().map(ByteBuf::from);
-        let kyber_spk =
-            km.kyber_spk_bytes()
-                .map(|(key_id, priv_b, pub_b)| crate::cfe::CfeKyberSpkV1 {
-                    key_id,
-                    kyber_priv: ByteBuf::from(priv_b),
-                    kyber_pub: ByteBuf::from(pub_b),
-                });
-
-        let payload = crate::cfe::CfePrivateKeysV1 {
-            suite_id: 1,
-            ik_priv: ByteBuf::from(ik_priv),
-            sk_priv: ByteBuf::from(sk_priv),
-            spk_priv: ByteBuf::from(spk_priv),
-            spk_sig: ByteBuf::from(spk_sig),
-            spk_id,
-            ik_pub: ByteBuf::from(ik_pub),
-            vk_pub: ByteBuf::from(vk_pub),
-            spk_pub: ByteBuf::from(spk_pub),
-            old_spks,
-            hybrid_sig_priv,
-            kyber_spk,
-        };
-
+        let payload = self.lifecycle.client.to_private_keys_cfe()?;
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
             .map_err(|e| e.to_string())
     }

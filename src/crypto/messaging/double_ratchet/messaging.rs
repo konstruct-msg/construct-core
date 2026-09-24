@@ -46,7 +46,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         tracing::info!(
             target: "crypto::double_ratchet",
             contact_id = %contact_id,
-            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
             session_id = %shared_session_id,
             "INITIATOR session_id derived"
         );
@@ -148,7 +148,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         tracing::info!(
             target: "crypto::double_ratchet",
-            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
             session_id = %shared_session_id,
             "RESPONDER session_id derived"
         );
@@ -337,7 +337,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             contact_id = %self.contact_id,
             session_id = %self.session_id,
             msg_num = %message_number,
-            dh_pub_prefix = %hex::encode(&dh_public_key[..4]),
+            dh_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&dh_public_key),
             ad_len = %associated_data.len(),
             "ENCRYPT AD built"
         );

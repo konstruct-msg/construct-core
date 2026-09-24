@@ -62,6 +62,7 @@
 use crate::crypto::SuiteID;
 use crate::crypto::handshake::{InitiatorState, KeyAgreement};
 use crate::crypto::keys::build_prologue;
+use crate::crypto::log_fingerprint::{public_prefix, secret_fingerprint};
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -337,18 +338,21 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
                 None
             };
 
+        let local_identity_public_prefix = P::from_private_key_to_public_key(local_identity)
+            .map(|k| public_prefix(k.as_ref()))
+            .unwrap_or_default();
         trace!(
             target: "crypto::x3dh",
-            key_prefix = %hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]),
-            "INITIATOR IK_A_priv"
+            key_prefix = %local_identity_public_prefix,
+            "INITIATOR IK_A_pub"
         );
         trace!(
             target: "crypto::x3dh",
-            key_prefix = %hex::encode(&remote_signed_prekey_public.as_ref()[..4.min(remote_signed_prekey_public.as_ref().len())]),
+            key_prefix = %public_prefix(remote_signed_prekey_public.as_ref()),
             "INITIATOR SPK_B_pub"
         );
         let ephemeral_public_prefix = P::from_private_key_to_public_key(&ephemeral_private)
-            .map(|k| hex::encode(&k.as_ref()[..4.min(k.as_ref().len())]))
+            .map(|k| public_prefix(k.as_ref()))
             .unwrap_or_default();
         trace!(
             target: "crypto::x3dh",
@@ -357,37 +361,25 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         );
         trace!(
             target: "crypto::x3dh",
-            key_prefix = %hex::encode(&remote_identity_public.as_ref()[..4.min(remote_identity_public.as_ref().len())]),
+            key_prefix = %public_prefix(remote_identity_public.as_ref()),
             "INITIATOR IK_B_pub"
         );
         trace!(
             target: "crypto::x3dh",
-            key_prefix = %hex::encode(&dh1[..4.min(dh1.len())]),
-            "INITIATOR DH1"
-        );
-        trace!(
-            target: "crypto::x3dh",
-            key_prefix = %hex::encode(&dh2[..4.min(dh2.len())]),
-            "INITIATOR DH2"
-        );
-        trace!(
-            target: "crypto::x3dh",
-            key_prefix = %hex::encode(&dh3[..4.min(dh3.len())]),
-            "INITIATOR DH3"
-        );
-        trace!(
-            target: "crypto::x3dh",
-            key_prefix = %dh4_opt
+            dh1_fp = %secret_fingerprint("x3dh-dh1", &dh1),
+            dh2_fp = %secret_fingerprint("x3dh-dh2", &dh2),
+            dh3_fp = %secret_fingerprint("x3dh-dh3", &dh3),
+            dh4_fp = %dh4_opt
                 .as_ref()
-                .map(|d| hex::encode(&d[..4.min(d.len())]))
+                .map(|d| secret_fingerprint("x3dh-dh4", d))
                 .unwrap_or_else(|| "NONE".to_string()),
             has_dh4 = dh4_opt.is_some(),
-            "INITIATOR DH4"
+            "INITIATOR DH1..DH4"
         );
         if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
             trace!(
                 target: "crypto::x3dh",
-                key_prefix = %hex::encode(&otpk_bytes[..4.min(otpk_bytes.len())]),
+                key_prefix = %public_prefix(otpk_bytes),
                 otpk_id = ?remote_bundle.one_time_prekey_id,
                 "INITIATOR OTPK_B_pub"
             );
@@ -425,12 +417,6 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         )
         .map_err(|e| format!("HKDF derivation failed: {}", e))?;
 
-        trace!(
-            target: "crypto::x3dh",
-            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
-            "INITIATOR root_key"
-        );
-
         debug!(
             target: "crypto::x3dh",
             root_key_len = %root_key.len(),
@@ -438,7 +424,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         );
         tracing::info!(
             target: "crypto::x3dh",
-            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            root_key_fp = %secret_fingerprint("root_key", &root_key),
             "INITIATOR X3DH root_key"
         );
 
@@ -492,46 +478,31 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
             None
         };
 
+        let local_spk_public_prefix = P::from_private_key_to_public_key(local_signed_prekey)
+            .map(|k| public_prefix(k.as_ref()))
+            .unwrap_or_default();
+        let local_identity_public_prefix = P::from_private_key_to_public_key(local_identity)
+            .map(|k| public_prefix(k.as_ref()))
+            .unwrap_or_default();
         tracing::info!(
             target: "crypto::x3dh",
-            spk_b_priv_prefix = %hex::encode(&local_signed_prekey.as_ref()[..4.min(local_signed_prekey.as_ref().len())]),
-            "[X3DH RESPONDER] SPK_B_priv[:4]"
+            spk_b_pub_prefix = %local_spk_public_prefix,
+            ik_b_pub_prefix = %local_identity_public_prefix,
+            ik_a_pub_prefix = %public_prefix(remote_identity.as_ref()),
+            ek_a_pub_prefix = %public_prefix(remote_ephemeral.as_ref()),
+            "[X3DH RESPONDER] keys"
         );
-        tracing::info!(
+        tracing::debug!(
             target: "crypto::x3dh",
-            ik_b_priv_prefix = %hex::encode(&local_identity.as_ref()[..4.min(local_identity.as_ref().len())]),
-            "[X3DH RESPONDER] IK_B_priv[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            ik_a_pub_prefix = %hex::encode(&remote_identity.as_ref()[..4.min(remote_identity.as_ref().len())]),
-            "[X3DH RESPONDER] IK_A_pub[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            ek_a_pub_prefix = %hex::encode(&remote_ephemeral.as_ref()[..4.min(remote_ephemeral.as_ref().len())]),
-            "[X3DH RESPONDER] EK_A_pub[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            dh1_prefix = %hex::encode(&dh1[..4.min(dh1.len())]),
-            "[X3DH RESPONDER] DH1[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            dh2_prefix = %hex::encode(&dh2[..4.min(dh2.len())]),
-            "[X3DH RESPONDER] DH2[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            dh3_prefix = %hex::encode(&dh3[..4.min(dh3.len())]),
-            "[X3DH RESPONDER] DH3[:4]"
-        );
-        tracing::info!(
-            target: "crypto::x3dh",
-            dh4_prefix = %dh4_opt.as_ref().map(|d| hex::encode(&d[..4.min(d.len())])).unwrap_or_else(|| "NONE".to_string()),
+            dh1_fp = %secret_fingerprint("x3dh-dh1", &dh1),
+            dh2_fp = %secret_fingerprint("x3dh-dh2", &dh2),
+            dh3_fp = %secret_fingerprint("x3dh-dh3", &dh3),
+            dh4_fp = %dh4_opt
+                .as_ref()
+                .map(|d| secret_fingerprint("x3dh-dh4", d))
+                .unwrap_or_else(|| "NONE".to_string()),
             has_dh4 = dh4_opt.is_some(),
-            "[X3DH RESPONDER] DH4[:4]"
+            "[X3DH RESPONDER] DH1..DH4"
         );
 
         debug!(
@@ -567,7 +538,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         );
         tracing::info!(
             target: "crypto::x3dh",
-            root_key_prefix = %hex::encode(&root_key[..8.min(root_key.len())]),
+            root_key_fp = %secret_fingerprint("root_key", &root_key),
             "RESPONDER X3DH root_key"
         );
 

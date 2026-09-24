@@ -565,7 +565,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             session_id = %id_prefix(&self.session_id),
             msg_num = %encrypted.message_number,
             ad_version = %ad_version,
-            dh_pub_prefix = %hex::encode(&encrypted.dh_public_key[..4.min(encrypted.dh_public_key.len())]),
+            dh_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&encrypted.dh_public_key),
             ad_len = %associated_data.len(),
             "DECRYPT AD built"
         );

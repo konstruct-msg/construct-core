@@ -5,7 +5,8 @@
 # В construct-server три деплоя подряд упали на `cargo fmt --all -- --check`
 # (2026-08-13): локально всё собиралось — `cargo check` не смотрит на
 # форматирование. Тот же риск здесь: Linux job `Lint + Tests` начинает с
-# fmt, потом двумя clippy (default + post-quantum) с `-D warnings`.
+# fmt и проверкой логов на ключевой материал, потом двумя clippy
+# (default + post-quantum) с `-D warnings`.
 #
 # Порядок совпадает с `.github/workflows/ci.yml` job `test`. Хук ценен
 # ровно настолько, насколько он повторяет то, что решает судьбу пуша.
@@ -25,6 +26,11 @@ printf '\n[pre-push] cargo fmt\n'
 if ! cargo fmt --all -- --check; then
     fail=1
     printf '\n  чинится одной командой: cargo fmt --all\n'
+fi
+
+printf '\n[pre-push] ключевой материал в логах\n'
+if ! .github/scripts/check-secret-logging.sh; then
+    fail=1
 fi
 
 # Clippy идёт последним и только если fmt прошёл: он самый долгий
