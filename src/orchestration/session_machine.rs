@@ -206,6 +206,15 @@ pub enum Phase {
         owed: bool,
         unacked: u32,
         peer_asked: bool,
+        /// Which session the debt condemns — the core's `session_id` of the ratchet that was
+        /// held when the teardown was owed, set by `condemn`, meaningful only while `owed`.
+        ///
+        /// Lives here and not in a map beside the machine because it is part of the debt: it is
+        /// born with it and dies with it. Without it the alarm could only ask "is there a
+        /// session?", and the broken ratchet the debt exists to tear down *is* a session — the
+        /// payout read it as one re-established in the meantime and dropped itself (device logs
+        /// 2026-09-24).
+        condemned: Option<String>,
     },
 }
 
@@ -343,12 +352,13 @@ pub enum Effect {
 ///
 /// A struct rather than a tuple since it grew a fourth field: `(u64, bool, u32, bool)` at a call
 /// site says nothing, and the two bools are one typo apart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TearDownRecord {
     since_ms: u64,
     owed: bool,
     unacked: u32,
     peer_asked: bool,
+    condemned: Option<String>,
 }
 
 /// One phase per device, and the transitions between them.
@@ -400,6 +410,7 @@ impl SessionMachine {
                 owed,
                 unacked,
                 peer_asked,
+                condemned,
             }) if now.saturating_sub(*since_ms)
                 < if *peer_asked {
                     PEER_TEARDOWN_QUIET_MS
@@ -412,6 +423,7 @@ impl SessionMachine {
                     owed: *owed,
                     unacked: *unacked,
                     peer_asked: *peer_asked,
+                    condemned: condemned.clone(),
                 }
             }
             // An expired `Opening` or a `TearingDown` whose window has passed is `Absent` as far
@@ -434,6 +446,7 @@ impl SessionMachine {
                 owed,
                 unacked,
                 peer_asked,
+                condemned,
             }) => {
                 let forgotten = now.saturating_sub(*since_ms) >= UNACKED_BUDGET_TTL_MS;
                 Some(TearDownRecord {
@@ -441,6 +454,7 @@ impl SessionMachine {
                     owed: *owed,
                     unacked: if forgotten { 0 } else { *unacked },
                     peer_asked: *peer_asked,
+                    condemned: condemned.clone(),
                 })
             }
             _ => None,
@@ -501,6 +515,7 @@ impl SessionMachine {
                                 owed: false,
                                 unacked: u32::from(evidence),
                                 peer_asked: false,
+                                condemned: None,
                             },
                         );
                         return Effect::TearDown;
@@ -535,6 +550,7 @@ impl SessionMachine {
                             // Ours now: we are the side that sent, so a later suppression is a
                             // debt again.
                             peer_asked: false,
+                            condemned: None,
                         },
                     );
                     return Effect::TearDown;
@@ -546,6 +562,8 @@ impl SessionMachine {
                         owed: true,
                         unacked: record.unacked,
                         peer_asked: record.peer_asked,
+                        // Until `condemn` names the session this ask was about.
+                        condemned: record.condemned,
                     },
                 );
                 Effect::DeferTearDown {
@@ -585,6 +603,7 @@ impl SessionMachine {
                         owed: false,
                         unacked,
                         peer_asked: true,
+                        condemned: None,
                     },
                 );
                 Effect::Nothing
@@ -602,8 +621,10 @@ impl SessionMachine {
                     // not spend the teardown budget — nothing was sent to the peer. Nor does it
                     // claim the phase for us: a heal is local, so it does not make a peer-asked
                     // quiet into our own window.
-                    let (owed, unacked, peer_asked) =
-                        record.map_or((false, 0, false), |r| (r.owed, r.unacked, r.peer_asked));
+                    let (owed, unacked, peer_asked, condemned) = record
+                        .map_or((false, 0, false, None), |r| {
+                            (r.owed, r.unacked, r.peer_asked, r.condemned)
+                        });
                     self.phases.insert(
                         device_id.to_string(),
                         Phase::TearingDown {
@@ -611,6 +632,7 @@ impl SessionMachine {
                             owed,
                             unacked,
                             peer_asked,
+                            condemned,
                         },
                     );
                     Effect::Heal
@@ -683,6 +705,7 @@ impl SessionMachine {
                             owed: false,
                             unacked: record.unacked,
                             peer_asked: false,
+                            condemned: None,
                         },
                     );
                     Effect::TearDown
@@ -766,6 +789,32 @@ impl SessionMachine {
                 ..
             }
         )
+    }
+
+    /// Name the session an owed teardown condemns. Called by the orchestrator right after a
+    /// deferral, because the machine holds no sessions and the orchestrator does; a no-op unless
+    /// a debt is owed, since a condemned session with no debt against it means nothing.
+    pub fn condemn(&mut self, device_id: &str, session: Option<String>) {
+        if let Some(Phase::TearingDown {
+            owed: true,
+            condemned,
+            ..
+        }) = self.phases.get_mut(device_id)
+        {
+            *condemned = session;
+        }
+    }
+
+    /// The session an owed teardown condemns, if one is owed and it was named.
+    pub fn condemned(&self, device_id: &str) -> Option<String> {
+        match self.phases.get(device_id) {
+            Some(Phase::TearingDown {
+                owed: true,
+                condemned,
+                ..
+            }) => condemned.clone(),
+            _ => None,
+        }
     }
 
     /// Whether a teardown is owed to this device — the debt the cooldown deferred.

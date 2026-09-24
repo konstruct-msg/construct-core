@@ -153,6 +153,12 @@ impl SessionLifecycleManager {
         self.client.has_session(contact_id)
     }
 
+    /// Which session is active for `contact_id` — `None` when there is none. Two answers that
+    /// differ name two different ratchets, which `has_active_session` cannot tell apart.
+    pub fn active_session_id(&self, contact_id: &str) -> Option<String> {
+        self.client.get_session_id(contact_id)
+    }
+
     pub fn has_archive(&self, contact_id: &str) -> bool {
         self.archives.contains_key(contact_id)
     }

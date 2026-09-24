@@ -124,6 +124,9 @@ pub enum RoutingDecision {
         /// looking exactly like an init. The content type is the only thing that tells them
         /// apart, and it is the fact the confirm gate needs — see `Action::HeldPendingAck`.
         is_handshake: bool,
+        /// Why the decrypt refused, as the ratchet said it. Carried so the platform log can say
+        /// it — see `Orchestrator::decision_to_actions`.
+        reason: String,
     },
     /// Session is irrecoverably broken — send END_SESSION.
     EndSessionNeeded { contact_id: String, reason: String },
@@ -401,7 +404,7 @@ impl MessageRouter {
                         return RoutingDecision::EndSessionNeeded {
                             contact_id: msg.contact_id.clone(),
                             reason: format!(
-                                "incoming heal throttled for {} — possible heal exhaustion attack",
+                                "incoming heal throttled for {} — possible heal exhaustion attack; decrypt: {e}",
                                 &msg.contact_id
                             ),
                         };
@@ -418,6 +421,7 @@ impl MessageRouter {
                             msg.content_type,
                             CT_SESSION_RESET | CT_SESSION_RESET_INIT
                         ),
+                        reason: e,
                     }
                 } else {
                     RoutingDecision::EndSessionNeeded {

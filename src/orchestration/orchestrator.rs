@@ -199,16 +199,19 @@ impl Orchestrator {
             .sessions
             .handle(&contact_id, SessionEvent::WantToTearDown { cause })
         {
-            SessionEffect::DeferTearDown { retry_after_ms } => vec![
-                Action::EndSessionSuppressed {
-                    contact_id: contact_id.clone(),
-                    retry_after_ms,
-                },
-                Action::ScheduleTimer {
-                    timer_id: format!("cooldown_expired:{contact_id}"),
-                    delay_ms: retry_after_ms,
-                },
-            ],
+            SessionEffect::DeferTearDown { retry_after_ms } => {
+                self.condemn_active_session(&contact_id);
+                vec![
+                    Action::EndSessionSuppressed {
+                        contact_id: contact_id.clone(),
+                        retry_after_ms,
+                    },
+                    Action::ScheduleTimer {
+                        timer_id: format!("cooldown_expired:{contact_id}"),
+                        delay_ms: retry_after_ms,
+                    },
+                ]
+            }
             // No timer: nothing is owed. The peer tore this ratchet down and knows it is gone,
             // so the ask is answered rather than postponed — arming a retry here would be the
             // 20 s grace's opposite, a guaranteed teardown back at a peer that already reset.
@@ -1652,6 +1655,8 @@ impl Orchestrator {
                 // a third that was not holding anything.
                 // The machine decides whether the window's debt is paid; `Timeout` is the one
                 // alarm it asks for, and this is where the client's clock wakes it.
+                // Read before `Timeout`: paying the debt starts a fresh window, which carries none.
+                let condemned = self.sessions.condemned(&contact_id);
                 if self.sessions.handle(&contact_id, SessionEvent::Timeout)
                     == SessionEffect::TearDown
                 {
@@ -1660,14 +1665,16 @@ impl Orchestrator {
                     // crossing-teardown defect, and it is exactly what an unconditional
                     // re-send would cause here.
                     //
-                    // NOT COVERED: this belt itself. `handle_session_init_completed` cancels the
-                    // debt on the path iOS actually takes, and that *is* tested
-                    // (`test_owed_end_session_is_void_once_the_session_is_re_established`); this
-                    // check catches a session that appeared without that event, and reaching it
-                    // from a test needs a real established session in the harness. On device it
-                    // is the log line below — if a teardown ever surprises a healthy session,
-                    // its absence is what to look for.
-                    if self.lifecycle.has_active_session(&contact_id) {
+                    // "Came back" is a *different* session, not any session. Until 2026-09-24
+                    // this asked `has_active_session`, and the debt is almost always owed against
+                    // a session that is still held — a diverged ratchet stays in place until the
+                    // END_SESSION that condemns it goes out, which is the thing being owed. So
+                    // the check dropped exactly the debts it was meant to pay (device logs: two
+                    // phones, one divergence, no teardown for an hour). A debt with no session
+                    // named — a restart dropped it, or none was held — keeps the old answer:
+                    // any session now present is treated as new.
+                    let current = self.lifecycle.active_session_id(&contact_id);
+                    if current.is_some() && current != condemned {
                         tracing::info!(
                             target: "orchestration",
                             contact_id = %contact_id,
@@ -1806,12 +1813,16 @@ impl Orchestrator {
                 // in full — and the field is destructured rather than ignored so a future
                 // heartbeat carrying something else has to come back through here.
                 is_handshake: false,
+                reason,
             } => {
                 // Decrypt failed on heartbeat msgNum=0 — proactively trigger heal.
                 if self.sessions.awaits_acknowledgement(&cid) {
-                    return vec![Action::HeldPendingAck { contact_id: cid }];
+                    return vec![
+                        Action::HeldPendingAck { contact_id: cid },
+                        decrypt_failed(reason),
+                    ];
                 }
-                match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
+                let mut actions = match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
                     SessionEffect::DeferHeal { retry_after_ms } => vec![Action::HealSuppressed {
                         contact_id: cid,
                         retry_after_ms,
@@ -1820,7 +1831,9 @@ impl Orchestrator {
                         contact_id: cid,
                         role: role.as_wire().to_string(),
                     }],
-                }
+                };
+                actions.push(decrypt_failed(reason));
+                actions
             }
             other => self.decision_to_actions(other, &contact_id),
         }
@@ -1828,7 +1841,35 @@ impl Orchestrator {
 
     // ── Decision → Actions ────────────────────────────────────────────────────
 
-    fn decision_to_actions(&mut self, decision: RoutingDecision, _contact_id: &str) -> Vec<Action> {
+    /// Name the ratchet a just-deferred teardown condemns, so the alarm that pays it can tell it
+    /// from one established in the meantime.
+    fn condemn_active_session(&mut self, contact_id: &str) {
+        let session = self.lifecycle.active_session_id(contact_id);
+        self.sessions.condemn(contact_id, session);
+    }
+
+    /// Every decision a refused decrypt produced also says *why* it was refused.
+    ///
+    /// The decision itself is heal / tear down / hold, and it is the same for every cause; the
+    /// cause is what a divergence is diagnosed from. Until 2026-09-24 it was dropped here
+    /// (`reason: _`) and on the heal path never left the router at all, so a device log could
+    /// show two phones answering every message with END_SESSION and not one word on what the
+    /// ratchet had objected to. The platform bridge's `log_event` is not wired on iOS, so an
+    /// action is the only channel that reaches the log.
+    fn decision_to_actions(&mut self, decision: RoutingDecision, contact_id: &str) -> Vec<Action> {
+        let refused = match &decision {
+            RoutingDecision::SessionHealNeeded { reason, .. }
+            | RoutingDecision::EndSessionNeeded { reason, .. } => Some(reason.clone()),
+            _ => None,
+        };
+        let mut actions = self.decide_actions(decision, contact_id);
+        if let Some(reason) = refused {
+            actions.push(decrypt_failed(reason));
+        }
+        actions
+    }
+
+    fn decide_actions(&mut self, decision: RoutingDecision, _contact_id: &str) -> Vec<Action> {
         match decision {
             RoutingDecision::Decrypted {
                 plaintext,
@@ -1911,6 +1952,8 @@ impl Orchestrator {
                 contact_id: cid,
                 role,
                 is_handshake,
+                // Reported by `decision_to_actions`, which wraps this for every refusal.
+                reason: _,
             } => {
                 // Our own announcement to this device is still unanswered, so this failure is
                 // our re-init's own consequence. Healing on it archives the session we built in
@@ -1953,6 +1996,7 @@ impl Orchestrator {
             }
             RoutingDecision::EndSessionNeeded {
                 contact_id: cid,
+                // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
             } => {
                 // The same hold as the heal above, and there is no exemption to make here: a
@@ -1982,6 +2026,7 @@ impl Orchestrator {
                         // silently: build 585 lost three media messages inside one five-second
                         // window. The debt is a flag, so every suppression in the window folds
                         // into the single teardown the timer pays.
+                        self.condemn_active_session(&cid);
                         vec![
                             Action::EndSessionSuppressed {
                                 contact_id: cid.clone(),
@@ -2068,6 +2113,16 @@ fn preview(plaintext: &[u8]) -> String {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// `NotifyError` code for a decrypt the ratchet refused. The message is the ratchet's own error.
+pub const DECRYPT_FAILED: &str = "decrypt_failed";
+
+fn decrypt_failed(reason: String) -> Action {
+    Action::NotifyError {
+        code: DECRYPT_FAILED.to_string(),
+        message: reason,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2415,6 +2470,7 @@ mod tests {
             contact_id: cid.to_string(),
             role: crate::orchestration::message_router::Role::Responder,
             is_handshake,
+            reason: "AEAD decryption failed".to_string(),
         }
     }
 
@@ -3270,5 +3326,168 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SendEndSession { .. }))
         );
+    }
+
+    // ── The owed teardown names the session it condemns (2026-09-24) ─────────
+
+    /// Give `o` an initiator session with a fresh peer device, the way `init_session` leaves one.
+    fn hold_session_with_new_peer(o: &mut Orchestrator) -> String {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+        use crate::device_id::derive_device_id;
+
+        let peer = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let bundle = peer.get_registration_bundle().unwrap();
+        let identity = peer.key_manager().identity_public_key().unwrap().clone();
+        let device = derive_device_id(&bundle.identity_public);
+        let x3dh = X3DHPublicKeyBundle {
+            identity_public: bundle.identity_public.clone(),
+            signed_prekey_public: bundle.signed_prekey_public.clone(),
+            signature: bundle.signature.clone(),
+            verifying_key: bundle.verifying_key.clone(),
+            suite_id: bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
+        };
+        o.lifecycle
+            .client
+            .init_session(&device, &x3dh, &identity, 0)
+            .unwrap();
+        device
+    }
+
+    fn pays_teardown(actions: &[Action], device: &str) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == device))
+    }
+
+    /// The device logs of 2026-09-24: a diverged ratchet stays held until the END_SESSION that
+    /// condemns it goes out, so the debt is owed against a session that is still there — and the
+    /// payout, asking only "is there a session?", read it as re-established and dropped itself.
+    ///
+    /// Mutation: restore `has_active_session` as the payout's check — this reddens.
+    #[test]
+    fn an_owed_teardown_against_the_session_still_held_is_paid() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        let device = hold_session_with_new_peer(&mut o);
+
+        let granted = o.decision_to_actions(end_session_needed(&device), "");
+        assert!(
+            pays_teardown(&granted, &device),
+            "the first teardown goes out"
+        );
+        let deferred = o.decision_to_actions(end_session_needed(&device), "");
+        assert!(o.sessions.owes_teardown(&device), "the second is owed");
+        assert!(!pays_teardown(&deferred, &device));
+        assert!(
+            o.lifecycle.has_active_session(&device),
+            "the premise: still held"
+        );
+
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
+        let paid = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: format!("cooldown_expired:{device}"),
+        });
+        assert!(
+            pays_teardown(&paid, &device),
+            "the debt was owed against the session that is still held, and was dropped"
+        );
+    }
+
+    /// The case the check exists for, kept: a session established during the cooldown is a
+    /// different ratchet, and tearing it down is the crossing-teardown defect.
+    ///
+    /// Mutation: pay whenever a debt is owed, ignoring the session — this reddens.
+    #[test]
+    fn an_owed_teardown_is_void_once_a_different_session_holds_the_device() {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        let device = hold_session_with_new_peer(&mut o);
+
+        let _ = o.decision_to_actions(end_session_needed(&device), "");
+        let _ = o.decision_to_actions(end_session_needed(&device), "");
+        let condemned = o.lifecycle.active_session_id(&device);
+        assert!(condemned.is_some());
+
+        // A new ratchet with the same device, arrived without the event that cancels the debt.
+        o.lifecycle.client.remove_session(&device);
+        let replaced = hold_session_with_new_peer_as(&mut o, &device);
+        assert!(replaced);
+        assert_ne!(
+            o.lifecycle.active_session_id(&device),
+            condemned,
+            "the premise: a new session"
+        );
+
+        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
+        let paid = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: format!("cooldown_expired:{device}"),
+        });
+        assert!(
+            !pays_teardown(&paid, &device),
+            "a session established during the cooldown was torn down by a debt owed to its predecessor"
+        );
+    }
+
+    /// Re-open a session under an existing device id, as a crossing re-init would.
+    fn hold_session_with_new_peer_as(o: &mut Orchestrator, device: &str) -> bool {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+
+        let peer = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let bundle = peer.get_registration_bundle().unwrap();
+        let identity = peer.key_manager().identity_public_key().unwrap().clone();
+        let x3dh = X3DHPublicKeyBundle {
+            identity_public: bundle.identity_public.clone(),
+            signed_prekey_public: bundle.signed_prekey_public.clone(),
+            signature: bundle.signature.clone(),
+            verifying_key: bundle.verifying_key.clone(),
+            suite_id: bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+            supports_pq_ratchet: false,
+        };
+        o.lifecycle
+            .client
+            .init_session(device, &x3dh, &identity, 0)
+            .is_ok()
+    }
+
+    /// A refused decrypt says why, on both paths the refusal takes. The cause was dropped here
+    /// (`reason: _`) and never left the router on the heal path, so a device log showed every
+    /// message answered with END_SESSION and nothing on what the ratchet objected to.
+    ///
+    /// Mutation: drop the `NotifyError` push in `decision_to_actions` — this reddens.
+    #[test]
+    fn a_refused_decrypt_reports_its_cause_on_both_paths() {
+        let mut o = make_orchestrator("alice");
+        for (path, actions) in [
+            (
+                "tear down",
+                o.decision_to_actions(end_session_needed("bob"), ""),
+            ),
+            (
+                "heal",
+                o.decision_to_actions(heal_needed("carol", false), ""),
+            ),
+        ] {
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::NotifyError { code, message }
+                        if code == DECRYPT_FAILED && message == "AEAD decryption failed"
+                )),
+                "the {path} path lost the ratchet's reason: {actions:?}"
+            );
+        }
     }
 }
