@@ -278,7 +278,7 @@ pub struct OtpkPair {
 }
 
 /// Full OTPK record for persistence (includes private key for Keychain storage)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OtpkRecord {
     pub key_id: u32,
     pub private_key: Vec<u8>, // Base64-encoded private key bytes
@@ -296,7 +296,7 @@ pub struct KyberSpkRecord {
 }
 
 // Private keys for persistence (exported via UDL)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PrivateKeysJson {
     pub identity_secret: String,      // Base64
     pub signing_secret: String,       // Base64
@@ -315,7 +315,7 @@ pub struct PrivateKeysJson {
 
 // Invite crypto types (exported via UDL)
 // Note: These are UniFFI-compatible wrappers, actual crypto logic is in crypto::invite_crypto
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EphemeralKeyPair {
     pub secret_key: Vec<u8>, // 32 bytes
     pub public_key: Vec<u8>, // 32 bytes
@@ -327,13 +327,13 @@ pub struct InviteSignature {
 }
 
 // Post-quantum KEM types (exported via UDL)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLKEMKeyPair {
     pub public_key: Vec<u8>, // ML-KEM-768: 1184 bytes
     pub secret_key: Vec<u8>, // ML-KEM-768: 2400 bytes
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLKEMEncapsulation {
     pub ciphertext: Vec<u8>,    // ML-KEM-768: 1088 bytes
     pub shared_secret: Vec<u8>, // 32 bytes
@@ -916,7 +916,7 @@ impl ClassicCryptoCore {
             .into_iter()
             .map(|(id, priv_key, pub_key)| crate::cfe::CfeOtpkRecordV1 {
                 id,
-                priv_key: ByteBuf::from(priv_key),
+                priv_key: crate::crypto::SecretBytes::from(priv_key),
                 pub_key: ByteBuf::from(pub_key),
             })
             .collect();
@@ -939,7 +939,7 @@ impl ClassicCryptoCore {
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
             .iter()
-            .map(|r| (r.id, r.priv_key.to_vec(), r.pub_key.to_vec()))
+            .map(|r| (r.id, r.priv_key.expose().to_vec(), r.pub_key.to_vec()))
             .collect();
 
         let mut client = self
@@ -1090,7 +1090,7 @@ use crate::crypto::invite_crypto;
 pub fn generate_ephemeral_keypair() -> Result<EphemeralKeyPair, CryptoError> {
     let keypair = invite_crypto::generate_ephemeral_keypair()?;
     Ok(EphemeralKeyPair {
-        secret_key: keypair.secret_key,
+        secret_key: keypair.secret_key.into_vec(),
         public_key: keypair.public_key,
     })
 }
@@ -2502,7 +2502,7 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_keygen()
         .map(|kp| MLKEMKeyPair {
             public_key: kp.public_key,
-            secret_key: kp.secret_key,
+            secret_key: kp.secret_key.into_vec(),
         })
         .map_err(|_e| CryptoError::InitializationFailed)
 }
@@ -2522,7 +2522,7 @@ pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, C
     crate::crypto::pq_x3dh::mlkem768_encapsulate(&public_key)
         .map(|enc| MLKEMEncapsulation {
             ciphertext: enc.ciphertext,
-            shared_secret: enc.shared_secret,
+            shared_secret: enc.shared_secret.into_vec(),
         })
         .map_err(|e| CryptoError::EncryptionFailed { message: e })
 }
@@ -2543,6 +2543,7 @@ pub fn mlkem768_decapsulate(
     ciphertext: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
+        .map(crate::crypto::SecretBytes::into_vec)
         .map_err(|e| CryptoError::DecryptionFailed { message: e })
 }
 
@@ -2557,7 +2558,7 @@ pub fn mlkem768_decapsulate(
 // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────────
 
 /// ML-DSA-65 keypair exposed across the FFI boundary.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MLDSAKeyPair {
     /// Secret key: 32-byte signing seed (RustCrypto ml-dsa; expanded key re-derived on sign)
     pub secret_key: Vec<u8>,
@@ -2566,7 +2567,7 @@ pub struct MLDSAKeyPair {
 }
 
 /// Hybrid (Ed25519 + ML-DSA-65) signature keypair.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HybridSignatureKeyPair {
     /// Hybrid private key: 2016 bytes
     /// [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
@@ -4042,7 +4043,7 @@ impl CfeAction {
             SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
             SaveToSecureStore { slot, data } => Self::SaveToSecureStore {
                 slot: slot.into(),
-                data,
+                data: data.into_vec(),
             },
             PersistMessage { message_json } => Self::PersistMessage { message_json },
             PersistAck {

@@ -1,3 +1,4 @@
+use crate::crypto::SecretBytes;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
@@ -164,7 +165,7 @@ impl Default for CfeRegistrationBundleV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfeOldSpkV1 {
     #[serde(rename = "priv")]
-    pub spk_priv: ByteBuf,
+    pub spk_priv: SecretBytes,
     #[serde(rename = "sig")]
     pub spk_sig: ByteBuf,
     #[serde(rename = "id")]
@@ -185,7 +186,7 @@ pub struct CfeKyberSpkV1 {
     #[serde(rename = "id")]
     pub key_id: u32,
     #[serde(rename = "priv")]
-    pub kyber_priv: ByteBuf,
+    pub kyber_priv: SecretBytes,
     #[serde(rename = "pub")]
     pub kyber_pub: ByteBuf,
 }
@@ -196,11 +197,11 @@ pub struct CfePrivateKeysV1 {
     pub suite_id: u8,
 
     #[serde(rename = "ik_priv")]
-    pub ik_priv: ByteBuf,
+    pub ik_priv: SecretBytes,
     #[serde(rename = "sk_priv")]
-    pub sk_priv: ByteBuf,
+    pub sk_priv: SecretBytes,
     #[serde(rename = "spk_priv")]
-    pub spk_priv: ByteBuf,
+    pub spk_priv: SecretBytes,
     #[serde(rename = "spk_sig")]
     pub spk_sig: ByteBuf,
 
@@ -224,7 +225,7 @@ pub struct CfePrivateKeysV1 {
     /// Owned by the core (persisted in CFE) for centralized crypto key management.
     /// Lazily created; absent for legacy pre-hybrid accounts until first ensure.
     #[serde(rename = "hs_priv", default, skip_serializing_if = "Option::is_none")]
-    pub hybrid_sig_priv: Option<ByteBuf>,
+    pub hybrid_sig_priv: Option<SecretBytes>,
 
     /// Optional ML-KEM-768 signed prekey, persisted atomically with the rest of the
     /// key-state. Absent until the platform commits one (post-upload confirmation).
@@ -239,7 +240,7 @@ pub struct CfeSkippedKeyEntryV1 {
     #[serde(rename = "n")]
     pub msg_number: u32,
     #[serde(rename = "k")]
-    pub key_bytes: ByteBuf,
+    pub key_bytes: SecretBytes,
     #[serde(rename = "ts")]
     pub timestamp: u64,
 }
@@ -252,8 +253,8 @@ pub struct CfeSkippedKeyEntryV1 {
 pub struct CfeSessionJsonWrapperV1 {
     #[serde(rename = "cid")]
     pub contact_id: String,
-    #[serde(rename = "json", with = "serde_bytes")]
-    pub json_bytes: ByteBuf,
+    #[serde(rename = "json")]
+    pub json_bytes: SecretBytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,11 +276,11 @@ pub struct CfeSessionStateV1 {
     pub session_id: ByteBuf,
 
     #[serde(rename = "rk")]
-    pub rk: ByteBuf,
+    pub rk: SecretBytes,
     #[serde(rename = "sck")]
-    pub sck: ByteBuf,
+    pub sck: SecretBytes,
     #[serde(rename = "rck")]
-    pub rck: ByteBuf,
+    pub rck: SecretBytes,
 
     #[serde(rename = "scl")]
     pub scl: u32,
@@ -290,7 +291,7 @@ pub struct CfeSessionStateV1 {
 
     #[serde(rename = "dh_priv")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dh_priv: Option<ByteBuf>,
+    pub dh_priv: Option<SecretBytes>,
 
     #[serde(rename = "dh_pub")]
     pub dh_pub: ByteBuf,
@@ -309,7 +310,7 @@ pub struct CfeSessionStateV1 {
 
     #[serde(rename = "pq_rk1")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_rk1: Option<ByteBuf>,
+    pub pq_rk1: Option<SecretBytes>,
 
     /// Unix timestamp of the last DH ratchet step (zero = unknown / legacy session).
     #[serde(rename = "lra")]
@@ -339,17 +340,11 @@ pub struct CfePqEpochSecretV1 {
     #[serde(rename = "e")]
     pub epoch: u32,
     #[serde(rename = "ss")]
-    pub secret: ByteBuf,
-}
-
-impl Drop for CfePqEpochSecretV1 {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut *self.secret);
-    }
+    pub secret: SecretBytes,
 }
 
 /// Initiator-side in-flight PQ exchange: fresh ML-KEM-768 keypair proposing
-/// `epoch`. Secret key is zeroized on drop.
+/// `epoch`. The secret key is `SecretBytes`: zeroized on drop, redacted in `Debug`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfePqPendingExchangeV1 {
     #[serde(rename = "e")]
@@ -357,19 +352,13 @@ pub struct CfePqPendingExchangeV1 {
     #[serde(rename = "pk")]
     pub public: ByteBuf,
     #[serde(rename = "sk")]
-    pub secret: ByteBuf,
-}
-
-impl Drop for CfePqPendingExchangeV1 {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut *self.secret);
-    }
+    pub secret: SecretBytes,
 }
 
 /// Responder-side pending PQ ciphertext plus the *provisional* epoch secret.
 /// This may be the only copy of an epoch the initiator already activated —
 /// losing it on restore would make that epoch permanently undecryptable,
-/// which is why it must be persisted. Secret is zeroized on drop.
+/// which is why it must be persisted. The secret is `SecretBytes`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfePqPendingCiphertextV1 {
     #[serde(rename = "e")]
@@ -380,13 +369,7 @@ pub struct CfePqPendingCiphertextV1 {
     #[serde(rename = "c")]
     pub ciphertext: ByteBuf,
     #[serde(rename = "ss")]
-    pub secret: ByteBuf,
-}
-
-impl Drop for CfePqPendingCiphertextV1 {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut *self.secret);
-    }
+    pub secret: SecretBytes,
 }
 
 /// Complete sparse-PQ-ratchet sub-state for a suite-3 session — everything a
@@ -425,7 +408,7 @@ pub struct CfeOtpkRecordV1 {
     #[serde(rename = "id")]
     pub id: u32,
     #[serde(rename = "priv")]
-    pub priv_key: ByteBuf,
+    pub priv_key: SecretBytes,
     #[serde(rename = "pub")]
     pub pub_key: ByteBuf,
 }
@@ -454,8 +437,8 @@ pub struct CfeKyberDeferredEntryV1 {
     #[serde(rename = "id")]
     pub otpk_id: u32,
     /// 32-byte ML-KEM-768 shared secret, pending `apply_pq_contribution`.
-    #[serde(rename = "ss", with = "serde_bytes")]
-    pub shared_secret: ByteBuf,
+    #[serde(rename = "ss")]
+    pub shared_secret: SecretBytes,
     /// INITIATOR only: the ML-KEM ciphertext that must travel in the first message with
     /// this shared secret. The two are one contribution — the sender mixes `ss` into its
     /// root key when it packs message 0, and the responder can only derive the same root
@@ -498,7 +481,7 @@ pub struct CfeMlsStoreEntryV1 {
     #[serde(rename = "k")]
     pub key: ByteBuf,
     #[serde(rename = "v")]
-    pub value: ByteBuf,
+    pub value: SecretBytes,
 }
 
 /// Device-level OpenMLS storage snapshot: ALL group states, ratchet secrets

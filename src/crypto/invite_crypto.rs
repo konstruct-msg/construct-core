@@ -19,8 +19,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// Used once then discarded after invite is accepted
 #[derive(Debug, Clone)]
 pub struct EphemeralKeyPair {
-    pub secret_key: Vec<u8>, // 32 bytes
-    pub public_key: Vec<u8>, // 32 bytes
+    pub secret_key: crate::crypto::SecretBytes, // 32 bytes
+    pub public_key: Vec<u8>,                    // 32 bytes
 }
 
 /// Ed25519 signature for invite verification
@@ -42,7 +42,7 @@ pub fn generate_ephemeral_keypair() -> Result<EphemeralKeyPair, CryptoError> {
     let public = PublicKey::from(&secret);
 
     Ok(EphemeralKeyPair {
-        secret_key: secret.to_bytes().to_vec(),
+        secret_key: crate::crypto::SecretBytes::from_slice(&secret.to_bytes()),
         public_key: public.to_bytes().to_vec(),
     })
 }

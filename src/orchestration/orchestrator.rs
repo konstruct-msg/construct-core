@@ -950,7 +950,7 @@ impl Orchestrator {
             .into_iter()
             .map(|(id, priv_key, pub_key)| crate::cfe::CfeOtpkRecordV1 {
                 id,
-                priv_key: ByteBuf::from(priv_key),
+                priv_key: crate::crypto::SecretBytes::from(priv_key),
                 pub_key: ByteBuf::from(pub_key),
             })
             .collect();
@@ -972,7 +972,7 @@ impl Orchestrator {
         let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = bundle
             .records
             .iter()
-            .map(|r| (r.id, r.priv_key.to_vec(), r.pub_key.to_vec()))
+            .map(|r| (r.id, r.priv_key.expose().to_vec(), r.pub_key.to_vec()))
             .collect();
 
         self.lifecycle.client.import_one_time_prekeys(keys);
@@ -1361,7 +1361,7 @@ impl Orchestrator {
                 && let Err(e) = self
                     .lifecycle
                     .client
-                    .apply_pq_contribution_to_session(&contact_id, &shared_secret)
+                    .apply_pq_contribution_to_session(&contact_id, shared_secret.expose())
             {
                 return vec![Action::NotifyError {
                     code: "OUTGOING_MESSAGE_PQXDH_APPLY_FAILED".to_string(),
@@ -1429,7 +1429,7 @@ impl Orchestrator {
                 slot: SecureStoreSlot::Session {
                     contact_id: contact_id.clone(),
                 },
-                data: session_bytes,
+                data: session_bytes.into(),
             });
         }
         actions.push(Action::SendEncryptedMessage {
@@ -1460,7 +1460,7 @@ impl Orchestrator {
                         slot: SecureStoreSlot::Session {
                             contact_id: contact_id.clone(),
                         },
-                        data: session_bytes,
+                        data: session_bytes.into(),
                     });
                 }
                 actions.push(Action::SendEncryptedMessage {
@@ -1524,7 +1524,7 @@ impl Orchestrator {
                 slot: SecureStoreSlot::Session {
                     contact_id: contact_id.clone(),
                 },
-                data: bytes,
+                data: bytes.into(),
             });
         }
 
@@ -2054,7 +2054,7 @@ impl Orchestrator {
             .ok()
             .map(|cfe| Action::SaveToSecureStore {
                 slot: SecureStoreSlot::OrchestratorState,
-                data: cfe,
+                data: cfe.into(),
             })
     }
 }

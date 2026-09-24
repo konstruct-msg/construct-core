@@ -266,7 +266,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             epoch: self.current_pq_epoch.saturating_add(1),
             keypair: PqRatchetKeyPair {
                 public: keypair.public_key,
-                secret: keypair.secret_key,
+                secret: keypair.secret_key.into_vec(),
             },
         });
         self.pq_pending_since = unix_now();
@@ -347,7 +347,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                             epoch: *epoch,
                             ek_hash: incoming_hash,
                             ciphertext: enc.ciphertext,
-                            secret: enc.shared_secret,
+                            secret: enc.shared_secret.into_vec(),
                         });
                     }
                     Err(e) => {
@@ -372,7 +372,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         let mut ex = self.pending_pq_exchange.take().expect("checked above");
                         ex.zeroize();
                         self.current_pq_epoch = *epoch;
-                        self.insert_pq_epoch_secret(*epoch, shared_secret);
+                        self.insert_pq_epoch_secret(*epoch, shared_secret.into_vec());
                         self.pq_pending_since = 0;
                     }
                     Err(e) => {

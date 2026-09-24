@@ -101,6 +101,10 @@ pub mod keys;
 /// Log-safe fingerprints of secrets: equal-or-not, never the bytes
 pub(crate) mod log_fingerprint;
 
+/// Secret bytes: zeroed on drop, redacted in `Debug`, serde-identical to `ByteBuf`
+pub mod secret_bytes;
+pub use secret_bytes::SecretBytes;
+
 pub mod master_key;
 
 /// Invite crypto - dynamic contact invites with ephemeral keys

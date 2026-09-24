@@ -312,7 +312,7 @@ impl MlsStore {
             .iter()
             .map(|(k, v)| CfeMlsStoreEntryV1 {
                 key: ByteBuf::from(k.clone()),
-                value: ByteBuf::from(v.clone()),
+                value: crate::crypto::SecretBytes::from(v.clone()),
             })
             .collect();
         entries.sort_by(|a, b| a.key.cmp(&b.key));

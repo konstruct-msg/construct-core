@@ -220,7 +220,7 @@ impl SessionLifecycleManager {
             slot: SecureStoreSlot::Session {
                 contact_id: contact_id.to_string(),
             },
-            data: session_bytes,
+            data: session_bytes.into(),
         }];
 
         Ok(EncryptResult {
@@ -255,7 +255,7 @@ impl SessionLifecycleManager {
             slot: SecureStoreSlot::Session {
                 contact_id: contact_id.to_string(),
             },
-            data: session_bytes,
+            data: session_bytes.into(),
         }];
 
         Ok(DecryptResult { plaintext, actions })
@@ -307,7 +307,7 @@ impl SessionLifecycleManager {
             slot: SecureStoreSlot::Session {
                 contact_id: contact_id.to_string(),
             },
-            data: session_bytes,
+            data: session_bytes.into(),
         }];
 
         Ok(DecryptResult { plaintext, actions })
@@ -373,7 +373,7 @@ impl SessionLifecycleManager {
                 slot: SecureStoreSlot::SessionArchive {
                     contact_id: contact_id.to_string(),
                 },
-                data: vec![], // empty = delete sentinel
+                data: vec![].into(), // empty = delete sentinel
             });
         }
         actions
@@ -421,7 +421,7 @@ impl SessionLifecycleManager {
         // Phase 2: apply to in-memory DR state.
         if let Err(e) = self
             .client
-            .apply_pq_contribution_to_session(contact_id, &contribution.shared_secret)
+            .apply_pq_contribution_to_session(contact_id, contribution.shared_secret.expose())
         {
             return vec![Action::NotifyError {
                 code: "PQ_CONTRIBUTION_FAILED".to_string(),
@@ -449,7 +449,7 @@ impl SessionLifecycleManager {
         let cfe_export_action = match self.pq_manager.export_cfe() {
             Ok(cfe) => vec![Action::SaveToSecureStore {
                 slot: SecureStoreSlot::KyberSessionState,
-                data: cfe,
+                data: cfe.into(),
             }],
             Err(_) => vec![], // Non-fatal: CFE re-exported on next PQ state change.
         };
@@ -458,7 +458,7 @@ impl SessionLifecycleManager {
             slot: SecureStoreSlot::Session {
                 contact_id: contact_id.to_string(),
             },
-            data: session_bytes,
+            data: session_bytes.into(),
         }];
         actions.extend(delete_actions);
         actions.extend(cfe_export_action);
@@ -1055,13 +1055,12 @@ mod tests {
 
     #[test]
     fn test_import_session_bytes_handles_old_json_wrapper_format() {
-        use serde_bytes::ByteBuf;
         // Simulate data produced by the old export_session_cfe (JSON inside CFE wrapper).
         let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
         let json = alice.export_session_json_for(&bob_device_id).unwrap();
         let wrapper = crate::cfe::CfeSessionJsonWrapperV1 {
             contact_id: bob_device_id.clone(),
-            json_bytes: ByteBuf::from(json.into_bytes()),
+            json_bytes: crate::crypto::SecretBytes::from(json.into_bytes()),
         };
         let old_bytes =
             crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &wrapper).unwrap();
