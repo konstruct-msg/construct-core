@@ -601,4 +601,8 @@ pub struct CfeOrchestratorStateV1 {
     /// blobs written before 2026-09-24: nothing remembered, which is where every device starts.
     #[serde(rename = "skd", default, skip_serializing_if = "Vec::is_empty")]
     pub signed_kyber_devices: Vec<String>,
+    /// Devices that have advertised or used the sparse PQ ratchet (suite 3), sorted. Absent on
+    /// older blobs: nothing remembered.
+    #[serde(rename = "prd", default, skip_serializing_if = "Vec::is_empty")]
+    pub pq_ratchet_devices: Vec<String>,
 }

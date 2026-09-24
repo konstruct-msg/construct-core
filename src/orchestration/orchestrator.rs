@@ -434,8 +434,29 @@ impl Orchestrator {
         use crate::crypto::kyber_prekey_auth::PqAuthentication;
         use crate::orchestration::pq_prekey_plan::{
             ClassicReason, KyberPrekeyContext, KyberPrekeyDecision, KyberPrekeyOffer,
-            plan_kyber_prekey,
+            plan_kyber_prekey, plan_pq_ratchet_capability,
         };
+
+        // The sparse PQ ratchet's capability flag is as strippable as a Kyber signature;
+        // decided first for the same reason — a refusal leaves no session behind.
+        let pq_ratchet_advertised = public_bundle.supports_pq_ratchet;
+        if let Some(reason) = plan_pq_ratchet_capability(
+            crate::crypto::session_api::local_supports_pq_ratchet(),
+            pq_ratchet_advertised,
+            self.lifecycle.has_used_pq_ratchet(contact_id),
+        ) {
+            tracing::error!(
+                target: "crypto::security",
+                contact_id = %contact_id,
+                reason = ?reason,
+                "PQ downgrade refused: this device used the PQ ratchet before, and this bundle \
+                 does not advertise it"
+            );
+            return Err(format!(
+                "PQ_DOWNGRADE_REFUSED: {reason:?} — device {contact_id} used the PQ ratchet \
+                 before; the bundle does not advertise it"
+            ));
+        }
 
         // Decided before anything is created: a refusal must leave no session behind.
         let plan = plan_kyber_prekey(
@@ -509,6 +530,9 @@ impl Orchestrator {
         if presented_signed_spk {
             self.lifecycle.record_signed_kyber(contact_id);
         }
+        if pq_ratchet_advertised {
+            self.lifecycle.record_pq_ratchet(contact_id);
+        }
 
         // PQXDH: encapsulate to the planned Kyber key and defer applying the secret to the
         // first outgoing message.
@@ -573,6 +597,14 @@ impl Orchestrator {
         }
 
         Ok(contact_id.to_string())
+    }
+
+    /// A session a peer opened with the PQ ratchet proves that device has it: remember it, so a
+    /// later bundle of theirs that stops advertising it is refused rather than silently classic.
+    fn note_received_suite(&mut self, contact_id: &str, suite_id: u16) {
+        if suite_id == crate::crypto::SuiteID::PQ_RATCHET.as_u16() {
+            self.lifecycle.record_pq_ratchet(contact_id);
+        }
     }
 
     pub fn init_receiving_session_with_msg(
@@ -645,6 +677,7 @@ impl Orchestrator {
                 first_message.one_time_prekey_id,
             )
             .map_err(|e| e.to_string())?;
+        self.note_received_suite(contact_id, first_message.suite_id);
 
         Ok((contact_id.to_string(), plaintext))
     }
@@ -737,6 +770,7 @@ impl Orchestrator {
                 decoded.one_time_prekey_id,
             )
             .map_err(|e| e.to_string())?;
+        self.note_received_suite(contact_id, decoded.suite_id);
 
         Ok((contact_id.to_string(), plaintext))
     }
@@ -3755,6 +3789,89 @@ mod kyber_prekey_auth_tests {
         assert_eq!(label(&o, &device), PqAuthentication::Classic);
         assert!(!o.lifecycle.pq_manager.has_pending(&device));
         assert!(!o.lifecycle.has_presented_signed_kyber(&device));
+    }
+
+    fn advertising_pq_ratchet(peer: &Peer) -> X3DHPublicKeyBundle {
+        X3DHPublicKeyBundle {
+            supports_pq_ratchet: true,
+            ..peer.bundle()
+        }
+    }
+
+    /// The cheapest PQ downgrade: the server drops the unsigned `supports_pq_ratchet` flag and
+    /// the initiator quietly negotiates CLASSIC. Once a device has advertised the ratchet, a
+    /// bundle without it is refused, before any session exists.
+    ///
+    /// Mutation: skip the capability refusal — this reddens.
+    #[test]
+    fn a_withdrawn_pq_ratchet_capability_is_refused() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+
+        o.init_session_with_bundle(&device, advertising_pq_ratchet(&peer), peer.signed(), false)
+            .unwrap();
+        assert!(o.lifecycle.has_used_pq_ratchet(&device));
+        assert_eq!(
+            o.get_session_suite_id(&device),
+            crate::crypto::SuiteID::PQ_RATCHET.as_u16(),
+            "the premise: the ratchet was negotiated"
+        );
+
+        // Remembered across a restart.
+        let state = o.export_orchestrator_state_cfe().unwrap();
+        let mut o = orchestrator();
+        o.import_orchestrator_state_cfe(&state).unwrap();
+        assert!(o.lifecycle.has_used_pq_ratchet(&device));
+
+        let err = o
+            .init_session_with_bundle(&device, peer.bundle(), peer.signed(), false)
+            .unwrap_err();
+        assert!(
+            err.starts_with("PQ_DOWNGRADE_REFUSED: PqRatchetWithdrawn"),
+            "{err}"
+        );
+        assert!(
+            !o.has_active_session(&device),
+            "a refusal leaves no session"
+        );
+    }
+
+    /// A device we have never seen with the ratchet is not refused for lacking it.
+    #[test]
+    fn a_device_that_never_advertised_the_ratchet_opens_classic() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+        o.init_session_with_bundle(&device, peer.bundle(), peer.signed(), false)
+            .unwrap();
+        assert!(!o.lifecycle.has_used_pq_ratchet(&device));
+        assert_eq!(
+            o.get_session_suite_id(&device),
+            crate::crypto::SuiteID::CLASSIC.as_u16()
+        );
+    }
+
+    /// The responder learns the capability from the session itself: a suite-3 first message is
+    /// proof the device has the ratchet, and a later bundle without it is refused.
+    #[test]
+    fn a_received_suite_3_session_is_remembered() {
+        let mut o = orchestrator();
+        let peer = Peer::new();
+        let device = peer.device();
+
+        o.note_received_suite(&device, crate::crypto::SuiteID::CLASSIC.as_u16());
+        assert!(!o.lifecycle.has_used_pq_ratchet(&device));
+        o.note_received_suite(&device, crate::crypto::SuiteID::PQ_RATCHET.as_u16());
+        assert!(o.lifecycle.has_used_pq_ratchet(&device));
+
+        let err = o
+            .init_session_with_bundle(&device, peer.bundle(), peer.signed(), false)
+            .unwrap_err();
+        assert!(
+            err.starts_with("PQ_DOWNGRADE_REFUSED: PqRatchetWithdrawn"),
+            "{err}"
+        );
     }
 
     /// `is_pq_strengthened` used to be `pre_pq_root_key.is_none()`, which only the responder

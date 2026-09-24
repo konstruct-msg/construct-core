@@ -81,6 +81,29 @@ pub enum RefuseReason {
     SignedKyberWithdrawn,
     /// The device presented a signed Kyber SPK before; this bundle's signature is wrong.
     InvalidSignature,
+    /// The device advertised the sparse PQ ratchet (suite 3) before, or opened a suite-3
+    /// session with us; this bundle does not advertise it.
+    PqRatchetWithdrawn,
+}
+
+/// Whether an initiator may open a session with a device whose bundle does not advertise the
+/// sparse PQ ratchet (suite 3). `None`: go ahead, and negotiation picks what the bundle offers.
+///
+/// `supports_pq_ratchet` is a flag the server serves beside the bundle, unsigned. Dropping it is
+/// the cheapest downgrade there is: the initiator negotiates `CLASSIC`, nothing fails, and the
+/// session simply never gets its PQ ratchet. A device that has advertised the ratchet — or used
+/// it with us — and now arrives without it is the same strip as a missing Kyber signature, and
+/// is refused the same way.
+///
+/// A build without the ratchet (`local_pq_ratchet_available == false`) refuses nothing: it
+/// would negotiate `CLASSIC` with every peer anyway.
+pub fn plan_pq_ratchet_capability(
+    local_pq_ratchet_available: bool,
+    advertised: bool,
+    advertised_before: bool,
+) -> Option<RefuseReason> {
+    (local_pq_ratchet_available && advertised_before && !advertised)
+        .then_some(RefuseReason::PqRatchetWithdrawn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +421,27 @@ mod tests {
                 reason: ClassicReason::NoKyberKey
             }
         );
+    }
+
+    /// Only a device known to have the PQ ratchet, arriving without it, is refused — and only
+    /// by a build that has the ratchet itself.
+    #[test]
+    fn pq_ratchet_capability_rows() {
+        // (local, advertised, before) -> refused?
+        let rows = [
+            ((true, true, true), false),
+            ((true, true, false), false),
+            ((true, false, false), false),
+            ((true, false, true), true),
+            ((false, false, true), false),
+        ];
+        for ((local, advertised, before), refused) in rows {
+            assert_eq!(
+                plan_pq_ratchet_capability(local, advertised, before),
+                refused.then_some(RefuseReason::PqRatchetWithdrawn),
+                "local={local} advertised={advertised} before={before}"
+            );
+        }
     }
 
     #[test]
