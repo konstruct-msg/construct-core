@@ -60,6 +60,19 @@ mod tests;
 
 pub use storage::{SerializableSession, SkippedKeyEntry};
 
+/// Prefix of the error for a message whose position on the **current** receiving chain has no
+/// key left: the key was used — this message, or a copy of it, already decrypted — or a skipped
+/// key expired. Nothing is wrong with the session.
+///
+/// It needs a name because the caller used to read it as a desync. A first message that opened
+/// the session as responder came round again — from the platform's init queue, or a stream
+/// replayed below its cursor — and the router, seeing `msg_num == 0` fail, healed: it archived
+/// the session that very message had just built, and the next message of the first flight was
+/// lost to an END_SESSION round trip (two-simulator stand, 2026-09-25, on both the old build and
+/// the PQXDH v2 one). A new session's first message never lands here — its ratchet key is new,
+/// so it takes the DH ratchet step and fails, if it fails, on AEAD.
+pub const MESSAGE_KEY_CONSUMED: &str = "MESSAGE_KEY_CONSUMED";
+
 /// AD (Associated Data) version byte — increment here when the AD format changes.
 /// Both `encrypt` and `decrypt_with_key` must use this constant so a version
 /// mismatch surfaces as an AEAD failure rather than a silent format bug.

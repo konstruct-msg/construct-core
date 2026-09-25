@@ -4022,6 +4022,73 @@ mod pqxdh_v2_tests {
         assert!(a.is_pq_strengthened && b.is_pq_strengthened);
     }
 
+    /// The stand defect of 2026-09-25, in the core. The responder opens the session from the
+    /// first message; that message never passes the ACK store, so when it comes round again —
+    /// the platform's init queue replaying it, or a stream replayed below its cursor — it is
+    /// routed like any other. It must be a duplicate. Read as a desync it was healed, the heal
+    /// archived the session the message had just built, and the next message of the first flight
+    /// was lost to an END_SESSION round trip.
+    ///
+    /// Mutation: drop the `MESSAGE_KEY_CONSUMED` arm from the router — this reddens.
+    #[test]
+    fn the_first_message_coming_round_again_is_a_duplicate_not_a_desync() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, true);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        let msg1 = alice.encrypt_bytes_for("bob", b"second").unwrap();
+        bob.init_receiving_session_from_wire_payload(
+            "alice",
+            &initiator_bundle_json(&alice),
+            &msg0,
+        )
+        .unwrap();
+        let session = bob.lifecycle.active_session_id("alice").unwrap();
+
+        // The ratchet names what happened.
+        let err = bob
+            .lifecycle
+            .decrypt_wire_payload("alice", &msg0)
+            .unwrap_err();
+        assert!(
+            err.starts_with(crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED),
+            "{err}"
+        );
+
+        let received = |bob: &mut Orchestrator, id: &str, data: &[u8], msg_num: u32| {
+            bob.handle_event(IncomingEvent::MessageReceived {
+                message_id: id.to_string(),
+                from: "alice".to_string(),
+                data: data.to_vec(),
+                msg_num,
+                kem_ct: vec![],
+                otpk_id: 0,
+                is_control: false,
+                content_type: 0,
+            })
+        };
+        let again = received(&mut bob, "carrier", &msg0, 0);
+        assert!(
+            !again.iter().any(|a| matches!(
+                a,
+                Action::SessionHealNeeded { .. }
+                    | Action::HealSuppressed { .. }
+                    | Action::SendEndSession { .. }
+                    | Action::NotifyError { .. }
+            )),
+            "a copy of the carrier must not heal or tear down: {again:?}"
+        );
+        assert_eq!(bob.lifecycle.active_session_id("alice").unwrap(), session);
+
+        let next = received(&mut bob, "second", &msg1, 1);
+        assert!(
+            next.iter().any(|a| matches!(
+                a,
+                Action::MessageDecrypted { plaintext, .. } if plaintext == b"second"
+            )),
+            "the rest of the first flight still opens: {next:?}"
+        );
+    }
+
     /// The whole first flight repeats the header, so the responder can open the session from
     /// whichever message reaches it first; the peer's first answer ends it.
     #[test]

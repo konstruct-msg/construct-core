@@ -659,7 +659,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             }
         }
 
+        // Reached only without a DH ratchet step (after one the chain restarts at 0, and the loop
+        // above returns) and with `message_number` below the chain: a position already consumed.
         self.restore_snapshot(snapshot);
-        Err("Message key not found".to_string())
+        Err(format!(
+            "{}: message {} on the current receiving chain (now at {}) has no key left",
+            super::MESSAGE_KEY_CONSUMED,
+            encrypted.message_number,
+            self.receiving_chain_length
+        ))
     }
 }

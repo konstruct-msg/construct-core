@@ -28,6 +28,7 @@
 /// ```
 use std::collections::{HashMap, VecDeque};
 
+use crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED;
 use crate::orchestration::actions::Action;
 use crate::orchestration::healing_queue::HealDirection;
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
@@ -388,6 +389,25 @@ impl MessageRouter {
                     plaintext: result.plaintext,
                     content_type: msg.content_type,
                     actions,
+                }
+            }
+            Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => {
+                // Already decrypted — by this path, or as the carrier a responder init opened the
+                // session from, which never passes the ACK store. A duplicate, not a desync: the
+                // session is intact, and healing it would archive the ratchet this very message
+                // built. Recorded in the in-memory ACK cache so the next copy stops at step 1; not
+                // persisted, since `Duplicate` carries no actions — after a restart a copy lands
+                // here again and is judged the same way, which is the part that matters.
+                tracing::info!(
+                    target: "crypto::router",
+                    contact_id = %msg.contact_id,
+                    message_id = %msg.message_id,
+                    msg_number = msg.msg_number,
+                    "decrypt found the key already consumed — duplicate, session kept"
+                );
+                let _ = lifecycle.ack_store.mark_processed(&msg.message_id);
+                RoutingDecision::Duplicate {
+                    message_id: msg.message_id.clone(),
                 }
             }
             Err(e) => {
