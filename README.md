@@ -199,7 +199,9 @@ server can drop them — they hide patterns from a network observer, not from th
 | `post-quantum`  | ML-KEM-768 + ML-DSA-65 post-quantum cryptography               |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
-features pull in `construct-veil` and `openmls`. `construct-veil` is a git dependency pinned
+features pull in `post-quantum`, `construct-veil` and `openmls`: a platform library always has
+ML-KEM (a platform feature without `post-quantum` is a `compile_error!`). A build with no
+platform feature and no `post-quantum` is classic-only and negotiates `CLASSIC` with everyone. `construct-veil` is a git dependency pinned
 by commit (`rev` in `Cargo.toml`) — no sibling checkout is needed for any build.
 
 ## Testing
@@ -209,7 +211,7 @@ by commit (`rev` in `Cargo.toml`) — no sibling checkout is needed for any buil
 cargo test --features post-quantum
 
 # The exported UniFFI surface (compiled only with a platform feature)
-cargo test --features mac,post-quantum
+cargo test --features mac
 
 # Security audit (advisory policy in .cargo/audit.toml)
 cargo audit
@@ -222,7 +224,7 @@ from outside the repository — for one command:
 
 ```bash
 cargo --config 'patch."https://github.com/konstruct-msg/construct-veil".construct-veil.path="../construct-veil"' \
-  test --features mac,post-quantum
+  test --features mac
 ```
 
 or persistently in your own `~/.cargo/config.toml`:

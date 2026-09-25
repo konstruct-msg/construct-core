@@ -14,14 +14,14 @@
 
 ### Key Commands
 - **Build**: `cargo build`
-- **Test**: `cargo test --features post-quantum` for the core; `cargo test --features mac,post-quantum` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
+- **Test**: `cargo test --features post-quantum` for the core; `cargo test --features mac` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
 - **Benchmarks**: `cargo bench --bench crypto_bench`
 - **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default + `post-quantum` (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
 
 ### Feature Flags
-- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
-- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
-- `post-quantum`: Enables ML-KEM-768 and ML-DSA support.
+- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS, `post-quantum`).
+- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil + `post-quantum`.
+- `post-quantum`: Enables ML-KEM-768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that).
 
 ## Development Conventions
 

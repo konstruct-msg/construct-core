@@ -37,6 +37,15 @@ pub static CONSTRUCT_CORE_VERSION: &str = concat!(
     "\0"
 );
 
+// A platform library without ML-KEM is a silent downgrade: it negotiates CLASSIC with every
+// peer and the app still looks the same. The platform features pull `post-quantum` in
+// (Cargo.toml); this is what fails if that list ever loses it.
+#[cfg(all(
+    any(feature = "ios", feature = "mac", feature = "android"),
+    not(feature = "post-quantum")
+))]
+compile_error!("ios/mac/android builds must include the `post-quantum` feature");
+
 // Core modules (platform-independent)
 pub mod cfe;
 pub mod config;
