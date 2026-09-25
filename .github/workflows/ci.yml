@@ -84,6 +84,7 @@ jobs:
       # the function was absent from the UDL and unreachable from every client. `cargo check
       # --features mac` further down catches compile errors only, which is exactly why the gap
       # was invisible: the module built, so nothing looked missing.
+      # `mac` implies `post-quantum`, so this is also the feature set every platform ships.
       - name: Run tests (exported UniFFI surface)
         working-directory: construct-core
         run: cargo test --features mac
@@ -221,7 +222,7 @@ jobs:
             -t armeabi-v7a \
             -t x86_64 \
             -o ../android-out/jniLibs \
-            build --release --features "android,post-quantum"
+            build --release --features android
 
       # The README written a few steps below tells integrators to identify a
       # build by running exactly this command. Run it here, against the .so we
