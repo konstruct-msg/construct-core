@@ -4,21 +4,21 @@
 ///
 /// ```text
 /// orchestration/
-///   platform_bridge  — PlatformBridge callback trait (Phase 0)
-///   actions          — Action + IncomingEvent enums (Phase 0, used by all phases)
+///   platform_bridge  — PlatformBridge callback trait
+///   actions          — Action + IncomingEvent enums
 ///   clock            — Clock trait + SystemClock + MockClock (time injection)
-///   ack_store        — ACK deduplication (Phase 1a)
-///   healing_queue    — Session healing queue (Phase 1b)
-///   session_lifecycle— Session lifecycle (Phase 3)       [TODO]
+///   ack_store        — ACK deduplication
+///   healing_queue    — Messages held for replay once a session is renegotiated
+///   session_lifecycle— The sessions held: encrypt/decrypt, archive, restore
 ///   session_machine  — What phase a ratchet is in, and what may happen to it next
-///   message_router   — Decision engine (Phase 4)         [TODO]
+///   message_router   — Incoming message → dedup, session lookup, decrypt → RoutingDecision
 ///   teardown_plan    — Which of a peer's devices a teardown touches
 ///   initiation_plan  — Whether to open a session with a device now, and as which side
 ///   receiving_init_plan — Which queued message opens a session, against which device
 ///   send_plan        — Who gets a copy of an outgoing message
 ///   receiving_decrypt_plan — Which device session an incoming message is tried against
 ///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, or why no session opens
-///   orchestrator     — Top-level facade (Phase 5)        [TODO]
+///   orchestrator     — handle_event: every event in, every Action out
 /// ```
 pub mod ack_store;
 pub mod actions;
