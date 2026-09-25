@@ -280,6 +280,17 @@ dictionary KyberSpkRecord {
     sequence<u8> secret_key;
 };
 
+/// One ML-KEM-1024 Kyber prekey to upload (PQXDH v2). Both signatures are over
+/// `"KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || public_key`; upload `created_at`
+/// with the key — the signatures cover it.
+dictionary KyberPrekeyUpload {
+    u32 key_id;                    // SPKs count from 1, one-time keys from 1_000_000
+    sequence<u8> public_key;       // 1568 bytes
+    u64 created_at;                // unix seconds
+    sequence<u8> signature;        // Ed25519, identity signing key
+    sequence<u8> hybrid_signature; // Ed25519 + ML-DSA-65, hybrid identity key (3373 bytes)
+};
+
 interface ClassicCryptoCore {
     /// Typed registration bundle fields.
     [Throws=CryptoError]
@@ -1076,6 +1087,44 @@ interface OrchestratorCore {
     void set_kyber_spk(u32 key_id, sequence<u8> secret_key, sequence<u8> public_key);
 
     KyberSpkRecord? kyber_spk();
+
+    // ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ────────────────────────────────
+    // The core generates, signs and holds them; the seeds never leave it. After every call
+    // that changes them, persist `export_kyber_prekeys()` (as with `export_one_time_prekeys`).
+
+    [Throws=CryptoError]
+    sequence<KyberPrekeyUpload> generate_kyber_one_time_prekeys(u32 count);
+
+    u32 kyber_one_time_prekey_count();
+
+    /// After a replace-all upload of Kyber one-time keys; returns how many were removed.
+    u32 prune_kyber_one_time_prekeys_below(u32 min_keep_id);
+
+    /// Start a Kyber SPK rotation (with the classic SPK): the key to upload. Calling it again
+    /// before commit/rollback returns the same key, so a retried upload uploads the same key.
+    [Throws=CryptoError]
+    KyberPrekeyUpload begin_kyber_spk_rotation();
+
+    /// The server confirmed the upload. Returns false if nothing was pending.
+    boolean commit_kyber_spk_rotation();
+
+    /// The upload failed.
+    void rollback_kyber_spk_rotation();
+
+    /// The current Kyber SPK's upload record again, or null before the first commit.
+    [Throws=CryptoError]
+    KyberPrekeyUpload? current_kyber_spk_upload();
+
+    /// Decapsulate with our Kyber prekey `key_id` (0 = current SPK). For history transfer; the
+    /// handshake decapsulates inside the core.
+    [Throws=CryptoError]
+    sequence<u8> kyber_prekey_decapsulate(u32 key_id, sequence<u8> ciphertext);
+
+    [Throws=CryptoError]
+    sequence<u8> export_kyber_prekeys();
+
+    [Throws=CryptoError]
+    void import_kyber_prekeys(sequence<u8> data);
 
     void set_local_user_id(string user_id);
 

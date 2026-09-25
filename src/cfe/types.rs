@@ -21,7 +21,9 @@ pub enum CfeMessageType {
     InboundEvent = 0x10,
     OutboundActions = 0x11,
 
-    // Post-Quantum (ML-KEM-768)
+    // Post-Quantum
+    /// The core's ML-KEM-1024 prekeys (`CfeKyberPrekeysV1`). Reserved since the start and
+    /// never written before them.
     KyberPrivateKeys = 0x20,
     KyberSessionState = 0x21,
 
@@ -173,6 +175,10 @@ pub struct CfeOldSpkV1 {
     /// Unix timestamp (seconds) when this key was originally created.
     #[serde(rename = "ts")]
     pub created_at: i64,
+    /// When it was rotated out; retention (14 days) counts from here. Absent in records written
+    /// before it existed — read as "retired at import".
+    #[serde(rename = "rt", default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<i64>,
 }
 
 /// The ML-KEM-768 (Kyber) signed prekey — the PQXDH KEM leg.
@@ -216,7 +222,7 @@ pub struct CfePrivateKeysV1 {
     pub spk_pub: ByteBuf,
 
     /// Previous signed prekeys retained for cross-restart RESPONDER compatibility.
-    /// Old entries are pruned to `prekey_cleanup_period_secs` on export.
+    /// Entries retired longer than `prekey_cleanup_period_secs` (14 days) ago are pruned.
     #[serde(rename = "old_spks", default, skip_serializing_if = "Vec::is_empty")]
     pub old_spks: Vec<CfeOldSpkV1>,
 
@@ -429,6 +435,51 @@ pub struct CfeOtpkBundleV1 {
     pub records: Vec<CfeOtpkRecordV1>,
     #[serde(rename = "next_id")]
     pub next_id: u32,
+}
+
+// ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ─────────────────────────────────────
+
+/// One Kyber prekey the core holds: the FIPS 203 seed is the whole secret, the public key is
+/// derived from it, and the signatures are re-made on demand — so a pool entry is ~80 bytes, not
+/// the ~5 KB a key, its expanded secret and a hybrid signature would take.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeKyberPrekeyV1 {
+    #[serde(rename = "id")]
+    pub key_id: u32,
+    /// Signed `created_at` (unix seconds).
+    #[serde(rename = "ts")]
+    pub created_at: u64,
+    /// 64-byte ML-KEM seed `d ‖ z`.
+    #[serde(rename = "seed")]
+    pub seed: SecretBytes,
+}
+
+/// A Kyber SPK that has been rotated out, kept for first messages still in flight to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeRetiredKyberSpkV1 {
+    #[serde(rename = "k")]
+    pub prekey: CfeKyberPrekeyV1,
+    /// When it stopped being current (unix seconds); dropped 14 days later.
+    #[serde(rename = "rt")]
+    pub retired_at: u64,
+}
+
+/// All of the core's Kyber prekeys. msg_type = `KyberPrivateKeys` (0x20).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CfeKyberPrekeysV1 {
+    #[serde(rename = "spk", default, skip_serializing_if = "Option::is_none")]
+    pub spk: Option<CfeKyberPrekeyV1>,
+    /// Generated and handed out for upload, not yet confirmed.
+    #[serde(rename = "pend", default, skip_serializing_if = "Option::is_none")]
+    pub pending_spk: Option<CfeKyberPrekeyV1>,
+    #[serde(rename = "old", default)]
+    pub retired_spks: Vec<CfeRetiredKyberSpkV1>,
+    #[serde(rename = "otpk", default)]
+    pub otpks: Vec<CfeKyberPrekeyV1>,
+    #[serde(rename = "nspk")]
+    pub next_spk_id: u32,
+    #[serde(rename = "notpk")]
+    pub next_otpk_id: u32,
 }
 
 // ── PQC / ML-KEM-768 CFE types ────────────────────────────────────────────────

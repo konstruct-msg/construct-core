@@ -44,7 +44,8 @@ construct-core/
 │   │   ├── suites/                # classic and hybrid CryptoProvider implementations
 │   │   ├── provider.rs            # CryptoProvider trait
 │   │   ├── suite_id.rs            # suite ids 1 / 2 / 3
-│   │   ├── pq_x3dh.rs             # ML-KEM-768 keygen / encapsulate / decapsulate
+│   │   ├── pq_x3dh.rs             # ML-KEM-768 and ML-KEM-1024 keygen / encapsulate / decapsulate
+│   │   ├── kyber_prekeys.rs       # the core's ML-KEM-1024 prekeys: SPK rotation, one-time pool
 │   │   ├── kyber_prekey_auth.rs   # Kyber prekey signature check + PQ-authentication label
 │   │   ├── sealed_sender/         # sealed-sender box + sender certificates
 │   │   ├── device_copy_tag.rs     # per-message tag naming the device a copy is for
@@ -147,10 +148,20 @@ Names follow NIST FIPS; informal names in parens.
 When the peer's bundle carries a Kyber prekey, the initiator encapsulates to it (ML-KEM-768,
 FIPS 203) and mixes the shared secret into the X3DH root key when it sends the first message:
 `root = HKDF(salt = rk, ikm = kem_ss, info = "construct-pqxdh-v1")`; the ciphertext travels in
-that message, and the responder derives the same root. The secret is applied before message 0 is
-encrypted, so from the first message on the root depends on both the X25519 and the ML-KEM
-secret. This is *not* Signal's PQXDH: the KEM secret is mixed in after X3DH rather than into its
-initial derivation, and the KEM ciphertext is not bound into the KDF.
+that message, and the responder derives the same root. What that does **not** cover: the
+initiator's first sending chain is derived from the X3DH secret *before* the mix, so message 0 and
+everything sent before the first reply are protected by X25519 only. Every chain after the first
+DH ratchet step depends on both. This is *not* Signal's PQXDH: the KEM secret is mixed in after
+X3DH rather than into its initial derivation, and the KEM ciphertext is not bound into the KDF.
+
+**Being replaced by PQXDH v2** (construct-docs `cryptocore/PQXDH_V2_DESIGN.md`,
+`decisions/pqxdh-v2-mandatory-pq-cutover.md`): the ML-KEM-1024 secret goes into the initial key,
+PQ is mandatory for new sessions, and the Kyber keys, their choice and decapsulation live in the
+core. In place so far — the core's own **ML-KEM-1024 prekeys** (`crypto::kyber_prekeys`): a
+signed prekey with two-phase rotation and 14-day retention of rotated-out keys, a one-time pool,
+64-byte seeds as the only secret, each key signed (Ed25519 and hybrid) over
+`"KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || kyber_public` so its age is the
+device's word, not the server's. The handshake does not use them yet.
 
 The Kyber prekey's Ed25519 signature is verified by the core
 (`"KonstruktX3DH-v1" || 0x00 0x10 || kyber_public`, key-service field 12), and the session is
@@ -171,8 +182,9 @@ OTPK signatures yet).
 **Ed25519 + ML-DSA-65** (FIPS 204) — both must verify. RustCrypto `ml-dsa`, seed-based, the same
 implementation as the Konstruct server (cross-verification pinned by an interop test). The core
 exposes them as primitives; iOS signs the Kyber SPK with them (key-service field 23) and checks
-that signature itself — **the core does not verify hybrid signatures yet**. Older docs claiming
-"Kyber-1024" or "Dilithium deployed" are wrong.
+that signature itself. The core signs its own v2 Kyber prekeys with them and can check such a
+signature (`check_kyber_prekey_hybrid_signature`), but no session decision uses it yet. Older docs
+claiming "Dilithium deployed" are wrong; "Kyber-1024" becomes true with PQXDH v2.
 
 ### Social recovery
 

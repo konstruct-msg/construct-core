@@ -1018,6 +1018,103 @@ impl Orchestrator {
         self.lifecycle.client.kyber_spk_bytes()
     }
 
+    // ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ─────────────────────────────────
+    //
+    // Every mutation changes the `KyberPrivateKeys` blob; the platform persists
+    // `export_kyber_prekeys_cfe()` after each one, as it does the X25519 pool.
+
+    pub fn generate_kyber_one_time_prekeys(
+        &mut self,
+        count: u32,
+    ) -> Result<Vec<crate::crypto::kyber_prekeys::KyberPrekeyUpload>, String> {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .generate_kyber_one_time_prekeys(count)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn kyber_one_time_prekey_count(&self) -> u32 {
+        self.lifecycle
+            .client
+            .key_manager()
+            .kyber_prekeys()
+            .otpk_count() as u32
+    }
+
+    pub fn prune_kyber_one_time_prekeys_below(&mut self, min_keep_id: u32) -> u32 {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .kyber_prekeys_mut()
+            .prune_otpks_below(min_keep_id) as u32
+    }
+
+    pub fn begin_kyber_spk_rotation(
+        &mut self,
+    ) -> Result<crate::crypto::kyber_prekeys::KyberPrekeyUpload, String> {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .begin_kyber_spk_rotation()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn commit_kyber_spk_rotation(&mut self) -> bool {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .commit_kyber_spk_rotation()
+    }
+
+    pub fn rollback_kyber_spk_rotation(&mut self) {
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .rollback_kyber_spk_rotation();
+    }
+
+    pub fn current_kyber_spk_upload(
+        &self,
+    ) -> Result<Option<crate::crypto::kyber_prekeys::KyberPrekeyUpload>, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .current_kyber_spk_upload()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn kyber_prekey_decapsulate(
+        &self,
+        key_id: u32,
+        ciphertext: &[u8],
+    ) -> Result<crate::crypto::SecretBytes, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .decapsulate_with_kyber_prekey(key_id, ciphertext)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn export_kyber_prekeys_cfe(&self) -> Result<Vec<u8>, String> {
+        let record = self.lifecycle.client.key_manager().kyber_prekeys().to_cfe();
+        crate::cfe::encode(crate::cfe::CfeMessageType::KyberPrivateKeys, &record)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn import_kyber_prekeys_cfe(&mut self, data: &[u8]) -> Result<(), String> {
+        let record = crate::cfe::decode_as::<crate::cfe::CfeKyberPrekeysV1>(
+            data,
+            crate::cfe::CfeMessageType::KyberPrivateKeys,
+        )
+        .map_err(|e| e.to_string())?;
+        self.lifecycle
+            .client
+            .key_manager_mut()
+            .import_kyber_prekeys(&record);
+        Ok(())
+    }
+
     /// Returns the raw bytes of our X3DH identity public key.
     /// Used by the UI for safety-number display and key export.
     pub fn identity_public_key_bytes(&self) -> Result<Vec<u8>, String> {

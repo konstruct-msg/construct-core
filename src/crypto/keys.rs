@@ -11,6 +11,12 @@ use std::marker::PhantomData;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+/// How long a rotated-out signed prekey — classic or Kyber — is kept for first messages still in
+/// flight to it: the server's queue TTL (7 days) plus as much again. One constant for both, so the
+/// two cannot drift apart. Counted from rotation, not creation: a key rotated out on day 30 of its
+/// life still has its full window.
+pub const SPK_RETENTION_AFTER_ROTATION_SECS: u64 = 14 * 24 * 3600;
+
 /// Build prologue for X3DH signature (как в Noise Protocol)
 /// Prologue включает протокол и suite ID для предотвращения key substitution attacks
 pub fn build_prologue(suite_id: SuiteID) -> Vec<u8> {
@@ -101,6 +107,10 @@ pub struct PrekeyStore<P: CryptoProvider> {
     pub signature: Vec<u8>,
     pub created_at: i64,
     pub key_id: u32,
+    /// When it stopped being the current SPK; `None` while it is current. Retention counts from
+    /// here — `created_at` is 0 for an SPK restored from the key record, so counting from creation
+    /// deleted the previous SPK the moment a restored device rotated.
+    pub retired_at: Option<i64>,
 }
 
 /// Менеджер криптографических ключей
@@ -139,6 +149,10 @@ pub struct KeyManager<P: CryptoProvider> {
     /// no PQ primitives are needed to carry the bytes.
     kyber_spk: Option<(u32, Vec<u8>, Vec<u8>)>,
 
+    /// The ML-KEM-1024 prekeys (PQXDH v2): signed prekey with rotation history, one-time pool.
+    /// Persisted as its own CFE blob (`KyberPrivateKeys`), like the X25519 one-time pool.
+    kyber_prekeys: crate::crypto::kyber_prekeys::KyberPrekeyStore,
+
     _phantom: PhantomData<P>,
 }
 
@@ -156,6 +170,7 @@ impl<P: CryptoProvider> KeyManager<P> {
             #[cfg(feature = "post-quantum")]
             hybrid_sig_priv: None,
             kyber_spk: None,
+            kyber_prekeys: Default::default(),
             _phantom: PhantomData,
         }
     }
@@ -197,6 +212,7 @@ impl<P: CryptoProvider> KeyManager<P> {
             signature: prekey_signature,
             created_at: 0, // Не важно для восстановленных ключей
             key_id: 1,
+            retired_at: None,
         });
 
         Ok(())
@@ -321,10 +337,12 @@ impl<P: CryptoProvider> KeyManager<P> {
             signature,
             created_at: crate::utils::time::current_timestamp(),
             key_id,
+            retired_at: None,
         };
 
         // Сохраняем старый prekey в историю
-        if let Some(old_prekey) = self.current_signed_prekey.take() {
+        if let Some(mut old_prekey) = self.current_signed_prekey.take() {
+            old_prekey.retired_at = Some(crate::utils::time::current_timestamp());
             self.old_prekeys.insert(old_prekey.key_id, old_prekey);
         }
 
@@ -349,8 +367,9 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Очистка старых prekeys
     fn cleanup_old_prekeys(&mut self, max_age_seconds: i64) {
         let now = crate::utils::time::current_timestamp();
-        self.old_prekeys
-            .retain(|_, prekey| now - prekey.created_at < max_age_seconds);
+        self.old_prekeys.retain(|_, prekey| {
+            now - prekey.retired_at.unwrap_or(prekey.created_at) < max_age_seconds
+        });
     }
 
     /// Экспорт регистрационного bundle
@@ -607,6 +626,139 @@ impl<P: CryptoProvider> KeyManager<P> {
         self.kyber_spk.clone()
     }
 
+    // ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ─────────────────────────────────
+
+    pub fn kyber_prekeys(&self) -> &crate::crypto::kyber_prekeys::KyberPrekeyStore {
+        &self.kyber_prekeys
+    }
+
+    pub fn kyber_prekeys_mut(&mut self) -> &mut crate::crypto::kyber_prekeys::KyberPrekeyStore {
+        &mut self.kyber_prekeys
+    }
+
+    /// The upload record for one of our Kyber prekeys: its public key and both signatures over
+    /// `kyber_prekey_sign_message_v2(created_at, public)` — Ed25519 by the identity signing key,
+    /// and hybrid (Ed25519 + ML-DSA-65) by the hybrid identity key.
+    ///
+    /// The hybrid key must already exist (`ensure_hybrid_signature_key`, then persist the private
+    /// keys). Creating it here would be silent: a platform that did not re-save the private keys
+    /// afterwards would sign the next batch with a *different* hybrid key after a restart, and a
+    /// peer that pinned the first one would refuse the device.
+    pub fn kyber_prekey_upload(
+        &self,
+        prekey: &crate::crypto::kyber_prekeys::KyberPrekey,
+    ) -> Result<crate::crypto::kyber_prekeys::KyberPrekeyUpload> {
+        let public_key = prekey.public_key().map_err(Self::crypto_err)?;
+        let message = crate::crypto::kyber_prekey_auth::kyber_prekey_sign_message_v2(
+            prekey.created_at,
+            &public_key,
+        );
+        let (signing_key, _) = self
+            .signing_key
+            .as_ref()
+            .ok_or_else(|| Self::crypto_err("Signing key not initialized".to_string()))?;
+        let signature = P::sign(signing_key, &message).map_err(ConstructError::Crypto)?;
+        let hybrid_signature = self.sign_hybrid(&message)?;
+        Ok(crate::crypto::kyber_prekeys::KyberPrekeyUpload {
+            key_id: prekey.key_id,
+            public_key,
+            created_at: prekey.created_at,
+            signature,
+            hybrid_signature,
+        })
+    }
+
+    /// Generate `count` Kyber one-time prekeys; the records are what to upload.
+    pub fn generate_kyber_one_time_prekeys(
+        &mut self,
+        count: u32,
+    ) -> Result<Vec<crate::crypto::kyber_prekeys::KyberPrekeyUpload>> {
+        self.require_hybrid_key()?;
+        let now = Self::now();
+        let keys = self
+            .kyber_prekeys
+            .generate_otpks(count, now)
+            .map_err(Self::crypto_err)?;
+        keys.iter().map(|k| self.kyber_prekey_upload(k)).collect()
+    }
+
+    /// Start a Kyber SPK rotation: the record to upload. Rotate together with the classic SPK.
+    pub fn begin_kyber_spk_rotation(
+        &mut self,
+    ) -> Result<crate::crypto::kyber_prekeys::KyberPrekeyUpload> {
+        self.require_hybrid_key()?;
+        let prekey = self
+            .kyber_prekeys
+            .begin_spk_rotation(Self::now())
+            .map_err(Self::crypto_err)?;
+        self.kyber_prekey_upload(&prekey)
+    }
+
+    /// The server confirmed the pending Kyber SPK. `false` if nothing was pending.
+    pub fn commit_kyber_spk_rotation(&mut self) -> bool {
+        self.kyber_prekeys.commit_spk_rotation(Self::now())
+    }
+
+    pub fn rollback_kyber_spk_rotation(&mut self) {
+        self.kyber_prekeys.rollback_spk_rotation();
+    }
+
+    /// The current Kyber SPK's upload record again (a re-registration, a server that lost it).
+    pub fn current_kyber_spk_upload(
+        &self,
+    ) -> Result<Option<crate::crypto::kyber_prekeys::KyberPrekeyUpload>> {
+        match self.kyber_prekeys.current_spk().cloned() {
+            Some(prekey) => self.kyber_prekey_upload(&prekey).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Decapsulate `ciphertext` with our Kyber prekey `key_id` (`0` = the current SPK).
+    ///
+    /// For the one caller outside a handshake that encapsulates to our Kyber SPK — history
+    /// transfer. The seed never leaves the core. A ciphertext for another key does not fail here
+    /// (implicit rejection); it yields a secret that will not open what it was meant to.
+    pub fn decapsulate_with_kyber_prekey(
+        &self,
+        key_id: u32,
+        ciphertext: &[u8],
+    ) -> Result<crate::crypto::SecretBytes> {
+        let prekey = if key_id == 0 {
+            self.kyber_prekeys.current_spk()
+        } else {
+            self.kyber_prekeys.find(key_id)
+        }
+        .ok_or_else(|| Self::crypto_err(format!("Kyber prekey {key_id} not held")))?;
+        crate::crypto::pq_x3dh::mlkem1024_decapsulate(prekey.seed(), ciphertext)
+            .map_err(Self::crypto_err)
+    }
+
+    /// Replace the Kyber prekeys from a snapshot (`KyberPrivateKeys` CFE).
+    pub fn import_kyber_prekeys(&mut self, record: &crate::cfe::CfeKyberPrekeysV1) {
+        self.kyber_prekeys =
+            crate::crypto::kyber_prekeys::KyberPrekeyStore::from_cfe(record, Self::now());
+    }
+
+    /// Checked before a key is generated, so a refusal leaves no unsigned key in the store.
+    fn require_hybrid_key(&self) -> Result<()> {
+        if self.hybrid_signature_public_key().is_none() {
+            return Err(Self::crypto_err(
+                "hybrid identity key missing: call ensure_hybrid_signature_key and persist the \
+                 private keys before generating Kyber prekeys"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn now() -> u64 {
+        u64::try_from(crate::utils::time::current_timestamp()).unwrap_or(0)
+    }
+
+    fn crypto_err(message: String) -> ConstructError {
+        ConstructError::Crypto(crate::error::CryptoError::Other(message))
+    }
+
     // Non-pq stubs (no-op / None) so call sites in export/import don't need per-cfg.
     #[cfg(not(feature = "post-quantum"))]
     pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>> {
@@ -651,17 +803,21 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Restore a previously serialized old prekey (called during `import_private_keys`).
     ///
-    /// Skips entries older than `max_age_seconds` to mirror the in-memory cleanup logic.
+    /// Skips entries retired longer than the retention window ago, mirroring the in-memory
+    /// cleanup. A record written before `retired_at` existed (`None`) counts as retired now: it
+    /// gets a full window rather than being judged by a creation time that may be 0.
     pub fn add_old_prekey(
         &mut self,
         spk_priv_bytes: Vec<u8>,
         spk_sig: Vec<u8>,
         key_id: u32,
         created_at: i64,
+        retired_at: Option<i64>,
     ) -> Result<()> {
         let max_age = crate::config::Config::global().prekey_cleanup_period_secs;
         let now = crate::utils::time::current_timestamp();
-        if now - created_at >= max_age {
+        let retired_at = retired_at.unwrap_or(now);
+        if now - retired_at >= max_age {
             return Ok(());
         }
         let secret = P::kem_private_key_from_bytes(spk_priv_bytes);
@@ -673,6 +829,7 @@ impl<P: CryptoProvider> KeyManager<P> {
                 signature: spk_sig,
                 created_at,
                 key_id,
+                retired_at: Some(retired_at),
             },
         );
         // Advance next_prekey_id so future rotations don't reuse an old id.
@@ -862,6 +1019,169 @@ impl<P: CryptoProvider> Default for KeyManager<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod spk_retention {
+        use crate::crypto::keys::{KeyManager, SPK_RETENTION_AFTER_ROTATION_SECS};
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+        type Km = KeyManager<ClassicSuiteProvider>;
+
+        #[test]
+        fn one_retention_for_both_signed_prekeys() {
+            assert_eq!(SPK_RETENTION_AFTER_ROTATION_SECS, 14 * 24 * 3600);
+            assert_eq!(
+                crate::config::Config::global().prekey_cleanup_period_secs as u64,
+                SPK_RETENTION_AFTER_ROTATION_SECS,
+                "classic SPK retention and the Kyber store's must be the same constant"
+            );
+        }
+
+        /// A device restored from its key record has a current SPK with `created_at == 0`. The
+        /// first rotation after that used to delete it on the spot (age since creation ≥ window),
+        /// so a first message already in flight to it could never be read.
+        #[test]
+        fn a_restored_spk_survives_its_first_rotation() {
+            let mut original = Km::new();
+            original.initialize().unwrap();
+            let identity = original.identity_secret_key_bytes().unwrap();
+            let signing = original.signing_secret_key_bytes().unwrap();
+            let spk = original.current_signed_prekey().unwrap();
+            let (spk_secret, spk_sig) = (spk.key_pair.0.as_ref().to_vec(), spk.signature.clone());
+
+            let spk_id = original.current_signed_prekey_id().unwrap();
+            let mut restored = Km::new();
+            restored
+                .initialize_from_keys_with_id(identity, signing, spk_secret, spk_sig, spk_id)
+                .unwrap();
+            let before = restored.current_signed_prekey_id().unwrap();
+            restored.rotate_signed_prekey().unwrap();
+            assert_ne!(restored.current_signed_prekey_id().unwrap(), before);
+            assert!(
+                restored.get_prekey(before).is_some(),
+                "the pre-rotation SPK must be kept for its retention window"
+            );
+        }
+
+        #[test]
+        fn a_restored_old_spk_is_judged_by_its_retirement() {
+            let now = crate::utils::time::current_timestamp();
+            let day = 24 * 3600;
+            let mut km = Km::new();
+            km.initialize().unwrap();
+            let spk = km.current_signed_prekey().unwrap();
+            let (spk_secret, spk_sig) = (spk.key_pair.0.as_ref().to_vec(), spk.signature.clone());
+
+            // Created long ago, retired yesterday: kept.
+            km.add_old_prekey(spk_secret.clone(), spk_sig.clone(), 50, 0, Some(now - day))
+                .unwrap();
+            assert!(km.get_prekey(50).is_some());
+            // Retired 15 days ago: past the window.
+            km.add_old_prekey(
+                spk_secret.clone(),
+                spk_sig.clone(),
+                51,
+                now,
+                Some(now - 15 * day),
+            )
+            .unwrap();
+            assert!(km.get_prekey(51).is_none());
+            // Written before `retired_at` existed: a full window from now.
+            km.add_old_prekey(spk_secret, spk_sig, 52, 0, None).unwrap();
+            assert!(km.get_prekey(52).is_some());
+        }
+    }
+
+    #[cfg(feature = "post-quantum")]
+    mod kyber_prekeys {
+        use crate::crypto::keys::KeyManager;
+        use crate::crypto::kyber_prekey_auth::{
+            KyberPrekeySignature, check_kyber_prekey_hybrid_signature,
+            check_kyber_prekey_signature_v2,
+        };
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+        fn manager() -> KeyManager<ClassicSuiteProvider> {
+            let mut km = KeyManager::<ClassicSuiteProvider>::new();
+            km.initialize().unwrap();
+            km.ensure_hybrid_signature_key().unwrap();
+            km
+        }
+
+        /// What the core uploads is what an initiator will check: both signatures verify under
+        /// this device's keys, over the key and its time.
+        #[test]
+        fn upload_records_carry_both_signatures_over_key_and_time() {
+            let mut km = manager();
+            let vk: Vec<u8> = <_ as AsRef<[u8]>>::as_ref(km.verifying_key().unwrap()).to_vec();
+            let hybrid = km.hybrid_signature_public_key().unwrap();
+            let mut records = km.generate_kyber_one_time_prekeys(2).unwrap();
+            records.push(km.begin_kyber_spk_rotation().unwrap());
+            for r in &records {
+                assert_eq!(r.public_key.len(), 1568);
+                assert_eq!(
+                    check_kyber_prekey_signature_v2(
+                        &vk,
+                        &r.public_key,
+                        r.created_at,
+                        Some(&r.signature)
+                    ),
+                    KyberPrekeySignature::Valid,
+                    "Ed25519, key {}",
+                    r.key_id
+                );
+                assert_eq!(
+                    check_kyber_prekey_hybrid_signature(
+                        &hybrid,
+                        &r.public_key,
+                        r.created_at,
+                        Some(&r.hybrid_signature)
+                    ),
+                    KyberPrekeySignature::Valid,
+                    "hybrid, key {}",
+                    r.key_id
+                );
+            }
+        }
+
+        #[test]
+        fn without_a_hybrid_key_nothing_is_generated() {
+            let mut km = KeyManager::<ClassicSuiteProvider>::new();
+            km.initialize().unwrap();
+            assert!(km.generate_kyber_one_time_prekeys(1).is_err());
+            assert!(km.begin_kyber_spk_rotation().is_err());
+            assert_eq!(
+                km.kyber_prekeys().otpk_count(),
+                0,
+                "no unsigned key left behind"
+            );
+            assert!(km.kyber_prekeys().find(1).is_none());
+        }
+
+        #[test]
+        fn decapsulation_by_id_and_current_spk() {
+            let mut km = manager();
+            let otpk = km.generate_kyber_one_time_prekeys(1).unwrap().remove(0);
+            let spk = km.begin_kyber_spk_rotation().unwrap();
+            assert!(km.commit_kyber_spk_rotation());
+
+            for (id, public) in [(otpk.key_id, &otpk.public_key), (0, &spk.public_key)] {
+                let enc = crate::crypto::pq_x3dh::mlkem1024_encapsulate(public).unwrap();
+                let ss = km
+                    .decapsulate_with_kyber_prekey(id, &enc.ciphertext)
+                    .unwrap();
+                assert_eq!(ss.expose(), enc.shared_secret.expose(), "key id {id}");
+            }
+            assert!(
+                km.decapsulate_with_kyber_prekey(999_999_999, &[0; 1568])
+                    .is_err()
+            );
+            assert_eq!(
+                km.current_kyber_spk_upload().unwrap().unwrap().public_key,
+                spk.public_key,
+                "the re-upload record is the current key"
+            );
+        }
+    }
 
     #[test]
     fn test_x25519_keypair_zeroize() {

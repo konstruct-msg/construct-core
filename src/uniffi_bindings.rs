@@ -278,6 +278,28 @@ fn pq_field_from_bytes(
     }
 }
 
+/// One ML-KEM-1024 Kyber prekey to upload — mirrors the UDL `KyberPrekeyUpload`.
+#[derive(Debug, Clone)]
+pub struct KyberPrekeyUpload {
+    pub key_id: u32,
+    pub public_key: Vec<u8>,
+    pub created_at: u64,
+    pub signature: Vec<u8>,
+    pub hybrid_signature: Vec<u8>,
+}
+
+impl From<crate::crypto::kyber_prekeys::KyberPrekeyUpload> for KyberPrekeyUpload {
+    fn from(r: crate::crypto::kyber_prekeys::KyberPrekeyUpload) -> Self {
+        Self {
+            key_id: r.key_id,
+            public_key: r.public_key,
+            created_at: r.created_at,
+            signature: r.signature,
+            hybrid_signature: r.hybrid_signature,
+        }
+    }
+}
+
 /// One-time prekey pair for upload to server
 #[derive(Debug, Clone)]
 pub struct OtpkPair {
@@ -1741,6 +1763,69 @@ mod tests {
         assert_eq!(spk.key_id, 42);
         assert_eq!(spk.secret_key, secret);
         assert_eq!(spk.public_key, public);
+    }
+
+    /// The core's Kyber prekeys survive the platform's persistence path: generate (after the
+    /// hybrid key exists and the private keys were saved), export both blobs, restore into a new
+    /// core, and the restored core decapsulates what was encapsulated to the uploaded keys and
+    /// re-signs the current SPK with the same hybrid key.
+    #[test]
+    fn kyber_prekeys_survive_export_and_restore() {
+        let core = make_orchestrator("kyber_owner");
+        assert!(
+            core.generate_kyber_one_time_prekeys(1).is_err(),
+            "no hybrid identity key yet: generation is refused, not silently keyed"
+        );
+        let hybrid_public = core.ensure_hybrid_signature_key().unwrap();
+        let private_keys = core.export_private_keys().unwrap();
+
+        let otpks = core.generate_kyber_one_time_prekeys(2).unwrap();
+        let spk = core.begin_kyber_spk_rotation().unwrap();
+        assert!(core.commit_kyber_spk_rotation());
+        assert_eq!(core.kyber_one_time_prekey_count(), 2);
+        let kyber_blob = core.export_kyber_prekeys().unwrap();
+
+        let restored =
+            create_orchestrator_core_from_keys(private_keys, "kyber_owner".into()).unwrap();
+        restored.import_kyber_prekeys(kyber_blob).unwrap();
+        assert_eq!(restored.kyber_one_time_prekey_count(), 2);
+
+        for (id, public) in [
+            (otpks[0].key_id, &otpks[0].public_key),
+            (otpks[1].key_id, &otpks[1].public_key),
+            (0, &spk.public_key),
+        ] {
+            let enc = crate::crypto::pq_x3dh::mlkem1024_encapsulate(public).unwrap();
+            let ss = restored
+                .kyber_prekey_decapsulate(id, enc.ciphertext.clone())
+                .unwrap();
+            assert_eq!(ss, enc.shared_secret.expose(), "key {id}");
+        }
+
+        let again = restored.current_kyber_spk_upload().unwrap().unwrap();
+        assert_eq!(again.public_key, spk.public_key);
+        assert_eq!(again.created_at, spk.created_at);
+        assert_eq!(
+            crate::crypto::kyber_prekey_auth::check_kyber_prekey_hybrid_signature(
+                &hybrid_public,
+                &again.public_key,
+                again.created_at,
+                Some(&again.hybrid_signature)
+            ),
+            crate::crypto::kyber_prekey_auth::KyberPrekeySignature::Valid,
+            "re-signed with the persisted hybrid key"
+        );
+
+        assert_eq!(
+            restored.prune_kyber_one_time_prekeys_below(otpks[1].key_id),
+            1
+        );
+        assert!(
+            restored
+                .kyber_prekey_decapsulate(otpks[0].key_id, vec![0; 1568])
+                .is_err(),
+            "a pruned key is gone"
+        );
     }
 
     /// Strict `init_session` must REJECT a bundle whose SPK is past the 10-day staleness limit.
@@ -3628,6 +3713,84 @@ impl OrchestratorCore {
                 public_key,
                 secret_key,
             })
+    }
+
+    pub fn generate_kyber_one_time_prekeys(
+        &self,
+        count: u32,
+    ) -> Result<Vec<KyberPrekeyUpload>, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let records = orch.generate_kyber_one_time_prekeys(count).map_err(|e| {
+            tracing::error!(target: "crypto::uniffi", error = %e, "generate_kyber_one_time_prekeys failed");
+            CryptoError::InitializationFailed
+        })?;
+        Ok(records.into_iter().map(KyberPrekeyUpload::from).collect())
+    }
+
+    pub fn kyber_one_time_prekey_count(&self) -> u32 {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.kyber_one_time_prekey_count()
+    }
+
+    pub fn prune_kyber_one_time_prekeys_below(&self, min_keep_id: u32) -> u32 {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.prune_kyber_one_time_prekeys_below(min_keep_id)
+    }
+
+    pub fn begin_kyber_spk_rotation(&self) -> Result<KyberPrekeyUpload, CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.begin_kyber_spk_rotation()
+            .map(KyberPrekeyUpload::from)
+            .map_err(|e| {
+                tracing::error!(target: "crypto::uniffi", error = %e, "begin_kyber_spk_rotation failed");
+                CryptoError::InitializationFailed
+            })
+    }
+
+    pub fn commit_kyber_spk_rotation(&self) -> bool {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.commit_kyber_spk_rotation()
+    }
+
+    pub fn rollback_kyber_spk_rotation(&self) {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.rollback_kyber_spk_rotation();
+    }
+
+    pub fn current_kyber_spk_upload(&self) -> Result<Option<KyberPrekeyUpload>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.current_kyber_spk_upload()
+            .map(|r| r.map(KyberPrekeyUpload::from))
+            .map_err(|e| {
+                tracing::error!(target: "crypto::uniffi", error = %e, "current_kyber_spk_upload failed");
+                CryptoError::InitializationFailed
+            })
+    }
+
+    pub fn kyber_prekey_decapsulate(
+        &self,
+        key_id: u32,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.kyber_prekey_decapsulate(key_id, &ciphertext)
+            .map(crate::crypto::SecretBytes::into_vec)
+            .map_err(|e| {
+                tracing::warn!(target: "crypto::uniffi", key_id, error = %e, "kyber_prekey_decapsulate failed");
+                CryptoError::DecryptionFailed { message: e }
+            })
+    }
+
+    pub fn export_kyber_prekeys(&self) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.export_kyber_prekeys_cfe()
+            .map_err(|e| serialization_failed("orchestrator export_kyber_prekeys", e))
+    }
+
+    pub fn import_kyber_prekeys(&self, data: Vec<u8>) -> Result<(), CryptoError> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.import_kyber_prekeys_cfe(&data)
+            .map_err(|e| serialization_failed("orchestrator import_kyber_prekeys", e))
     }
 
     pub fn set_local_user_id(&self, user_id: String) {
