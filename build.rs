@@ -17,23 +17,46 @@ fn main() {
     // answer for a build from a tarball with no history.
     let commit = std::env::var("GITHUB_SHA")
         .ok()
-        .or_else(|| {
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .and_then(|out| String::from_utf8(out.stdout).ok())
-        })
-        .map(|sha| sha.trim().chars().take(12).collect::<String>())
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .map(|sha| sha.chars().take(12).collect::<String>())
         .filter(|sha| !sha.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=CONSTRUCT_CORE_COMMIT={commit}");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-    // Catches a branch switch, not a new commit on the same branch: a stale
-    // stamp is possible on a dev machine and never on a release, which builds
-    // from a fresh checkout. The releases are what integrators identify builds
-    // by, so that is where it has to be right.
-    println!("cargo:rerun-if-changed=.git/HEAD");
+
+    // What moves when the commit does. `.git/HEAD` alone moves on a branch
+    // switch but not on a commit to the branch checked out — that writes the
+    // branch's ref — so every local build after a fresh commit stamped the
+    // commit before it, and `build_crypto_lib.sh` reported the slices as built
+    // from a core they were not built from (2026-09-23). Paths come from
+    // `--git-path` because in a worktree `.git` is a file, not a directory.
+    //
+    // The branch refs are watched as a directory, which cargo scans
+    // recursively: a ref that `git gc` packed has no file of its own until the
+    // next commit writes one, and a path that does not exist would make cargo
+    // rerun this script on every build. `packed-refs` only when it exists, for
+    // the same reason.
+    let head = git(&["rev-parse", "--git-path", "HEAD"]).unwrap_or_else(|| ".git/HEAD".to_string());
+    let mut watched = vec![head];
+    watched.extend(git(&["rev-parse", "--git-path", "refs/heads"]));
+    watched.extend(
+        git(&["rev-parse", "--git-path", "packed-refs"])
+            .filter(|p| std::path::Path::new(p).exists()),
+    );
+    for path in watched {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+/// One line of git's output, or nothing when git is absent or the command fails.
+fn git(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
