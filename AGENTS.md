@@ -37,14 +37,13 @@
 ### 3. Cross-Platform Boundary (UniFFI)
 - When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
 - Prefer passing `bytes` (sequence<u8>) or `string` for complex data to ensure compatibility across languages.
-- **The UDL is not the only API.** `construct-tui` depends on this crate by path and uses its `pub`
-  Rust modules directly (`orchestration`, `cfe`, `crypto::{sealed_sender, handshake, suites,
-  client_api, keys}`, `wire_payload`, `pow`, `device_id`). Changing a `pub` type or signature there
-  breaks it even when the UDL is untouched — check it builds (`cargo check` in construct-tui with
-  this crate at `../construct-core`) and say in the PR what it has to change.
+- **`construct-tui` is paused** (2026-09-25) until iOS, Android and multi-device are settled. It
+  uses this crate's `pub` Rust modules by path, and it already does not build against `main`. A
+  change here does not have to keep it building or be checked against it; it will be brought up to
+  date in one piece when work on it resumes.
 
 **If two clients must agree on it, this crate must export it — not describe it.** There are two
-clients now (`construct-messenger`, `construct-tui`) and Android is coming. Anything a client would
+clients now (`construct-messenger` on iOS, `construct-android`). Anything a client would
 otherwise reimplement is a decision that will diverge, and divergence here is silent: the copy is
 dropped as foreign, the message never appears, and neither side can say which one is right. The
 `content_type` split between iOS and the TUI was found by comparing tables, not by a failure.
