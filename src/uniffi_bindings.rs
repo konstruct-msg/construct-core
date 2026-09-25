@@ -2059,6 +2059,66 @@ mod tests {
         assert_eq!(health.pq_authentication, PqAuthentication::Authenticated);
     }
 
+    /// The responder's other entry: the envelope's payload as packed, unpacked by the core. What
+    /// `init_receiving_session` needs copied into `BinaryFirstMessage` — the v2 flag, the Kyber
+    /// prekey id, the ciphertext — the platform never touches here.
+    #[test]
+    fn test_pqxdh_v2_responder_from_the_wire_payload() {
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
+        bob_bundle.suite_id = 1;
+
+        alice
+            .init_session("bob_user_id".to_string(), bob_bundle)
+            .unwrap();
+        let encrypted = alice
+            .encrypt_message("bob_user_id".to_string(), b"hello".to_vec())
+            .unwrap();
+        let wire = wire_payload_pack(WirePayload {
+            dh_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+            kyber_otpk_id: encrypted.kyber_prekey_id,
+            previous_chain_length: 0,
+            suite_id: encrypted.suite_id,
+            kem_ciphertext: Some(encrypted.kem_ciphertext),
+            sealed_box: encrypted.content,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: false,
+        })
+        .unwrap();
+
+        let result = bob
+            .init_receiving_session_from_wire_payload(
+                "alice_user_id".to_string(),
+                alice_bundle.clone(),
+                wire,
+            )
+            .unwrap();
+        assert_eq!(result.decrypted_message, b"hello");
+        let health = bob.get_session_health("alice_user_id".to_string()).unwrap();
+        assert_eq!(health.pq_handshake, PqHandshake::InitialV2);
+
+        // Not a payload at all: refused, and no session is left behind.
+        let carol = make_orchestrator("carol_user_id");
+        let err = carol
+            .init_receiving_session_from_wire_payload(
+                "alice_user_id".to_string(),
+                alice_bundle,
+                vec![0u8; 8],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, CryptoError::SessionInitializationFailed { message }
+                if message.starts_with("wire_payload unpack failed")),
+            "{err:?}"
+        );
+        assert!(!carol.has_session("alice_user_id".to_string()));
+    }
+
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
     /// FIRST message through the uniffi wire types the iOS app uses.
     ///
@@ -3600,9 +3660,33 @@ impl OrchestratorCore {
             kyber_prekey_id: first_message.kyber_prekey_id,
             kem_ciphertext: first_message.kem_ciphertext,
         };
+        self.init_receiving(&contact_id, &public_bundle, &first_msg)
+    }
+
+    /// RESPONDER init from the envelope's `encrypted_payload`, unpacked by the core. Prefer it to
+    /// `init_receiving_session`, whose `BinaryFirstMessage` is a platform copy of the same fields.
+    pub fn init_receiving_session_from_wire_payload(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+        wire_payload: Vec<u8>,
+    ) -> Result<SessionInitResult, CryptoError> {
+        use crate::orchestration::orchestrator::IncomingFirstMessage;
+        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
+        let first_msg = IncomingFirstMessage::from_wire_payload(&wire_payload)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
+        self.init_receiving(&contact_id, &public_bundle, &first_msg)
+    }
+
+    fn init_receiving(
+        &self,
+        contact_id: &str,
+        public_bundle: &X3DHPublicKeyBundle,
+        first_msg: &crate::orchestration::orchestrator::IncomingFirstMessage,
+    ) -> Result<SessionInitResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
-            .init_receiving_session_with_msg(&contact_id, &public_bundle, &first_msg)
+            .init_receiving_session_with_msg(contact_id, public_bundle, first_msg)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
         Ok(SessionInitResult {
             session_id,

@@ -83,6 +83,28 @@ pub struct IncomingFirstMessage {
     pub kem_ciphertext: Vec<u8>,
 }
 
+impl IncomingFirstMessage {
+    /// The first message as the envelope carries it (`encrypted_payload`), unpacked here so that
+    /// no field the responder needs — the PQXDH v2 flag, the Kyber prekey id, the KEM ciphertext,
+    /// the suite-3 tags — passes through a platform copy on the way in.
+    pub fn from_wire_payload(wire_payload: &[u8]) -> Result<Self, String> {
+        let d = crate::wire_payload::unpack(wire_payload)
+            .map_err(|e| format!("wire_payload unpack failed: {e}"))?;
+        Ok(Self {
+            ephemeral_public_key: d.dh_public_key,
+            message_number: d.message_number,
+            content: d.sealed_box,
+            one_time_prekey_id: d.one_time_prekey_id,
+            suite_id: d.suite_id,
+            pq_message_epoch: d.pq_message_epoch,
+            pq_ratchet_field: d.pq_ratchet_field,
+            pqxdh_v2: d.pqxdh_v2,
+            kyber_prekey_id: d.kyber_otpk_id,
+            kem_ciphertext: d.kem_ciphertext.unwrap_or_default(),
+        })
+    }
+}
+
 /// An encrypted outgoing message and the handshake header it carries, ready to pack.
 #[derive(Debug, Clone)]
 pub struct OutgoingEncrypted {

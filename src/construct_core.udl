@@ -1039,6 +1039,12 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
 
+    // RESPONDER init from the envelope's encrypted_payload as received. The core unpacks it, so
+    // the PQXDH v2 flag, the Kyber prekey id, the KEM ciphertext and the suite-3 tags cannot be
+    // lost in a platform copy. Prefer it to init_receiving_session.
+    [Throws=CryptoError]
+    SessionInitResult init_receiving_session_from_wire_payload(string contact_id, BinaryKeyBundle recipient_bundle, sequence<u8> wire_payload);
+
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
 
