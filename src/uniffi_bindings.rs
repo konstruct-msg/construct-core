@@ -3589,7 +3589,14 @@ impl OrchestratorCore {
         contact_id: String,
         recipient_bundle: BinaryKeyBundle,
     ) -> Result<String, CryptoError> {
-        check_bundle_freshness(&recipient_bundle)?;
+        if let Err(e) = check_bundle_freshness(&recipient_bundle) {
+            // Refused before the orchestrator saw it, so its own refusal path never ran.
+            self.inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reopen_refused(&contact_id);
+            return Err(e);
+        }
         self.open_session_inner(contact_id, recipient_bundle, false, true)
     }
 
@@ -3609,8 +3616,17 @@ impl OrchestratorCore {
         allow_stale: bool,
         replace: bool,
     ) -> Result<String, CryptoError> {
-        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
+        let parsed = binary_bundle_to_x3dh(&recipient_bundle);
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let public_bundle = match parsed {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                if replace {
+                    orch.reopen_refused(&contact_id);
+                }
+                return Err(e);
+            }
+        };
         let open = if replace {
             crate::orchestration::orchestrator::Orchestrator::reopen_session_with_bundle
         } else {

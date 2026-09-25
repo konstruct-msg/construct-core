@@ -294,6 +294,22 @@ pub enum Event {
     /// The init finished, either way. The machine does not care which: a failed init leaves no
     /// session, and a successful one is visible in the lifecycle manager.
     OpenFinished,
+    /// The reopen this `Opening` was granted for was refused, and the session held before it is
+    /// still held, unchanged — `reopen_session_with_bundle` puts it back on any error.
+    ///
+    /// Not `OpenFinished` for a different reason than the outcome: that event is how a session
+    /// that exists *again* settles a teardown record, and a refusal built nothing. What it does
+    /// have to end is the `Opening`, including an announced one. The platform raises the confirm
+    /// gate before the init runs (so no ping can take `msgNum = 0` from the SESSION_RESET_INIT),
+    /// and a refused init leaves no carrier to wait on: the peer holds the ratchet we still hold.
+    /// Before this event the gate stayed up for `OPENING_CONFIRM_WINDOW_MS` after every
+    /// `PQ_REQUIRED` — the PQXDH v2 upgrade sweep meeting an old build, the one case the reopen
+    /// was designed to leave untouched (stand run 2026-09-25).
+    ///
+    /// Sent by the core itself, from the reopen's error path, and never for `init_session`: that
+    /// call also refuses when a session is already held, which can be the announced one whose
+    /// answer the gate is rightly waiting for.
+    OpenFailed,
     /// A SESSION_RESET_INIT has gone out to this device.
     ///
     /// A report of something the platform did, not a request — it is the one fact about an
@@ -525,6 +541,15 @@ impl SessionMachine {
                 // Paying the debt afterwards would tear down the session that fixed the problem
                 // — the crossing-teardown defect, arriving by its own timer.
                 self.phases.remove(device_id);
+                Effect::Nothing
+            }
+
+            Event::OpenFailed => {
+                // Only the `Opening`. A teardown record is not this refusal's to settle: nothing
+                // replaced the ratchet it condemns.
+                if matches!(self.phases.get(device_id), Some(Phase::Opening { .. })) {
+                    self.phases.remove(device_id);
+                }
                 Effect::Nothing
             }
 
@@ -1051,6 +1076,51 @@ mod tests {
         m.handle("dev", Event::SriAnnounced);
         m.handle("dev", Event::PeerAcked);
         assert_eq!(m.phase("dev"), Phase::Absent);
+    }
+
+    /// A refused reopen ends the opening even after the platform raised the gate for it: there
+    /// is no carrier to wait on, and the ratchet the peer holds is the one we still hold.
+    ///
+    /// Mutation: make `OpenFailed` a no-op — this reddens.
+    #[test]
+    fn a_refused_reopen_ends_the_opening_it_was_granted_for() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(
+            m.handle(
+                "dev",
+                Event::WantToReopen {
+                    peer_rebuilds: false
+                }
+            ),
+            Effect::Open
+        );
+        m.handle("dev", Event::SriAnnounced);
+        assert!(
+            m.awaits_acknowledgement("dev"),
+            "the platform raised the gate first"
+        );
+        assert_eq!(m.handle("dev", Event::OpenFailed), Effect::Nothing);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+        assert!(!m.awaits_acknowledgement("dev"));
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// And touches nothing else. A teardown debt condemns a ratchet a refusal did not replace.
+    ///
+    /// Mutation: remove the phase whatever it is — this reddens.
+    #[test]
+    fn a_refused_reopen_leaves_a_teardown_record_alone() {
+        let (mut m, _) = machine(1_000);
+        m.handle(
+            "dev",
+            Event::WantToTearDown {
+                cause: TearDownCause::Blind,
+            },
+        );
+        let before = m.phase("dev");
+        assert!(matches!(before, Phase::TearingDown { .. }));
+        m.handle("dev", Event::OpenFailed);
+        assert_eq!(m.phase("dev"), before);
     }
 
     // ── The announcement, and waiting for it ──────────────────────────────────

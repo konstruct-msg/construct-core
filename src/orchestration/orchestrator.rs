@@ -727,7 +727,17 @@ impl Orchestrator {
             );
             self.lifecycle.client.put_back_session(contact_id, session);
         }
+        if opened.is_err() {
+            self.reopen_refused(contact_id);
+        }
         opened
+    }
+
+    /// The machine's half of a refused reopen: the `Opening` it granted ends, gate included.
+    /// Called from here and, for a bundle refused before it reaches the orchestrator, from the FFI
+    /// `reopen_session`. Idempotent: a device not in `Opening` is left as it is.
+    pub fn reopen_refused(&mut self, contact_id: &str) {
+        self.sessions.handle(contact_id, SessionEvent::OpenFailed);
     }
 
     /// PQXDH v2 responder: the ML-KEM part of a first message, decapsulated with our own Kyber
@@ -4359,6 +4369,32 @@ mod pqxdh_v2_tests {
             PqHandshake::None
         );
         zed.encrypt_bytes_for("bob", b"still here").unwrap();
+    }
+
+    /// The same refusal as the platform meets it: the sweep grants the open, the platform raises
+    /// the confirm gate before the init runs, and the init is refused. Nothing was built, so
+    /// nothing may keep holding sends to this peer — on the 2026-09-25 stand the gate stayed up
+    /// for the whole confirm window after every `PQ_REQUIRED`.
+    ///
+    /// Mutation: drop `reopen_refused` from `reopen_session_with_bundle` — this reddens.
+    #[test]
+    fn a_refused_reopen_leaves_no_confirm_gate() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        assert_eq!(opened(&sweep(&mut zed)), ["bob"]);
+        zed.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        assert!(zed.awaits_acknowledgement("bob"));
+
+        let (x3dh, _) = bundle_of(&mut bob, false);
+        zed.reopen_session_with_bundle("bob", x3dh, KyberBundleKeys::default(), false)
+            .unwrap_err();
+        assert!(!zed.awaits_acknowledgement("bob"));
+        assert_eq!(
+            zed.sessions.phase("bob"),
+            crate::orchestration::session_machine::Phase::Absent
+        );
     }
 
     #[test]
