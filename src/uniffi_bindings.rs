@@ -1928,6 +1928,62 @@ mod tests {
     /// components carry the handshake; the responder opens the session from them, burns the key
     /// and hands back the prekeys to persist.
     #[cfg(feature = "post-quantum")]
+    /// `reopen_session` is the answer to `OpenSession` with or without a session held, and a
+    /// refused reopen leaves the held session in place (the upgrade sweep meeting an old build).
+    #[test]
+    fn test_reopen_session_replaces_only_once_the_new_one_exists() {
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut bundle = pq_bundle(&bob);
+        bundle.suite_id = 1;
+        bundle.spk_uploaded_at = now;
+        bundle.spk_rotation_epoch = 4;
+        bundle.kyber_spk_uploaded_at = now;
+        bundle.kyber_spk_rotation_epoch = 5;
+        let bob_id = || "bob_user_id".to_string();
+        let kyber_prekey_in_use = || {
+            alice
+                .encrypt_message(bob_id(), b"x".to_vec())
+                .unwrap()
+                .kyber_prekey_id
+        };
+
+        // Nothing held: an ordinary open.
+        alice.reopen_session(bob_id(), bundle.clone()).unwrap();
+        let spk_id = kyber_prekey_in_use();
+
+        // A bundle without the hybrid identity key, as an old build serves it: refused, kept.
+        let mut old_build = bundle.clone();
+        old_build.hybrid_identity_key = None;
+        old_build.hybrid_identity_signature = None;
+        let err = alice.reopen_session(bob_id(), old_build).unwrap_err();
+        assert!(
+            matches!(&err, CryptoError::SessionInitializationFailed { message }
+                if message.starts_with("PQ_REQUIRED")),
+            "{err:?}"
+        );
+        assert!(alice.has_session(bob_id()));
+        assert_eq!(kyber_prekey_in_use(), spk_id);
+
+        // A bundle that yields a v2 session replaces the held one.
+        let otpk = bob
+            .generate_kyber_one_time_prekeys(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        bundle.kyber_one_time_prekey_id = Some(otpk.key_id);
+        bundle.kyber_one_time_prekey_public = Some(otpk.public_key);
+        bundle.kyber_one_time_prekey_created_at = Some(otpk.created_at);
+        bundle.kyber_one_time_prekey_signature = Some(otpk.signature);
+        bundle.kyber_one_time_prekey_hybrid_signature = Some(otpk.hybrid_signature);
+        alice.reopen_session(bob_id(), bundle).unwrap();
+        assert_eq!(kyber_prekey_in_use(), otpk.key_id);
+    }
+
     #[test]
     fn test_pqxdh_v2_through_the_exported_api() {
         use crate::crypto::SuiteID;
@@ -3466,15 +3522,42 @@ impl OrchestratorCore {
         self.init_session_inner(contact_id, recipient_bundle, true)
     }
 
+    /// The answer to `CfeAction::OpenSession`: open a session, replacing the one held only once
+    /// the new one exists. See `Orchestrator::reopen_session_with_bundle`.
+    pub fn reopen_session(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+    ) -> Result<String, CryptoError> {
+        check_bundle_freshness(&recipient_bundle)?;
+        self.open_session_inner(contact_id, recipient_bundle, false, true)
+    }
+
     fn init_session_inner(
         &self,
         contact_id: String,
         recipient_bundle: BinaryKeyBundle,
         allow_stale: bool,
     ) -> Result<String, CryptoError> {
+        self.open_session_inner(contact_id, recipient_bundle, allow_stale, false)
+    }
+
+    fn open_session_inner(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+        allow_stale: bool,
+        replace: bool,
+    ) -> Result<String, CryptoError> {
         let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.init_session_with_bundle(
+        let open = if replace {
+            crate::orchestration::orchestrator::Orchestrator::reopen_session_with_bundle
+        } else {
+            crate::orchestration::orchestrator::Orchestrator::init_session_with_bundle
+        };
+        open(
+            &mut orch,
             &contact_id,
             public_bundle,
             crate::orchestration::orchestrator::KyberBundleKeys {
@@ -4191,7 +4274,9 @@ pub enum CfeAction {
         redelivery: bool,
     },
     /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
-    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told.
+    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told. Build it with
+    /// `reopen_session`, which also covers a session still held: the PQXDH v2 upgrade sweep asks
+    /// this for classical sessions.
     OpenSession {
         contact_id: String,
     },

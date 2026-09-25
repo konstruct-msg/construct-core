@@ -879,7 +879,8 @@ interface CfeAction {
     /// this exact init was already applied (true), or it pre-dates the session held (false).
     ResetInitSuperseded(string contact_id, boolean redelivery);
     /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
-    /// SESSION_RESET_INIT) — not a bare local init.
+    /// SESSION_RESET_INIT) — not a bare local init. Build it with `reopen_session`, which also
+    /// covers a session still held: the PQXDH v2 upgrade sweep asks this for classical sessions.
     OpenSession(string contact_id);
     /// Too soon to open: the peer tore this ratchet down and its rebuild may be in the same
     /// flush. The core arms the retry itself; do NOT schedule one.
@@ -1027,6 +1028,13 @@ interface OrchestratorCore {
     // The caller is responsible for flagging the resulting session as "at-risk".
     [Throws=CryptoError]
     string init_session_allowing_stale(string contact_id, BinaryKeyBundle recipient_bundle);
+
+    // The answer to CfeAction.OpenSession, with or without a session held: builds the new
+    // session first and replaces the held one only if that succeeded. A refusal (PQ_REQUIRED
+    // while the peer has no Kyber-1024 keys yet) leaves the held session exactly as it was.
+    // Do not remove the session yourself before calling it.
+    [Throws=CryptoError]
+    string reopen_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
     [Throws=CryptoError]
     SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);

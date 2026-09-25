@@ -839,6 +839,19 @@ where
         self.sessions.remove(contact_id).is_some()
     }
 
+    /// Take the session with `contact_id` out of the map without dropping it.
+    ///
+    /// For a replacement that must not lose the old session if the new one cannot be built:
+    /// `put_back_session` returns it unchanged, with no serialisation of its secrets in between.
+    pub(crate) fn take_session(&mut self, contact_id: &str) -> Option<Session<P, H, M>> {
+        self.sessions.remove(contact_id)
+    }
+
+    /// Return a session taken by `take_session`.
+    pub(crate) fn put_back_session(&mut self, contact_id: &str, session: Session<P, H, M>) {
+        self.sessions.insert(contact_id.to_string(), session);
+    }
+
     ///
     /// Используется для восстановления сессий из persistent storage (Keychain).
     ///

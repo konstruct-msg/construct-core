@@ -147,7 +147,30 @@ pub struct Orchestrator {
     active_chats: HashSet<String>,
     /// A responder init burned a Kyber one-time prekey since `take_kyber_prekeys_to_persist`.
     kyber_prekeys_dirty: bool,
+    /// Devices the PQXDH v2 upgrade sweep has already asked to reopen since launch.
+    ///
+    /// In memory on purpose: "once" means once per launch, not once ever. A reopen refused
+    /// because the peer is still on a build without Kyber-1024 keys leaves the classical session
+    /// in place, and the next launch is when to try again — the peer may have updated by then.
+    /// Within a launch, a second ask is the loop the batch timer would otherwise become.
+    pq_upgrade_asked: HashSet<String>,
 }
+
+/// How long after `AppLaunched` the PQXDH v2 upgrade sweep runs (ms).
+///
+/// After the prewarm sweep and the launch-time fetch of pending messages, not with them: an
+/// SRI raised while the peer's backlog is still arriving replaces the ratchet that backlog was
+/// encrypted on.
+pub const PQ_UPGRADE_SWEEP_DELAY_MS: u64 = 15_000;
+
+/// How many devices one pass of the upgrade sweep reopens.
+///
+/// Each reopen is a bundle fetch and one of the peer's one-time prekeys. A device with many
+/// classical sessions reopens them in batches rather than in one burst.
+pub const PQ_UPGRADE_BATCH: usize = 8;
+
+/// The pause between two batches of the upgrade sweep (ms).
+pub const PQ_UPGRADE_BATCH_INTERVAL_MS: u64 = 30_000;
 
 impl Orchestrator {
     /// Create a new orchestrator for the given local user.
@@ -169,6 +192,7 @@ impl Orchestrator {
             prewarm_done: HashSet::new(),
             active_chats: HashSet::new(),
             kyber_prekeys_dirty: false,
+            pq_upgrade_asked: HashSet::new(),
         }
     }
 
@@ -651,6 +675,37 @@ impl Orchestrator {
             "session opened (PQXDH v2 initiator)"
         );
         Ok(contact_id.to_string())
+    }
+
+    /// Open a session to `contact_id` from its fetched bundle, **replacing** the one held, but
+    /// only once the new one exists.
+    ///
+    /// The answer to `OpenSession`, whether or not a session is held. `init_session_with_bundle`
+    /// refuses while one is, so a reopen used to be "remove, then init" on the platform — and a
+    /// refused init after the remove left the pair with no session at all. That is the ordinary
+    /// outcome of the PQXDH v2 upgrade sweep while the peer is still on a build without
+    /// Kyber-1024 keys (`PQ_REQUIRED`), so the order is the core's: the held session is set
+    /// aside, the new one is built, and on any error the held one is put back exactly as it was.
+    /// On success the old ratchet is dropped, as it is after any SESSION_RESET_INIT.
+    pub fn reopen_session_with_bundle(
+        &mut self,
+        contact_id: &str,
+        public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        kyber: KyberBundleKeys,
+        allow_stale: bool,
+    ) -> Result<String, String> {
+        let held = self.lifecycle.client.take_session(contact_id);
+        let opened = self.init_session_with_bundle(contact_id, public_bundle, kyber, allow_stale);
+        if let (Err(e), Some(session)) = (&opened, held) {
+            tracing::warn!(
+                target: "crypto::orchestrator",
+                contact_id = %contact_id,
+                error = %e,
+                "reopen refused — keeping the session already held"
+            );
+            self.lifecycle.client.put_back_session(contact_id, session);
+        }
+        opened
     }
 
     /// PQXDH v2 responder: the ML-KEM part of a first message, decapsulated with our own Kyber
@@ -1819,7 +1874,7 @@ impl Orchestrator {
 
     fn handle_app_launched(&mut self) -> Vec<Action> {
         // Schedule a GC and prewarm sweep on launch.
-        vec![
+        let mut actions = vec![
             Action::ScheduleTimer {
                 timer_id: "gc_sweep".to_string(),
                 delay_ms: 5_000,
@@ -1828,7 +1883,90 @@ impl Orchestrator {
                 timer_id: "prewarm_sweep".to_string(),
                 delay_ms: 2_000,
             },
-        ]
+        ];
+        // Only a build that opens v2 sessions can upgrade anything: without `post-quantum` the
+        // reopened session would be classical again, and the sweep would reopen it every launch.
+        if cfg!(feature = "post-quantum") {
+            actions.push(Action::ScheduleTimer {
+                timer_id: "pq_upgrade_sweep".to_string(),
+                delay_ms: PQ_UPGRADE_SWEEP_DELAY_MS,
+            });
+        }
+        actions
+    }
+
+    /// Devices whose session should be reopened to get PQXDH v2 (design §6).
+    ///
+    /// A session opened before the cutover whose ML-KEM contribution never landed
+    /// (`PqHandshake::None`) stays classical for its whole life: nothing in the ratchet brings PQ
+    /// in later. A new session is v2 from its first message, so reopening is the whole upgrade.
+    /// `DeferredV1` sessions are left alone — only their first flight, long since sent, was
+    /// classical, and a new session would not protect it.
+    ///
+    /// Only the side `tie_break_role` makes INITIATOR asks. Both ends see the same classical
+    /// session after they update; if both reopened, the two SRIs would cross and each would
+    /// replace the session the other had just built. The ranking is the one `ReopenRequested`
+    /// already uses, so the responder waits exactly as it waits after a teardown.
+    ///
+    /// Devices already asked since launch are left out (`pq_upgrade_asked`). Sorted, so the
+    /// batches are the same on every run.
+    pub fn pq_upgrade_candidates(&self) -> Vec<String> {
+        use crate::crypto::kyber_prekey_auth::PqHandshake;
+
+        let me = self.lifecycle.client.local_user_id();
+        let mut candidates: Vec<String> = self
+            .get_all_session_contact_ids()
+            .into_iter()
+            .filter(|contact_id| !self.pq_upgrade_asked.contains(contact_id))
+            .filter(|contact_id| matches!(tie_break_role(me, contact_id), Role::Initiator))
+            .filter(|contact_id| {
+                self.get_session_health(contact_id)
+                    .is_some_and(|health| health.pq_handshake == PqHandshake::None)
+            })
+            .collect();
+        candidates.sort();
+        candidates
+    }
+
+    /// One batch of the upgrade: reopen, through the machine, as an announced X3DH.
+    ///
+    /// `OpenSession` and not a teardown first. The platform answers it by fetching the peer's
+    /// bundle and calling `reopen_session_with_bundle`, which keeps the held session when the
+    /// peer has no Kyber-1024 keys yet (`PQ_REQUIRED`). So a peer still on an old build
+    /// keeps its working classical session, and only a peer that can take a v2 session gets one,
+    /// by the SESSION_RESET_INIT path every reset already takes. A teardown first would leave the
+    /// pair with no session at all until the peer updated.
+    ///
+    /// Anything the machine says other than `Open` — an opening already in flight, a teardown
+    /// whose quiet is still running — ends in a new session anyway, and a new session is v2, so
+    /// those devices count as asked too.
+    fn pq_upgrade_sweep(&mut self) -> Vec<Action> {
+        let candidates = self.pq_upgrade_candidates();
+        let more = candidates.len() > PQ_UPGRADE_BATCH;
+        let mut actions = Vec::new();
+        for contact_id in candidates.into_iter().take(PQ_UPGRADE_BATCH) {
+            self.pq_upgrade_asked.insert(contact_id.clone());
+            if let SessionEffect::Open = self.sessions.handle(
+                &contact_id,
+                SessionEvent::WantToReopen {
+                    peer_rebuilds: false,
+                },
+            ) {
+                tracing::info!(
+                    target: "crypto::orchestrator",
+                    contact_id = %contact_id,
+                    "reopening a classical session to upgrade it to PQXDH v2"
+                );
+                actions.push(Action::OpenSession { contact_id });
+            }
+        }
+        if more {
+            actions.push(Action::ScheduleTimer {
+                timer_id: "pq_upgrade_sweep".to_string(),
+                delay_ms: PQ_UPGRADE_BATCH_INTERVAL_MS,
+            });
+        }
+        actions
     }
 
     fn handle_timer_fired(&mut self, timer_id: String) -> Vec<Action> {
@@ -1840,6 +1978,7 @@ impl Orchestrator {
                 self.sessions.prune_expired();
                 actions
             }
+            "pq_upgrade_sweep" if cfg!(feature = "post-quantum") => self.pq_upgrade_sweep(),
             _ if timer_id.starts_with("cooldown_expired:") => {
                 let contact_id = timer_id["cooldown_expired:".len()..].to_string();
                 let mut actions = vec![Action::ScheduleTimer {
@@ -2461,7 +2600,9 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Action::ScheduleTimer { .. }))
             .collect();
-        assert_eq!(timers.len(), 2);
+        // GC and prewarm; plus the PQXDH v2 upgrade sweep where this build opens v2 sessions.
+        let expected = if cfg!(feature = "post-quantum") { 3 } else { 2 };
+        assert_eq!(timers.len(), expected);
     }
 
     #[test]
@@ -4033,6 +4174,194 @@ mod pqxdh_v2_tests {
         assert_eq!(plaintext, b"after restart");
         assert_eq!(
             alice.get_session_health("bob").unwrap().pq_handshake,
+            PqHandshake::InitialV2
+        );
+    }
+
+    // ── Upgrading sessions opened before the cutover (design §6) ─────────────────────────────
+
+    /// A session as a pre-cutover build left it: classical X3DH, no ML-KEM ever applied.
+    fn classical(me: &mut Orchestrator, peer: &mut Orchestrator, contact_id: &str) {
+        let (x3dh, _) = bundle_of(peer, false);
+        let identity =
+            ClassicSuiteProvider::kem_public_key_from_bytes(x3dh.identity_public.clone());
+        me.lifecycle
+            .client
+            .init_session_with_pq(contact_id, &x3dh, &identity, 0, false, None)
+            .unwrap();
+        assert_eq!(
+            me.get_session_health(contact_id).unwrap().pq_handshake,
+            PqHandshake::None
+        );
+    }
+
+    /// A session whose v1 deferred contribution did land, as its record reads after the upgrade.
+    fn deferred_v1(me: &mut Orchestrator, peer: &mut Orchestrator, contact_id: &str) {
+        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
+        classical(me, peer, contact_id);
+        let record = me
+            .lifecycle
+            .client
+            .get_session(contact_id)
+            .unwrap()
+            .messaging_session()
+            .to_serializable();
+        let mut json = serde_json::to_value(&record).unwrap();
+        json["pq_handshake"] = serde_json::json!(PqHandshake::DeferredV1.as_u8());
+        let record: SerializableSession = serde_json::from_value(json).unwrap();
+        let session = DoubleRatchetSession::from_serializable(record).unwrap();
+        me.lifecycle.client.remove_session(contact_id);
+        me.lifecycle.client.import_session(contact_id, session);
+        assert_eq!(
+            me.get_session_health(contact_id).unwrap().pq_handshake,
+            PqHandshake::DeferredV1
+        );
+    }
+
+    fn sweep(o: &mut Orchestrator) -> Vec<Action> {
+        o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "pq_upgrade_sweep".to_string(),
+        })
+    }
+
+    fn opened(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::OpenSession { contact_id } => Some(contact_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rearmed(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::ScheduleTimer { timer_id, delay_ms }
+                if timer_id == "pq_upgrade_sweep" && *delay_ms == PQ_UPGRADE_BATCH_INTERVAL_MS)
+        })
+    }
+
+    /// Mutation: drop the `tie_break_role` filter from `pq_upgrade_candidates` — this reddens
+    /// (`zzz`, where this device is RESPONDER, would be reopened from both ends).
+    #[test]
+    fn the_upgrade_sweep_reopens_only_classical_sessions_it_initiates() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "amy");
+        classical(&mut zed, &mut bob, "bob");
+        deferred_v1(&mut zed, &mut bob, "cat");
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        zed.init_session_with_bundle("dan", x3dh, kyber, false)
+            .unwrap();
+        // "zed" < "zzz": the peer is the INITIATOR here, and it is the one that reopens.
+        classical(&mut zed, &mut bob, "zzz");
+
+        let launched = zed.handle_event(IncomingEvent::AppLaunched);
+        assert!(
+            launched
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleTimer { timer_id, delay_ms }
+            if timer_id == "pq_upgrade_sweep" && *delay_ms == PQ_UPGRADE_SWEEP_DELAY_MS))
+        );
+
+        let first = sweep(&mut zed);
+        assert_eq!(opened(&first), ["amy", "bob"]);
+        assert!(!rearmed(&first));
+        // The ask is the machine's too: a second open of the same ratchet waits.
+        assert!(
+            zed.sessions
+                .handle("bob", SessionEvent::WantToOpen)
+                .eq(&SessionEffect::WaitForOpen)
+        );
+        // Once per launch, even while the sessions are still classical.
+        assert!(opened(&sweep(&mut zed)).is_empty());
+    }
+
+    /// The next launch asks again for a session that is still classical — the peer may have
+    /// updated since — and not for one the upgrade already replaced.
+    #[test]
+    fn a_new_launch_asks_again_for_what_is_still_classical() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "amy");
+        classical(&mut zed, &mut bob, "bob");
+        assert_eq!(opened(&sweep(&mut zed)), ["amy", "bob"]);
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        zed.reopen_session_with_bundle("bob", x3dh, kyber, false)
+            .unwrap();
+
+        let mut relaunched = device("zed");
+        for contact_id in ["amy", "bob"] {
+            let saved = zed.lifecycle.export_session_bytes_for(contact_id).unwrap();
+            relaunched
+                .lifecycle
+                .import_session_bytes(contact_id, &saved)
+                .unwrap();
+        }
+        assert_eq!(opened(&sweep(&mut relaunched)), ["amy"]);
+    }
+
+    #[test]
+    fn the_upgrade_sweep_goes_in_batches() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        let contacts: Vec<String> = (0..PQ_UPGRADE_BATCH + 2)
+            .map(|i| format!("c{i:02}"))
+            .collect();
+        for contact_id in &contacts {
+            classical(&mut zed, &mut bob, contact_id);
+        }
+        let first = sweep(&mut zed);
+        assert_eq!(opened(&first), contacts[..PQ_UPGRADE_BATCH]);
+        assert!(rearmed(&first));
+        let second = sweep(&mut zed);
+        assert_eq!(opened(&second), contacts[PQ_UPGRADE_BATCH..]);
+        assert!(!rearmed(&second));
+    }
+
+    /// The case the upgrade meets while the peer is still on an old build: its bundle has no
+    /// Kyber-1024 key. The working session must survive the refusal.
+    ///
+    /// Mutation: drop `put_back_session` from `reopen_session_with_bundle` — this reddens.
+    #[test]
+    fn a_refused_reopen_keeps_the_session_held() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        let before = zed.lifecycle.active_session_id("bob").unwrap();
+
+        let (x3dh, _) = bundle_of(&mut bob, false);
+        let err = zed
+            .reopen_session_with_bundle("bob", x3dh, KyberBundleKeys::default(), false)
+            .unwrap_err();
+        assert!(err.starts_with("PQ_REQUIRED"), "{err}");
+        assert_eq!(zed.lifecycle.active_session_id("bob").unwrap(), before);
+        assert_eq!(
+            zed.get_session_health("bob").unwrap().pq_handshake,
+            PqHandshake::None
+        );
+        zed.encrypt_bytes_for("bob", b"still here").unwrap();
+    }
+
+    #[test]
+    fn an_accepted_reopen_is_v2_and_the_peer_opens_it() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        let before = zed.lifecycle.active_session_id("bob").unwrap();
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        zed.reopen_session_with_bundle("bob", x3dh, kyber, false)
+            .unwrap();
+        assert_ne!(zed.lifecycle.active_session_id("bob").unwrap(), before);
+        assert_eq!(
+            zed.get_session_health("bob").unwrap().pq_handshake,
+            PqHandshake::InitialV2
+        );
+        assert!(zed.pq_upgrade_candidates().is_empty());
+
+        let msg0 = zed.encrypt_bytes_for("bob", b"upgraded").unwrap();
+        let (_, plaintext) = bob
+            .init_receiving_session_from_wire_payload("zed", &initiator_bundle_json(&zed), &msg0)
+            .unwrap();
+        assert_eq!(plaintext, b"upgraded");
+        assert_eq!(
+            bob.get_session_health("zed").unwrap().pq_handshake,
             PqHandshake::InitialV2
         );
     }

@@ -163,6 +163,10 @@ pub enum Action {
     /// The answer to `ReopenRequested`, and to the timer that follows a deferred one. The
     /// platform owns the announce because the carrier is its transport; what it no longer owns is
     /// *when*.
+    ///
+    /// Also raised over a session that is still held, by the PQXDH v2 upgrade sweep
+    /// (`Orchestrator::pq_upgrade_candidates`). Build it with `reopen_session_with_bundle`, which
+    /// replaces a held session only once the new one exists — never remove it first.
     OpenSession {
         contact_id: String,
     },
