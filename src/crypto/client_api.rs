@@ -256,7 +256,7 @@ where
 
         for (priv_bytes, sig, id, created_at) in old_spks {
             key_manager
-                .add_old_prekey(priv_bytes, sig, id, created_at)
+                .add_old_prekey(priv_bytes, sig, id, created_at, None)
                 .map_err(|e| format!("Failed to restore old prekey {}: {:?}", id, e))?;
         }
 
@@ -1038,6 +1038,7 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
                 spk_sig: ByteBuf::from(store.signature.clone()),
                 spk_id: store.key_id,
                 created_at: store.created_at,
+                retired_at: store.retired_at,
             })
             .collect();
         old_spks.sort_by_key(|e| e.spk_id);
@@ -1068,28 +1069,29 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
     /// current and pre-rotation signed prekeys, hybrid signature key, Kyber SPK.
     /// `local_user_id` is not part of the record; the caller sets it.
     pub fn from_private_keys_cfe(keys: crate::cfe::CfePrivateKeysV1) -> Result<Self, String> {
-        let old_spks = keys
-            .old_spks
-            .into_iter()
-            .map(|e| {
-                (
-                    e.spk_priv.into_vec(),
-                    e.spk_sig.into_vec(),
-                    e.spk_id,
-                    e.created_at,
-                )
-            })
-            .collect();
-
         let mut client = Self::from_keys_with_history_and_hybrid(
             keys.ik_priv.into_vec(),
             keys.sk_priv.into_vec(),
             keys.spk_priv.into_vec(),
             keys.spk_sig.into_vec(),
             keys.spk_id,
-            old_spks,
+            Vec::new(),
             keys.hybrid_sig_priv.map(|b| b.into_vec()),
         )?;
+        // Added here rather than through the tuple list so each keeps its `retired_at`.
+        for e in keys.old_spks {
+            let id = e.spk_id;
+            client
+                .key_manager_mut()
+                .add_old_prekey(
+                    e.spk_priv.into_vec(),
+                    e.spk_sig.into_vec(),
+                    id,
+                    e.created_at,
+                    e.retired_at,
+                )
+                .map_err(|err| format!("Failed to restore old prekey {id}: {err:?}"))?;
+        }
 
         if let Some(k) = keys.kyber_spk {
             client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
@@ -1757,6 +1759,10 @@ mod tests {
         assert!(
             !old_ids.is_empty(),
             "the premise: a rotation leaves history"
+        );
+        assert!(
+            record.old_spks.iter().all(|e| e.retired_at.is_some()),
+            "a rotated-out SPK records when it retired: retention counts from there"
         );
 
         let restored = TestClient::from_private_keys_cfe(record.clone()).unwrap();

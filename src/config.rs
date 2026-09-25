@@ -102,8 +102,8 @@ pub struct Config {
     /// По умолчанию: 1 час
     pub message_timestamp_past_tolerance_secs: i64,
 
-    /// Период cleanup старых prekeys (в секундах)
-    /// По умолчанию: 30 дней
+    /// Сколько хранится signed prekey после ротации (в секундах), классический и Kyber.
+    /// По умолчанию: `SPK_RETENTION_AFTER_ROTATION_SECS` (14 дней).
     pub prekey_cleanup_period_secs: i64,
 
     // ============================================
@@ -152,7 +152,8 @@ impl Default for Config {
             // Временные параметры
             message_timestamp_future_tolerance_secs: 300, // 5 minutes
             message_timestamp_past_tolerance_secs: 3600,  // 1 hour
-            prekey_cleanup_period_secs: 30 * 24 * 60 * 60, // 30 days
+            prekey_cleanup_period_secs: crate::crypto::keys::SPK_RETENTION_AFTER_ROTATION_SECS
+                as i64,
 
             // Сетевые параметры
             websocket_retry_initial_ms: 1000,

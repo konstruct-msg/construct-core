@@ -60,6 +60,79 @@ pub fn check_kyber_prekey_signature(
     }
 }
 
+// ── v2: ML-KEM-1024 prekeys, freshness under the signature ──────────────────────
+
+/// Suite byte of the v2 Kyber prekey signature message.
+///
+/// A new byte, not a new meaning for `0x10`: a v1 signature (768-bit key, no timestamp) must not
+/// verify as a v2 one, or an old key could be served as a new one.
+pub const KYBER_PREKEY_SIGN_SUITE_V2: u8 = 0x11;
+
+/// The oldest a Kyber SPK may be, by its **signed** `created_at`, for an initiator to encapsulate
+/// to it. Not subject to `allow_stale`: that override exists because the classic SPK's upload
+/// time is the server's unsigned word; here, skipping the check is the replay attack itself.
+pub const KYBER_SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+
+/// `"KonstruktX3DH-v1" ‖ 0x00 0x11 ‖ created_at (u64 BE) ‖ kyber_public` — what the device's
+/// identity key (Ed25519, and the hybrid key) signs for every v2 Kyber prekey, SPK and OTPK
+/// alike. `created_at` sits under the signature so a server cannot pass off a long-rotated key
+/// as current: the bundle's `kyber_spk_uploaded_at` is the server's own, unsigned claim.
+pub fn kyber_prekey_sign_message_v2(created_at: u64, kyber_public: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + kyber_public.len());
+    payload.extend_from_slice(&created_at.to_be_bytes());
+    payload.extend_from_slice(kyber_public);
+    KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(
+        KYBER_PREKEY_SIGN_SUITE_V2,
+        &payload,
+    )
+}
+
+/// Check a v2 Kyber prekey's Ed25519 signature against the bundle's `verifying_key`.
+pub fn check_kyber_prekey_signature_v2(
+    verifying_key: &[u8],
+    kyber_public: &[u8],
+    created_at: u64,
+    signature: Option<&[u8]>,
+) -> KyberPrekeySignature {
+    let Some(signature) = signature.filter(|s| !s.is_empty()) else {
+        return KyberPrekeySignature::Missing;
+    };
+    let message = kyber_prekey_sign_message_v2(created_at, kyber_public);
+    let key = ClassicSuiteProvider::signature_public_key_from_bytes(verifying_key.to_vec());
+    match ClassicSuiteProvider::verify(&key, &message, signature) {
+        Ok(()) => KyberPrekeySignature::Valid,
+        Err(_) => KyberPrekeySignature::Invalid,
+    }
+}
+
+/// Check a v2 Kyber prekey's hybrid (Ed25519 + ML-DSA-65) signature against the device's hybrid
+/// identity key — the half of the prekey's authenticity that a quantum adversary cannot forge.
+///
+/// What this does **not** establish on its own: that `hybrid_identity_key` is the device's. The
+/// bundle binds it to the device only by an Ed25519 cross-signature (key-service field 21), which
+/// is exactly what such an adversary could forge. The caller pins the hybrid key per device.
+#[cfg(feature = "post-quantum")]
+pub fn check_kyber_prekey_hybrid_signature(
+    hybrid_identity_key: &[u8],
+    kyber_public: &[u8],
+    created_at: u64,
+    signature: Option<&[u8]>,
+) -> KyberPrekeySignature {
+    use crate::crypto::suites::hybrid::{HYBRID_SIG_PUBLIC_KEY_SIZE, HybridSuiteProvider};
+    let Some(signature) = signature.filter(|s| !s.is_empty()) else {
+        return KyberPrekeySignature::Missing;
+    };
+    if hybrid_identity_key.len() != HYBRID_SIG_PUBLIC_KEY_SIZE {
+        return KyberPrekeySignature::Invalid;
+    }
+    let message = kyber_prekey_sign_message_v2(created_at, kyber_public);
+    let key = HybridSuiteProvider::signature_public_key_from_bytes(hybrid_identity_key.to_vec());
+    match HybridSuiteProvider::verify(&key, &message, signature) {
+        Ok(()) => KyberPrekeySignature::Valid,
+        Err(_) => KyberPrekeySignature::Invalid,
+    }
+}
+
 /// What a session's post-quantum layer is, as far as this device can know.
 ///
 /// Persisted with the session (`pqa` in the CFE session record) and reported by
@@ -174,6 +247,78 @@ mod tests {
         assert_eq!(
             check_kyber_prekey_signature(&vk, &pk, Some(&sig)),
             KyberPrekeySignature::Invalid
+        );
+    }
+
+    /// The exact v2 bytes: `"KonstruktX3DH-v1" || 0x00 0x11 || created_at (BE) || pk`. The server
+    /// verifies uploads against the same bytes; a change here is a protocol change.
+    #[test]
+    fn the_v2_signed_message_is_suite_0x11_time_then_key() {
+        let msg = kyber_prekey_sign_message_v2(0x0102_0304_0506_0708, &[0xAA, 0xBB]);
+        let mut expected = b"KonstruktX3DH-v1".to_vec();
+        expected.extend_from_slice(&[0x00, 0x11]);
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        expected.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn a_v2_signature_binds_the_time_and_is_not_a_v1_one() {
+        let pk = vec![7_u8; 1568];
+        let (sk, vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
+        let sig =
+            ClassicSuiteProvider::sign(&sk, &kyber_prekey_sign_message_v2(1000, &pk)).unwrap();
+        assert_eq!(
+            check_kyber_prekey_signature_v2(&vk, &pk, 1000, Some(&sig)),
+            KyberPrekeySignature::Valid
+        );
+        assert_eq!(
+            check_kyber_prekey_signature_v2(&vk, &pk, 1001, Some(&sig)),
+            KyberPrekeySignature::Invalid,
+            "a server that rewrites created_at breaks the signature"
+        );
+        assert_eq!(
+            check_kyber_prekey_signature_v2(&vk, &pk, 1000, None),
+            KyberPrekeySignature::Missing
+        );
+
+        // A v1 (0x10) signature over the same key is not a v2 one.
+        let v1 = ClassicSuiteProvider::sign(
+            &sk,
+            &KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x10, &pk),
+        )
+        .unwrap();
+        assert_eq!(
+            check_kyber_prekey_signature_v2(&vk, &pk, 1000, Some(&v1)),
+            KyberPrekeySignature::Invalid
+        );
+    }
+
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn the_hybrid_signature_verifies_over_the_same_v2_message() {
+        use crate::crypto::suites::hybrid::HybridSuiteProvider;
+        let pk = vec![9_u8; 1568];
+        let (hsk, hpk) = HybridSuiteProvider::generate_signature_keys().unwrap();
+        let sig = HybridSuiteProvider::sign(&hsk, &kyber_prekey_sign_message_v2(42, &pk)).unwrap();
+        assert_eq!(
+            check_kyber_prekey_hybrid_signature(&hpk, &pk, 42, Some(&sig)),
+            KyberPrekeySignature::Valid
+        );
+        assert_eq!(
+            check_kyber_prekey_hybrid_signature(&hpk, &pk, 43, Some(&sig)),
+            KyberPrekeySignature::Invalid
+        );
+        let (_, other) = HybridSuiteProvider::generate_signature_keys().unwrap();
+        assert_eq!(
+            check_kyber_prekey_hybrid_signature(&other, &pk, 42, Some(&sig)),
+            KyberPrekeySignature::Invalid,
+            "another hybrid key"
+        );
+        assert_eq!(
+            check_kyber_prekey_hybrid_signature(&hpk[..32], &pk, 42, Some(&sig)),
+            KyberPrekeySignature::Invalid,
+            "a truncated key is refused, not a panic"
         );
     }
 

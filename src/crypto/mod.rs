@@ -128,6 +128,9 @@ pub mod device_copy_tag;
 /// Kyber prekey signature check and the PQ-authentication label of a session
 pub mod kyber_prekey_auth;
 
+/// The core's ML-KEM-1024 prekeys: signed prekey with rotation history, one-time pool
+pub mod kyber_prekeys;
+
 /// SLIP-39 social recovery — vault key Shamir Secret Sharing + bundle encryption
 pub mod social_recovery;
 
