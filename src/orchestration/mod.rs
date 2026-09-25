@@ -9,7 +9,6 @@
 ///   clock            — Clock trait + SystemClock + MockClock (time injection)
 ///   ack_store        — ACK deduplication (Phase 1a)
 ///   healing_queue    — Session healing queue (Phase 1b)
-///   pq_contribution  — PQ contribution manager (Phase 2)
 ///   session_lifecycle— Session lifecycle (Phase 3)       [TODO]
 ///   session_machine  — What phase a ratchet is in, and what may happen to it next
 ///   message_router   — Decision engine (Phase 4)         [TODO]
@@ -18,7 +17,7 @@
 ///   receiving_init_plan — Which queued message opens a session, against which device
 ///   send_plan        — Who gets a copy of an outgoing message
 ///   receiving_decrypt_plan — Which device session an incoming message is tried against
-///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, and what the session is called
+///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, or why no session opens
 ///   orchestrator     — Top-level facade (Phase 5)        [TODO]
 /// ```
 pub mod ack_store;
@@ -29,7 +28,7 @@ pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
 pub mod platform_bridge;
-pub mod pq_contribution;
+#[cfg(feature = "post-quantum")]
 pub mod pq_prekey_plan;
 pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
@@ -46,12 +45,9 @@ pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation
 pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role};
 pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
-pub use pq_contribution::{
-    DeferredContribution, EncapsulationResult, PQContributionManager, SPKRotationPending,
-};
+#[cfg(feature = "post-quantum")]
 pub use pq_prekey_plan::{
-    ClassicReason, KyberPrekeyContext, KyberPrekeyDecision, KyberPrekeyOffer, KyberPrekeyPlan,
-    RefuseReason, plan_kyber_prekey,
+    KyberPrekeyOffer, PqxdhChoice, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,
 };
 pub use receiving_decrypt_plan::plan_receiving_decrypt;
 pub use receiving_init_plan::{

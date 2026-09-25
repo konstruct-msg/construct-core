@@ -50,12 +50,12 @@ fn setup_sessions() -> (
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     // Alice performs X3DH as initiator
     let (root_key_alice, initiator_state) =
-        X3DHProtocol::<Provider>::perform_as_initiator(&alice_identity_priv, &bob_bundle).unwrap();
+        X3DHProtocol::<Provider>::perform_as_initiator(&alice_identity_priv, &bob_bundle, None)
+            .unwrap();
 
     let mut alice_session = DoubleRatchetSession::<Provider>::new_initiator_session(
         &root_key_alice,
@@ -77,6 +77,7 @@ fn setup_sessions() -> (
         &bob_signed_prekey_priv,
         &alice_identity_pub,
         &alice_ephemeral_pub,
+        None,
         None,
     )
     .unwrap();

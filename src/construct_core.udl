@@ -13,10 +13,8 @@ namespace construct_core {
     [Throws=CryptoError]
     sequence<u8> intake_tag(sequence<u8> intake_key, string recipient_account_id, u64 epoch);
 
-    // Whether this core build supports SuiteID::PQ_RATCHET (suite 3).
-    // Pass as supports_pq_ratchet in UploadPreKeysRequest so peers can
-    // negotiate suite-3 sessions against this device.
-    boolean supports_pq_ratchet();
+    // `supports_pq_ratchet()` was here: suite 3 is mandatory in every platform build, and the
+    // unsigned bundle flag it fed was the downgrade (PQXDH v2 cutover).
 
     // Wire payload framing — the SINGLE source of truth for the encrypted_payload
     // byte layout (see wire_payload.rs). Platform SDKs (iOS/Android) MUST call
@@ -84,13 +82,14 @@ dictionary WirePayload {
     sequence<u8> dh_public_key;        // 32-byte X25519 ephemeral public key
     u32 message_number;
     u32 one_time_prekey_id;            // 0 = fallback 3-DH / not a first message
-    u32 kyber_otpk_id;                 // 0 = Kyber SPK used; >0 = Kyber OTPK id
+    u32 kyber_otpk_id;                 // the responder's Kyber prekey (SPK ids from 1, one-time from 1 000 000); 0 = none
     u32 previous_chain_length;         // Double Ratchet PN field
-    u16 suite_id;                      // crypto-suite identifier (1/2/3)
-    sequence<u8>? kem_ciphertext;      // ML-KEM-768 ciphertext for first messages
+    u16 suite_id;                      // ratchet suite (1/3); the PQXDH v2 bit is stripped / set by the core
+    sequence<u8>? kem_ciphertext;      // ML-KEM-1024 ciphertext on the initiator's first flight
     sequence<u8> sealed_box;           // nonce || ciphertext || auth_tag
     u32 pq_message_epoch;              // suite-3 PQ epoch tag (0 otherwise)
     sequence<u8> pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
+    boolean pqxdh_v2 = false;          // unpack: the wire carried the PQXDH v2 flag. pack: ignored (set from kem_ciphertext)
 };
 
 // ============================================================================
@@ -140,12 +139,19 @@ dictionary EncryptedMessageComponents {
     u16 suite_id;              // negotiated DR suite (e.g. 3 = PQ_RATCHET); transmit so the receiver rebuilds the exact AEAD AD (task #12)
     u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
     sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
+    // The PQXDH v2 handshake header — on every message of the initiator's first flight, until the
+    // peer answers; empty / 0 otherwise. Pack it as WirePayload.kem_ciphertext / kyber_otpk_id.
+    sequence<u8> kem_ciphertext;
+    u32 kyber_prekey_id;
 };
 
 dictionary SessionInitResult {
     string session_id;
     sequence<u8> decrypted_message;  // raw plaintext bytes — may be binary or UTF-8
     sequence<u8> storage_key;  // 32-byte random key for the first received message
+    // The core's Kyber prekeys after this init burned a one-time key: persist it as the
+    // `export_kyber_prekeys()` blob. Null when nothing changed.
+    sequence<u8>? kyber_prekeys;
 };
 
 /// Binary key bundle passed across the FFI boundary — no JSON encoding.
@@ -162,18 +168,26 @@ dictionary BinaryKeyBundle {
     u32 spk_rotation_epoch;
     u64 kyber_spk_uploaded_at;
     u32 kyber_spk_rotation_epoch;
+    // ── PQXDH v2: everything below comes from the key service as served. PQ is mandatory: a
+    // bundle that does not yield a Kyber prekey the core can trust is refused ("PQ_REQUIRED: …").
+    // Every Kyber prekey is signed, Ed25519 by `verifying_key` and hybrid by `hybrid_identity_key`,
+    // over "KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || public key.
+    /// Kyber signed prekey (ML-KEM-1024, 1568 bytes), its id and signed creation time.
     sequence<u8>? kyber_pre_key_public;
+    u32? kyber_pre_key_id = null;
+    u64? kyber_pre_key_created_at = null;
+    sequence<u8>? kyber_pre_key_signature = null;
+    sequence<u8>? kyber_pre_key_hybrid_signature = null;
+    /// Kyber one-time prekey (id from 1 000 000), preferred when present and signed.
     sequence<u8>? kyber_one_time_prekey_public;
     u32? kyber_one_time_prekey_id;
-    boolean supports_pq_ratchet;
-    /// Ed25519 signature by `verifying_key` over `build_x3dh_sign_message(0x10,
-    /// kyber_pre_key_public)` — key-service `DevicePreKeyBundle` field 12. Pass it: the core
-    /// verifies it, labels the session, and refuses a device that has presented one before and
-    /// now arrives without.
-    sequence<u8>? kyber_pre_key_signature = null;
-    /// The same over the Kyber OTPK. No source yet (the bundle does not carry it); until it
-    /// does, a verified Kyber SPK is used in preference to the unsigned OTPK.
+    u64? kyber_one_time_prekey_created_at = null;
     sequence<u8>? kyber_one_time_prekey_signature = null;
+    sequence<u8>? kyber_one_time_prekey_hybrid_signature = null;
+    /// Hybrid identity key (Ed25519 + ML-DSA-65, 1984 bytes; field 20) and the Ed25519
+    /// cross-signature binding it to `verifying_key` (field 21). Pinned per device on first use.
+    sequence<u8>? hybrid_identity_key = null;
+    sequence<u8>? hybrid_identity_signature = null;
 };
 
 /// Binary first-message bundle for init_receiving_session — no JSON encoding.
@@ -185,6 +199,19 @@ dictionary BinaryFirstMessage {
     u16 suite_id;              // negotiated DR suite the initiator encrypted with (task #12)
     u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
     sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
+    // The PQXDH v2 handshake, as `wire_payload_unpack` returned it. Required: a first message
+    // without it is refused ("PQXDH_REQUIRED"). `init_receiving_session_from_wire_payload` takes
+    // the raw payload and needs none of this copying.
+    boolean pqxdh_v2;
+    u32 kyber_prekey_id;       // WirePayload.kyber_otpk_id
+    sequence<u8> kem_ciphertext;
+};
+
+/// How a session's post-quantum layer started.
+enum PqHandshake {
+    "None",        // no ML-KEM at session start
+    "DeferredV1",  // before the PQXDH v2 cutover: first sending chain was X25519-only
+    "InitialV2",   // PQXDH v2: ML-KEM-1024 in the initial key, every message covered
 };
 
 /// Read-only health snapshot of a Double Ratchet session.
@@ -207,6 +234,7 @@ dictionary SessionHealthReport {
     u64 last_ratchet_at;
     string session_id;
     PqAuthentication pq_authentication;
+    PqHandshake pq_handshake;
 };
 
 dictionary DecryptedMessageResult {
@@ -269,15 +297,6 @@ dictionary OtpkRecord {
     u32 key_id;
     sequence<u8> private_key;
     sequence<u8> public_key;
-};
-
-/// ML-KEM-768 signed prekey held in the core key-state (PQXDH KEM leg).
-/// Persisted atomically inside the private-keys CFE blob — replaces the
-/// standalone platform Keychain triple (key-store consolidation Phase 2).
-dictionary KyberSpkRecord {
-    u32 key_id;
-    sequence<u8> public_key;
-    sequence<u8> secret_key;
 };
 
 /// One ML-KEM-1024 Kyber prekey to upload (PQXDH v2). Both signatures are over
@@ -361,15 +380,6 @@ interface ClassicCryptoCore {
     [Throws=CryptoError]
     RotatedSpkBundle rotate_signed_prekey();
 
-    // ── Post-Quantum Session Strengthening ───────────────────────────────────
-
-    /// Mix a ML-KEM-768 shared secret into an existing session's root key.
-    ///
-    /// Call after init_session (sender) with kem_ss from mlkem768_encapsulate,
-    /// or after init_receiving_session (receiver) with kem_ss from mlkem768_decapsulate.
-    /// Both sides must call this with the same shared secret to stay in sync.
-    [Throws=CryptoError]
-    void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
 };
 
 // ============================================================================
@@ -435,15 +445,9 @@ interface TrafficProtectionManager {
     boolean is_currently_active();
 };
 
-// ── Post-Quantum Cryptography (ML-KEM-768) ───────────────────────────────────
+// ── Post-Quantum Cryptography (ML-KEM) ───────────────────────────────────────
 
-/// Generated ML-KEM-768 keypair (for Kyber Signed Pre-Key or One-Time Pre-Key upload).
-dictionary MLKEMKeyPair {
-    sequence<u8> public_key;
-    sequence<u8> secret_key;
-};
-
-/// Result of ML-KEM-768 encapsulation (sender side of PQXDH handshake).
+/// Result of an ML-KEM-1024 encapsulation (history transfer to a peer's Kyber SPK).
 dictionary MLKEMEncapsulation {
     sequence<u8> ciphertext;
     sequence<u8> shared_secret;
@@ -547,22 +551,14 @@ namespace construct_core {
     u64 battery_aware_jitter_ms(u64 base_ms, u64 max_jitter_ms, float battery_level);
     u64 recommended_send_delay_ms(boolean is_high_priority, float battery_level);
 
-    // ── Post-Quantum KEM (ML-KEM-768) ────────────────────────────────────────
+    // ── Post-Quantum KEM (ML-KEM-1024) ───────────────────────────────────────
+    // The handshake runs ML-KEM inside the core; nothing on the platform calls it for sessions.
+    // History transfer encapsulates to a peer's Kyber SPK with this, and the receiving side
+    // decapsulates with `OrchestratorCore.kyber_prekey_decapsulate` (the seed never leaves the core).
 
-    /// Generate an ML-KEM-768 keypair for PQC key registration.
+    /// Encapsulate to an ML-KEM-1024 public key (1568 bytes).
     [Throws=CryptoError]
-    MLKEMKeyPair mlkem768_keygen();
-
-    /// Encapsulate to a recipient's ML-KEM-768 public key (sender side PQXDH).
-    /// Returns ciphertext (to include in proto PreKeySignalMessage.kem_ciphertext)
-    /// and shared_secret (to pass to ClassicCryptoCore.apply_pq_contribution).
-    [Throws=CryptoError]
-    MLKEMEncapsulation mlkem768_encapsulate(sequence<u8> public_key);
-
-    /// Decapsulate a received ML-KEM-768 ciphertext (receiver side PQXDH).
-    /// Returns shared_secret to pass to ClassicCryptoCore.apply_pq_contribution.
-    [Throws=CryptoError]
-    sequence<u8> mlkem768_decapsulate(sequence<u8> secret_key, sequence<u8> ciphertext);
+    MLKEMEncapsulation mlkem1024_encapsulate(sequence<u8> public_key);
 
     // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────
 
@@ -846,12 +842,6 @@ interface CfeSecureStoreSlot {
     Session(string contact_id);
     /// A terminated session, kept for late-arriving messages. Empty payload means delete.
     SessionArchive(string contact_id);
-    /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
-    PqDeferred(string contact_id);
-    /// Whole PQContributionManager snapshot.
-    KyberSessionState();
-    /// Secret half of a committed ML-KEM signed prekey. No reachable emitter today.
-    KyberSignedPrekey(u32 key_id);
     /// Orchestrator coordination state.
     OrchestratorState();
 };
@@ -863,7 +853,6 @@ interface CfeAction {
     DecryptMessage(string contact_id, bytes ciphertext);
     EncryptMessage(string contact_id, bytes plaintext);
     InitSession(string contact_id, string bundle_json);
-    ApplyPqContribution(string contact_id, bytes kem_ss);
     ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, bytes plaintext);
     SessionHealNeeded(string contact_id, string role);
@@ -1084,10 +1073,6 @@ interface OrchestratorCore {
 
     u32 prune_one_time_prekeys_below(u32 min_keep_id);
 
-    void set_kyber_spk(u32 key_id, sequence<u8> secret_key, sequence<u8> public_key);
-
-    KyberSpkRecord? kyber_spk();
-
     // ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ────────────────────────────────
     // The core generates, signs and holds them; the seeds never leave it. After every call
     // that changes them, persist `export_kyber_prekeys()` (as with `export_one_time_prekeys`).
@@ -1131,18 +1116,6 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     RotatedSpkBundle rotate_signed_prekey();
 
-    [Throws=CryptoError]
-    void apply_pq_contribution(string contact_id, sequence<u8> kem_shared_secret);
-
-    /// Export the PQContributionManager state as a CFE binary blob.
-    /// Persist under CfeSecureStoreSlot::KyberSessionState.
-    [Throws=CryptoError]
-    sequence<u8> export_kyber_session_state();
-
-    /// Restore the PQContributionManager state from a CFE blob.
-    [Throws=CryptoError]
-    void import_kyber_session_state(sequence<u8> data);
-
     /// Export the full orchestrator coordination state (ACK cache, healing queue,
     /// init locks, archive index, prekey tracker) as a CFE binary blob.
     /// Persist under CfeSecureStoreSlot::OrchestratorState.
@@ -1154,33 +1127,6 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     void import_orchestrator_state(sequence<u8> data);
 
-    /// Register a KEM shared secret as a deferred contribution.
-    void register_pq_deferred(string contact_id, u32 otpk_id, sequence<u8> shared_secret);
-};
-
-// ── RustPQContributions ───────────────────────────────────────────────────────
-
-/// Thread-safe store for deferred PQXDH shared secrets.
-///
-/// Replaces `pendingPQContributions: [String: [UInt8]] + NSLock` in PQCKeyManager.
-///
-/// Protocol: encapsulate (session init) → store SS here → encrypt msg0 with
-/// classic-only DR state → consume SS here → applyPqContribution to DR session.
-/// Both sides must apply PQ at the same moment; if consume returns null, skip PQ.
-interface RustPQContributions {
-    constructor();
-
-    /// Store the KEM shared secret for `contact_id`.
-    void store_deferred(string contact_id, sequence<u8> shared_secret);
-
-    /// Remove and return the stored shared secret. Returns null if not found.
-    sequence<u8>? take_deferred(string contact_id);
-
-    /// Discard any pending contribution (e.g. on send failure).
-    void clear(string contact_id);
-
-    /// `true` if a deferred contribution exists for `contact_id`.
-    boolean has_pending(string contact_id);
 };
 
 // ── ConstructPrivacyPass ──────────────────────────────────────────────────────

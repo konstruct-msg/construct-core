@@ -40,7 +40,15 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             skipped_message_keys: Default::default(), // legacy field, no longer written
             skipped_key_timestamps: Default::default(), // legacy field, no longer written
             skipped_keys,
-            pre_pq_root_key: self.pre_pq_root_key.as_ref().map(|k| k.as_ref().to_vec()),
+            prekey_header: self
+                .prekey_header
+                .as_ref()
+                .map(|h| SerializablePrekeyHeader {
+                    one_time_prekey_id: h.one_time_prekey_id,
+                    kyber_prekey_id: h.kyber_prekey_id,
+                    kem_ciphertext: h.kem_ciphertext.clone(),
+                }),
+            pq_handshake: Some(self.pq_handshake.as_u8()),
             session_id: self.session_id.clone(),
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
@@ -127,11 +135,15 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             previous_sending_length: data.previous_sending_length,
             skipped_message_keys,
             skipped_key_timestamps,
-            pre_pq_root_key: data
-                .pre_pq_root_key
-                .as_deref()
-                .map(|bytes| Self::bytes_to_aead_key(bytes))
-                .transpose()?,
+            prekey_header: data.prekey_header.as_ref().map(|h| PrekeyHeader {
+                one_time_prekey_id: h.one_time_prekey_id,
+                kyber_prekey_id: h.kyber_prekey_id,
+                kem_ciphertext: h.kem_ciphertext.clone(),
+            }),
+            pq_handshake: data
+                .pq_handshake
+                .map(PqHandshake::from_u8)
+                .unwrap_or_else(|| PqHandshake::legacy(data.pq_applied)),
             // PQ ratchet state is restored below from `data.pq_ratchet` after
             // validation; defaults here cover non-suite-3 sessions and blobs
             // whose PQ state fails validation (degrade-not-fail).
@@ -315,6 +327,13 @@ pub struct SkippedKeyEntry {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SerializablePrekeyHeader {
+    one_time_prekey_id: u32,
+    kyber_prekey_id: u32,
+    kem_ciphertext: Vec<u8>,
+}
+
 /// Serializable session format for storage
 ///
 /// # Security Considerations
@@ -379,11 +398,12 @@ pub struct SerializableSession {
     /// v2: skipped keys properly namespaced by (remote_dh_public, msg_number)
     #[serde(default)]
     pub(crate) skipped_keys: Vec<SkippedKeyEntry>,
-    /// RESPONDER-only: pre-second-ratchet root key for symmetric PQXDH derivation.
-    /// Consumed after PQ contribution is applied. Absent for INITIATOR sessions
-    /// and for sessions that have already applied their PQ contribution.
-    #[serde(default)]
-    pre_pq_root_key: Option<Vec<u8>>,
+    /// INITIATOR: the handshake header the first flight repeats (`PrekeyHeader`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prekey_header: Option<SerializablePrekeyHeader>,
+    /// `PqHandshake::as_u8`; absent on sessions recorded before it (derived from `pq_applied`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_handshake: Option<u8>,
     session_id: String,
     contact_id: String,
     #[serde(default)]
@@ -463,9 +483,6 @@ impl Drop for SerializableSession {
         self.sending_chain_key.zeroize();
         self.receiving_chain_key.zeroize();
         if let Some(ref mut k) = self.dh_ratchet_private {
-            k.zeroize();
-        }
-        if let Some(ref mut k) = self.pre_pq_root_key {
             k.zeroize();
         }
         for entry in &mut self.skipped_keys {
@@ -592,10 +609,15 @@ impl SerializableSession {
                     timestamp: e.timestamp,
                 })
                 .collect(),
-            pq_rk1: self
-                .pre_pq_root_key
-                .clone()
-                .map(crate::crypto::SecretBytes::from),
+            prekey_header: self
+                .prekey_header
+                .as_ref()
+                .map(|h| crate::cfe::CfePrekeyHeaderV1 {
+                    one_time_prekey_id: h.one_time_prekey_id,
+                    kyber_prekey_id: h.kyber_prekey_id,
+                    kem_ciphertext: ByteBuf::from(h.kem_ciphertext.clone()),
+                }),
+            pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
             pq_authentication: self.pq_authentication,
             pq_applied: self.pq_applied,
@@ -662,7 +684,12 @@ impl SerializableSession {
                     timestamp: e.timestamp,
                 })
                 .collect(),
-            pre_pq_root_key: data.pq_rk1.map(|b| b.into_vec()),
+            prekey_header: data.prekey_header.map(|h| SerializablePrekeyHeader {
+                one_time_prekey_id: h.one_time_prekey_id,
+                kyber_prekey_id: h.kyber_prekey_id,
+                kem_ciphertext: h.kem_ciphertext.into_vec(),
+            }),
+            pq_handshake: data.pq_handshake,
             session_id: session_id_hex,
             contact_id: data.contact_id,
             local_user_id: data.local_uid,

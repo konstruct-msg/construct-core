@@ -382,7 +382,6 @@ impl MessageRouter {
             Ok(result) => {
                 let mut actions = lifecycle.ack_store.mark_processed(&msg.message_id);
                 actions.extend(result.actions);
-                actions.extend(lifecycle.maybe_apply_pq_contribution(&msg.contact_id));
                 RoutingDecision::Decrypted {
                     contact_id: msg.contact_id.clone(),
                     message_id: msg.message_id.clone(),

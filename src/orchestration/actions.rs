@@ -25,17 +25,6 @@ pub enum SecureStoreSlot {
     Session { contact_id: String },
     /// A terminated session, kept for late-arriving messages. Empty payload means delete.
     SessionArchive { contact_id: String },
-    /// Deferred ML-KEM contribution for one contact. Empty payload means delete.
-    PqDeferred { contact_id: String },
-    /// Whole `PQContributionManager` snapshot.
-    KyberSessionState,
-    /// Secret half of a committed ML-KEM signed prekey.
-    ///
-    /// Nothing reaches this today: `commit_spk_rotation` is called only from its own tests, and
-    /// iOS rotates the Kyber SPK through `PreKeyRotationService` instead. Kept faithful rather
-    /// than dropped so that if the emitter ever becomes reachable the platform is forced to
-    /// answer for it.
-    KyberSignedPrekey { key_id: u32 },
     /// Orchestrator coordination state.
     OrchestratorState,
 }
@@ -54,10 +43,6 @@ pub enum Action {
     InitSession {
         contact_id: String,
         bundle_json: String,
-    },
-    ApplyPQContribution {
-        contact_id: String,
-        kem_ss: Vec<u8>,
     },
     ArchiveSession {
         contact_id: String,

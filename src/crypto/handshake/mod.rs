@@ -45,6 +45,28 @@ pub struct InitiatorState<P: CryptoProvider> {
     pub ephemeral_private: P::KemPrivateKey,
 }
 
+/// The ML-KEM part of a PQXDH v2 handshake, as both sides hold it once the KEM has run.
+///
+/// With it, the root key is `HKDF(0xFF×32, DH1‖DH2‖DH3[‖DH4]‖SS, "Construct-PQXDH-RootKey-v2" ‖
+/// SHA-256(kyber_public) ‖ SHA-256(kem_ciphertext))`: every key of the session, the first message's
+/// included, depends on X25519 *and* ML-KEM. Without it (`None`) the derivation is classical X3DH —
+/// only builds without `post-quantum` do that. construct-docs `cryptocore/PQXDH_V2_DESIGN.md` §5.1.
+#[derive(Clone, Copy)]
+pub struct PqxdhInput<'a> {
+    /// The 32-byte ML-KEM-1024 shared secret.
+    pub shared_secret: &'a [u8],
+    /// The Kyber prekey the initiator encapsulated to (1568 bytes).
+    pub kyber_public: &'a [u8],
+    /// The ciphertext the first message carries (1568 bytes).
+    pub kem_ciphertext: &'a [u8],
+}
+
+impl std::fmt::Debug for PqxdhInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PqxdhInput").finish_non_exhaustive()
+    }
+}
+
 /// Протокол установки ключей (Key Agreement)
 ///
 /// Этот trait абстрагирует процесс установки общего секретного ключа
@@ -125,6 +147,7 @@ pub trait KeyAgreement<P: CryptoProvider> {
     fn perform_as_initiator(
         local_identity: &P::KemPrivateKey,
         remote_bundle: &Self::PublicKeyBundle,
+        pq: Option<&PqxdhInput<'_>>,
     ) -> Result<(Self::SharedSecret, InitiatorState<P>), String>;
 
     /// Выполнить handshake как получатель (Bob)
@@ -171,6 +194,7 @@ pub trait KeyAgreement<P: CryptoProvider> {
         remote_identity: &P::KemPublicKey,
         remote_ephemeral: &P::KemPublicKey,
         local_one_time_prekey: Option<&P::KemPrivateKey>,
+        pq: Option<&PqxdhInput<'_>>,
     ) -> Result<Self::SharedSecret, String>;
 }
 
@@ -178,4 +202,4 @@ pub trait KeyAgreement<P: CryptoProvider> {
 pub mod x3dh;
 
 // Backward compatibility
-pub use x3dh::{X3DHProtocol, X3DHPublicKeyBundle, X3DHRegistrationBundle};
+pub use x3dh::{X3DHProtocol, X3DHPublicKeyBundle, X3DHRegistrationBundle, derive_root_key};

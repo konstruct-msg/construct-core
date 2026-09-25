@@ -40,7 +40,6 @@ fn make_bob_bundle() -> (
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
     (bundle, bob_priv, bob_spk_priv, bob_pub)
 }
@@ -79,7 +78,6 @@ fn test_alice_bob_full_exchange() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     // Alice performs X3DH as initiator
@@ -87,6 +85,7 @@ fn test_alice_bob_full_exchange() {
         X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
             &alice_identity_priv,
             &bob_bundle,
+            None,
         )
         .unwrap();
 
@@ -115,6 +114,7 @@ fn test_alice_bob_full_exchange() {
         &bob_signed_prekey_priv,
         &alice_identity_pub,
         &alice_ephemeral_pub,
+        None,
         None,
     )
     .unwrap();
@@ -176,12 +176,12 @@ fn test_out_of_order_messages() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     let (root_key, initiator_state) = X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
         &alice_identity_priv,
         &bob_bundle,
+        None,
     )
     .unwrap();
 
@@ -210,6 +210,7 @@ fn test_out_of_order_messages() {
         &alice_identity_pub,
         &alice_ephemeral_pub,
         None,
+        None,
     )
     .unwrap();
 
@@ -233,113 +234,6 @@ fn test_out_of_order_messages() {
     // Now receive msg2 - should use skipped key
     let dec2 = bob.decrypt(&msg2).unwrap();
     assert_eq!(dec2, b"Message 2");
-}
-
-/// Verify that apply_pq_contribution produces symmetric root keys on both sides.
-///
-/// Before the fix, INITIATOR applied PQ to RK1 but RESPONDER applied PQ to RK2,
-/// causing irreversible key divergence. After the fix, both sides apply PQ to RK1
-/// (the root key after the first DH ratchet step), and RESPONDER re-derives its
-/// second ratchet from the PQ-enhanced root key.
-#[test]
-fn test_pqxdh_symmetric_contribution() {
-    use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-
-    let (alice_identity_priv, alice_identity_pub) =
-        ClassicSuiteProvider::generate_kem_keys().unwrap();
-    let (bob_identity_priv, bob_identity_pub) = ClassicSuiteProvider::generate_kem_keys().unwrap();
-
-    let (bob_signed_prekey_priv, bob_signed_prekey_pub) =
-        ClassicSuiteProvider::generate_kem_keys().unwrap();
-    let (bob_signing_key, bob_verifying_key) =
-        ClassicSuiteProvider::generate_signature_keys().unwrap();
-    let bob_signature = {
-        let prologue = build_prologue(SuiteID::CLASSIC);
-        let mut msg = prologue;
-        msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
-        ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
-    };
-
-    let bob_bundle = X3DHPublicKeyBundle {
-        identity_public: bob_identity_pub.clone(),
-        signed_prekey_public: bob_signed_prekey_pub.clone(),
-        signature: bob_signature,
-        verifying_key: bob_verifying_key,
-        suite_id: SuiteID::CLASSIC,
-        one_time_prekey_public: None,
-        one_time_prekey_id: None,
-        spk_uploaded_at: 0,
-        spk_rotation_epoch: 0,
-        kyber_spk_uploaded_at: 0,
-        kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
-    };
-
-    // Alice: INITIATOR
-    let (root_key_alice, initiator_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
-            &alice_identity_priv,
-            &bob_bundle,
-        )
-        .unwrap();
-
-    let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
-        &root_key_alice,
-        initiator_state,
-        &bob_identity_pub,
-        "bob".to_string(),
-        "alice".to_string(),
-        SuiteID::CLASSIC,
-    )
-    .unwrap();
-
-    // Alice encrypts msg0
-    let msg0 = alice.encrypt(b"Hello with PQ!").unwrap();
-
-    // Bob: RESPONDER
-    let alice_eph_pub =
-        ClassicSuiteProvider::kem_public_key_from_bytes(msg0.dh_public_key.to_vec());
-    let root_key_bob = X3DHProtocol::<ClassicSuiteProvider>::perform_as_responder(
-        &bob_identity_priv,
-        &bob_signed_prekey_priv,
-        &alice_identity_pub,
-        &alice_eph_pub,
-        None,
-    )
-    .unwrap();
-
-    let (mut bob, plaintext0) =
-        DoubleRatchetSession::<ClassicSuiteProvider>::new_responder_session(
-            &root_key_bob,
-            &bob_identity_priv,
-            &msg0,
-            "alice".to_string(),
-            "bob".to_string(),
-        )
-        .unwrap();
-    assert_eq!(plaintext0, b"Hello with PQ!");
-
-    // Simulate a KEM shared secret (same on both sides, as if from ML-KEM encaps/decaps)
-    let kem_shared_secret = b"fake-but-identical-kem-shared-secret-32b";
-
-    // Apply PQ contribution on both sides
-    alice.apply_pq_contribution(kem_shared_secret).unwrap();
-    bob.apply_pq_contribution(kem_shared_secret).unwrap();
-
-    // Bob sends reply AFTER PQ contribution — this is the critical test.
-    // Before the fix, Alice could NOT decrypt this because root keys diverged.
-    let reply = bob.encrypt(b"Reply after PQ!").unwrap();
-    let decrypted_reply = alice.decrypt(&reply).unwrap();
-    assert_eq!(decrypted_reply, b"Reply after PQ!");
-
-    // Continue with a multi-turn conversation to verify ratchet stays in sync
-    let msg2 = alice.encrypt(b"Message 2 from Alice").unwrap();
-    let dec2 = bob.decrypt(&msg2).unwrap();
-    assert_eq!(dec2, b"Message 2 from Alice");
-
-    let msg3 = bob.encrypt(b"Message 3 from Bob").unwrap();
-    let dec3 = alice.decrypt(&msg3).unwrap();
-    assert_eq!(dec3, b"Message 3 from Bob");
 }
 
 /// Verify that decrypt() rolls back session state on AEAD failure,
@@ -372,11 +266,10 @@ fn test_decrypt_rollback_on_failure() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bob_bundle)
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bob_bundle, None)
             .unwrap();
 
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
@@ -397,6 +290,7 @@ fn test_decrypt_rollback_on_failure() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -455,11 +349,11 @@ fn test_max_message_jump_dos_guard() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     let (rk, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk,
         init_state,
@@ -477,6 +371,7 @@ fn test_max_message_jump_dos_guard() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -537,11 +432,11 @@ fn test_cleanup_on_deserialize() {
         spk_rotation_epoch: 0,
         kyber_spk_uploaded_at: 0,
         kyber_spk_rotation_epoch: 0,
-        supports_pq_ratchet: false,
     };
 
     let (rk, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk,
         init_state,
@@ -559,6 +454,7 @@ fn test_cleanup_on_deserialize() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -621,7 +517,8 @@ fn test_ad_symmetric_with_realistic_uuid_ids() {
     let bob_uuid = "81f02199-8374-48f8-8a5f-549434ccc53f";
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
 
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
@@ -641,6 +538,7 @@ fn test_ad_symmetric_with_realistic_uuid_ids() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -692,7 +590,8 @@ fn test_ad_mismatch_inconsistent_ids_fails() {
     );
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -711,6 +610,7 @@ fn test_ad_mismatch_inconsistent_ids_fails() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -766,7 +666,8 @@ fn test_ad_mismatch_across_identifier_spaces_fails() {
     );
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
 
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
@@ -788,6 +689,7 @@ fn test_ad_mismatch_across_identifier_spaces_fails() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -829,7 +731,8 @@ fn test_ad_symmetric_any_consistent_format_works() {
     let bob_id = "bob_node";
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -848,6 +751,7 @@ fn test_ad_symmetric_any_consistent_format_works() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -875,7 +779,8 @@ fn test_ad_same_id_both_sides_accidentally_works() {
     let shared_id = "shared-user-id-for-both";
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -894,6 +799,7 @@ fn test_ad_same_id_both_sides_accidentally_works() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -922,7 +828,8 @@ fn test_ad_mismatch_empty_local_user_id_fails() {
     let bob_uuid = "81f02199-8374-48f8-8a5f-549434ccc53f";
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -941,6 +848,7 @@ fn test_ad_mismatch_empty_local_user_id_fails() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -974,7 +882,8 @@ fn test_ad_mismatch_wrong_contact_id_same_format_fails() {
     let bob_uuid = "81f02199-8374-48f8-8a5f-549434ccc53f";
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -993,6 +902,7 @@ fn test_ad_mismatch_wrong_contact_id_same_format_fails() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -1035,7 +945,8 @@ fn make_session_pair(
     let (bundle, bob_priv, bob_spk_priv, bob_pub) = make_bob_bundle();
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -1053,6 +964,7 @@ fn make_session_pair(
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -1314,7 +1226,8 @@ fn test_concurrent_init_loser_switches_to_responder() {
 
     // ── Alice: INITIATOR (WIN) ────────────────────────────────────────────
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -1335,6 +1248,7 @@ fn test_concurrent_init_loser_switches_to_responder() {
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();
@@ -1772,7 +1686,8 @@ fn make_pq_session_pair(
     let (bundle, bob_priv, bob_spk_priv, bob_pub) = make_bob_bundle();
 
     let (rk_alice, init_state) =
-        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle).unwrap();
+        X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(&alice_priv, &bundle, None)
+            .unwrap();
     let mut alice = DoubleRatchetSession::<ClassicSuiteProvider>::new_initiator_session(
         &rk_alice,
         init_state,
@@ -1792,6 +1707,7 @@ fn make_pq_session_pair(
         &bob_spk_priv,
         &alice_pub,
         &alice_eph,
+        None,
         None,
     )
     .unwrap();

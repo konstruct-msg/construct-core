@@ -116,12 +116,8 @@ pub struct X3DHPublicKeyBundle {
     /// 0 = not provided.
     #[serde(default)]
     pub kyber_spk_rotation_epoch: u32,
-
-    /// Whether the owner of this bundle supports SuiteID::PQ_RATCHET (=3) for
-    /// sparse continuous post-quantum ratchet on established sessions.
-    /// Additive capability field (spec: PQ_RATCHET_AND_OTPK_ELIMINATION_SPEC).
-    #[serde(default)]
-    pub supports_pq_ratchet: bool,
+    // `supports_pq_ratchet` was here: suite 3 is mandatory now, and an unsigned flag the server
+    // could drop was the downgrade. Serialized bundles that still carry it are read as before.
 }
 
 /// Регистрационные данные для отправки на сервер
@@ -150,6 +146,37 @@ pub struct X3DHRegistrationBundle {
 /// Stateless struct - все данные передаются через параметры методов.
 pub struct X3DHProtocol<P: CryptoProvider> {
     _phantom: PhantomData<P>,
+}
+
+/// HKDF info of the classical X3DH root key (builds without `post-quantum`).
+const X3DH_ROOT_INFO_CLASSIC: &[u8] = b"Construct-X3DH-RootKey-v1";
+/// HKDF info prefix of the PQXDH v2 root key; followed by SHA-256 of the Kyber key and ciphertext.
+const X3DH_ROOT_INFO_PQXDH_V2: &[u8] = b"Construct-PQXDH-RootKey-v2";
+
+/// The X3DH root key from the DH outputs `DH1‖DH2‖DH3[‖DH4]`, with the ML-KEM secret appended to
+/// the input when there is one (PQXDH v2, `PqxdhInput`). Salt `0xFF×32` as in Signal's X3DH §2.2.
+///
+/// The Kyber key and ciphertext are bound through `info`. ML-KEM already hashes the encapsulation
+/// key into its secret; binding both explicitly costs nothing and removes any reliance on which
+/// properties a particular KEM has.
+pub fn derive_root_key<P: CryptoProvider>(
+    combined_dh: Vec<u8>,
+    pq: Option<&super::PqxdhInput<'_>>,
+) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let salt = [0xFF_u8; 32];
+    let mut ikm = zeroize::Zeroizing::new(combined_dh);
+    let info = match pq {
+        None => X3DH_ROOT_INFO_CLASSIC.to_vec(),
+        Some(pq) => {
+            ikm.extend_from_slice(pq.shared_secret);
+            let mut info = X3DH_ROOT_INFO_PQXDH_V2.to_vec();
+            info.extend_from_slice(&Sha256::digest(pq.kyber_public));
+            info.extend_from_slice(&Sha256::digest(pq.kem_ciphertext));
+            info
+        }
+    };
+    P::hkdf_derive_key(&salt, &ikm, &info, 32).map_err(|e| format!("HKDF derivation failed: {e}"))
 }
 
 impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
@@ -207,6 +234,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
     fn perform_as_initiator(
         local_identity: &P::KemPrivateKey,
         remote_bundle: &Self::PublicKeyBundle,
+        pq: Option<&super::PqxdhInput<'_>>,
     ) -> Result<(Self::SharedSecret, InitiatorState<P>), String> {
         use tracing::{debug, error, trace};
 
@@ -406,16 +434,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
 
         // 4. Derive root key using HKDF
         debug!(target: "crypto::x3dh", "Step 3: Deriving root key with HKDF");
-        // ✅ SECURITY: Use 0xFF salt per Signal X3DH specification (section 2.2)
-        // Ref: SECURITY_AUDIT.md #7 - Empty HKDF salt weakens preimage resistance
-        let salt = [0xFF_u8; 32];
-        let root_key = P::hkdf_derive_key(
-            &salt,
-            &combined_dh,
-            b"Construct-X3DH-RootKey-v1",
-            32, // 32 bytes root key
-        )
-        .map_err(|e| format!("HKDF derivation failed: {}", e))?;
+        let root_key = derive_root_key::<P>(combined_dh, pq)?;
 
         debug!(
             target: "crypto::x3dh",
@@ -443,6 +462,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         remote_identity: &P::KemPublicKey,
         remote_ephemeral: &P::KemPublicKey,
         local_one_time_prekey: Option<&P::KemPrivateKey>,
+        pq: Option<&super::PqxdhInput<'_>>,
     ) -> Result<Self::SharedSecret, String> {
         use tracing::{debug, trace};
 
@@ -526,10 +546,7 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
 
         // Derive root key using HKDF
         debug!(target: "crypto::x3dh", "Deriving root key with HKDF");
-        // ✅ SECURITY: Use 0xFF salt per Signal X3DH specification (section 2.2)
-        let salt = [0xFF_u8; 32];
-        let root_key = P::hkdf_derive_key(&salt, &combined_dh, b"Construct-X3DH-RootKey-v1", 32)
-            .map_err(|e| format!("HKDF derivation failed: {}", e))?;
+        let root_key = derive_root_key::<P>(combined_dh, pq)?;
 
         debug!(
             target: "crypto::x3dh",
@@ -543,6 +560,81 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
         );
 
         Ok(root_key)
+    }
+}
+
+#[cfg(test)]
+mod root_key_tests {
+    use super::derive_root_key;
+    use crate::crypto::handshake::PqxdhInput;
+    use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Known answers, computed outside this crate (Python `hmac`/`hashlib` HKDF-SHA256) from the
+    /// formula in `PQXDH_V2_DESIGN.md` §5.1. Any change to the derivation fails here, not between
+    /// two devices.
+    #[test]
+    fn known_answers() {
+        let dh = vec![1_u8; 128];
+        let (ss, pk, ct) = (vec![2_u8; 32], vec![3_u8; 1568], vec![4_u8; 1568]);
+        let pq = PqxdhInput {
+            shared_secret: &ss,
+            kyber_public: &pk,
+            kem_ciphertext: &ct,
+        };
+        assert_eq!(
+            hex(&derive_root_key::<ClassicSuiteProvider>(dh.clone(), Some(&pq)).unwrap()),
+            "c87b3cea317cffc64ea57b63f51eba0779534a58ec86cb69e135498b9c9082ae"
+        );
+        assert_eq!(
+            hex(&derive_root_key::<ClassicSuiteProvider>(dh, None).unwrap()),
+            "d8961a834110bc831176d487b24275ba276953641047e4e2b9cf65d7a39c7131"
+        );
+    }
+
+    /// Each PQ input changes the key: the secret, and the key and ciphertext it is bound to.
+    #[test]
+    fn every_pq_input_is_bound() {
+        let dh = vec![1_u8; 96];
+        let (ss, pk, ct) = (vec![2_u8; 32], vec![3_u8; 1568], vec![4_u8; 1568]);
+        let base = PqxdhInput {
+            shared_secret: &ss,
+            kyber_public: &pk,
+            kem_ciphertext: &ct,
+        };
+        let k = |pq: PqxdhInput<'_>| {
+            derive_root_key::<ClassicSuiteProvider>(dh.clone(), Some(&pq)).unwrap()
+        };
+        let reference = k(base);
+        let (ss2, pk2, ct2) = (vec![9_u8; 32], vec![9_u8; 1568], vec![9_u8; 1568]);
+        assert_ne!(
+            reference,
+            k(PqxdhInput {
+                shared_secret: &ss2,
+                ..base
+            })
+        );
+        assert_ne!(
+            reference,
+            k(PqxdhInput {
+                kyber_public: &pk2,
+                ..base
+            })
+        );
+        assert_ne!(
+            reference,
+            k(PqxdhInput {
+                kem_ciphertext: &ct2,
+                ..base
+            })
+        );
+        assert_ne!(
+            reference,
+            derive_root_key::<ClassicSuiteProvider>(dh.clone(), None).unwrap()
+        );
     }
 }
 
@@ -594,7 +686,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Alice выполняет X3DH как initiator
@@ -602,6 +693,7 @@ mod tests {
             X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
                 &alice_identity_priv,
                 &bob_public_bundle,
+                None,
             )
             .unwrap();
 
@@ -617,6 +709,7 @@ mod tests {
             &bob_signed_prekey_priv,
             &alice_identity_pub,
             &alice_ephemeral_pub,
+            None,
             None,
         )
         .unwrap();
@@ -650,13 +743,13 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Alice должна отклонить невалидную подпись
         let result = X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
             &alice_identity_priv,
             &malicious_bundle,
+            None,
         );
 
         assert!(result.is_err(), "X3DH must reject invalid signature");
@@ -750,7 +843,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Проверка: perform_as_initiator должен принять старую подпись (обратная совместимость)
@@ -758,6 +850,7 @@ mod tests {
         let result = X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
             &alice_identity_priv,
             &old_bundle,
+            None,
         );
 
         assert!(
@@ -797,7 +890,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Проверка: perform_as_initiator должен принять новую подпись
@@ -805,6 +897,7 @@ mod tests {
         let result = X3DHProtocol::<ClassicSuiteProvider>::perform_as_initiator(
             &alice_identity_priv,
             &new_bundle,
+            None,
         );
 
         assert!(

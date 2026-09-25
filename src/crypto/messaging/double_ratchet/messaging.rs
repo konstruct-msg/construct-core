@@ -89,7 +89,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
-            pre_pq_root_key: None,
+            prekey_header: None,
+            pq_handshake: PqHandshake::None,
             pq_turns_since_mix: 0,
             // Single-initiator discipline: only the DR initiator starts PQ exchanges.
             is_pq_initiator: suite_id.is_pq_ratchet(),
@@ -169,13 +170,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             P::kdf_rk(&root_key_val, &dh_output).map_err(|e| format!("KDF_RK failed: {}", e))?;
         root_key_val = new_root_key;
 
-        // ⚡ Save the root key at this point (RK1) for PQXDH deferred contribution.
-        // Both INITIATOR and RESPONDER have RK1 after the first ratchet step, so
-        // applying PQ to RK1 produces identical results on both sides.
-        // Without this, INITIATOR applies PQ to RK1 but RESPONDER applies PQ to RK2
-        // (after the second ratchet below), causing irreversible key divergence.
-        let pre_pq_root_key = root_key_val.clone();
-
         // Generate new DH pair for sending
         let (dh_private, dh_public) =
             P::generate_kem_keys().map_err(|e| format!("Failed to generate DH keys: {}", e))?;
@@ -208,7 +202,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
-            pre_pq_root_key: Some(pre_pq_root_key),
+            prekey_header: None,
+            pq_handshake: PqHandshake::None,
             pq_turns_since_mix: 0,
             is_pq_initiator: false,
             current_pq_epoch: 0,
@@ -404,6 +399,65 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     /// - Лимит на количество skipped keys (MAX_SKIPPED_MESSAGES)
     /// - Automatic cleanup старых ключей по timestamp
     fn decrypt(&mut self, encrypted: &Self::EncryptedMessage) -> Result<Vec<u8>, String> {
+        let result = self.decrypt_message(encrypted);
+        // The peer answered: the responder has the session, the handshake header is done.
+        // (A first-flight message never decrypts at the initiator — it is the initiator's own.)
+        if result.is_ok() {
+            self.prekey_header = None;
+        }
+        result
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn contact_id(&self) -> &str {
+        &self.contact_id
+    }
+
+    fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64) {
+        use tracing::debug;
+
+        let now = crate::utils::time::now();
+        let initial_count = self.skipped_message_keys.len();
+
+        // Collect keys to remove (avoids borrow conflict between two HashMaps)
+        let keys_to_remove: Vec<_> = self
+            .skipped_message_keys
+            .keys()
+            .filter(|key| match self.skipped_key_timestamps.get(*key) {
+                Some(&ts) => (now as i64 - ts as i64) >= max_age_seconds,
+                None => true, // no timestamp → remove
+            })
+            .cloned()
+            .collect();
+
+        for key in &keys_to_remove {
+            self.skipped_message_keys.remove(key);
+            self.skipped_key_timestamps.remove(key);
+        }
+
+        let removed_count = initial_count - self.skipped_message_keys.len();
+        if removed_count > 0 {
+            debug!(
+                target: "crypto::double_ratchet",
+                removed = %removed_count,
+                remaining = %self.skipped_message_keys.len(),
+                "Cleaned up old skipped message keys"
+            );
+        }
+    }
+
+    fn health_snapshot(&self) -> DrHealthSnapshot {
+        DoubleRatchetSession::health_snapshot(self)
+    }
+}
+
+// Internal implementation details
+
+impl<P: CryptoProvider> DoubleRatchetSession<P> {
+    /// The ratchet's decrypt; `SecureMessaging::decrypt` wraps it.
+    fn decrypt_message(&mut self, encrypted: &EncryptedRatchetMessage) -> Result<Vec<u8>, String> {
         use tracing::{debug, trace};
 
         // Periodically evict stale skipped-message keys to bound memory usage.
@@ -608,55 +662,4 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         self.restore_snapshot(snapshot);
         Err("Message key not found".to_string())
     }
-
-    fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    fn contact_id(&self) -> &str {
-        &self.contact_id
-    }
-
-    fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64) {
-        use tracing::debug;
-
-        let now = crate::utils::time::now();
-        let initial_count = self.skipped_message_keys.len();
-
-        // Collect keys to remove (avoids borrow conflict between two HashMaps)
-        let keys_to_remove: Vec<_> = self
-            .skipped_message_keys
-            .keys()
-            .filter(|key| match self.skipped_key_timestamps.get(*key) {
-                Some(&ts) => (now as i64 - ts as i64) >= max_age_seconds,
-                None => true, // no timestamp → remove
-            })
-            .cloned()
-            .collect();
-
-        for key in &keys_to_remove {
-            self.skipped_message_keys.remove(key);
-            self.skipped_key_timestamps.remove(key);
-        }
-
-        let removed_count = initial_count - self.skipped_message_keys.len();
-        if removed_count > 0 {
-            debug!(
-                target: "crypto::double_ratchet",
-                removed = %removed_count,
-                remaining = %self.skipped_message_keys.len(),
-                "Cleaned up old skipped message keys"
-            );
-        }
-    }
-
-    fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
-        DoubleRatchetSession::apply_pq_contribution(self, kem_shared_secret)
-    }
-
-    fn health_snapshot(&self) -> DrHealthSnapshot {
-        DoubleRatchetSession::health_snapshot(self)
-    }
 }
-
-// Internal implementation details

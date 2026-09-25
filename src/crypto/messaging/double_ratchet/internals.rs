@@ -20,6 +20,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             // initiator session — classical ones included — reported itself strengthened.
             is_pq_strengthened: self.pq_applied.unwrap_or(false),
             pq_authentication: self.pq_authentication,
+            pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
             session_id: self.session_id.clone(),
         }
@@ -55,66 +56,22 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         hex::encode(&h.finalize()[..8])
     }
 
-    /// Mix a post-quantum KEM shared secret into the session root key (PQXDH contribution).
-    ///
-    /// Both sender and receiver call this after `init_session`/`init_receiving_session`
-    /// with their respective KEM shared secret. The resulting root key is derived from
-    /// BOTH the classical X3DH and ML-KEM-768, providing HNDL (Harvest Now Decrypt Later)
-    /// protection: an attacker must break BOTH X25519 AND ML-KEM-768 to read messages.
-    ///
-    /// Derivation: `new_root_key = HKDF(salt=current_root_key, ikm=kem_ss, info="construct-pqxdh-v1")`
-    pub fn apply_pq_contribution(&mut self, kem_shared_secret: &[u8]) -> Result<(), String> {
-        match self.pre_pq_root_key.take() {
-            Some(saved_rk1) => {
-                // RESPONDER path: apply PQ to the saved RK1 (after 1st ratchet, before 2nd).
-                // The INITIATOR also applies PQ to RK1, so both sides derive the same PQ root key.
-                // After PQ-enhancing RK1, we must re-derive the second ratchet (sending chain)
-                // so that our sending_chain_key matches what the INITIATOR will compute when
-                // they perform a DH ratchet to receive our reply.
-                let rk1_bytes = saved_rk1.as_ref().to_vec();
-                let pq_rk1_bytes =
-                    P::hkdf_derive_key(&rk1_bytes, kem_shared_secret, b"construct-pqxdh-v1", 32)
-                        .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
-                let pq_rk1 = Self::bytes_to_aead_key(&pq_rk1_bytes)?;
-
-                // Re-derive the second ratchet: KDF_RK(PQ_RK1, DH(our_priv, remote_pub))
-                let dh_priv = self
-                    .dh_ratchet_private
-                    .as_ref()
-                    .ok_or("Missing DH ratchet private key during PQ re-derive")?;
-                let remote_pub = self
-                    .remote_dh_public
-                    .as_ref()
-                    .ok_or("Missing remote DH public key during PQ re-derive")?;
-                let dh_output = P::kem_decapsulate(dh_priv, remote_pub.as_ref())
-                    .map_err(|e| format!("DH failed during PQ re-derive: {}", e))?;
-                let (new_root_key, new_sending_chain) = P::kdf_rk(&pq_rk1, &dh_output)
-                    .map_err(|e| format!("KDF_RK re-derive failed: {}", e))?;
-
-                self.root_key = new_root_key;
-                self.sending_chain_key = new_sending_chain;
-                self.pq_authentication = PqAuthentication::Received;
-            }
-            _ => {
-                // INITIATOR path: root_key is already RK1, apply PQ directly.
-                let current_root = self.root_key.as_ref().to_vec();
-                let new_root_bytes =
-                    P::hkdf_derive_key(&current_root, kem_shared_secret, b"construct-pqxdh-v1", 32)
-                        .map_err(|e| format!("PQ contribution HKDF failed: {:?}", e))?;
-                self.root_key = Self::bytes_to_aead_key(&new_root_bytes)?;
-                // A secret that reached us without the orchestrator's Kyber-prekey plan (the
-                // platform's own ML-KEM call, `apply_pq_contribution` over FFI) came from a key
-                // nobody here verified.
-                if matches!(
-                    self.pq_authentication,
-                    PqAuthentication::Classic | PqAuthentication::Unknown
-                ) {
-                    self.pq_authentication = PqAuthentication::Unauthenticated;
-                }
-            }
-        }
+    /// This session was built by PQXDH v2: the ML-KEM secret is in its initial key. Records how
+    /// (and, for the initiator, whose key it was — `authentication`).
+    pub fn mark_pqxdh_v2(&mut self, authentication: PqAuthentication) {
+        self.pq_handshake = PqHandshake::InitialV2;
         self.pq_applied = Some(true);
-        Ok(())
+        self.pq_authentication = authentication;
+    }
+
+    /// INITIATOR: the header the first flight carries (see `PrekeyHeader`).
+    pub fn set_prekey_header(&mut self, header: PrekeyHeader) {
+        self.prekey_header = Some(header);
+    }
+
+    /// The header to attach to an outgoing message, while the peer has not answered yet.
+    pub fn prekey_header(&self) -> Option<&PrekeyHeader> {
+        self.prekey_header.as_ref()
     }
 
     /// Label the PQ layer of a session this device initiated (the Kyber-prekey plan's verdict).

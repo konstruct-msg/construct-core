@@ -12,7 +12,7 @@
 //! [4 bytes]  kyber_otpk_id         (u32 LE; 0 = Kyber SPK used; >0 = Kyber OTPK ID)
 //! [2 bytes]  kem_ciphertext_len    (u16 LE; 0 = no PQC)
 //! [4 bytes]  previous_chain_length (u32 LE; DR PN field for out-of-order recovery)
-//! [2 bytes]  suite_id              (u16 LE; crypto-suite identifier)
+//! [2 bytes]  suite_id              (u16 LE; crypto-suite identifier; bit 0x0100 = PQXDH v2)
 //! [N bytes]  kem_ciphertext        (present only when kem_ciphertext_len > 0)
 //! [rest]     sealed_box            (nonce || ciphertext || auth_tag)
 //! ```
@@ -26,6 +26,15 @@ const KYBER_OTPK_ID_SIZE: usize = 4;
 const KEM_LEN_SIZE: usize = 2;
 const PREV_CHAIN_LEN_SIZE: usize = 4;
 const SUITE_ID_SIZE: usize = 2;
+/// Set in the wire `suite_id` of every message that carries a PQXDH v2 handshake (a KEM
+/// ciphertext): the initiator's first flight. The low byte stays the ratchet suite; `unpack`
+/// strips the bit, so everything past the wire sees the suite the AEAD authenticated.
+///
+/// Why a bit when there is no compatibility to keep: an older core would otherwise derive a
+/// classical key, fail the AEAD and read the result as corruption (heal). `0x0101`/`0x0103` is a
+/// suite id it rejects outright.
+pub const PQXDH_V2_FLAG: u16 = 0x0100;
+
 /// Fixed header size (no KEM ciphertext): 52 bytes.
 pub const HEADER_SIZE: usize = MSG_NUM_SIZE
     + DH_KEY_SIZE
@@ -47,8 +56,10 @@ pub struct DecodedWirePayload {
     pub previous_chain_length: u32,
     /// Crypto-suite identifier (matches `EncryptedRatchetMessage.suite_id`).
     pub suite_id: u16,
-    /// ML-KEM-768 ciphertext (1088 bytes) for PQXDH first messages; `None` otherwise.
+    /// ML-KEM-1024 ciphertext (1568 bytes) on the initiator's first flight; `None` otherwise.
     pub kem_ciphertext: Option<Vec<u8>>,
+    /// The wire `suite_id` carried `PQXDH_V2_FLAG` (stripped from `suite_id` above).
+    pub pqxdh_v2: bool,
     /// `nonce || ciphertext || auth_tag` — the ChaCha20-Poly1305 sealed box.
     pub sealed_box: Vec<u8>,
     /// Suite 3 only: PQ epoch whose secret was mixed into this message's key
@@ -104,6 +115,14 @@ pub fn pack(
     }
 
     // Suite-3 PQ section (see layout above). Empty for other suites.
+    // The flag is the wire's business: derived from the ciphertext, never taken from the caller.
+    let suite_id = suite_id & !PQXDH_V2_FLAG;
+    let wire_suite_id = if kem_len > 0 {
+        suite_id | PQXDH_V2_FLAG
+    } else {
+        suite_id
+    };
+
     let pq_bytes: Vec<u8> = if suite_id == 3 {
         let mut b = Vec::with_capacity(5);
         b.extend_from_slice(&pq_message_epoch.to_le_bytes());
@@ -142,7 +161,7 @@ pub fn pack(
     payload.extend_from_slice(&kyber_otpk_id.to_le_bytes());
     payload.extend_from_slice(&(kem_len as u16).to_le_bytes());
     payload.extend_from_slice(&previous_chain_length.to_le_bytes());
-    payload.extend_from_slice(&suite_id.to_le_bytes());
+    payload.extend_from_slice(&wire_suite_id.to_le_bytes());
     if let Some(kem) = kem_ciphertext {
         payload.extend_from_slice(kem);
     }
@@ -191,11 +210,16 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
     );
 
     let suite_id_offset = prev_chain_offset + PREV_CHAIN_LEN_SIZE;
-    let suite_id = u16::from_le_bytes(
+    let wire_suite_id = u16::from_le_bytes(
         data[suite_id_offset..suite_id_offset + SUITE_ID_SIZE]
             .try_into()
             .unwrap(),
     );
+    let pqxdh_v2 = wire_suite_id & PQXDH_V2_FLAG != 0;
+    let suite_id = wire_suite_id & !PQXDH_V2_FLAG;
+    if pqxdh_v2 && kem_len == 0 {
+        return Err(WirePayloadError::PqxdhFlagWithoutCiphertext);
+    }
 
     let sealed_box_start = HEADER_SIZE + kem_len;
     if data.len() <= sealed_box_start {
@@ -279,6 +303,7 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
         previous_chain_length,
         suite_id,
         kem_ciphertext,
+        pqxdh_v2,
         sealed_box,
         pq_message_epoch,
         pq_ratchet_field,
@@ -297,6 +322,8 @@ pub enum WirePayloadError {
     InvalidPqFieldType(u8),
     #[error("Payload too short: {0} bytes")]
     TooShort(usize),
+    #[error("PQXDH v2 flag set without a KEM ciphertext")]
+    PqxdhFlagWithoutCiphertext,
 }
 
 #[cfg(test)]
@@ -306,6 +333,56 @@ mod tests {
     fn make_sealed_box(n: u8) -> Vec<u8> {
         // 12-byte nonce + 32-byte ciphertext + 16-byte tag = 60 bytes
         vec![n; 60]
+    }
+
+    /// PQXDH v2: a KEM ciphertext sets the flag on the wire and nowhere else; `unpack` strips it
+    /// back off. A caller cannot set it without a ciphertext, and the wire cannot carry it
+    /// without one.
+    #[test]
+    fn the_pqxdh_v2_flag_follows_the_ciphertext() {
+        let dh_key = vec![0xAA; 32];
+        let sealed = make_sealed_box(0xBB);
+        let kem = vec![0x44; 1568];
+
+        let packed = pack(&dh_key, 0, 0, 1_000_001, 0, 3, Some(&kem), &sealed, 0, None).unwrap();
+        let wire_suite =
+            u16::from_le_bytes(packed[HEADER_SIZE - 2..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(
+            wire_suite,
+            3 | PQXDH_V2_FLAG,
+            "an older core sees suite 0x0103 and refuses"
+        );
+        let decoded = unpack(&packed).unwrap();
+        assert!(decoded.pqxdh_v2);
+        assert_eq!(
+            decoded.suite_id, 3,
+            "stripped: the AEAD authenticated suite 3"
+        );
+        assert_eq!(decoded.kem_ciphertext.as_deref(), Some(kem.as_slice()));
+
+        let plain = pack(
+            &dh_key,
+            1,
+            0,
+            0,
+            0,
+            3 | PQXDH_V2_FLAG,
+            None,
+            &sealed,
+            0,
+            None,
+        )
+        .unwrap();
+        let decoded = unpack(&plain).unwrap();
+        assert!(!decoded.pqxdh_v2, "the caller's bit is not the wire's");
+        assert_eq!(decoded.suite_id, 3);
+
+        let mut forged = plain.clone();
+        forged[HEADER_SIZE - 2..HEADER_SIZE].copy_from_slice(&(3 | PQXDH_V2_FLAG).to_le_bytes());
+        assert!(matches!(
+            unpack(&forged),
+            Err(WirePayloadError::PqxdhFlagWithoutCiphertext)
+        ));
     }
 
     #[test]

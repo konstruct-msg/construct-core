@@ -19,7 +19,6 @@ use crate::orchestration::ack_store::AckStore;
 use crate::orchestration::actions::{Action, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::healing_queue::HealingQueue;
-use crate::orchestration::pq_contribution::PQContributionManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -105,20 +104,16 @@ pub struct SessionLifecycleManager {
     pub(crate) client: ClassicClient<ClassicSuiteProvider>,
     pub ack_store: AckStore,
     pub healing_queue: HealingQueue,
-    pub pq_manager: PQContributionManager,
     /// contactId → archived session CFE binary (latest archive only).
     archives: HashMap<String, crate::crypto::SecretBytes>,
     /// contactId → Unix timestamp of the archive (for GC).
     archive_timestamps: HashMap<String, u64>,
     /// contactId → last seen OTPK ID (used to detect reinstall).
     prekey_tracker: HashMap<String, u32>,
-    /// Devices that have presented a Kyber SPK whose signature verified. From then on a bundle of
-    /// theirs without one is a stripped bundle, not a transition — see `pq_prekey_plan`.
-    signed_kyber_devices: std::collections::BTreeSet<String>,
-    /// Devices that have advertised the sparse PQ ratchet (suite 3) or opened a suite-3 session
-    /// with us. From then on a bundle of theirs without the capability is a stripped bundle —
-    /// see `plan_pq_ratchet_capability`.
-    pq_ratchet_devices: std::collections::BTreeSet<String>,
+    /// Device → SHA-256 of the hybrid identity key it presented the first time a session to it
+    /// was opened. The bundle binds that key to the device only by an Ed25519 cross-signature, so
+    /// the pin is what a quantum adversary cannot get past — see `pq_prekey_plan`.
+    hybrid_identity_pins: std::collections::BTreeMap<String, [u8; 32]>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
 }
@@ -145,12 +140,10 @@ impl SessionLifecycleManager {
             client,
             ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
             healing_queue: HealingQueue::new_with_clock(3, 24 * 60 * 60, clock.clone()),
-            pq_manager: PQContributionManager::new(),
             archives: HashMap::new(),
             archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
-            signed_kyber_devices: std::collections::BTreeSet::new(),
-            pq_ratchet_devices: std::collections::BTreeSet::new(),
+            hybrid_identity_pins: std::collections::BTreeMap::new(),
             my_user_id,
             clock,
         }
@@ -188,29 +181,26 @@ impl SessionLifecycleManager {
         self.archive_timestamps.remove(contact_id);
         self.prekey_tracker.remove(contact_id);
         self.healing_queue.remove(contact_id);
-        self.pq_manager.discard_for_contact(contact_id);
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
-        self.signed_kyber_devices.remove(contact_id);
-        self.pq_ratchet_devices.remove(contact_id);
+        self.hybrid_identity_pins.remove(contact_id);
     }
 
-    /// `true` once `device_id` has presented a Kyber SPK whose signature verified.
-    pub fn has_presented_signed_kyber(&self, device_id: &str) -> bool {
-        self.signed_kyber_devices.contains(device_id)
+    /// Now, by the injected clock (unix seconds).
+    pub fn now_secs(&self) -> u64 {
+        self.clock.now_secs()
     }
 
-    pub fn record_signed_kyber(&mut self, device_id: &str) {
-        self.signed_kyber_devices.insert(device_id.to_string());
+    /// The hybrid identity key pinned for `device_id`, if a session to it was ever opened.
+    pub fn pinned_hybrid_identity(&self, device_id: &str) -> Option<&[u8; 32]> {
+        self.hybrid_identity_pins.get(device_id)
     }
 
-    /// `true` once `device_id` has advertised or used the sparse PQ ratchet (suite 3).
-    pub fn has_used_pq_ratchet(&self, device_id: &str) -> bool {
-        self.pq_ratchet_devices.contains(device_id)
-    }
-
-    pub fn record_pq_ratchet(&mut self, device_id: &str) {
-        self.pq_ratchet_devices.insert(device_id.to_string());
+    /// Pin on first sight; an existing pin is never replaced here (a change is refused upstream).
+    pub fn pin_hybrid_identity(&mut self, device_id: &str, fingerprint: [u8; 32]) {
+        self.hybrid_identity_pins
+            .entry(device_id.to_string())
+            .or_insert(fingerprint);
     }
 
     /// Update the local user-id on both the lifecycle manager and the
@@ -427,91 +417,7 @@ impl SessionLifecycleManager {
 
     // ── PQ contribution helpers ───────────────────────────────────────────────
 
-    /// Apply a deferred PQ contribution for `contact_id` (if one exists).
-    ///
-    /// Returns `Vec<Action>` — empty if no contribution was pending.
-    ///
-    /// **Crash-safe two-phase design:**
-    /// 1. Peek at the contribution without removing it from the manager.
-    /// 2. Apply it to the session (mutates in-memory DR state).
-    /// 3. Export the updated session JSON.
-    /// 4. Only if both steps succeed: finalize (remove from in-memory pending).
-    /// 5. Include an updated `SecureStoreSlot::KyberSessionState` CFE in the
-    ///    same action batch.
-    ///
-    /// The platform must persist all returned actions atomically.  If the
-    /// process crashes before that, the next launch restores the contribution
-    /// from the old CFE snapshot and replays this method safely.
-    pub fn maybe_apply_pq_contribution(&mut self, contact_id: &str) -> Vec<Action> {
-        // Phase 1: peek — do NOT remove yet.
-        let contribution = match self.pq_manager.peek_deferred(contact_id) {
-            Some(c) => c,
-            None => return vec![],
-        };
-
-        // Phase 2: apply to in-memory DR state.
-        if let Err(e) = self
-            .client
-            .apply_pq_contribution_to_session(contact_id, contribution.shared_secret.expose())
-        {
-            return vec![Action::NotifyError {
-                code: "PQ_CONTRIBUTION_FAILED".to_string(),
-                message: e,
-            }];
-        }
-
-        // Phase 3: export updated session as CFE binary (MessagePack, no JSON).
-        let session_bytes = match self.export_session_bytes_for(contact_id) {
-            Ok(b) => b,
-            Err(e) => {
-                return vec![Action::NotifyError {
-                    code: "SESSION_EXPORT_FAILED".to_string(),
-                    message: e,
-                }];
-            }
-        };
-
-        // Phase 4: finalize — remove from in-memory pending, get delete sentinel.
-        let delete_actions = self.pq_manager.finalize_consumed(contact_id);
-
-        // Phase 5: export updated CFE snapshot (now without this contact's entry).
-        // Including this in the same batch ensures that a restart after partial
-        // persistence replays from a consistent state (either both applied or neither).
-        let cfe_export_action = match self.pq_manager.export_cfe() {
-            Ok(cfe) => vec![Action::SaveToSecureStore {
-                slot: SecureStoreSlot::KyberSessionState,
-                data: cfe.into(),
-            }],
-            Err(_) => vec![], // Non-fatal: CFE re-exported on next PQ state change.
-        };
-
-        let mut actions = vec![Action::SaveToSecureStore {
-            slot: SecureStoreSlot::Session {
-                contact_id: contact_id.to_string(),
-            },
-            data: session_bytes.into(),
-        }];
-        actions.extend(delete_actions);
-        actions.extend(cfe_export_action);
-        actions
-    }
-
     // ── State persistence ─────────────────────────────────────────────────────
-
-    /// Export the Kyber `PQContributionManager` state as a CFE binary blob.
-    ///
-    /// The caller should persist the returned bytes in `SecureStoreSlot::KyberSessionState`.
-    pub fn export_kyber_session_state_cfe(&self) -> Result<Vec<u8>, String> {
-        self.pq_manager.export_cfe()
-    }
-
-    /// Restore the Kyber `PQContributionManager` state from a CFE binary blob.
-    ///
-    /// Any previously-loaded state (including in-progress SPK rotations) is
-    /// replaced.  Returns an error if the blob is malformed.
-    pub fn import_kyber_session_state_cfe(&mut self, data: &[u8]) -> Result<(), String> {
-        self.pq_manager.import_cfe(data)
-    }
 
     /// Export the full orchestrator coordination state (healing queue, archive
     /// index, prekey tracker) as a CFE binary blob — msg_type 0x05.
@@ -572,8 +478,14 @@ impl SessionLifecycleManager {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
-            signed_kyber_devices: self.signed_kyber_devices.iter().cloned().collect(),
-            pq_ratchet_devices: self.pq_ratchet_devices.iter().cloned().collect(),
+            hybrid_identity_pins: self
+                .hybrid_identity_pins
+                .iter()
+                .map(|(device, fp)| crate::cfe::CfeHybridPinV1 {
+                    device_id: device.clone(),
+                    fingerprint: serde_bytes::ByteBuf::from(fp.to_vec()),
+                })
+                .collect(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -624,8 +536,17 @@ impl SessionLifecycleManager {
         self.archives = state.archives.into_iter().collect();
         self.archive_timestamps = state.archive_timestamps.into_iter().collect();
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
-        self.signed_kyber_devices = state.signed_kyber_devices.into_iter().collect();
-        self.pq_ratchet_devices = state.pq_ratchet_devices.into_iter().collect();
+        // A pin that is not 32 bytes cannot be compared with anything; dropping it re-pins on the
+        // next session, which is where a device with no pin starts anyway.
+        self.hybrid_identity_pins = state
+            .hybrid_identity_pins
+            .into_iter()
+            .filter_map(|p| {
+                <[u8; 32]>::try_from(p.fingerprint.as_slice())
+                    .ok()
+                    .map(|fp| (p.device_id, fp))
+            })
+            .collect();
 
         // Return init_locks for the caller to restore.
         Ok(state.init_locks.into_iter().collect())
@@ -801,24 +722,14 @@ mod tests {
             b"heal-payload".to_vec(),
             crate::orchestration::healing_queue::HealDirection::Incoming,
         );
-        let _ = mgr
-            .pq_manager
-            .register_shared_secret("bob", 7, b"pq-secret");
+        mgr.pin_hybrid_identity("bob", [7; 32]);
 
         mgr.forget_contact_state("bob");
 
         assert!(!mgr.has_archive("bob"));
         assert!(!mgr.is_reinstall("bob", 99));
         assert!(!mgr.healing_queue.has_pending("bob"));
-        assert!(mgr.pq_manager.peek_deferred("bob").is_none());
-    }
-
-    #[test]
-    fn test_maybe_apply_pq_contribution_no_pending() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        let actions = mgr.maybe_apply_pq_contribution("bob");
-        assert!(actions.is_empty());
+        assert!(mgr.pinned_hybrid_identity("bob").is_none());
     }
 
     #[test]
@@ -888,7 +799,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
         alice
             .client
@@ -1184,8 +1094,7 @@ mod tests {
             archives: vec![],
             archive_timestamps: vec![],
             prekey_tracker: vec![],
-            signed_kyber_devices: vec![],
-            pq_ratchet_devices: vec![],
+            hybrid_identity_pins: vec![],
         };
         let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
 

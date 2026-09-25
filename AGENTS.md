@@ -6,7 +6,7 @@
 
 - **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. `PlatformBridge` is exported over UniFFI but the orchestrator does not call it; logging goes through `tracing`.
 - **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
-- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from the ML-KEM-768 contribution at session start and the suite-3 sparse PQ ratchet, not from swapping the provider.
+- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from **PQXDH v2** — an ML-KEM-1024 secret in the session's initial key, mandatory, with Kyber keys owned by the core (`crypto::kyber_prekeys`, `orchestration::pq_prekey_plan`) — and the mandatory suite-3 sparse ML-KEM-768 ratchet, not from swapping the provider.
 - **CFE (Construct Format Envelope)**: A custom binary format — 16-byte header (magic, version, type, flags, payload length, CRC32) around a MessagePack payload (`rmp_serde::to_vec_named`) — used for state persistence and migration from legacy JSON formats.
 - **UniFFI Bindings**: Cross-platform bindings are defined in `src/construct_core.udl` and implemented in `src/uniffi_bindings.rs`.
 
@@ -21,7 +21,7 @@
 ### Feature Flags
 - `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS, `post-quantum`).
 - `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil + `post-quantum`.
-- `post-quantum`: Enables ML-KEM-768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that).
+- `post-quantum`: Enables ML-KEM-1024/768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that). Without it the core opens classical sessions only, which platform builds refuse.
 
 ## Development Conventions
 

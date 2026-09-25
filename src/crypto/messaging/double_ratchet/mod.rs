@@ -45,7 +45,7 @@
 //! ```
 
 use crate::crypto::SuiteID;
-use crate::crypto::kyber_prekey_auth::PqAuthentication;
+use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +101,8 @@ pub struct DrHealthSnapshot {
     pub is_pq_strengthened: bool,
     /// Whose Kyber key the PQ layer came from; see `PqAuthentication`.
     pub pq_authentication: PqAuthentication,
+    /// How the PQ layer started; see `PqHandshake`.
+    pub pq_handshake: PqHandshake,
     /// Unix timestamp of the last DH ratchet step (init counts as first ratchet).
     pub last_ratchet_at: u64,
     /// Shared session identifier (hex).
@@ -237,6 +239,20 @@ fn derive_shared_session_id<P: CryptoProvider>(
     Ok(hex::encode(&bytes))
 }
 
+/// What an initiator's messages carry until the peer answers: the prekeys the handshake used and
+/// the ML-KEM ciphertext, which the responder needs to derive the session's first key (PQXDH v2).
+/// Public values only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrekeyHeader {
+    /// X25519 one-time prekey of the responder (0 = none).
+    pub one_time_prekey_id: u32,
+    /// The responder's Kyber prekey the ciphertext is for (SPK ids from 1, one-time from
+    /// 1 000 000); 0 = no ML-KEM (a build without `post-quantum`).
+    pub kyber_prekey_id: u32,
+    /// ML-KEM-1024 ciphertext (1568 bytes); empty when `kyber_prekey_id == 0`.
+    pub kem_ciphertext: Vec<u8>,
+}
+
 /// Double Ratchet Session
 ///
 /// Хранит состояние Double Ratchet для обмена сообщениями с одним контактом.
@@ -278,11 +294,13 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
 
-    /// RESPONDER-only: root key after the first DH ratchet, before the second.
-    /// Used by `apply_pq_contribution` to apply PQ at a point where both sides
-    /// have the same root key (RK1), ensuring symmetric PQXDH derivation.
-    /// Consumed (set to None) after PQ is applied.
-    pre_pq_root_key: Option<P::AeadKey>,
+    /// INITIATOR only, until the peer's first message arrives: the handshake header every
+    /// outgoing message repeats, so the responder can build the session from whichever of the
+    /// first flight reaches it first.
+    prekey_header: Option<PrekeyHeader>,
+
+    /// How this session's PQ layer started (`PqHandshake`).
+    pq_handshake: PqHandshake,
 
     /// Sparse continuous PQ ratchet (suite_id = `PQ_RATCHET`) — see
     /// `internals::maybe_advance_pq_ratchet`. Number of DH-ratchet turns since the
@@ -408,9 +426,6 @@ impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
         self.sending_chain_key.zeroize();
         self.receiving_chain_key.zeroize();
         if let Some(k) = self.dh_ratchet_private.as_mut() {
-            k.zeroize();
-        }
-        if let Some(k) = self.pre_pq_root_key.as_mut() {
             k.zeroize();
         }
         if let Some(kp) = self.pending_pq_exchange.as_mut() {

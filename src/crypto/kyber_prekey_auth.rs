@@ -1,32 +1,20 @@
 //! Is this Kyber prekey the peer's, and what may a session built on it be called.
 //!
-//! # Why the core checks this
+//! Every Kyber prekey a device uploads is signed by it over
+//! `"KonstruktX3DH-v1" ‖ 0x00 0x11 ‖ created_at (u64 BE) ‖ kyber_public` — Ed25519 by its identity
+//! key and hybrid (Ed25519 + ML-DSA-65) by its hybrid identity key. Two clients must reach the same
+//! verdict on the same bytes, so the checks live here; `orchestration::pq_prekey_plan` decides
+//! from them whether a session may be opened (PQXDH v2 makes PQ mandatory: an unsigned or
+//! unverifiable key is a refusal, not a classic session).
 //!
-//! Every Kyber SPK a device uploads carries an Ed25519 signature by that device's identity
-//! signing key over `"KonstruktX3DH-v1" || 0x00 0x10 || kyber_public` — the classic SPK message
-//! with suite byte `0x10` (iOS `PQCKeyManager.signKyberKey`; the server rejects an upload whose
-//! signature does not verify, key-service `core.rs:960`). Until 2026-09-24 nobody on the
-//! receiving side checked it: iOS read the field and dropped it, and `init_session` had no
-//! parameter for it. A server that substituted the Kyber key got the ML-KEM secret of every
-//! session opened to that device, and every indicator still said "PQ".
-//!
-//! Two clients must reach the same verdict on the same bytes, so the verdict is computed here.
-//!
-//! # What an unverified key is still worth
-//!
-//! The KEM secret is mixed into a root key the classical X3DH already produced
-//! (`HKDF(rk, kem_ss, "construct-pqxdh-v1")`), and the classical half stays authenticated by the
-//! SPK signature this crate does check. A substituted Kyber key therefore gives its substitute
-//! `kem_ss` and nothing else: classical protection is intact, and against a passive recorder that
-//! does not control the server the unverified key still protects. So an unsigned key is used —
-//! but the session it builds is labelled [`PqAuthentication::Unauthenticated`], never "PQ".
+//! The v1 message (`0x10`, a 768-bit key, no time) and its check are gone with the cutover
+//! (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`). Before 2026-09-24 nobody on the
+//! receiving side checked a Kyber signature at all; a substituted key got the ML-KEM secret of
+//! every session opened to that device while every indicator said "PQ".
 
 use crate::crypto::keys::KeyManager;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
-
-/// Suite byte of the Kyber prekey signature message (the classic SPK uses `0x01`).
-pub const KYBER_PREKEY_SIGN_SUITE: u8 = 0x10;
 
 /// The signature on one Kyber prekey, as the bundle presented it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,26 +26,6 @@ pub enum KyberPrekeySignature {
     /// Present and does not verify. An honest server never serves this: it rejects such an
     /// upload. This is tampering, not a transition.
     Invalid,
-}
-
-/// Check `signature` over `kyber_public` against the bundle's Ed25519 `verifying_key`.
-pub fn check_kyber_prekey_signature(
-    verifying_key: &[u8],
-    kyber_public: &[u8],
-    signature: Option<&[u8]>,
-) -> KyberPrekeySignature {
-    let Some(signature) = signature.filter(|s| !s.is_empty()) else {
-        return KyberPrekeySignature::Missing;
-    };
-    let message = KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(
-        KYBER_PREKEY_SIGN_SUITE,
-        kyber_public,
-    );
-    let key = ClassicSuiteProvider::signature_public_key_from_bytes(verifying_key.to_vec());
-    match ClassicSuiteProvider::verify(&key, &message, signature) {
-        Ok(()) => KyberPrekeySignature::Valid,
-        Err(_) => KyberPrekeySignature::Invalid,
-    }
 }
 
 // ── v2: ML-KEM-1024 prekeys, freshness under the signature ──────────────────────
@@ -179,76 +147,53 @@ impl PqAuthentication {
     }
 }
 
+/// How a session's post-quantum layer started — `SessionHealthReport.pq_handshake`.
+///
+/// Together with [`PqAuthentication`] (whose key), this is everything a person may be told about
+/// "PQ" for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PqHandshake {
+    /// No ML-KEM at session start.
+    #[default]
+    None,
+    /// Established before PQXDH v2: the ML-KEM secret was mixed in after the first ratchet
+    /// step, so the initiator's first sending chain was X25519-only. Only sessions older than
+    /// the cutover have it.
+    DeferredV1,
+    /// PQXDH v2: the ML-KEM-1024 secret is in the initial key; every message is covered.
+    InitialV2,
+}
+
+impl PqHandshake {
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::DeferredV1 => 1,
+            Self::InitialV2 => 2,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::DeferredV1,
+            2 => Self::InitialV2,
+            _ => Self::None,
+        }
+    }
+
+    /// For a session recorded before this field existed: the old deferred contribution was the
+    /// only kind, so an applied one is `DeferredV1` and anything else claims nothing.
+    pub const fn legacy(pq_applied: Option<bool>) -> Self {
+        match pq_applied {
+            Some(true) => Self::DeferredV1,
+            _ => Self::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn signed(kyber_public: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let (sk, vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let msg = KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x10, kyber_public);
-        (vk, ClassicSuiteProvider::sign(&sk, &msg).unwrap())
-    }
-
-    /// The exact bytes iOS signs: `"KonstruktX3DH-v1" || 0x00 0x10 || pk`.
-    #[test]
-    fn the_signed_message_is_the_one_ios_signs() {
-        let pk = [0xAA_u8; 4];
-        let msg = KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(
-            KYBER_PREKEY_SIGN_SUITE,
-            &pk,
-        );
-        let mut expected = b"KonstruktX3DH-v1".to_vec();
-        expected.extend_from_slice(&[0x00, 0x10]);
-        expected.extend_from_slice(&pk);
-        assert_eq!(msg, expected);
-    }
-
-    #[test]
-    fn a_valid_signature_verifies() {
-        let pk = vec![7_u8; 1184];
-        let (vk, sig) = signed(&pk);
-        assert_eq!(
-            check_kyber_prekey_signature(&vk, &pk, Some(&sig)),
-            KyberPrekeySignature::Valid
-        );
-    }
-
-    #[test]
-    fn absent_and_empty_are_missing() {
-        let pk = vec![7_u8; 1184];
-        let (vk, _) = signed(&pk);
-        assert_eq!(
-            check_kyber_prekey_signature(&vk, &pk, None),
-            KyberPrekeySignature::Missing
-        );
-        assert_eq!(
-            check_kyber_prekey_signature(&vk, &pk, Some(&[])),
-            KyberPrekeySignature::Missing
-        );
-    }
-
-    #[test]
-    fn a_substituted_key_or_a_classic_spk_signature_is_invalid() {
-        let pk = vec![7_u8; 1184];
-        let (vk, sig) = signed(&pk);
-        let mut other = pk.clone();
-        other[0] ^= 1;
-        assert_eq!(
-            check_kyber_prekey_signature(&vk, &other, Some(&sig)),
-            KyberPrekeySignature::Invalid,
-            "a signature over another key"
-        );
-
-        // The classic SPK signature (suite byte 0x01) over the same bytes must not pass for a
-        // Kyber one: the suite byte is what keeps the two from being interchangeable.
-        let (sk, vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let classic = KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x01, &pk);
-        let sig = ClassicSuiteProvider::sign(&sk, &classic).unwrap();
-        assert_eq!(
-            check_kyber_prekey_signature(&vk, &pk, Some(&sig)),
-            KyberPrekeySignature::Invalid
-        );
-    }
 
     /// The exact v2 bytes: `"KonstruktX3DH-v1" || 0x00 0x11 || created_at (BE) || pk`. The server
     /// verifies uploads against the same bytes; a change here is a protocol change.
