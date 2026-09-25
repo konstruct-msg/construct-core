@@ -115,6 +115,10 @@ pub struct SessionLifecycleManager {
     /// Devices that have presented a Kyber SPK whose signature verified. From then on a bundle of
     /// theirs without one is a stripped bundle, not a transition — see `pq_prekey_plan`.
     signed_kyber_devices: std::collections::BTreeSet<String>,
+    /// Devices that have advertised the sparse PQ ratchet (suite 3) or opened a suite-3 session
+    /// with us. From then on a bundle of theirs without the capability is a stripped bundle —
+    /// see `plan_pq_ratchet_capability`.
+    pq_ratchet_devices: std::collections::BTreeSet<String>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
 }
@@ -146,6 +150,7 @@ impl SessionLifecycleManager {
             archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
             signed_kyber_devices: std::collections::BTreeSet::new(),
+            pq_ratchet_devices: std::collections::BTreeSet::new(),
             my_user_id,
             clock,
         }
@@ -187,6 +192,7 @@ impl SessionLifecycleManager {
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
         self.signed_kyber_devices.remove(contact_id);
+        self.pq_ratchet_devices.remove(contact_id);
     }
 
     /// `true` once `device_id` has presented a Kyber SPK whose signature verified.
@@ -196,6 +202,15 @@ impl SessionLifecycleManager {
 
     pub fn record_signed_kyber(&mut self, device_id: &str) {
         self.signed_kyber_devices.insert(device_id.to_string());
+    }
+
+    /// `true` once `device_id` has advertised or used the sparse PQ ratchet (suite 3).
+    pub fn has_used_pq_ratchet(&self, device_id: &str) -> bool {
+        self.pq_ratchet_devices.contains(device_id)
+    }
+
+    pub fn record_pq_ratchet(&mut self, device_id: &str) {
+        self.pq_ratchet_devices.insert(device_id.to_string());
     }
 
     /// Update the local user-id on both the lifecycle manager and the
@@ -558,6 +573,7 @@ impl SessionLifecycleManager {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
             signed_kyber_devices: self.signed_kyber_devices.iter().cloned().collect(),
+            pq_ratchet_devices: self.pq_ratchet_devices.iter().cloned().collect(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -609,6 +625,7 @@ impl SessionLifecycleManager {
         self.archive_timestamps = state.archive_timestamps.into_iter().collect();
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
         self.signed_kyber_devices = state.signed_kyber_devices.into_iter().collect();
+        self.pq_ratchet_devices = state.pq_ratchet_devices.into_iter().collect();
 
         // Return init_locks for the caller to restore.
         Ok(state.init_locks.into_iter().collect())
@@ -1168,6 +1185,7 @@ mod tests {
             archive_timestamps: vec![],
             prekey_tracker: vec![],
             signed_kyber_devices: vec![],
+            pq_ratchet_devices: vec![],
         };
         let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
 

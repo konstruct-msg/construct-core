@@ -140,7 +140,7 @@ Names follow NIST FIPS; informal names in parens.
 |---|---|---|
 | 1 | `CLASSIC` | The table above. |
 | 2 | `PQ_HYBRID` | **Reserved.** No session negotiates it; the hybrid-signature primitives below live under this name. |
-| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. Chosen only when this build has `post-quantum` and the peer's bundle advertises `supports_pq_ratchet`. |
+| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. Chosen only when this build has `post-quantum` and the peer's bundle advertises `supports_pq_ratchet`. A device that has advertised or used it before and now arrives without the flag is **refused** (`PQ_DOWNGRADE_REFUSED: PqRatchetWithdrawn`) — the flag is unsigned, and dropping it would otherwise silently downgrade to `CLASSIC`. |
 
 ### ML-KEM-768 at session start (independent of `suite_id`)
 
