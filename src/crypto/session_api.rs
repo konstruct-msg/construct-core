@@ -58,45 +58,19 @@ use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use std::marker::PhantomData;
 
-/// Whether this build can run `SuiteID::PQ_RATCHET` sessions (the sparse
-/// continuous PQ ratchet needs the ML-KEM-768 primitives behind the
-/// `post-quantum` feature). Exposed through UniFFI so platforms can advertise
-/// the capability in their uploaded prekey bundle (`supports_pq_ratchet`,
-/// key-service migration 063).
+/// Whether this build runs `SuiteID::PQ_RATCHET` (suite 3) sessions — the sparse continuous PQ
+/// ratchet needs the ML-KEM-768 primitives behind `post-quantum`.
+///
+/// Suite 3 is mandatory where it exists (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`):
+/// an initiator with `post-quantum` always negotiates it, and there is no capability flag to read
+/// or to strip — the unsigned `supports_pq_ratchet` bundle flag and its downgrade ledger are gone.
 pub const fn local_supports_pq_ratchet() -> bool {
-    cfg!(feature = "post-quantum") && PQ_RATCHET_ENABLED
+    cfg!(feature = "post-quantum")
 }
 
-/// Master switch for `SuiteID::PQ_RATCHET` (suite 3) negotiation.
-///
-/// Gates BOTH the advertised capability (`supports_pq_ratchet` UDL) and initiator
-/// negotiation. Was disabled in shipped builds while the uniffi/iOS wire boundary
-/// dropped the DR message's `suite_id`/`pq_message_epoch`/`pq_ratchet_field`
-/// (task #12); the canonical `wire_payload` pack/unpack is now exposed over UniFFI
-/// and platforms carry all three fields end-to-end, so suite 3 is live.
-const PQ_RATCHET_ENABLED: bool = true;
-
-/// Initiator-side suite negotiation: `PQ_RATCHET` only when this build has the
-/// PQ primitives *and* the peer's fetched bundle advertises support; `CLASSIC`
-/// otherwise (existing behavior, including for peers on older servers whose
-/// bundles lack the field entirely).
-///
-/// Bundle access is generic over `H::PublicKeyBundle` via JSON, following the
-/// `validate_bundle_freshness` idiom in `client_api.rs` — a bundle type without
-/// the field simply negotiates `CLASSIC`.
-fn negotiated_initiator_suite<P, H>(bundle: &H::PublicKeyBundle) -> SuiteID
-where
-    P: CryptoProvider,
-    H: KeyAgreement<P>,
-{
-    if !local_supports_pq_ratchet() {
-        return SuiteID::CLASSIC;
-    }
-    let peer_supports = serde_json::to_value(bundle)
-        .ok()
-        .and_then(|v| v.get("supports_pq_ratchet").and_then(|b| b.as_bool()))
-        .unwrap_or(false);
-    if peer_supports {
+/// The suite a session this build initiates runs: suite 3 with `post-quantum`, classic without.
+fn negotiated_initiator_suite() -> SuiteID {
+    if local_supports_pq_ratchet() {
         SuiteID::PQ_RATCHET
     } else {
         SuiteID::CLASSIC
@@ -180,6 +154,7 @@ where
         remote_identity: &P::KemPublicKey,
         contact_id: String,
         local_user_id: String,
+        pq: Option<&crate::crypto::handshake::PqxdhInput<'_>>,
     ) -> Result<Self, String> {
         use tracing::{error, info};
 
@@ -190,8 +165,8 @@ where
         );
 
         // 1. Perform handshake (X3DH)
-        let (root_key, initiator_state) = H::perform_as_initiator(local_identity, remote_bundle)
-            .map_err(|e| {
+        let (root_key, initiator_state) =
+            H::perform_as_initiator(local_identity, remote_bundle, pq).map_err(|e| {
                 error!(
                     target: "crypto::session",
                     error = %e,
@@ -207,7 +182,7 @@ where
 
         // 2. Create messaging session (Double Ratchet)
         // Convert root_key to &[u8] - X3DH returns Vec<u8>
-        let suite_id = negotiated_initiator_suite::<P, H>(remote_bundle);
+        let suite_id = negotiated_initiator_suite();
         info!(
             target: "crypto::session",
             contact_id = %contact_id,
@@ -301,6 +276,7 @@ where
         contact_id: String,
         local_user_id: String,
         local_one_time_prekey: Option<&P::KemPrivateKey>,
+        pq: Option<&crate::crypto::handshake::PqxdhInput<'_>>,
     ) -> Result<(Self, Vec<u8>), String> {
         use tracing::info;
 
@@ -318,6 +294,7 @@ where
             remote_identity,
             remote_ephemeral,
             local_one_time_prekey,
+            pq,
         )?;
 
         info!(
@@ -486,7 +463,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Alice initializes session
@@ -496,6 +472,7 @@ mod tests {
             &bob_identity_pub,
             "bob".to_string(),
             "alice".to_string(),
+            None,
         )
         .unwrap();
 
@@ -538,7 +515,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Alice initializes session as initiator
@@ -548,6 +524,7 @@ mod tests {
             &bob_identity_pub,
             "bob".to_string(),
             "alice".to_string(),
+            None,
         )
         .unwrap();
 
@@ -569,6 +546,7 @@ mod tests {
             &encrypted1,
             "alice".to_string(),
             "bob".to_string(),
+            None,
             None,
         )
         .unwrap();
@@ -635,7 +613,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         let mut session = TestSession::init_as_initiator(
@@ -644,6 +621,7 @@ mod tests {
             &bob_identity_pub,
             "bob".to_string(),
             "alice".to_string(),
+            None,
         )
         .unwrap();
 

@@ -181,22 +181,6 @@ pub struct CfeOldSpkV1 {
     pub retired_at: Option<i64>,
 }
 
-/// The ML-KEM-768 (Kyber) signed prekey — the PQXDH KEM leg.
-///
-/// Folded into the core key-state so it persists atomically with the other private
-/// keys (Phase 2 of key-store-consolidation-and-server-authority). Formerly a
-/// standalone platform Keychain triple (`construct.kyber.spk.*`) that desynced
-/// independently of the core snapshot — the build-497 blocker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeKyberSpkV1 {
-    #[serde(rename = "id")]
-    pub key_id: u32,
-    #[serde(rename = "priv")]
-    pub kyber_priv: SecretBytes,
-    #[serde(rename = "pub")]
-    pub kyber_pub: ByteBuf,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CfePrivateKeysV1 {
     #[serde(rename = "suite_id")]
@@ -232,11 +216,8 @@ pub struct CfePrivateKeysV1 {
     /// Lazily created; absent for legacy pre-hybrid accounts until first ensure.
     #[serde(rename = "hs_priv", default, skip_serializing_if = "Option::is_none")]
     pub hybrid_sig_priv: Option<SecretBytes>,
-
-    /// Optional ML-KEM-768 signed prekey, persisted atomically with the rest of the
-    /// key-state. Absent until the platform commits one (post-upload confirmation).
-    #[serde(rename = "kyber_spk", default, skip_serializing_if = "Option::is_none")]
-    pub kyber_spk: Option<CfeKyberSpkV1>,
+    // `kyber_spk` (the ML-KEM-768 signed prekey) was here. The core's ML-KEM-1024 prekeys are
+    // their own blob (`KyberPrivateKeys`); a record that still carries the key reads without it.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +242,17 @@ pub struct CfeSessionJsonWrapperV1 {
     pub contact_id: String,
     #[serde(rename = "json")]
     pub json_bytes: SecretBytes,
+}
+
+/// `PrekeyHeader` in a session record: public values only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePrekeyHeaderV1 {
+    #[serde(rename = "otpk")]
+    pub one_time_prekey_id: u32,
+    #[serde(rename = "kid")]
+    pub kyber_prekey_id: u32,
+    #[serde(rename = "ct")]
+    pub kem_ciphertext: ByteBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,9 +306,15 @@ pub struct CfeSessionStateV1 {
     #[serde(default)]
     pub skipped: Vec<CfeSkippedKeyEntryV1>,
 
-    #[serde(rename = "pq_rk1")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_rk1: Option<SecretBytes>,
+    // `pq_rk1` (the v1 responder's pre-contribution root key) was here; v1 is gone and the
+    // named-map codec ignores the key in older blobs.
+    /// INITIATOR, until the peer answers: the handshake header the first flight repeats.
+    #[serde(rename = "pkh", default, skip_serializing_if = "Option::is_none")]
+    pub prekey_header: Option<CfePrekeyHeaderV1>,
+
+    /// `PqHandshake::as_u8`. Absent on blobs written before PQXDH v2.
+    #[serde(rename = "pqh", default, skip_serializing_if = "Option::is_none")]
+    pub pq_handshake: Option<u8>,
 
     /// Unix timestamp of the last DH ratchet step (zero = unknown / legacy session).
     #[serde(rename = "lra")]
@@ -482,55 +480,6 @@ pub struct CfeKyberPrekeysV1 {
     pub next_otpk_id: u32,
 }
 
-// ── PQC / ML-KEM-768 CFE types ────────────────────────────────────────────────
-
-/// One entry in the Kyber session state: a deferred PQ contribution for a
-/// specific contact that has been encapsulated/decapsulated but not yet applied
-/// to the session root key.
-///
-/// Wire format is kept lean — the shared secret is 32 bytes, `otpk_id` is u32.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeKyberDeferredEntryV1 {
-    /// The contact's stable user ID (UUID string without braces).
-    #[serde(rename = "cid")]
-    pub contact_id: String,
-    /// ML-KEM OTPK identifier that was used for this contribution.
-    #[serde(rename = "id")]
-    pub otpk_id: u32,
-    /// 32-byte ML-KEM-768 shared secret, pending `apply_pq_contribution`.
-    #[serde(rename = "ss")]
-    pub shared_secret: SecretBytes,
-    /// INITIATOR only: the ML-KEM ciphertext that must travel in the first message with
-    /// this shared secret. The two are one contribution — the sender mixes `ss` into its
-    /// root key when it packs message 0, and the responder can only derive the same root
-    /// from `ct`. A snapshot that kept `ss` and dropped `ct` restored a sender that
-    /// applied the secret and sent nothing to decapsulate (2026-09-24).
-    ///
-    /// Absent for RESPONDER entries (the ciphertext was received, not sent) and in
-    /// snapshots written before the field existed; old readers ignore it.
-    #[serde(rename = "ct", default, skip_serializing_if = "Option::is_none")]
-    pub kem_ciphertext: Option<ByteBuf>,
-}
-
-/// Full CFE snapshot of the `PQContributionManager` — all deferred Kyber
-/// contributions plus the monotonic OTPK ID counter.
-///
-/// msg_type = `KyberSessionState` (0x21).
-/// Persisted to the secure store whenever a new deferred contribution is added
-/// or consumed so that the state survives process restarts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeKyberSessionStateV1 {
-    /// Version field — always 1 for this format.
-    #[serde(rename = "ver")]
-    pub ver: u8,
-    /// All per-contact deferred contributions currently in flight.
-    #[serde(rename = "entries")]
-    pub entries: Vec<CfeKyberDeferredEntryV1>,
-    /// Next OTPK ID to allocate (monotonically increasing across restarts).
-    #[serde(rename = "next_id")]
-    pub next_otpk_id: u32,
-}
-
 // ── OpenMLS store CFE types (0x44) ────────────────────────────────────────────
 
 /// One key/value pair of the OpenMLS `MemoryStorage` snapshot.
@@ -648,12 +597,19 @@ pub struct CfeOrchestratorStateV1 {
     /// contactId → last seen OTPK ID (reinstall detection).
     #[serde(rename = "ptk")]
     pub prekey_tracker: Vec<(String, u32)>,
-    /// Devices that have presented a Kyber SPK with a verifying signature (sorted). Absent on
-    /// blobs written before 2026-09-24: nothing remembered, which is where every device starts.
-    #[serde(rename = "skd", default, skip_serializing_if = "Vec::is_empty")]
-    pub signed_kyber_devices: Vec<String>,
-    /// Devices that have advertised or used the sparse PQ ratchet (suite 3), sorted. Absent on
-    /// older blobs: nothing remembered.
-    #[serde(rename = "prd", default, skip_serializing_if = "Vec::is_empty")]
-    pub pq_ratchet_devices: Vec<String>,
+    // `skd` (devices that had signed a v1 Kyber SPK) and `prd` (devices that had advertised the
+    // PQ ratchet) were here; PQXDH v2 refuses every unsigned bundle and makes suite 3 mandatory,
+    // so neither ledger has anything left to remember. Old keys are ignored on read.
+    /// Device → SHA-256 of its pinned hybrid identity key, sorted by device.
+    #[serde(rename = "hip", default, skip_serializing_if = "Vec::is_empty")]
+    pub hybrid_identity_pins: Vec<CfeHybridPinV1>,
+}
+
+/// A pinned hybrid identity key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeHybridPinV1 {
+    #[serde(rename = "d")]
+    pub device_id: String,
+    #[serde(rename = "fp")]
+    pub fingerprint: ByteBuf,
 }

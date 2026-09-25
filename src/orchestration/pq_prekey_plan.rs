@@ -1,467 +1,448 @@
-//! Which Kyber prekey an initiator encapsulates to — or whether it may open the session at all.
+//! Which Kyber prekey an initiator encapsulates to — or why it opens no session at all (PQXDH v2).
 //!
-//! # Why this is a plan in the core
+//! PQ is mandatory for new sessions (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`):
+//! there is no classic outcome. A bundle either yields a Kyber prekey this device can trust, or
+//! the session is refused before anything is created (`PQ_REQUIRED: <reason>`). The table is
+//! `cryptocore/PQXDH_V2_DESIGN.md` §5.4.
 //!
-//! "Is this bundle's Kyber key usable, and what is the session called" is a decision two clients
-//! must make identically; made in each client, it diverged before it existed (iOS logged
-//! "proceeding via classic X3DH" on a failed hybrid check and then used the unverified Kyber key
-//! anyway). The client hands over the bundle's Kyber keys and signatures and one fact it cannot
-//! know from the bundle — whether this device has presented a signed Kyber SPK before — and gets
-//! back what to do.
+//! What "trust" means here:
+//! - the device's **hybrid identity key** (Ed25519 + ML-DSA-65) is in the bundle, bound to its
+//!   Ed25519 identity by the cross-signature, and is the one pinned for this device the first time
+//!   it was seen — the binding alone is Ed25519, which is what a quantum adversary could forge;
+//! - the Kyber prekey carries **both** signatures over
+//!   `"KonstruktX3DH-v1" ‖ 0x00 0x11 ‖ created_at ‖ public`: Ed25519 by the identity key and
+//!   hybrid by the pinned hybrid key;
+//! - a signed prekey is no older than `KYBER_SPK_MAX_AGE_SECS` by its **signed** time.
 //!
-//! # The rules
-//!
-//! | Bundle | Decision |
-//! |---|---|
-//! | a present signature does not verify, device never presented a signed SPK | classic, security error — this is tampering, not a transition (the server rejects such uploads) |
-//! | a present signature does not verify, device presented one before | refuse |
-//! | SPK signature verifies | encapsulate, [`Authenticated`] — to the OTPK if *its* signature verifies, else to the SPK |
-//! | no verifiable SPK, device presented one before | refuse — the signature or the key was taken away |
-//! | no signatures, device never presented one | encapsulate, [`Unauthenticated`] — OTPK first, as before |
-//! | no Kyber key, device never presented one | classic |
-//!
-//! Stripping the key or its signature is the real attack of a transition period: a client that
-//! silently falls back to classic makes it invisible. Remembering that a device has presented a
-//! signed SPK is what makes it visible, and a signature that is *present and wrong* is the same
-//! strip by other means — so for a remembered device it is refused too.
-//!
-//! **An unsigned OTPK never wins over a verified SPK.** The server's bundle has no field for the
-//! OTPK's signature (iOS signs OTPKs; `DevicePreKeyBundle` does not carry it), so today every OTPK
-//! is unsigned. Preferring it would let whoever serves the bundle choose the unauthenticated key
-//! over the authenticated one — the downgrade this plan exists to stop. The cost is the OTPK's
-//! one-time property for the PQ layer; the classical layer keeps its own OTPK. Once the bundle
-//! carries the OTPK signature, a verified OTPK is used again.
-//!
-//! A build without `post-quantum` cannot encapsulate at all; it opens classic sessions and refuses
-//! nothing, since refusing would break every PQ peer.
-//!
-//! [`Authenticated`]: PqAuthentication::Authenticated
-//! [`Unauthenticated`]: PqAuthentication::Unauthenticated
+//! A one-time prekey is preferred (its secret is burned after use). Anything wrong with it falls
+//! back to the signed prekey rather than refusing: a server can always omit the one-time key, so
+//! refusing on a bad one would add no protection and cost availability.
 
 use crate::crypto::kyber_prekey_auth::{
-    KyberPrekeySignature, PqAuthentication, check_kyber_prekey_signature,
+    KYBER_SPK_MAX_AGE_SECS, KyberPrekeySignature, check_kyber_prekey_hybrid_signature,
+    check_kyber_prekey_signature_v2,
 };
+use crate::crypto::kyber_prekeys::KYBER_OTPK_ID_START;
+use crate::crypto::pq_x3dh::MLKEM1024_PK_SIZE;
 
-/// The Kyber half of a peer's bundle, as fetched.
-#[derive(Debug, Clone, Copy, Default)]
+/// One Kyber prekey as the bundle presents it.
+#[derive(Debug, Clone, Copy)]
 pub struct KyberPrekeyOffer<'a> {
-    /// The bundle's Ed25519 identity signing key (`verifying_key`) — the one that signed the
-    /// classic SPK this crate already verifies.
+    pub key_id: u32,
+    pub public: &'a [u8],
+    /// Signed creation time; the signatures cannot verify without it.
+    pub created_at: Option<u64>,
+    pub signature: Option<&'a [u8]>,
+    pub hybrid_signature: Option<&'a [u8]>,
+}
+
+/// The PQ-relevant part of a peer device's bundle.
+#[derive(Debug, Clone, Copy)]
+pub struct PqxdhOffer<'a> {
+    /// Ed25519 identity verifying key (the bundle's `verifying_key`).
     pub verifying_key: &'a [u8],
-    pub spk_public: Option<&'a [u8]>,
-    pub spk_signature: Option<&'a [u8]>,
-    pub otpk_public: Option<&'a [u8]>,
-    pub otpk_id: Option<u32>,
-    pub otpk_signature: Option<&'a [u8]>,
+    /// Hybrid identity key (key-service field 20).
+    pub hybrid_identity_key: Option<&'a [u8]>,
+    /// Ed25519 cross-signature binding it to `verifying_key` (field 21).
+    pub hybrid_identity_signature: Option<&'a [u8]>,
+    pub signed_prekey: Option<KyberPrekeyOffer<'a>>,
+    pub one_time_prekey: Option<KyberPrekeyOffer<'a>>,
 }
 
-/// What this device already knows about the peer device.
+/// What this device already knows.
+#[derive(Debug, Clone, Copy)]
+pub struct PqxdhContext<'a> {
+    pub now: u64,
+    /// SHA-256 of the hybrid identity key pinned for this device, if it was seen before.
+    pub pinned_hybrid_identity: Option<&'a [u8; 32]>,
+}
+
+/// Why no session is opened. `PQ_REQUIRED: {reason:?}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KyberPrekeyContext {
-    /// This build can run ML-KEM (`post-quantum` feature).
-    pub local_pq_available: bool,
-    /// The peer device has presented a Kyber SPK whose signature verified, in an earlier bundle.
-    pub presented_signed_spk_before: bool,
+pub enum PqxdhRefusal {
+    /// The bundle has no Kyber signed prekey.
+    NoKyberPrekey,
+    /// Wrong size or an id outside its range.
+    KyberPrekeyMalformed,
+    /// No Ed25519 signature (or no signed time) on the Kyber signed prekey.
+    KyberSignatureMissing,
+    /// An Ed25519 signature that does not verify — tampering, not a transition.
+    KyberSignatureInvalid,
+    /// Older than `KYBER_SPK_MAX_AGE_SECS` by its signed time.
+    KyberPrekeyStale,
+    /// No hybrid identity key, or no cross-signature binding it.
+    HybridIdentityMissing,
+    /// The cross-signature does not verify under the device's identity key.
+    HybridIdentityBindingInvalid,
+    /// A hybrid identity key other than the one pinned for this device.
+    HybridIdentityChanged,
+    /// No hybrid signature on the Kyber signed prekey.
+    HybridSignatureMissing,
+    /// A hybrid signature that does not verify.
+    HybridSignatureInvalid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClassicReason {
-    /// The bundle has no Kyber key.
-    NoKyberKey,
-    /// A Kyber signature in the bundle is present and does not verify. Log as a security event.
-    InvalidSignature,
-    /// This build has no ML-KEM.
-    LocalBuildWithoutPq,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefuseReason {
-    /// The device presented a signed Kyber SPK before; this bundle has none, or none that
-    /// verifies.
-    SignedKyberWithdrawn,
-    /// The device presented a signed Kyber SPK before; this bundle's signature is wrong.
-    InvalidSignature,
-    /// The device advertised the sparse PQ ratchet (suite 3) before, or opened a suite-3
-    /// session with us; this bundle does not advertise it.
-    PqRatchetWithdrawn,
-}
-
-/// Whether an initiator may open a session with a device whose bundle does not advertise the
-/// sparse PQ ratchet (suite 3). `None`: go ahead, and negotiation picks what the bundle offers.
-///
-/// `supports_pq_ratchet` is a flag the server serves beside the bundle, unsigned. Dropping it is
-/// the cheapest downgrade there is: the initiator negotiates `CLASSIC`, nothing fails, and the
-/// session simply never gets its PQ ratchet. A device that has advertised the ratchet — or used
-/// it with us — and now arrives without it is the same strip as a missing Kyber signature, and
-/// is refused the same way.
-///
-/// A build without the ratchet (`local_pq_ratchet_available == false`) refuses nothing: it
-/// would negotiate `CLASSIC` with every peer anyway.
-pub fn plan_pq_ratchet_capability(
-    local_pq_ratchet_available: bool,
-    advertised: bool,
-    advertised_before: bool,
-) -> Option<RefuseReason> {
-    (local_pq_ratchet_available && advertised_before && !advertised)
-        .then_some(RefuseReason::PqRatchetWithdrawn)
-}
-
+/// The prekey to encapsulate to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KyberPrekeyDecision {
-    /// Encapsulate to `kyber_public`. `otpk_id` is the Kyber OTPK id to report, 0 for the SPK.
-    Encapsulate {
-        kyber_public: Vec<u8>,
-        otpk_id: u32,
-        authentication: PqAuthentication,
-    },
-    /// Open a classical session.
-    Classic { reason: ClassicReason },
-    /// Do not open the session.
-    Refuse { reason: RefuseReason },
+pub struct PqxdhChoice {
+    pub kyber_prekey_id: u32,
+    pub kyber_public: Vec<u8>,
+    /// SHA-256 of the hybrid identity key that authenticated it — pin it once X3DH has verified
+    /// the bundle.
+    pub hybrid_identity_fingerprint: [u8; 32],
+    /// A one-time prekey was offered and could not be used (logged by the caller).
+    pub one_time_prekey_rejected: Option<PqxdhRefusal>,
 }
 
-/// The decision, and whether the caller must now remember that this device presented a signed
-/// Kyber SPK (true exactly when the SPK signature verified).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KyberPrekeyPlan {
-    pub decision: KyberPrekeyDecision,
-    pub presented_signed_spk: bool,
+pub fn hybrid_identity_fingerprint(hybrid_identity_key: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(hybrid_identity_key).into()
 }
 
-pub fn plan_kyber_prekey(offer: KyberPrekeyOffer<'_>, ctx: KyberPrekeyContext) -> KyberPrekeyPlan {
-    let judge = |public: Option<&[u8]>, signature: Option<&[u8]>| {
-        public.map(|pk| check_kyber_prekey_signature(offer.verifying_key, pk, signature))
-    };
-    let spk = judge(offer.spk_public, offer.spk_signature);
-    let otpk = judge(offer.otpk_public, offer.otpk_signature);
-    let presented_signed_spk = spk == Some(KyberPrekeySignature::Valid);
-    let plan = |decision| KyberPrekeyPlan {
-        decision,
-        presented_signed_spk,
-    };
-
-    if !ctx.local_pq_available {
-        return plan(KyberPrekeyDecision::Classic {
-            reason: ClassicReason::LocalBuildWithoutPq,
-        });
+pub fn plan_pqxdh(
+    offer: &PqxdhOffer<'_>,
+    ctx: &PqxdhContext<'_>,
+) -> Result<PqxdhChoice, PqxdhRefusal> {
+    let hybrid_key = check_hybrid_identity(offer)?;
+    let fingerprint = hybrid_identity_fingerprint(hybrid_key);
+    if let Some(pinned) = ctx.pinned_hybrid_identity
+        && *pinned != fingerprint
+    {
+        return Err(PqxdhRefusal::HybridIdentityChanged);
     }
 
-    let invalid = Some(KyberPrekeySignature::Invalid);
-    if spk == invalid || otpk == invalid {
-        return plan(if ctx.presented_signed_spk_before {
-            KyberPrekeyDecision::Refuse {
-                reason: RefuseReason::InvalidSignature,
+    let mut one_time_prekey_rejected = None;
+    if let Some(otpk) = offer.one_time_prekey {
+        match check_prekey(
+            offer.verifying_key,
+            hybrid_key,
+            &otpk,
+            Range::OneTime,
+            ctx.now,
+        ) {
+            Ok(()) => {
+                return Ok(PqxdhChoice {
+                    kyber_prekey_id: otpk.key_id,
+                    kyber_public: otpk.public.to_vec(),
+                    hybrid_identity_fingerprint: fingerprint,
+                    one_time_prekey_rejected: None,
+                });
             }
-        } else {
-            KyberPrekeyDecision::Classic {
-                reason: ClassicReason::InvalidSignature,
-            }
-        });
+            Err(reason) => one_time_prekey_rejected = Some(reason),
+        }
     }
 
-    let encapsulate =
-        |public: Option<&[u8]>, otpk_id: u32, authentication| KyberPrekeyDecision::Encapsulate {
-            kyber_public: public.map(<[u8]>::to_vec).unwrap_or_default(),
-            otpk_id,
-            authentication,
-        };
-    let otpk_id = offer.otpk_id.unwrap_or(0);
-    let valid = Some(KyberPrekeySignature::Valid);
-
-    if otpk == valid {
-        return plan(encapsulate(
-            offer.otpk_public,
-            otpk_id,
-            PqAuthentication::Authenticated,
-        ));
-    }
-    if spk == valid {
-        return plan(encapsulate(
-            offer.spk_public,
-            0,
-            PqAuthentication::Authenticated,
-        ));
-    }
-    if ctx.presented_signed_spk_before {
-        return plan(KyberPrekeyDecision::Refuse {
-            reason: RefuseReason::SignedKyberWithdrawn,
-        });
-    }
-    if otpk.is_some() {
-        return plan(encapsulate(
-            offer.otpk_public,
-            otpk_id,
-            PqAuthentication::Unauthenticated,
-        ));
-    }
-    if spk.is_some() {
-        return plan(encapsulate(
-            offer.spk_public,
-            0,
-            PqAuthentication::Unauthenticated,
-        ));
-    }
-    plan(KyberPrekeyDecision::Classic {
-        reason: ClassicReason::NoKyberKey,
+    let spk = offer.signed_prekey.ok_or(PqxdhRefusal::NoKyberPrekey)?;
+    check_prekey(
+        offer.verifying_key,
+        hybrid_key,
+        &spk,
+        Range::Signed,
+        ctx.now,
+    )?;
+    Ok(PqxdhChoice {
+        kyber_prekey_id: spk.key_id,
+        kyber_public: spk.public.to_vec(),
+        hybrid_identity_fingerprint: fingerprint,
+        one_time_prekey_rejected,
     })
+}
+
+fn check_hybrid_identity<'a>(offer: &PqxdhOffer<'a>) -> Result<&'a [u8], PqxdhRefusal> {
+    use crate::crypto::keys::KeyManager;
+    use crate::crypto::provider::CryptoProvider;
+    use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+    let key = offer
+        .hybrid_identity_key
+        .filter(|k| !k.is_empty())
+        .ok_or(PqxdhRefusal::HybridIdentityMissing)?;
+    let binding = offer
+        .hybrid_identity_signature
+        .filter(|s| !s.is_empty())
+        .ok_or(PqxdhRefusal::HybridIdentityMissing)?;
+    let message = KeyManager::<ClassicSuiteProvider>::build_hybrid_identity_bind_message(key);
+    let vk = ClassicSuiteProvider::signature_public_key_from_bytes(offer.verifying_key.to_vec());
+    ClassicSuiteProvider::verify(&vk, &message, binding)
+        .map_err(|_| PqxdhRefusal::HybridIdentityBindingInvalid)?;
+    Ok(key)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Range {
+    Signed,
+    OneTime,
+}
+
+fn check_prekey(
+    verifying_key: &[u8],
+    hybrid_key: &[u8],
+    prekey: &KyberPrekeyOffer<'_>,
+    range: Range,
+    now: u64,
+) -> Result<(), PqxdhRefusal> {
+    let id_ok = match range {
+        Range::Signed => (1..KYBER_OTPK_ID_START).contains(&prekey.key_id),
+        Range::OneTime => prekey.key_id >= KYBER_OTPK_ID_START,
+    };
+    if prekey.public.len() != MLKEM1024_PK_SIZE || !id_ok {
+        return Err(PqxdhRefusal::KyberPrekeyMalformed);
+    }
+    let created_at = prekey
+        .created_at
+        .ok_or(PqxdhRefusal::KyberSignatureMissing)?;
+    match check_kyber_prekey_signature_v2(
+        verifying_key,
+        prekey.public,
+        created_at,
+        prekey.signature,
+    ) {
+        KyberPrekeySignature::Valid => {}
+        KyberPrekeySignature::Missing => return Err(PqxdhRefusal::KyberSignatureMissing),
+        KyberPrekeySignature::Invalid => return Err(PqxdhRefusal::KyberSignatureInvalid),
+    }
+    match check_kyber_prekey_hybrid_signature(
+        hybrid_key,
+        prekey.public,
+        created_at,
+        prekey.hybrid_signature,
+    ) {
+        KyberPrekeySignature::Valid => {}
+        KyberPrekeySignature::Missing => return Err(PqxdhRefusal::HybridSignatureMissing),
+        KyberPrekeySignature::Invalid => return Err(PqxdhRefusal::HybridSignatureInvalid),
+    }
+    // A one-time key is burned on use; replaying one only reaches a deleted secret.
+    if range == Range::Signed && now.saturating_sub(created_at) > KYBER_SPK_MAX_AGE_SECS {
+        return Err(PqxdhRefusal::KyberPrekeyStale);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::keys::KeyManager;
+    use crate::crypto::kyber_prekey_auth::kyber_prekey_sign_message_v2;
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
+    use crate::crypto::suites::hybrid::HybridSuiteProvider;
 
+    const NOW: u64 = 1_800_000_000;
+
+    /// A peer device: identity signing key, hybrid key bound to it, and a way to sign prekeys.
     struct Peer {
-        sk: crate::crypto::SecretBytes,
+        sk: Vec<u8>,
         vk: Vec<u8>,
+        hsk: crate::crypto::SecretBytes,
+        hpk: Vec<u8>,
+        binding: Vec<u8>,
+    }
+
+    struct Prekey {
+        id: u32,
+        public: Vec<u8>,
+        created_at: u64,
+        sig: Vec<u8>,
+        hsig: Vec<u8>,
     }
 
     impl Peer {
         fn new() -> Self {
             let (sk, vk) = ClassicSuiteProvider::generate_signature_keys().unwrap();
-            Self { sk, vk }
-        }
-        fn sign(&self, kyber_public: &[u8]) -> Vec<u8> {
-            let msg =
-                KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x10, kyber_public);
-            ClassicSuiteProvider::sign(&self.sk, &msg).unwrap()
-        }
-    }
-
-    const SPK: &[u8] = &[1; 1184];
-    const OTPK: &[u8] = &[2; 1184];
-
-    fn fresh() -> KyberPrekeyContext {
-        KyberPrekeyContext {
-            local_pq_available: true,
-            presented_signed_spk_before: false,
-        }
-    }
-    fn remembered() -> KyberPrekeyContext {
-        KyberPrekeyContext {
-            presented_signed_spk_before: true,
-            ..fresh()
-        }
-    }
-
-    fn encapsulates(plan: &KyberPrekeyPlan, key: &[u8], id: u32, auth: PqAuthentication) -> bool {
-        plan.decision
-            == KyberPrekeyDecision::Encapsulate {
-                kyber_public: key.to_vec(),
-                otpk_id: id,
-                authentication: auth,
+            let (hsk, hpk) = HybridSuiteProvider::generate_signature_keys().unwrap();
+            let bind = KeyManager::<ClassicSuiteProvider>::build_hybrid_identity_bind_message(&hpk);
+            let binding = ClassicSuiteProvider::sign(&sk, &bind).unwrap();
+            Self {
+                sk: sk.as_ref().to_vec(),
+                vk,
+                hsk,
+                hpk,
+                binding,
             }
+        }
+
+        fn prekey(&self, id: u32, created_at: u64) -> Prekey {
+            let public = vec![id as u8; MLKEM1024_PK_SIZE];
+            let msg = kyber_prekey_sign_message_v2(created_at, &public);
+            let sk = ClassicSuiteProvider::signature_private_key_from_bytes(self.sk.clone());
+            Prekey {
+                id,
+                sig: ClassicSuiteProvider::sign(&sk, &msg).unwrap(),
+                hsig: HybridSuiteProvider::sign(&self.hsk, &msg).unwrap(),
+                public,
+                created_at,
+            }
+        }
+    }
+
+    fn offer_of(p: &Prekey) -> KyberPrekeyOffer<'_> {
+        KyberPrekeyOffer {
+            key_id: p.id,
+            public: &p.public,
+            created_at: Some(p.created_at),
+            signature: Some(&p.sig),
+            hybrid_signature: Some(&p.hsig),
+        }
+    }
+
+    fn bundle<'a>(
+        peer: &'a Peer,
+        spk: Option<&'a Prekey>,
+        otpk: Option<&'a Prekey>,
+    ) -> PqxdhOffer<'a> {
+        PqxdhOffer {
+            verifying_key: &peer.vk,
+            hybrid_identity_key: Some(&peer.hpk),
+            hybrid_identity_signature: Some(&peer.binding),
+            signed_prekey: spk.map(offer_of),
+            one_time_prekey: otpk.map(offer_of),
+        }
+    }
+
+    fn ctx() -> PqxdhContext<'static> {
+        PqxdhContext {
+            now: NOW,
+            pinned_hybrid_identity: None,
+        }
     }
 
     #[test]
-    fn a_signed_spk_is_authenticated_and_remembered() {
+    fn a_signed_one_time_key_is_preferred() {
         let peer = Peer::new();
-        let sig = peer.sign(SPK);
-        let plan = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                spk_public: Some(SPK),
-                spk_signature: Some(&sig),
-                ..Default::default()
-            },
-            fresh(),
+        let (spk, otpk) = (peer.prekey(3, NOW), peer.prekey(1_000_005, NOW));
+        let choice = plan_pqxdh(&bundle(&peer, Some(&spk), Some(&otpk)), &ctx()).unwrap();
+        assert_eq!(choice.kyber_prekey_id, 1_000_005);
+        assert_eq!(choice.kyber_public, otpk.public);
+        assert_eq!(
+            choice.hybrid_identity_fingerprint,
+            hybrid_identity_fingerprint(&peer.hpk)
         );
-        assert!(encapsulates(&plan, SPK, 0, PqAuthentication::Authenticated));
-        assert!(plan.presented_signed_spk);
-    }
-
-    /// Mutation: prefer any OTPK over the SPK — this reddens.
-    #[test]
-    fn an_unsigned_otpk_does_not_win_over_a_verified_spk() {
-        let peer = Peer::new();
-        let sig = peer.sign(SPK);
-        let plan = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                spk_public: Some(SPK),
-                spk_signature: Some(&sig),
-                otpk_public: Some(OTPK),
-                otpk_id: Some(9),
-                otpk_signature: None,
-            },
-            fresh(),
-        );
-        assert!(encapsulates(&plan, SPK, 0, PqAuthentication::Authenticated));
     }
 
     #[test]
-    fn a_verified_otpk_is_preferred() {
+    fn without_a_usable_one_time_key_the_signed_key_is_used() {
         let peer = Peer::new();
-        let (spk_sig, otpk_sig) = (peer.sign(SPK), peer.sign(OTPK));
-        let plan = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                spk_public: Some(SPK),
-                spk_signature: Some(&spk_sig),
-                otpk_public: Some(OTPK),
-                otpk_id: Some(9),
-                otpk_signature: Some(&otpk_sig),
-            },
-            fresh(),
+        let spk = peer.prekey(3, NOW);
+        let choice = plan_pqxdh(&bundle(&peer, Some(&spk), None), &ctx()).unwrap();
+        assert_eq!(choice.kyber_prekey_id, 3);
+        assert_eq!(choice.one_time_prekey_rejected, None);
+
+        // An unsigned one-time key (the server not serving its signature yet) and a tampered one
+        // both fall back to the signed key — the server could have omitted either.
+        let mut unsigned = peer.prekey(1_000_001, NOW);
+        unsigned.sig.clear();
+        let choice = plan_pqxdh(&bundle(&peer, Some(&spk), Some(&unsigned)), &ctx()).unwrap();
+        assert_eq!(choice.kyber_prekey_id, 3);
+        assert_eq!(
+            choice.one_time_prekey_rejected,
+            Some(PqxdhRefusal::KyberSignatureMissing)
         );
-        assert!(encapsulates(
-            &plan,
-            OTPK,
-            9,
-            PqAuthentication::Authenticated
-        ));
+
+        let mut tampered = peer.prekey(1_000_002, NOW);
+        tampered.public[0] ^= 1;
+        let choice = plan_pqxdh(&bundle(&peer, Some(&spk), Some(&tampered)), &ctx()).unwrap();
+        assert_eq!(
+            choice.one_time_prekey_rejected,
+            Some(PqxdhRefusal::KyberSignatureInvalid)
+        );
     }
 
+    /// Every row of the table that ends in a refusal.
     #[test]
-    fn unsigned_keys_from_a_new_device_are_used_and_labelled() {
+    fn each_refusal() {
         let peer = Peer::new();
-        let with_otpk = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                spk_public: Some(SPK),
-                otpk_public: Some(OTPK),
-                otpk_id: Some(4),
-                ..Default::default()
-            },
-            fresh(),
-        );
-        assert!(encapsulates(
-            &with_otpk,
-            OTPK,
-            4,
-            PqAuthentication::Unauthenticated
-        ));
-        assert!(!with_otpk.presented_signed_spk);
+        let good = peer.prekey(3, NOW);
+        let refuse = |offer: PqxdhOffer<'_>| plan_pqxdh(&offer, &ctx()).unwrap_err();
 
-        let spk_only = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                spk_public: Some(SPK),
-                ..Default::default()
-            },
-            fresh(),
+        assert_eq!(
+            refuse(bundle(&peer, None, None)),
+            PqxdhRefusal::NoKyberPrekey
         );
-        assert!(encapsulates(
-            &spk_only,
-            SPK,
-            0,
-            PqAuthentication::Unauthenticated
-        ));
-    }
 
-    #[test]
-    fn a_wrong_signature_is_never_used() {
-        let peer = Peer::new();
+        let mut short = peer.prekey(3, NOW);
+        short.public.truncate(1184);
+        assert_eq!(
+            refuse(bundle(&peer, Some(&short), None)),
+            PqxdhRefusal::KyberPrekeyMalformed
+        );
+        let one_time_id_as_spk = peer.prekey(1_000_000, NOW);
+        assert_eq!(
+            refuse(bundle(&peer, Some(&one_time_id_as_spk), None)),
+            PqxdhRefusal::KyberPrekeyMalformed
+        );
+
+        let mut no_sig = peer.prekey(3, NOW);
+        no_sig.sig.clear();
+        assert_eq!(
+            refuse(bundle(&peer, Some(&no_sig), None)),
+            PqxdhRefusal::KyberSignatureMissing
+        );
+        let mut no_time = bundle(&peer, Some(&good), None);
+        no_time.signed_prekey.as_mut().unwrap().created_at = None;
+        assert_eq!(refuse(no_time), PqxdhRefusal::KyberSignatureMissing);
+
+        let mut rewritten_time = bundle(&peer, Some(&good), None);
+        rewritten_time.signed_prekey.as_mut().unwrap().created_at = Some(NOW + 1);
+        assert_eq!(refuse(rewritten_time), PqxdhRefusal::KyberSignatureInvalid);
+
+        let stale = peer.prekey(3, NOW - KYBER_SPK_MAX_AGE_SECS - 1);
+        assert_eq!(
+            refuse(bundle(&peer, Some(&stale), None)),
+            PqxdhRefusal::KyberPrekeyStale
+        );
+        let old_but_fine = peer.prekey(3, NOW - KYBER_SPK_MAX_AGE_SECS);
+        assert!(plan_pqxdh(&bundle(&peer, Some(&old_but_fine), None), &ctx()).is_ok());
+
+        let mut no_hsig = peer.prekey(3, NOW);
+        no_hsig.hsig.clear();
+        assert_eq!(
+            refuse(bundle(&peer, Some(&no_hsig), None)),
+            PqxdhRefusal::HybridSignatureMissing
+        );
         let other = Peer::new();
-        let forged = other.sign(SPK);
-        let offer = KyberPrekeyOffer {
-            verifying_key: &peer.vk,
-            spk_public: Some(SPK),
-            spk_signature: Some(&forged),
-            otpk_public: Some(OTPK),
-            otpk_id: Some(4),
-            ..Default::default()
+        let mut foreign_hsig = peer.prekey(3, NOW);
+        foreign_hsig.hsig = other.prekey(3, NOW).hsig;
+        assert_eq!(
+            refuse(bundle(&peer, Some(&foreign_hsig), None)),
+            PqxdhRefusal::HybridSignatureInvalid
+        );
+
+        let mut no_hybrid = bundle(&peer, Some(&good), None);
+        no_hybrid.hybrid_identity_key = None;
+        assert_eq!(refuse(no_hybrid), PqxdhRefusal::HybridIdentityMissing);
+        let mut no_binding = bundle(&peer, Some(&good), None);
+        no_binding.hybrid_identity_signature = None;
+        assert_eq!(refuse(no_binding), PqxdhRefusal::HybridIdentityMissing);
+        let mut foreign_binding = bundle(&peer, Some(&good), None);
+        foreign_binding.hybrid_identity_signature = Some(&other.binding);
+        assert_eq!(
+            refuse(foreign_binding),
+            PqxdhRefusal::HybridIdentityBindingInvalid
+        );
+    }
+
+    /// A server that swaps in its own hybrid key — with a binding it can only forge by breaking
+    /// Ed25519 — is caught by the pin, not the binding.
+    #[test]
+    fn a_changed_hybrid_identity_is_refused() {
+        let peer = Peer::new();
+        let spk = peer.prekey(3, NOW);
+        let pinned = hybrid_identity_fingerprint(&peer.hpk);
+        let with_pin = PqxdhContext {
+            now: NOW,
+            pinned_hybrid_identity: Some(&pinned),
+        };
+        assert!(plan_pqxdh(&bundle(&peer, Some(&spk), None), &with_pin).is_ok());
+
+        let other = Peer::new();
+        let other_pin = hybrid_identity_fingerprint(&other.hpk);
+        let pinned_other = PqxdhContext {
+            now: NOW,
+            pinned_hybrid_identity: Some(&other_pin),
         };
         assert_eq!(
-            plan_kyber_prekey(offer, fresh()).decision,
-            KyberPrekeyDecision::Classic {
-                reason: ClassicReason::InvalidSignature
-            },
-            "not even the unsigned OTPK of the same bundle"
-        );
-        assert_eq!(
-            plan_kyber_prekey(offer, remembered()).decision,
-            KyberPrekeyDecision::Refuse {
-                reason: RefuseReason::InvalidSignature
-            }
-        );
-    }
-
-    /// The transition-period attack: the key or its signature taken away from a device known to
-    /// sign. Mutation: fall back to classic here — this reddens.
-    #[test]
-    fn a_remembered_device_without_a_verifiable_spk_is_refused() {
-        let peer = Peer::new();
-        let stripped_signature = KyberPrekeyOffer {
-            verifying_key: &peer.vk,
-            spk_public: Some(SPK),
-            otpk_public: Some(OTPK),
-            otpk_id: Some(4),
-            ..Default::default()
-        };
-        let stripped_key = KyberPrekeyOffer {
-            verifying_key: &peer.vk,
-            ..Default::default()
-        };
-        for offer in [stripped_signature, stripped_key] {
-            assert_eq!(
-                plan_kyber_prekey(offer, remembered()).decision,
-                KyberPrekeyDecision::Refuse {
-                    reason: RefuseReason::SignedKyberWithdrawn
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn no_kyber_key_from_a_new_device_is_classic() {
-        let peer = Peer::new();
-        let plan = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                ..Default::default()
-            },
-            fresh(),
-        );
-        assert_eq!(
-            plan.decision,
-            KyberPrekeyDecision::Classic {
-                reason: ClassicReason::NoKyberKey
-            }
-        );
-    }
-
-    /// Only a device known to have the PQ ratchet, arriving without it, is refused — and only
-    /// by a build that has the ratchet itself.
-    #[test]
-    fn pq_ratchet_capability_rows() {
-        // (local, advertised, before) -> refused?
-        let rows = [
-            ((true, true, true), false),
-            ((true, true, false), false),
-            ((true, false, false), false),
-            ((true, false, true), true),
-            ((false, false, true), false),
-        ];
-        for ((local, advertised, before), refused) in rows {
-            assert_eq!(
-                plan_pq_ratchet_capability(local, advertised, before),
-                refused.then_some(RefuseReason::PqRatchetWithdrawn),
-                "local={local} advertised={advertised} before={before}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_build_without_pq_refuses_nothing() {
-        let peer = Peer::new();
-        let plan = plan_kyber_prekey(
-            KyberPrekeyOffer {
-                verifying_key: &peer.vk,
-                ..Default::default()
-            },
-            KyberPrekeyContext {
-                local_pq_available: false,
-                presented_signed_spk_before: true,
-            },
-        );
-        assert_eq!(
-            plan.decision,
-            KyberPrekeyDecision::Classic {
-                reason: ClassicReason::LocalBuildWithoutPq
-            }
+            plan_pqxdh(&bundle(&peer, Some(&spk), None), &pinned_other).unwrap_err(),
+            PqxdhRefusal::HybridIdentityChanged
         );
     }
 }

@@ -112,9 +112,11 @@ pub struct SessionHealthReport {
     pub session_id: String,
     /// Whose Kyber key the PQ layer came from.
     pub pq_authentication: PqAuthentication,
+    /// How the PQ layer started.
+    pub pq_handshake: PqHandshake,
 }
 
-pub use crate::crypto::kyber_prekey_auth::PqAuthentication;
+pub use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
@@ -151,6 +153,9 @@ pub struct EncryptedMessageComponents {
     pub pq_message_epoch: u32,
     /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
     pub pq_ratchet_field: Vec<u8>,
+    /// PQXDH v2 handshake header on the initiator's first flight (empty / 0 otherwise).
+    pub kem_ciphertext: Vec<u8>,
+    pub kyber_prekey_id: u32,
 }
 
 // Result of decrypting a message: plaintext + per-message storage key.
@@ -192,6 +197,8 @@ pub struct SessionInitResult {
     pub session_id: String,
     pub decrypted_message: Vec<u8>, // raw plaintext bytes — may be binary or UTF-8
     pub storage_key: Vec<u8>,       // 32-byte random key for the first received message
+    /// The Kyber prekeys blob to persist when this init burned a one-time key.
+    pub kyber_prekeys: Option<Vec<u8>>,
 }
 
 /// Binary key bundle — mirrors the UDL `BinaryKeyBundle` dictionary.
@@ -210,16 +217,19 @@ pub struct BinaryKeyBundle {
     pub spk_rotation_epoch: u32,
     pub kyber_spk_uploaded_at: u64,
     pub kyber_spk_rotation_epoch: u32,
+    // PQXDH v2 — see the UDL for what each is and how it is signed.
     pub kyber_pre_key_public: Option<Vec<u8>>,
+    pub kyber_pre_key_id: Option<u32>,
+    pub kyber_pre_key_created_at: Option<u64>,
+    pub kyber_pre_key_signature: Option<Vec<u8>>,
+    pub kyber_pre_key_hybrid_signature: Option<Vec<u8>>,
     pub kyber_one_time_prekey_public: Option<Vec<u8>>,
     pub kyber_one_time_prekey_id: Option<u32>,
-    /// Peer capability from the server's PreKeyBundle (key-service field 24,
-    /// migration 063): initiators use it to negotiate `SuiteID::PQ_RATCHET`.
-    pub supports_pq_ratchet: bool,
-    /// Ed25519 over `build_x3dh_sign_message(0x10, kyber_pre_key_public)` (key-service field 12).
-    pub kyber_pre_key_signature: Option<Vec<u8>>,
-    /// The same over the Kyber OTPK; the bundle does not carry it yet.
+    pub kyber_one_time_prekey_created_at: Option<u64>,
     pub kyber_one_time_prekey_signature: Option<Vec<u8>>,
+    pub kyber_one_time_prekey_hybrid_signature: Option<Vec<u8>>,
+    pub hybrid_identity_key: Option<Vec<u8>>,
+    pub hybrid_identity_signature: Option<Vec<u8>>,
 }
 
 /// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
@@ -236,6 +246,10 @@ pub struct BinaryFirstMessage {
     pub pq_message_epoch: u32,
     /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
     pub pq_ratchet_field: Vec<u8>,
+    /// The PQXDH v2 handshake, as `wire_payload_unpack` returned it.
+    pub pqxdh_v2: bool,
+    pub kyber_prekey_id: u32,
+    pub kem_ciphertext: Vec<u8>,
 }
 
 /// Mirrors the UDL `WirePayload` dictionary and `wire_payload::DecodedWirePayload`.
@@ -254,6 +268,8 @@ pub struct WirePayload {
     pub pq_message_epoch: u32,
     /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
     pub pq_ratchet_field: Vec<u8>,
+    /// Unpack: the wire carried `PQXDH_V2_FLAG`. Pack: ignored — derived from `kem_ciphertext`.
+    pub pqxdh_v2: bool,
 }
 
 /// Serialize the optional suite-3 sparse PQ-ratchet field for the FFI/wire boundary.
@@ -315,16 +331,6 @@ pub struct OtpkRecord {
     pub public_key: Vec<u8>,  // Base64-encoded public key bytes
 }
 
-/// The ML-KEM-768 signed prekey held in the core key-state (PQXDH KEM leg).
-/// Persisted atomically with the private-keys CFE blob — replaces the standalone
-/// platform Keychain triple (key-store consolidation Phase 2).
-#[derive(Debug, Clone)]
-pub struct KyberSpkRecord {
-    pub key_id: u32,
-    pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
-}
-
 // Private keys for persistence (exported via UDL)
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PrivateKeysJson {
@@ -358,14 +364,8 @@ pub struct InviteSignature {
 
 // Post-quantum KEM types (exported via UDL)
 #[derive(Clone)]
-pub struct MLKEMKeyPair {
-    pub public_key: Vec<u8>, // ML-KEM-768: 1184 bytes
-    pub secret_key: Vec<u8>, // ML-KEM-768: 2400 bytes
-}
-
-#[derive(Clone)]
 pub struct MLKEMEncapsulation {
-    pub ciphertext: Vec<u8>,    // ML-KEM-768: 1088 bytes
+    pub ciphertext: Vec<u8>,    // ML-KEM-1024: 1568 bytes
     pub shared_secret: Vec<u8>, // 32 bytes
 }
 
@@ -546,6 +546,7 @@ impl ClassicCryptoCore {
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
                 pq_authentication: snap.pq_authentication,
+                pq_handshake: snap.pq_handshake,
             })
     }
 
@@ -712,6 +713,7 @@ impl ClassicCryptoCore {
                 &remote_ephemeral,
                 &encrypted_first_message,
                 first_message.one_time_prekey_id,
+                None,
             )
             .map_err(|e| {
                 tracing::error!(
@@ -742,6 +744,8 @@ impl ClassicCryptoCore {
             session_id: contact_id,
             decrypted_message,
             storage_key: gen_storage_key(),
+            // This core holds no Kyber prekeys (classic bootstrap core).
+            kyber_prekeys: None,
         })
     }
 
@@ -805,6 +809,9 @@ impl ClassicCryptoCore {
             suite_id: encrypted_message.suite_id,
             pq_message_epoch: encrypted_message.pq_message_epoch,
             pq_ratchet_field: pq_field_to_bytes(&encrypted_message.pq_ratchet_field),
+            // Classic bootstrap core: no PQXDH v2 handshake to carry.
+            kem_ciphertext: Vec::new(),
+            kyber_prekey_id: 0,
         })
     }
 
@@ -996,24 +1003,6 @@ impl ClassicCryptoCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         client.set_local_user_id(user_id);
-    }
-
-    /// Mix a ML-KEM-768 shared secret into an existing session's root key (PQXDH).
-    ///
-    /// Call after init_session (sender) or init_receiving_session (receiver) with
-    /// the kem_shared_secret from mlkem768_encapsulate / mlkem768_decapsulate.
-    pub fn apply_pq_contribution(
-        &self,
-        contact_id: String,
-        kem_shared_secret: Vec<u8>,
-    ) -> Result<(), CryptoError> {
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client
-            .apply_pq_contribution_to_session(&contact_id, &kem_shared_secret)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 
     /// Rotate the signed pre-key atomically.
@@ -1607,12 +1596,49 @@ mod tests {
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
             kyber_pre_key_public: None,
+            kyber_pre_key_id: None,
+            kyber_pre_key_created_at: None,
+            kyber_pre_key_signature: None,
+            kyber_pre_key_hybrid_signature: None,
             kyber_one_time_prekey_public: None,
             kyber_one_time_prekey_id: None,
-            supports_pq_ratchet: false,
-            kyber_pre_key_signature: None,
+            kyber_one_time_prekey_created_at: None,
             kyber_one_time_prekey_signature: None,
+            kyber_one_time_prekey_hybrid_signature: None,
+            hybrid_identity_key: None,
+            hybrid_identity_signature: None,
         }
+    }
+
+    /// `core`'s bundle as the key service serves it after PQXDH v2: the X3DH part plus a signed
+    /// Kyber SPK (committed here if the core has none) and the hybrid identity key bound to the
+    /// Ed25519 identity. PQ is mandatory, so this is what every session needs.
+    #[cfg(feature = "post-quantum")]
+    fn pq_bundle(core: &OrchestratorCore) -> BinaryKeyBundle {
+        let hybrid = core.ensure_hybrid_signature_key().unwrap();
+        let spk = match core.current_kyber_spk_upload().unwrap() {
+            Some(spk) => spk,
+            None => {
+                core.begin_kyber_spk_rotation().unwrap();
+                assert!(core.commit_kyber_spk_rotation());
+                core.current_kyber_spk_upload().unwrap().unwrap()
+            }
+        };
+        let signing = core.inner.lock().unwrap().get_signing_key_bytes().unwrap();
+        let binding = ClassicSuiteProvider::sign(
+            &ClassicSuiteProvider::signature_private_key_from_bytes(signing),
+            &core.build_hybrid_identity_bind_message(hybrid.clone()),
+        )
+        .unwrap();
+        let mut bundle = bundle_fields_to_binary(core.get_registration_bundle_fields().unwrap());
+        bundle.kyber_pre_key_id = Some(spk.key_id);
+        bundle.kyber_pre_key_public = Some(spk.public_key);
+        bundle.kyber_pre_key_created_at = Some(spk.created_at);
+        bundle.kyber_pre_key_signature = Some(spk.signature);
+        bundle.kyber_pre_key_hybrid_signature = Some(spk.hybrid_signature);
+        bundle.hybrid_identity_key = Some(hybrid);
+        bundle.hybrid_identity_signature = Some(binding);
+        bundle
     }
 
     /// Test that verifies session_id returned from init_session is the contact_id
@@ -1733,38 +1759,6 @@ mod tests {
         );
     }
 
-    /// Phase 2 of key-store consolidation: the Kyber SPK lives in the core key-state and
-    /// must survive the full uniffi persistence path (set_kyber_spk → export_private_keys →
-    /// create_orchestrator_core_from_keys → kyber_spk), exactly like the X25519 SPK.
-    /// Also guards additive compat: a blob exported WITHOUT a Kyber SPK must import fine.
-    #[test]
-    fn test_kyber_spk_survives_private_keys_cfe_roundtrip() {
-        let core = make_orchestrator("kyber_spk_user");
-        assert!(
-            core.kyber_spk().is_none(),
-            "fresh core must have no Kyber SPK"
-        );
-
-        // Blob without a Kyber SPK imports cleanly (backward compat — existing installs).
-        let legacy_blob = core.export_private_keys().unwrap();
-        let restored_legacy =
-            create_orchestrator_core_from_keys(legacy_blob, "kyber_spk_user".into()).unwrap();
-        assert!(restored_legacy.kyber_spk().is_none());
-
-        // Commit a Kyber SPK (ML-KEM-768 sizes) and round-trip it through the CFE blob.
-        let secret = vec![7u8; 2400];
-        let public = vec![9u8; 1184];
-        core.set_kyber_spk(42, secret.clone(), public.clone());
-        let blob = core.export_private_keys().unwrap();
-        let restored = create_orchestrator_core_from_keys(blob, "kyber_spk_user".into()).unwrap();
-        let spk = restored
-            .kyber_spk()
-            .expect("Kyber SPK must survive the CFE round-trip");
-        assert_eq!(spk.key_id, 42);
-        assert_eq!(spk.secret_key, secret);
-        assert_eq!(spk.public_key, public);
-    }
-
     /// The core's Kyber prekeys survive the platform's persistence path: generate (after the
     /// hybrid key exists and the private keys were saved), export both blobs, restore into a new
     /// core, and the restored core decapsulates what was encapsulated to the uploaded keys and
@@ -1836,7 +1830,7 @@ mod tests {
         let alice = make_orchestrator("alice_user");
         let bob = make_orchestrator("bob_user");
 
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
         bob_bundle.spk_uploaded_at = unix_secs_days_ago(31); // > 30d limit
 
         let err = alice
@@ -1855,7 +1849,7 @@ mod tests {
         let alice = make_orchestrator("alice_user");
         let bob = make_orchestrator("bob_user");
 
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
         bob_bundle.spk_uploaded_at = unix_secs_days_ago(60); // well past the 30d limit
 
         let session_id = alice
@@ -1872,7 +1866,7 @@ mod tests {
         let alice = make_orchestrator("alice_user");
         let bob = make_orchestrator("bob_user");
 
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
         bob_bundle.spk_uploaded_at = unix_secs_days_ago(31);
         bob_bundle.suite_id = 2; // PQ_HYBRID
         bob_bundle.kyber_spk_rotation_epoch = 0; // never uploaded a Kyber SPK
@@ -1896,7 +1890,7 @@ mod tests {
         let bob = make_orchestrator("bob_user_id");
 
         let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
         bob_bundle.spk_uploaded_at = unix_secs_days_ago(35); // stale → only degraded init works
 
         let session = alice
@@ -1914,6 +1908,9 @@ mod tests {
             suite_id: encrypted.suite_id,
             pq_message_epoch: encrypted.pq_message_epoch,
             pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
+            kyber_prekey_id: encrypted.kyber_prekey_id,
+            kem_ciphertext: encrypted.kem_ciphertext,
         };
         let bob_result = bob
             .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
@@ -1925,53 +1922,201 @@ mod tests {
         );
     }
 
-    /// REPRO (suite-3 activation): a DEVICE-SHAPED bundle — classic crypto suite (1), a real
-    /// one-time prekey, Kyber SPK + Kyber OTPK present, fresh SPK timestamps/epochs, and
-    /// `supports_pq_ratchet = true` — must still negotiate `SuiteID::PQ_RATCHET`. The minimal
-    /// test below strips all optional fields, so it cannot catch a negotiation drop that only
-    /// happens when the PQXDH branch runs.
+    /// A DEVICE-SHAPED bundle through the exported API, end to end: classic crypto suite (1), a
+    /// real X25519 one-time prekey, the Kyber SPK and a Kyber one-time prekey from the core, fresh
+    /// timestamps. PQXDH v2 opens a suite-3 session on the one-time Kyber key; the first message's
+    /// components carry the handshake; the responder opens the session from them, burns the key
+    /// and hands back the prekeys to persist.
     #[cfg(feature = "post-quantum")]
+    /// `reopen_session` is the answer to `OpenSession` with or without a session held, and a
+    /// refused reopen leaves the held session in place (the upgrade sweep meeting an old build).
     #[test]
-    fn test_pq_ratchet_negotiated_from_device_shaped_bundle() {
-        use crate::crypto::SuiteID;
-
+    fn test_reopen_session_replaces_only_once_the_new_one_exists() {
         let alice = make_orchestrator("alice_user_id");
         let bob = make_orchestrator("bob_user_id");
-
-        let bob_otpk = bob
-            .generate_one_time_prekeys(1)
-            .expect("bob generates an OTPK")
-            .pop()
-            .unwrap();
-        let bob_kyber = mlkem768_keygen().expect("kyber SPK keygen");
-        let bob_kyber_otpk = mlkem768_keygen().expect("kyber OTPK keygen");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let mut bundle = pq_bundle(&bob);
+        bundle.suite_id = 1;
+        bundle.spk_uploaded_at = now;
+        bundle.spk_rotation_epoch = 4;
+        bundle.kyber_spk_uploaded_at = now;
+        bundle.kyber_spk_rotation_epoch = 5;
+        let bob_id = || "bob_user_id".to_string();
+        let kyber_prekey_in_use = || {
+            alice
+                .encrypt_message(bob_id(), b"x".to_vec())
+                .unwrap()
+                .kyber_prekey_id
+        };
 
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
+        // Nothing held: an ordinary open.
+        alice.reopen_session(bob_id(), bundle.clone()).unwrap();
+        let spk_id = kyber_prekey_in_use();
+
+        // A bundle without the hybrid identity key, as an old build serves it: refused, kept.
+        let mut old_build = bundle.clone();
+        old_build.hybrid_identity_key = None;
+        old_build.hybrid_identity_signature = None;
+        let err = alice.reopen_session(bob_id(), old_build).unwrap_err();
+        assert!(
+            matches!(&err, CryptoError::SessionInitializationFailed { message }
+                if message.starts_with("PQ_REQUIRED")),
+            "{err:?}"
+        );
+        assert!(alice.has_session(bob_id()));
+        assert_eq!(kyber_prekey_in_use(), spk_id);
+
+        // A bundle that yields a v2 session replaces the held one.
+        let otpk = bob
+            .generate_kyber_one_time_prekeys(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        bundle.kyber_one_time_prekey_id = Some(otpk.key_id);
+        bundle.kyber_one_time_prekey_public = Some(otpk.public_key);
+        bundle.kyber_one_time_prekey_created_at = Some(otpk.created_at);
+        bundle.kyber_one_time_prekey_signature = Some(otpk.signature);
+        bundle.kyber_one_time_prekey_hybrid_signature = Some(otpk.hybrid_signature);
+        alice.reopen_session(bob_id(), bundle).unwrap();
+        assert_eq!(kyber_prekey_in_use(), otpk.key_id);
+    }
+
+    #[test]
+    fn test_pqxdh_v2_through_the_exported_api() {
+        use crate::crypto::SuiteID;
+
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+
+        let bob_otpk = bob.generate_one_time_prekeys(1).unwrap().pop().unwrap();
+        let mut bob_bundle = pq_bundle(&bob);
+        let kyber_otpk = bob
+            .generate_kyber_one_time_prekeys(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         bob_bundle.suite_id = 1; // server bundles advertise the CLASSIC crypto suite
         bob_bundle.one_time_prekey_public = Some(bob_otpk.public_key);
         bob_bundle.one_time_prekey_id = Some(bob_otpk.key_id);
-        bob_bundle.kyber_pre_key_public = Some(bob_kyber.public_key);
-        bob_bundle.kyber_one_time_prekey_public = Some(bob_kyber_otpk.public_key);
-        bob_bundle.kyber_one_time_prekey_id = Some(1);
+        bob_bundle.kyber_one_time_prekey_public = Some(kyber_otpk.public_key);
+        bob_bundle.kyber_one_time_prekey_id = Some(kyber_otpk.key_id);
+        bob_bundle.kyber_one_time_prekey_created_at = Some(kyber_otpk.created_at);
+        bob_bundle.kyber_one_time_prekey_signature = Some(kyber_otpk.signature);
+        bob_bundle.kyber_one_time_prekey_hybrid_signature = Some(kyber_otpk.hybrid_signature);
         bob_bundle.spk_uploaded_at = now;
         bob_bundle.spk_rotation_epoch = 4;
         bob_bundle.kyber_spk_uploaded_at = now;
         bob_bundle.kyber_spk_rotation_epoch = 5;
-        bob_bundle.supports_pq_ratchet = true;
 
         alice
             .init_session("bob_user_id".to_string(), bob_bundle)
             .expect("device-shaped init_session should succeed");
-
         assert_eq!(
             alice.get_session_suite_id("bob_user_id".to_string()),
             SuiteID::PQ_RATCHET.as_u16(),
-            "device-shaped bundle with supports_pq_ratchet=true must negotiate suite 3"
+            "suite 3 is mandatory"
         );
+
+        let encrypted = alice
+            .encrypt_message("bob_user_id".to_string(), b"hello".to_vec())
+            .unwrap();
+        assert_eq!(encrypted.kyber_prekey_id, kyber_otpk.key_id);
+        assert_eq!(encrypted.kem_ciphertext.len(), 1568);
+        assert_eq!(encrypted.one_time_prekey_id, bob_otpk.key_id);
+
+        let first_msg = BinaryFirstMessage {
+            ephemeral_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            content: encrypted.content,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+            suite_id: encrypted.suite_id,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: true,
+            kyber_prekey_id: encrypted.kyber_prekey_id,
+            kem_ciphertext: encrypted.kem_ciphertext,
+        };
+        let result = bob
+            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .unwrap();
+        assert_eq!(result.decrypted_message, b"hello");
+        assert!(
+            result.kyber_prekeys.is_some(),
+            "the one-time Kyber key was burned: the platform gets the blob to persist"
+        );
+        assert_eq!(bob.kyber_one_time_prekey_count(), 0);
+
+        let health = alice.get_session_health("bob_user_id".to_string()).unwrap();
+        assert_eq!(health.pq_handshake, PqHandshake::InitialV2);
+        assert_eq!(health.pq_authentication, PqAuthentication::Authenticated);
+    }
+
+    /// The responder's other entry: the envelope's payload as packed, unpacked by the core. What
+    /// `init_receiving_session` needs copied into `BinaryFirstMessage` — the v2 flag, the Kyber
+    /// prekey id, the ciphertext — the platform never touches here.
+    #[test]
+    fn test_pqxdh_v2_responder_from_the_wire_payload() {
+        let alice = make_orchestrator("alice_user_id");
+        let bob = make_orchestrator("bob_user_id");
+        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+        let mut bob_bundle = pq_bundle(&bob);
+        bob_bundle.suite_id = 1;
+
+        alice
+            .init_session("bob_user_id".to_string(), bob_bundle)
+            .unwrap();
+        let encrypted = alice
+            .encrypt_message("bob_user_id".to_string(), b"hello".to_vec())
+            .unwrap();
+        let wire = wire_payload_pack(WirePayload {
+            dh_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+            kyber_otpk_id: encrypted.kyber_prekey_id,
+            previous_chain_length: 0,
+            suite_id: encrypted.suite_id,
+            kem_ciphertext: Some(encrypted.kem_ciphertext),
+            sealed_box: encrypted.content,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: false,
+        })
+        .unwrap();
+
+        let result = bob
+            .init_receiving_session_from_wire_payload(
+                "alice_user_id".to_string(),
+                alice_bundle.clone(),
+                wire,
+            )
+            .unwrap();
+        assert_eq!(result.decrypted_message, b"hello");
+        let health = bob.get_session_health("alice_user_id".to_string()).unwrap();
+        assert_eq!(health.pq_handshake, PqHandshake::InitialV2);
+
+        // Not a payload at all: refused, and no session is left behind.
+        let carol = make_orchestrator("carol_user_id");
+        let err = carol
+            .init_receiving_session_from_wire_payload(
+                "alice_user_id".to_string(),
+                alice_bundle,
+                vec![0u8; 8],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, CryptoError::SessionInitializationFailed { message }
+                if message.starts_with("wire_payload unpack failed")),
+            "{err:?}"
+        );
+        assert!(!carol.has_session("alice_user_id".to_string()));
     }
 
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
@@ -1994,9 +2139,7 @@ mod tests {
         let bob = make_orchestrator("bob_user_id");
 
         let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-        let mut bob_bundle = bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        // Advertise the PQ-ratchet capability so Alice negotiates suite 3 as initiator.
-        bob_bundle.supports_pq_ratchet = true;
+        let bob_bundle = pq_bundle(&bob);
 
         let session = alice
             .init_session("bob_user_id".to_string(), bob_bundle)
@@ -2021,6 +2164,9 @@ mod tests {
             suite_id: encrypted.suite_id,
             pq_message_epoch: encrypted.pq_message_epoch,
             pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
+            kyber_prekey_id: encrypted.kyber_prekey_id,
+            kem_ciphertext: encrypted.kem_ciphertext,
         };
 
         let bob_result = bob
@@ -2058,6 +2204,7 @@ mod tests {
             sealed_box: vec![0x33; 60],
             pq_message_epoch: 9,
             pq_ratchet_field: pq_field_to_bytes(&Some(field.clone())),
+            pqxdh_v2: false, // ignored on pack: derived from the ciphertext
         };
 
         let bytes = wire_payload_pack(original.clone()).expect("pack must succeed");
@@ -2135,6 +2282,9 @@ mod tests {
             suite_id: encrypted.suite_id,
             pq_message_epoch: encrypted.pq_message_epoch,
             pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
+            kyber_prekey_id: encrypted.kyber_prekey_id,
+            kem_ciphertext: encrypted.kem_ciphertext,
         };
 
         let bob_session_result = bob
@@ -2241,6 +2391,9 @@ mod tests {
             suite_id: msg1.suite_id,
             pq_message_epoch: msg1.pq_message_epoch,
             pq_ratchet_field: msg1.pq_ratchet_field,
+            pqxdh_v2: !msg1.kem_ciphertext.is_empty(),
+            kyber_prekey_id: msg1.kyber_prekey_id,
+            kem_ciphertext: msg1.kem_ciphertext,
         };
 
         let bob_session_result = bob
@@ -2336,6 +2489,7 @@ mod tests {
                 &alice_ephemeral_pub,
                 &encrypted1,
                 0,
+                None,
             )
             .unwrap();
 
@@ -2414,9 +2568,10 @@ mod tests {
             ciphertext: ciphertext_parsed,
             nonce: nonce_parsed,
             previous_chain_length: 0,
-            suite_id: alice_bundle.suite_id.as_u16(), // Use Alice's bundle suite_id
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
+            // The message's negotiated suite, as the wire carries it — not the bundle's (task #12).
+            suite_id: encrypted1.suite_id,
+            pq_message_epoch: encrypted1.pq_message_epoch,
+            pq_ratchet_field: encrypted1.pq_ratchet_field.clone(),
         };
 
         eprintln!("[UNIFFI FLOW TEST] Reconstructed message:");
@@ -2437,6 +2592,7 @@ mod tests {
             &alice_ephemeral_pub,
             &reconstructed_message,
             0,
+            None,
         );
 
         match &result {
@@ -2629,15 +2785,6 @@ pub fn intake_tag(
         .map_err(|_| CryptoError::InvalidKeyData)
 }
 
-/// Whether this core build supports `SuiteID::PQ_RATCHET` (suite 3) sessions.
-///
-/// Platforms must pass this as `supports_pq_ratchet` in `UploadPreKeysRequest`
-/// so the server advertises the capability in this device's PreKeyBundle and
-/// peers can negotiate suite 3 (see key-service migration 063).
-pub fn supports_pq_ratchet() -> bool {
-    crate::crypto::session_api::local_supports_pq_ratchet()
-}
-
 /// Pack encrypted message components into the canonical `encrypted_payload` blob.
 ///
 /// This is the ONLY sanctioned way for a platform SDK to produce the wire bytes:
@@ -2681,6 +2828,7 @@ pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
         sealed_box: decoded.sealed_box,
         pq_message_epoch: decoded.pq_message_epoch,
         pq_ratchet_field: pq_field_to_bytes(&decoded.pq_ratchet_field),
+        pqxdh_v2: decoded.pqxdh_v2,
     })
 }
 
@@ -2723,66 +2871,15 @@ pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> O
 
 // ── Post-Quantum KEM Namespace Functions ─────────────────────────────────────
 
-/// Generate an ML-KEM-768 keypair for registration/upload to key server.
-///
-/// Returns (public_key=1184 bytes, secret_key=2400 bytes).
-/// Store secret_key securely in Keychain; upload public_key as KyberSignedPreKey.
-#[cfg(feature = "post-quantum")]
-pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
-    crate::crypto::pq_x3dh::mlkem768_keygen()
-        .map(|kp| MLKEMKeyPair {
-            public_key: kp.public_key,
-            secret_key: kp.secret_key.into_vec(),
-        })
-        .map_err(|_e| CryptoError::InitializationFailed)
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
-/// Encapsulate to a recipient's ML-KEM-768 public key (sender side PQXDH).
-///
-/// - `public_key`: recipient's Kyber SPK public key (1184 bytes) from their PreKeyBundle
-/// - Returns: ciphertext (include in PreKeySignalMessage.kem_ciphertext) + shared_secret
-///   (pass to ClassicCryptoCore.apply_pq_contribution)
-#[cfg(feature = "post-quantum")]
-pub fn mlkem768_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
-    crate::crypto::pq_x3dh::mlkem768_encapsulate(&public_key)
+/// Encapsulate to an ML-KEM-1024 public key — history transfer to a peer's Kyber SPK. The
+/// handshake never needs this: the core runs its own ML-KEM (PQXDH v2).
+pub fn mlkem1024_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
+    crate::crypto::pq_x3dh::mlkem1024_encapsulate(&public_key)
         .map(|enc| MLKEMEncapsulation {
             ciphertext: enc.ciphertext,
             shared_secret: enc.shared_secret.into_vec(),
         })
         .map_err(|e| CryptoError::EncryptionFailed { message: e })
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_encapsulate(_public_key: Vec<u8>) -> Result<MLKEMEncapsulation, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
-/// Decapsulate a received ML-KEM-768 ciphertext (receiver side PQXDH).
-///
-/// - `secret_key`: our Kyber SPK secret key from Keychain (2400 bytes)
-/// - `ciphertext`: from PreKeySignalMessage.kem_ciphertext (1088 bytes)
-/// - Returns: shared_secret (pass to ClassicCryptoCore.apply_pq_contribution)
-#[cfg(feature = "post-quantum")]
-pub fn mlkem768_decapsulate(
-    secret_key: Vec<u8>,
-    ciphertext: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::pq_x3dh::mlkem768_decapsulate(&secret_key, &ciphertext)
-        .map(crate::crypto::SecretBytes::into_vec)
-        .map_err(|e| CryptoError::DecryptionFailed { message: e })
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_decapsulate(
-    _secret_key: Vec<u8>,
-    _ciphertext: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
-    Err(CryptoError::InitializationFailed)
 }
 
 // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────────
@@ -3199,7 +3296,6 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
         spk_rotation_epoch: b.spk_rotation_epoch,
         kyber_spk_uploaded_at: b.kyber_spk_uploaded_at,
         kyber_spk_rotation_epoch: b.kyber_spk_rotation_epoch,
-        supports_pq_ratchet: b.supports_pq_ratchet,
     })
 }
 
@@ -3273,6 +3369,7 @@ impl OrchestratorCore {
                 last_ratchet_at: snap.last_ratchet_at,
                 session_id: snap.session_id,
                 pq_authentication: snap.pq_authentication,
+                pq_handshake: snap.pq_handshake,
             })
     }
 
@@ -3485,23 +3582,58 @@ impl OrchestratorCore {
         self.init_session_inner(contact_id, recipient_bundle, true)
     }
 
+    /// The answer to `CfeAction::OpenSession`: open a session, replacing the one held only once
+    /// the new one exists. See `Orchestrator::reopen_session_with_bundle`.
+    pub fn reopen_session(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+    ) -> Result<String, CryptoError> {
+        check_bundle_freshness(&recipient_bundle)?;
+        self.open_session_inner(contact_id, recipient_bundle, false, true)
+    }
+
     fn init_session_inner(
         &self,
         contact_id: String,
         recipient_bundle: BinaryKeyBundle,
         allow_stale: bool,
     ) -> Result<String, CryptoError> {
+        self.open_session_inner(contact_id, recipient_bundle, allow_stale, false)
+    }
+
+    fn open_session_inner(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+        allow_stale: bool,
+        replace: bool,
+    ) -> Result<String, CryptoError> {
         let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.init_session_with_bundle(
+        let open = if replace {
+            crate::orchestration::orchestrator::Orchestrator::reopen_session_with_bundle
+        } else {
+            crate::orchestration::orchestrator::Orchestrator::init_session_with_bundle
+        };
+        open(
+            &mut orch,
             &contact_id,
             public_bundle,
             crate::orchestration::orchestrator::KyberBundleKeys {
+                pre_key_id: recipient_bundle.kyber_pre_key_id,
                 pre_key_public: recipient_bundle.kyber_pre_key_public,
+                pre_key_created_at: recipient_bundle.kyber_pre_key_created_at,
                 pre_key_signature: recipient_bundle.kyber_pre_key_signature,
-                one_time_prekey_public: recipient_bundle.kyber_one_time_prekey_public,
+                pre_key_hybrid_signature: recipient_bundle.kyber_pre_key_hybrid_signature,
                 one_time_prekey_id: recipient_bundle.kyber_one_time_prekey_id,
+                one_time_prekey_public: recipient_bundle.kyber_one_time_prekey_public,
+                one_time_prekey_created_at: recipient_bundle.kyber_one_time_prekey_created_at,
                 one_time_prekey_signature: recipient_bundle.kyber_one_time_prekey_signature,
+                one_time_prekey_hybrid_signature: recipient_bundle
+                    .kyber_one_time_prekey_hybrid_signature,
+                hybrid_identity_key: recipient_bundle.hybrid_identity_key,
+                hybrid_identity_signature: recipient_bundle.hybrid_identity_signature,
             },
             allow_stale,
         )
@@ -3524,15 +3656,43 @@ impl OrchestratorCore {
             suite_id: first_message.suite_id,
             pq_message_epoch: first_message.pq_message_epoch,
             pq_ratchet_field: pq_field_from_bytes(&first_message.pq_ratchet_field),
+            pqxdh_v2: first_message.pqxdh_v2,
+            kyber_prekey_id: first_message.kyber_prekey_id,
+            kem_ciphertext: first_message.kem_ciphertext,
         };
+        self.init_receiving(&contact_id, &public_bundle, &first_msg)
+    }
+
+    /// RESPONDER init from the envelope's `encrypted_payload`, unpacked by the core. Prefer it to
+    /// `init_receiving_session`, whose `BinaryFirstMessage` is a platform copy of the same fields.
+    pub fn init_receiving_session_from_wire_payload(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+        wire_payload: Vec<u8>,
+    ) -> Result<SessionInitResult, CryptoError> {
+        use crate::orchestration::orchestrator::IncomingFirstMessage;
+        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
+        let first_msg = IncomingFirstMessage::from_wire_payload(&wire_payload)
+            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
+        self.init_receiving(&contact_id, &public_bundle, &first_msg)
+    }
+
+    fn init_receiving(
+        &self,
+        contact_id: &str,
+        public_bundle: &X3DHPublicKeyBundle,
+        first_msg: &crate::orchestration::orchestrator::IncomingFirstMessage,
+    ) -> Result<SessionInitResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
-            .init_receiving_session_with_msg(&contact_id, &public_bundle, &first_msg)
+            .init_receiving_session_with_msg(contact_id, public_bundle, first_msg)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
         Ok(SessionInitResult {
             session_id,
             decrypted_message: plaintext,
             storage_key: gen_storage_key(),
+            kyber_prekeys: orch.take_kyber_prekeys_to_persist(),
         })
     }
 
@@ -3542,26 +3702,27 @@ impl OrchestratorCore {
         plaintext: Vec<u8>,
     ) -> Result<EncryptedMessageComponents, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (
-            ephemeral_public_key,
-            message_number,
-            content,
-            one_time_prekey_id,
-            suite_id,
-            pq_message_epoch,
-            pq_ratchet_field,
-        ) = orch
+        let out = orch
             .encrypt_message_for(&contact_id, &plaintext)
             .map_err(|e| CryptoError::EncryptionFailed { message: e })?;
+        let header = out
+            .header
+            .unwrap_or(crate::crypto::messaging::double_ratchet::PrekeyHeader {
+                one_time_prekey_id: 0,
+                kyber_prekey_id: 0,
+                kem_ciphertext: Vec::new(),
+            });
         Ok(EncryptedMessageComponents {
-            ephemeral_public_key,
-            message_number,
-            content,
-            one_time_prekey_id,
+            ephemeral_public_key: out.message.dh_public_key.to_vec(),
+            message_number: out.message.message_number,
+            content: out.sealed_box,
+            one_time_prekey_id: header.one_time_prekey_id,
             storage_key: gen_storage_key(),
-            suite_id,
-            pq_message_epoch,
-            pq_ratchet_field: pq_field_to_bytes(&pq_ratchet_field),
+            suite_id: out.message.suite_id,
+            pq_message_epoch: out.message.pq_message_epoch,
+            pq_ratchet_field: pq_field_to_bytes(&out.message.pq_ratchet_field),
+            kem_ciphertext: header.kem_ciphertext,
+            kyber_prekey_id: header.kyber_prekey_id,
         })
     }
 
@@ -3696,25 +3857,6 @@ impl OrchestratorCore {
         orch.prune_otpks_below(min_keep_id)
     }
 
-    /// Store the ML-KEM-768 signed prekey in the core key-state. Commit-after-confirm is
-    /// the caller's contract: call only once the server has confirmed the public upload,
-    /// then persist the core snapshot (`export_private_keys`) — the key lives in that blob.
-    pub fn set_kyber_spk(&self, key_id: u32, secret_key: Vec<u8>, public_key: Vec<u8>) {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.set_kyber_spk(key_id, secret_key, public_key);
-    }
-
-    /// The ML-KEM-768 signed prekey held in the core key-state, or None if not committed yet.
-    pub fn kyber_spk(&self) -> Option<KyberSpkRecord> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.kyber_spk_bytes()
-            .map(|(key_id, secret_key, public_key)| KyberSpkRecord {
-                key_id,
-                public_key,
-                secret_key,
-            })
-    }
-
     pub fn generate_kyber_one_time_prekeys(
         &self,
         count: u32,
@@ -3808,45 +3950,6 @@ impl OrchestratorCore {
             public_key,
             signature,
         })
-    }
-
-    /// Register a KEM shared secret as a deferred contribution for `contact_id`.
-    ///
-    /// Call after ML-KEM encapsulation (INITIATOR) or decapsulation (RESPONDER).
-    /// Follow up with `exportKyberSessionState` + save to persist the new snapshot.
-    ///
-    pub fn register_pq_deferred(&self, contact_id: String, otpk_id: u32, shared_secret: Vec<u8>) {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = orch.register_pq_deferred(&contact_id, otpk_id, &shared_secret);
-    }
-
-    pub fn apply_pq_contribution(
-        &self,
-        contact_id: String,
-        kem_shared_secret: Vec<u8>,
-    ) -> Result<(), CryptoError> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.apply_pq_contribution_delegate(&contact_id, &kem_shared_secret)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
-    }
-
-    /// Export the `PQContributionManager` state as a CFE binary blob.
-    ///
-    /// Persist the returned bytes under `SecureStoreSlot::KyberSessionState`.
-    /// Call after any encapsulate / decapsulate / consume operation so that
-    /// deferred contributions survive process restarts.
-    pub fn export_kyber_session_state(&self) -> Result<Vec<u8>, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.export_kyber_session_state_cfe()
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
-    }
-
-    /// Restore the `PQContributionManager` from a CFE blob produced by
-    /// `export_kyber_session_state`.  Call at app start before any crypto.
-    pub fn import_kyber_session_state(&self, data: Vec<u8>) -> Result<(), CryptoError> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.import_kyber_session_state_cfe(&data)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 
     /// Export the full orchestrator coordination state (ACK cache, healing queue,
@@ -4108,9 +4211,6 @@ impl CfeIncomingEvent {
 pub enum CfeSecureStoreSlot {
     Session { contact_id: String },
     SessionArchive { contact_id: String },
-    PqDeferred { contact_id: String },
-    KyberSessionState,
-    KyberSignedPrekey { key_id: u32 },
     OrchestratorState,
 }
 
@@ -4120,9 +4220,6 @@ impl From<crate::orchestration::SecureStoreSlot> for CfeSecureStoreSlot {
         match slot {
             S::Session { contact_id } => Self::Session { contact_id },
             S::SessionArchive { contact_id } => Self::SessionArchive { contact_id },
-            S::PqDeferred { contact_id } => Self::PqDeferred { contact_id },
-            S::KyberSessionState => Self::KyberSessionState,
-            S::KyberSignedPrekey { key_id } => Self::KyberSignedPrekey { key_id },
             S::OrchestratorState => Self::OrchestratorState,
         }
     }
@@ -4141,10 +4238,6 @@ pub enum CfeAction {
     InitSession {
         contact_id: String,
         bundle_json: String,
-    },
-    ApplyPqContribution {
-        contact_id: String,
-        kem_ss: Vec<u8>,
     },
     ArchiveSession {
         contact_id: String,
@@ -4265,7 +4358,9 @@ pub enum CfeAction {
         redelivery: bool,
     },
     /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
-    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told.
+    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told. Build it with
+    /// `reopen_session`, which also covers a session still held: the PQXDH v2 upgrade sweep asks
+    /// this for classical sessions.
     OpenSession {
         contact_id: String,
     },
@@ -4338,9 +4433,6 @@ impl CfeAction {
                 contact_id,
                 bundle_json,
             },
-            ApplyPQContribution { contact_id, kem_ss } => {
-                Self::ApplyPqContribution { contact_id, kem_ss }
-            }
             ArchiveSession { contact_id } => Self::ArchiveSession { contact_id },
             MessageDecrypted {
                 contact_id,
@@ -4466,46 +4558,6 @@ impl CfeAction {
                 archive_bytes: archive_bytes.into_vec(),
             },
         }
-    }
-}
-
-// ── Orchestration — RustPQContributions (Phase 2 / M3) ───────────────────────
-
-pub struct RustPQContributions {
-    inner: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-}
-
-impl Default for RustPQContributions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RustPQContributions {
-    pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    pub fn store_deferred(&self, contact_id: String, shared_secret: Vec<u8>) {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.insert(contact_id, shared_secret);
-    }
-
-    pub fn take_deferred(&self, contact_id: String) -> Option<Vec<u8>> {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(&contact_id)
-    }
-
-    pub fn clear(&self, contact_id: String) {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(&contact_id);
-    }
-
-    pub fn has_pending(&self, contact_id: String) -> bool {
-        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.contains_key(&contact_id)
     }
 }
 

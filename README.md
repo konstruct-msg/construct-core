@@ -13,10 +13,11 @@ end-to-end encrypted messenger.**
 macOS, and Android run the *same* code via UniFFI rather than reimplementing crypto
 per platform. It provides:
 
-- **X3DH** asynchronous key agreement, with an **ML-KEM-768 contribution** mixed into the root
-  key when the peer publishes a Kyber prekey (see [Cryptography](#cryptography) for exactly how)
-- **Double Ratchet** for forward secrecy & post-compromise security, optionally with a sparse
-  continuous **ML-KEM-768 ratchet** (suite 3)
+- **PQXDH v2** asynchronous key agreement: X3DH with an **ML-KEM-1024** secret in the session's
+  initial key, so every message, the first included, depends on both (see
+  [Cryptography](#cryptography)). Post-quantum is mandatory for new sessions.
+- **Double Ratchet** for forward secrecy & post-compromise security, with a sparse continuous
+  **ML-KEM-768 ratchet** (suite 3, mandatory with `post-quantum`)
 - **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204) primitives
 - **MLS (RFC 9420)** group primitives via `openmls` (`ios` / `mac` / `android` features)
 - **Account recovery** — BIP39 mnemonic, and social recovery by Shamir secret sharing over
@@ -141,50 +142,62 @@ Names follow NIST FIPS; informal names in parens.
 |---|---|---|
 | 1 | `CLASSIC` | The table above. |
 | 2 | `PQ_HYBRID` | **Reserved.** No session negotiates it; the hybrid-signature primitives below live under this name. |
-| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. Chosen only when this build has `post-quantum` and the peer's bundle advertises `supports_pq_ratchet`. A device that has advertised or used it before and now arrives without the flag is **refused** (`PQ_DOWNGRADE_REFUSED: PqRatchetWithdrawn`) — the flag is unsigned, and dropping it would otherwise silently downgrade to `CLASSIC`. |
+| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. **Every session a `post-quantum` build opens** — there is no capability flag to read or strip (the unsigned `supports_pq_ratchet` was the downgrade). A responder refuses a first message on another suite. |
 
-### ML-KEM-768 at session start (independent of `suite_id`)
+### PQXDH v2 — ML-KEM-1024 in the initial key
 
-When the peer's bundle carries a Kyber prekey, the initiator encapsulates to it (ML-KEM-768,
-FIPS 203) and mixes the shared secret into the X3DH root key when it sends the first message:
-`root = HKDF(salt = rk, ikm = kem_ss, info = "construct-pqxdh-v1")`; the ciphertext travels in
-that message, and the responder derives the same root. What that does **not** cover: the
-initiator's first sending chain is derived from the X3DH secret *before* the mix, so message 0 and
-everything sent before the first reply are protected by X25519 only. Every chain after the first
-DH ratchet step depends on both. This is *not* Signal's PQXDH: the KEM secret is mixed in after
-X3DH rather than into its initial derivation, and the KEM ciphertext is not bound into the KDF.
+Design and decisions: construct-docs `cryptocore/PQXDH_V2_DESIGN.md`,
+`decisions/pqxdh-v2-mandatory-pq-cutover.md`.
 
-**Being replaced by PQXDH v2** (construct-docs `cryptocore/PQXDH_V2_DESIGN.md`,
-`decisions/pqxdh-v2-mandatory-pq-cutover.md`): the ML-KEM-1024 secret goes into the initial key,
-PQ is mandatory for new sessions, and the Kyber keys, their choice and decapsulation live in the
-core. In place so far — the core's own **ML-KEM-1024 prekeys** (`crypto::kyber_prekeys`): a
-signed prekey with two-phase rotation and 14-day retention of rotated-out keys, a one-time pool,
-64-byte seeds as the only secret, each key signed (Ed25519 and hybrid) over
-`"KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || kyber_public` so its age is the
-device's word, not the server's. The handshake does not use them yet.
+```text
+SK = HKDF(salt = 0xFF×32, ikm = DH1 ‖ DH2 ‖ DH3 [‖ DH4] ‖ SS,
+          info = "Construct-PQXDH-RootKey-v2" ‖ SHA-256(kyber_pk) ‖ SHA-256(kem_ct))
+```
 
-The Kyber prekey's Ed25519 signature is verified by the core
-(`"KonstruktX3DH-v1" || 0x00 0x10 || kyber_public`, key-service field 12), and the session is
-labelled accordingly — `SessionHealthReport.pq_authentication`:
+`SS` is the ML-KEM-1024 secret the initiator encapsulated to the responder's Kyber prekey. Every
+key of the session — its id, the first sending chain, everything after — derives from `SK`, so
+the first message is as post-quantum as the rest. (Before v2 the secret was mixed in after the
+first ratchet step and the initiator's first flight was X25519-only; such sessions report
+`pq_handshake = DeferredV1`.)
 
-| Bundle | Result |
-|---|---|
-| signature verifies | `Authenticated` — and the device is remembered as one that signs |
-| no signature | `Unauthenticated` — protects against a passive recorder, not against whoever served the bundle |
-| signature present and wrong | classical session, logged as a security event |
-| no verifiable Kyber key from a device that signed before | session **refused** (`PQ_DOWNGRADE_REFUSED`) |
+**The initiator refuses before anything is created** (`PQ_REQUIRED: <reason>`) unless the bundle
+yields a Kyber prekey it can trust (`orchestration::pq_prekey_plan`):
 
-An unsigned Kyber OTPK is never preferred over a verified SPK (the server bundle does not carry
-OTPK signatures yet).
+- the device's **hybrid identity key** (Ed25519 + ML-DSA-65, field 20) is present, bound to its
+  Ed25519 identity by the cross-signature (field 21), and is the key **pinned** for this device the
+  first time a session to it was opened (`HybridIdentityChanged` otherwise — the binding is
+  Ed25519, which a quantum adversary could forge; the pin is what it cannot);
+- the Kyber prekey (ML-KEM-1024) carries both signatures over
+  `"KonstruktX3DH-v1" ‖ 0x00 0x11 ‖ created_at (u64 BE) ‖ public` — Ed25519 by the identity key,
+  hybrid by the pinned hybrid key — and a signed prekey is at most 30 days old **by its signed
+  time** (`allow_stale` does not relax this: skipping it is the replay);
+- a one-time Kyber prekey is preferred (its secret is burned after use); anything wrong with it
+  falls back to the signed prekey, since a server could always have omitted it.
+
+The ciphertext and the prekey ids ride on every message of the initiator's first flight
+(`PrekeyHeader`, persisted with the session) until the peer answers. The wire marks those
+messages with bit `0x0100` in `suite_id` (`PQXDH_V2_FLAG`) — an older core rejects the suite id
+outright instead of misreading the message. The responder **decapsulates inside the core**
+(`crypto::kyber_prekeys`: the Kyber secrets are 64-byte seeds that never leave it), refuses a first
+message without the v2 handshake (`PQXDH_REQUIRED`), reports a prekey it no longer holds
+(`PQXDH_KEY_UNAVAILABLE` → heal), and burns a used one-time key. Rotated-out signed prekeys are
+kept 14 days (one constant for classic and Kyber).
+
+`SessionHealthReport`: `pq_handshake` (`None` / `DeferredV1` / `InitialV2`) says how PQ started,
+`pq_authentication` whose key it was (`Authenticated` for the initiator, `Received` for the
+responder of a v2 session). Anything a person is told about "PQ" is built from those two.
+
+A build without `post-quantum` has no Kyber keys and opens classical X3DH sessions; it cannot
+talk to platform builds, which always have it.
 
 ### Hybrid signatures
 
 **Ed25519 + ML-DSA-65** (FIPS 204) — both must verify. RustCrypto `ml-dsa`, seed-based, the same
 implementation as the Konstruct server (cross-verification pinned by an interop test). The core
-exposes them as primitives; iOS signs the Kyber SPK with them (key-service field 23) and checks
-that signature itself. The core signs its own v2 Kyber prekeys with them and can check such a
-signature (`check_kyber_prekey_hybrid_signature`), but no session decision uses it yet. Older docs
-claiming "Dilithium deployed" are wrong; "Kyber-1024" becomes true with PQXDH v2.
+exposes them as primitives, signs its own Kyber prekeys with them, and requires the hybrid
+signature on every Kyber prekey it encapsulates to (above). Older docs claiming "Dilithium
+deployed" for identities in general are wrong: the hybrid key authenticates Kyber prekeys, and
+its own authenticity rests on the per-device pin.
 
 ### Social recovery
 
@@ -208,7 +221,7 @@ server can drop them — they hide patterns from a network observer, not from th
 | `ios`           | iOS/macOS bindings via UniFFI (+ VEIL transport, MLS)          |
 | `mac`           | Native macOS build (same surface as `ios`)                     |
 | `android`       | Android JNI/Kotlin bindings via UniFFI                         |
-| `post-quantum`  | ML-KEM-768 + ML-DSA-65 post-quantum cryptography               |
+| `post-quantum`  | ML-KEM-1024 (PQXDH v2), ML-KEM-768 (suite-3 ratchet), ML-DSA-65 |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
 features pull in `post-quantum`, `construct-veil` and `openmls`: a platform library always has

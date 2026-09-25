@@ -379,6 +379,27 @@ where
         one_time_prekey_id: u32,
         allow_stale: bool,
     ) -> Result<String, String> {
+        self.init_session_with_pq(
+            contact_id,
+            remote_bundle,
+            remote_identity,
+            one_time_prekey_id,
+            allow_stale,
+            None,
+        )
+    }
+
+    /// Initiator init with the ML-KEM part of a PQXDH v2 handshake already run (`pq`), so the
+    /// session's root key depends on it from the first message on. `None` is classical X3DH.
+    pub fn init_session_with_pq(
+        &mut self,
+        contact_id: &str,
+        remote_bundle: &H::PublicKeyBundle,
+        remote_identity: &P::KemPublicKey,
+        one_time_prekey_id: u32,
+        allow_stale: bool,
+        pq: Option<&crate::crypto::handshake::PqxdhInput<'_>>,
+    ) -> Result<String, String> {
         use tracing::info;
         self.ensure_local_user_id_set()?;
 
@@ -415,6 +436,7 @@ where
             remote_identity,
             contact_id.to_string(),
             self.local_user_id.clone(),
+            pq,
         )?;
 
         let session_id = session.session_id().to_string();
@@ -574,6 +596,7 @@ where
             &remote_ephemeral,
             first_message,
             0, // OTPK consumed upstream when called via init_receiving_session (test path)
+            None,
         )
     }
 
@@ -598,6 +621,7 @@ where
         remote_ephemeral: &P::KemPublicKey,
         first_message: &M::EncryptedMessage,
         one_time_prekey_id: u32,
+        pq: Option<&crate::crypto::handshake::PqxdhInput<'_>>,
     ) -> Result<(String, Vec<u8>), String> {
         use tracing::{info, warn};
         self.ensure_local_user_id_set()?;
@@ -675,6 +699,7 @@ where
                 contact_id.to_string(),
                 self.local_user_id.clone(),
                 consumed_otpk.as_ref(),
+                pq,
             ) {
                 Ok((session, plaintext)) => {
                     let session_id = session.session_id().to_string();
@@ -814,23 +839,17 @@ where
         self.sessions.remove(contact_id).is_some()
     }
 
-    /// Apply a post-quantum KEM shared secret to an existing session's root key.
+    /// Take the session with `contact_id` out of the map without dropping it.
     ///
-    /// Call this immediately after `init_session` (sender) or `init_receiving_session`
-    /// (receiver) to mix ML-KEM-768 entropy into the session root key, providing
-    /// HNDL (Harvest Now Decrypt Later) protection.
-    pub fn apply_pq_contribution_to_session(
-        &mut self,
-        contact_id: &str,
-        kem_shared_secret: &[u8],
-    ) -> Result<(), String> {
-        let session = self
-            .sessions
-            .get_mut(contact_id)
-            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
-        session
-            .messaging_session_mut()
-            .apply_pq_contribution(kem_shared_secret)
+    /// For a replacement that must not lose the old session if the new one cannot be built:
+    /// `put_back_session` returns it unchanged, with no serialisation of its secrets in between.
+    pub(crate) fn take_session(&mut self, contact_id: &str) -> Option<Session<P, H, M>> {
+        self.sessions.remove(contact_id)
+    }
+
+    /// Return a session taken by `take_session`.
+    pub(crate) fn put_back_session(&mut self, contact_id: &str, session: Session<P, H, M>) {
+        self.sessions.insert(contact_id.to_string(), session);
     }
 
     ///
@@ -982,17 +1001,6 @@ where
     pub fn prune_one_time_prekeys_below(&mut self, min_keep_id: u32) -> usize {
         self.key_manager.prune_one_time_prekeys_below(min_keep_id)
     }
-
-    /// Store the ML-KEM-768 signed prekey in the key-state (commit-after-confirm).
-    pub fn set_kyber_spk(&mut self, key_id: u32, private_key: Vec<u8>, public_key: Vec<u8>) {
-        self.key_manager
-            .set_kyber_spk(key_id, private_key, public_key);
-    }
-
-    /// The stored ML-KEM-768 signed prekey as `(key_id, private, public)`, if any.
-    pub fn kyber_spk_bytes(&self) -> Option<(u32, Vec<u8>, Vec<u8>)> {
-        self.key_manager.kyber_spk_bytes()
-    }
 }
 
 /// Convenience type alias для X3DH + Double Ratchet с Classic Suite
@@ -1055,13 +1063,6 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
             spk_pub: ByteBuf::from(spk_pub),
             old_spks,
             hybrid_sig_priv: km.hybrid_signature_private_bytes(),
-            kyber_spk: km.kyber_spk_bytes().map(|(key_id, priv_b, pub_b)| {
-                crate::cfe::CfeKyberSpkV1 {
-                    key_id,
-                    kyber_priv: crate::crypto::SecretBytes::from(priv_b),
-                    kyber_pub: ByteBuf::from(pub_b),
-                }
-            }),
         })
     }
 
@@ -1093,9 +1094,6 @@ impl ClassicClient<crate::crypto::suites::classic::ClassicSuiteProvider> {
                 .map_err(|err| format!("Failed to restore old prekey {id}: {err:?}"))?;
         }
 
-        if let Some(k) = keys.kyber_spk {
-            client.set_kyber_spk(k.key_id, k.kyber_priv.into_vec(), k.kyber_pub.into_vec());
-        }
         Ok(client)
     }
 }
@@ -1148,7 +1146,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         // Alice initiates session with Bob
@@ -1179,6 +1176,7 @@ mod tests {
                 &alice_ephemeral_pub,
                 &encrypted1,
                 0,
+                None,
             )
             .unwrap();
 
@@ -1241,7 +1239,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice
@@ -1273,6 +1270,7 @@ mod tests {
             &alice_ephemeral_pub,
             &first,
             otpk_id,
+            None,
         );
         assert!(wrong.is_err(), "the wrong device must not open the carrier");
         assert_eq!(
@@ -1288,6 +1286,7 @@ mod tests {
                 &alice_ephemeral_pub,
                 &first,
                 otpk_id,
+                None,
             )
             .expect("the right device must still be able to open the carrier");
         assert_eq!(decrypted, b"Hello Bob!");
@@ -1303,6 +1302,7 @@ mod tests {
             &alice_ephemeral_pub,
             &first,
             otpk_id,
+            None,
         );
         assert!(
             replay.is_err(),
@@ -1310,10 +1310,9 @@ mod tests {
         );
     }
 
-    /// Suite negotiation: a bundle advertising `supports_pq_ratchet` yields a
-    /// suite-3 session end-to-end (initiator tags suite 3 on the wire, the
-    /// responder adopts it from the first message and interops), while a
-    /// bundle without the capability stays on CLASSIC.
+    /// Suite 3 is mandatory with `post-quantum`: every session is suite 3 end-to-end (initiator
+    /// tags suite 3 on the wire, the responder adopts it from the first message and interops).
+    /// There is no capability flag to read.
     #[cfg(feature = "post-quantum")]
     #[test]
     fn test_client_negotiates_pq_ratchet_from_bundle_capability() {
@@ -1338,7 +1337,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: true,
         };
 
         alice
@@ -1372,6 +1370,7 @@ mod tests {
                 &alice_ephemeral_pub,
                 &encrypted1,
                 0,
+                None,
             )
             .unwrap();
         assert_eq!(decrypted1, b"pq hello");
@@ -1389,9 +1388,10 @@ mod tests {
         );
     }
 
-    /// A bundle without the capability must keep negotiating CLASSIC.
+    /// Without `post-quantum` there is no suite 3 to negotiate: the session is classic.
+    #[cfg(not(feature = "post-quantum"))]
     #[test]
-    fn test_client_without_capability_stays_classic() {
+    fn test_client_without_post_quantum_stays_classic() {
         let mut alice = TestClient::new().unwrap();
         let bob = TestClient::new().unwrap();
         alice.set_local_user_id("alice".to_string());
@@ -1412,7 +1412,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice
@@ -1446,7 +1445,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice
@@ -1600,7 +1598,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice
@@ -1662,7 +1659,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice
@@ -1725,7 +1721,6 @@ mod tests {
             spk_rotation_epoch: 0,
             kyber_spk_uploaded_at: 0,
             kyber_spk_rotation_epoch: 0,
-            supports_pq_ratchet: false,
         };
 
         alice

@@ -77,7 +77,10 @@ fuzz_target!(|input: WireInput| {
             ct: ct.into_iter().take(u16::MAX as usize).collect(),
         }),
     };
-    let is_suite3 = input.suite_id == 3;
+    // `pack` owns the PQXDH v2 flag: it strips it from the caller's suite and sets it exactly
+    // when a KEM ciphertext is present, so the ratchet suite is the input without the bit.
+    let ratchet_suite = input.suite_id & !construct_core::wire_payload::PQXDH_V2_FLAG;
+    let is_suite3 = ratchet_suite == 3;
     let expected_epoch = if is_suite3 { input.pq_message_epoch } else { 0 };
     let expected_pq_field = if is_suite3 { pq_field.clone() } else { None };
 
@@ -107,7 +110,8 @@ fuzz_target!(|input: WireInput| {
     assert_eq!(decoded.one_time_prekey_id, input.one_time_prekey_id);
     assert_eq!(decoded.kyber_otpk_id, input.kyber_otpk_id);
     assert_eq!(decoded.previous_chain_length, input.previous_chain_length);
-    assert_eq!(decoded.suite_id, input.suite_id);
+    assert_eq!(decoded.suite_id, ratchet_suite);
+    assert_eq!(decoded.pqxdh_v2, kem_ref.is_some());
     assert_eq!(decoded.sealed_box, input.sealed_box);
     assert_eq!(decoded.pq_message_epoch, expected_epoch);
     assert_eq!(decoded.pq_ratchet_field, expected_pq_field);

@@ -95,6 +95,11 @@ fn proof_pack_unpack_roundtrip_with_pqc() {
         Some(kem_ct.as_slice()),
         "KEM ciphertext must round-trip"
     );
+    assert!(decoded.pqxdh_v2, "a KEM ciphertext sets the PQXDH v2 flag");
+    assert_eq!(
+        decoded.suite_id, 1,
+        "the flag is stripped from the ratchet suite"
+    );
     assert_eq!(decoded.sealed_box, sealed_box);
 }
 

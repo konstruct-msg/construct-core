@@ -232,14 +232,6 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
 
     /// Return a read-only health snapshot of this session's ratchet state.
     fn health_snapshot(&self) -> crate::crypto::messaging::double_ratchet::DrHealthSnapshot;
-
-    /// Mix a post-quantum KEM shared secret into the session root key (PQXDH).
-    ///
-    /// Default implementation is a no-op for non-PQ session types.
-    /// `DoubleRatchetSession` overrides this to do the actual HKDF mixing.
-    fn apply_pq_contribution(&mut self, _kem_shared_secret: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 // Re-exports

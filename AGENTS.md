@@ -6,7 +6,7 @@
 
 - **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. `PlatformBridge` is exported over UniFFI but the orchestrator does not call it; logging goes through `tracing`.
 - **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
-- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from the ML-KEM-768 contribution at session start and the suite-3 sparse PQ ratchet, not from swapping the provider.
+- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from **PQXDH v2** — an ML-KEM-1024 secret in the session's initial key, mandatory, with Kyber keys owned by the core (`crypto::kyber_prekeys`, `orchestration::pq_prekey_plan`) — and the mandatory suite-3 sparse ML-KEM-768 ratchet, not from swapping the provider.
 - **CFE (Construct Format Envelope)**: A custom binary format — 16-byte header (magic, version, type, flags, payload length, CRC32) around a MessagePack payload (`rmp_serde::to_vec_named`) — used for state persistence and migration from legacy JSON formats.
 - **UniFFI Bindings**: Cross-platform bindings are defined in `src/construct_core.udl` and implemented in `src/uniffi_bindings.rs`.
 
@@ -21,7 +21,7 @@
 ### Feature Flags
 - `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS, `post-quantum`).
 - `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil + `post-quantum`.
-- `post-quantum`: Enables ML-KEM-768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that).
+- `post-quantum`: Enables ML-KEM-1024/768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that). Without it the core opens classical sessions only, which platform builds refuse.
 
 ## Development Conventions
 
@@ -37,14 +37,13 @@
 ### 3. Cross-Platform Boundary (UniFFI)
 - When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
 - Prefer passing `bytes` (sequence<u8>) or `string` for complex data to ensure compatibility across languages.
-- **The UDL is not the only API.** `construct-tui` depends on this crate by path and uses its `pub`
-  Rust modules directly (`orchestration`, `cfe`, `crypto::{sealed_sender, handshake, suites,
-  client_api, keys}`, `wire_payload`, `pow`, `device_id`). Changing a `pub` type or signature there
-  breaks it even when the UDL is untouched — check it builds (`cargo check` in construct-tui with
-  this crate at `../construct-core`) and say in the PR what it has to change.
+- **`construct-tui` is paused** (2026-09-25) until iOS, Android and multi-device are settled. It
+  uses this crate's `pub` Rust modules by path, and it already does not build against `main`. A
+  change here does not have to keep it building or be checked against it; it will be brought up to
+  date in one piece when work on it resumes.
 
 **If two clients must agree on it, this crate must export it — not describe it.** There are two
-clients now (`construct-messenger`, `construct-tui`) and Android is coming. Anything a client would
+clients now (`construct-messenger` on iOS, `construct-android`). Anything a client would
 otherwise reimplement is a decision that will diverge, and divergence here is silent: the copy is
 dropped as foreign, the message never appears, and neither side can say which one is right. The
 `content_type` split between iOS and the TUI was found by comparing tables, not by a failure.
