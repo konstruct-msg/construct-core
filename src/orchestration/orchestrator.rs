@@ -264,7 +264,10 @@ impl Orchestrator {
         let epoch = self
             .get_session_health(contact_id)
             .map(|health| health.session_id);
-        let holds = self.confirm_holds.entry(contact_id.to_string()).or_default();
+        let holds = self
+            .confirm_holds
+            .entry(contact_id.to_string())
+            .or_default();
         if holds.iter().any(|h| h.message_id == refused.message_id) {
             return;
         }
@@ -3155,7 +3158,10 @@ mod tests {
             contact_id: "bob".to_string(),
         });
         o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(o.release_confirm_holds().is_empty(), "nothing leaves while the gate is up");
+        assert!(
+            o.release_confirm_holds().is_empty(),
+            "nothing leaves while the gate is up"
+        );
 
         let actions = o.handle_event(IncomingEvent::PeerAcked {
             contact_id: "bob".to_string(),
@@ -3235,10 +3241,16 @@ mod tests {
             opens_session,
         };
         assert!(held_opener_superseded(&hold(true, Some("e1")), Some("e2")));
-        assert!(held_opener_superseded(&hold(true, None), Some("e2")), "held with none, one exists now");
+        assert!(
+            held_opener_superseded(&hold(true, None), Some("e2")),
+            "held with none, one exists now"
+        );
         assert!(!held_opener_superseded(&hold(true, Some("e1")), Some("e1")));
         assert!(!held_opener_superseded(&hold(true, Some("e1")), None));
-        assert!(!held_opener_superseded(&hold(false, Some("e1")), Some("e2")), "content always replays");
+        assert!(
+            !held_opener_superseded(&hold(false, Some("e1")), Some("e2")),
+            "content always replays"
+        );
     }
 
     /// And a heal is held for the sharper version of the same reason: healing as RESPONDER runs
