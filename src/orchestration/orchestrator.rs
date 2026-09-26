@@ -879,7 +879,9 @@ impl Orchestrator {
         claimed: &str,
         bundles: &[crate::crypto::handshake::x3dh::X3DHPublicKeyBundle],
     ) -> ReceivingOpen {
-        use crate::orchestration::receiving_init_plan::{ReceivingInitCarrier, plan_receiving_init};
+        use crate::orchestration::receiving_init_plan::{
+            ReceivingInitCarrier, plan_receiving_init,
+        };
 
         let queued = self.router.pending_messages(claimed);
         let headers: Vec<Option<IncomingFirstMessage>> = queued
@@ -4963,12 +4965,19 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, true);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
         let msg1 = alice.encrypt_bytes_for(&bob_id, b"second").unwrap();
 
         let queued = deliver(&mut bob, &alice_id, "m0", msg0, 0);
-        assert!(queued.iter().any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })), "{queued:?}");
+        assert!(
+            queued
+                .iter()
+                .any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })),
+            "{queued:?}"
+        );
         deliver(&mut bob, &alice_id, "m1", msg1, 0);
 
         let alice_bundle = alice.get_registration_bundle_fields().unwrap();
@@ -4978,11 +4987,23 @@ mod pqxdh_v2_tests {
         assert_eq!(opened.opener_message_id.as_deref(), Some("m0"));
         assert_eq!(
             decrypted(&opened.actions),
-            vec![("m0".to_string(), b"first".to_vec()), ("m1".to_string(), b"second".to_vec())]
+            vec![
+                ("m0".to_string(), b"first".to_vec()),
+                ("m1".to_string(), b"second".to_vec())
+            ]
         );
-        assert!(opened.actions.iter().any(|a| matches!(a, Action::SaveToSecureStore { slot: SecureStoreSlot::Session { .. }, .. })));
+        assert!(opened.actions.iter().any(|a| matches!(
+            a,
+            Action::SaveToSecureStore {
+                slot: SecureStoreSlot::Session { .. },
+                ..
+            }
+        )));
         assert!(bob.router.pending_messages(&alice_id).is_empty());
-        assert_eq!(bob.get_session_health(&alice_id).unwrap().pq_handshake, PqHandshake::InitialV2);
+        assert_eq!(
+            bob.get_session_health(&alice_id).unwrap().pq_handshake,
+            PqHandshake::InitialV2
+        );
     }
 
     /// The account has two devices and the certificate names the wrong one. The walk still finds
@@ -4995,7 +5016,9 @@ mod pqxdh_v2_tests {
         let (sibling, sibling_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
 
         deliver(&mut bob, &sibling_id, "m0", msg0, 0);
@@ -5006,11 +5029,17 @@ mod pqxdh_v2_tests {
         let opened = bob.open_receiving(&sibling_id, &bundles);
 
         assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
-        assert!(bob.lifecycle.client.has_session(&alice_id) && !bob.lifecycle.client.has_session(&sibling_id));
+        assert!(
+            bob.lifecycle.client.has_session(&alice_id)
+                && !bob.lifecycle.client.has_session(&sibling_id)
+        );
         assert!(opened.actions.iter().any(
             |a| matches!(a, Action::NotifyError { code, .. } if code == "sender_device_mismatch")
         ));
-        assert_eq!(decrypted(&opened.actions), vec![("m0".to_string(), b"hello".to_vec())]);
+        assert_eq!(
+            decrypted(&opened.actions),
+            vec![("m0".to_string(), b"hello".to_vec())]
+        );
     }
 
     /// Nothing opens: the session already held is exactly as it was, the queue is gone, and the
@@ -5022,28 +5051,52 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(
+            &alice_id,
+            &initiator_bundle_json(&alice),
+            &msg0,
+        )
+        .unwrap();
         let before = bob.get_session_health(&alice_id).unwrap().session_id;
 
         // A second handshake from Alice that fails on the session Bob holds is a heal carrier.
         let (mut alice2, _) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice2.set_my_user_id(alice_id.clone());
-        alice2.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice2
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let reinit = alice2.encrypt_bytes_for(&bob_id, b"again").unwrap();
         let healed = deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
-        assert!(healed.iter().any(|a| matches!(a, Action::SessionHealNeeded { .. })), "{healed:?}");
-        assert_eq!(bob.router.pending_messages(&alice_id).len(), 1, "the heal's carrier waits in the queue");
+        assert!(
+            healed
+                .iter()
+                .any(|a| matches!(a, Action::SessionHealNeeded { .. })),
+            "{healed:?}"
+        );
+        assert_eq!(
+            bob.router.pending_messages(&alice_id).len(),
+            1,
+            "the heal's carrier waits in the queue"
+        );
 
         // The bundle of the device whose session Bob holds, which did not write this handshake
         // (another key under the same id): the attempt takes that session aside and fails.
-        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        let opened = bob.open_receiving(
+            &alice_id,
+            &[alice.get_registration_bundle_fields().unwrap()],
+        );
         assert!(opened.opened_device.is_none());
         assert_eq!(opened.tried_message_ids, vec!["m-heal".to_string()]);
-        assert_eq!(bob.get_session_health(&alice_id).unwrap().session_id, before, "the held session is untouched");
+        assert_eq!(
+            bob.get_session_health(&alice_id).unwrap().session_id,
+            before,
+            "the held session is untouched"
+        );
         assert!(bob.router.pending_messages(&alice_id).is_empty());
     }
 
@@ -5054,26 +5107,43 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(
+            &alice_id,
+            &initiator_bundle_json(&alice),
+            &msg0,
+        )
+        .unwrap();
         let before = bob.get_session_health(&alice_id).unwrap().session_id;
 
         // Alice lost her session and re-initialises with the same identity.
         alice.remove_session_by_contact(&bob_id);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
         deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
 
-        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        let opened = bob.open_receiving(
+            &alice_id,
+            &[alice.get_registration_bundle_fields().unwrap()],
+        );
         assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
-        assert_eq!(decrypted(&opened.actions), vec![("m-heal".to_string(), b"again".to_vec())]);
+        assert_eq!(
+            decrypted(&opened.actions),
+            vec![("m-heal".to_string(), b"again".to_vec())]
+        );
         assert!(opened.actions.iter().any(
             |a| matches!(a, Action::SessionTerminated { contact_id, .. } if *contact_id == alice_id)
         ), "the replaced session is archived");
-        assert_ne!(bob.get_session_health(&alice_id).unwrap().session_id, before);
+        assert_ne!(
+            bob.get_session_health(&alice_id).unwrap().session_id,
+            before
+        );
     }
 
     /// An exhausted heal takes its carriers with it; otherwise each reconnect's drain routes them
@@ -5085,25 +5155,48 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(
+            &alice_id,
+            &initiator_bundle_json(&alice),
+            &msg0,
+        )
+        .unwrap();
         let (mut other, _) = named_device();
         other.set_my_user_id(alice_id.clone());
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        other.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        deliver(&mut bob, &alice_id, "m-heal", other.encrypt_bytes_for(&bob_id, b"x").unwrap(), 0);
+        other
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        deliver(
+            &mut bob,
+            &alice_id,
+            "m-heal",
+            other.encrypt_bytes_for(&bob_id, b"x").unwrap(),
+            0,
+        );
         assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
 
         let mut last = Vec::new();
         for _ in 0..10 {
-            last = bob.handle_event(IncomingEvent::HealAttempted { contact_id: alice_id.clone() });
-            if last.iter().any(|a| matches!(a, Action::HealExhausted { .. })) {
+            last = bob.handle_event(IncomingEvent::HealAttempted {
+                contact_id: alice_id.clone(),
+            });
+            if last
+                .iter()
+                .any(|a| matches!(a, Action::HealExhausted { .. }))
+            {
                 break;
             }
         }
-        assert!(last.iter().any(|a| matches!(a, Action::HealExhausted { .. })), "{last:?}");
+        assert!(
+            last.iter()
+                .any(|a| matches!(a, Action::HealExhausted { .. })),
+            "{last:?}"
+        );
         assert!(bob.router.pending_messages(&alice_id).is_empty());
     }
 
@@ -5113,7 +5206,9 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
         deliver(&mut bob, &alice_id, "m0", msg0.clone(), 0);
         deliver(&mut bob, &alice_id, "m0", msg0, 0);

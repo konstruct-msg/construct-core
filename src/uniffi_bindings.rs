@@ -3706,7 +3706,11 @@ impl OrchestratorCore {
         Ok(ReceivingOpenResult {
             opened_device: open.opened_device,
             opener_message_id: open.opener_message_id,
-            actions: open.actions.into_iter().map(CfeAction::from_action).collect(),
+            actions: open
+                .actions
+                .into_iter()
+                .map(CfeAction::from_action)
+                .collect(),
             tried_message_ids: open.tried_message_ids,
             dropped_message_ids: open.dropped_message_ids,
             last_error: open.last_error,

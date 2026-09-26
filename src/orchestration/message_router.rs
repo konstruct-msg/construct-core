@@ -363,7 +363,10 @@ impl MessageRouter {
     /// `Orchestrator::open_receiving`, whichever way it was reached; the heal record keeps only
     /// the budget.
     pub fn hold_for_open(&mut self, msg: IncomingMessage) {
-        let queue = self.pending_queues.entry(msg.contact_id.clone()).or_default();
+        let queue = self
+            .pending_queues
+            .entry(msg.contact_id.clone())
+            .or_default();
         if queue.iter().any(|q| q.message_id == msg.message_id) {
             return;
         }
