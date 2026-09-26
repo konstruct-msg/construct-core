@@ -223,15 +223,65 @@ pub struct MessageRouter {
     /// Messages awaiting a platform DB ACK-check response.
     /// Key = message_id, Value = the buffered IncomingMessage.
     pending_ack_checks: HashMap<String, IncomingMessage>,
+    /// When each queued message arrived, by id — what `handshake_arrived_within` reads. Beside the
+    /// queue rather than in `IncomingMessage`, which is built in a hundred places that have no
+    /// clock; pruned to what is still queued whenever the queue shrinks.
+    arrived_at: HashMap<String, u64>,
+    clock: std::sync::Arc<dyn crate::orchestration::clock::Clock>,
 }
+
+/// How recently a queued handshake must have arrived to count as the peer opening a session *now*.
+///
+/// A queued handshake has no upper age — it waits until a session opens or the queue is dropped —
+/// so "we hold a handshake" and "their init is in flight" are different statements. Once a bundle
+/// is in hand a receiving init completes in hundredths of a second and the fetch in front of it
+/// takes about one; twenty seconds bounds the case where the handshake cannot be opened at all.
+/// That case deadlocked 2026-09-04 18:08, when an unopenable handshake answered "in flight"
+/// forever and the initiation plan yielded to a peer that was not opening anything.
+pub const PEER_INIT_FRESH_MS: u64 = 20_000;
 
 impl MessageRouter {
     pub fn new() -> Self {
+        Self::with_clock(crate::orchestration::clock::system_clock())
+    }
+
+    pub fn with_clock(clock: std::sync::Arc<dyn crate::orchestration::clock::Clock>) -> Self {
         Self {
             pending_queues: HashMap::new(),
             max_pending_per_user: MAX_PENDING_PER_USER,
             pending_ack_checks: HashMap::new(),
+            arrived_at: HashMap::new(),
+            clock,
         }
+    }
+
+    /// Forget arrival times of messages no longer queued.
+    fn prune_arrivals(&mut self) {
+        let queued: std::collections::HashSet<&str> = self
+            .pending_queues
+            .values()
+            .flatten()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        self.arrived_at.retain(|id, _| queued.contains(id.as_str()));
+    }
+
+    /// Whether any of `devices` has a session-opening message queued that arrived within
+    /// `window_ms` — the peer's own init reaching us right now. Asked by the initiation plan, which
+    /// yields to it rather than crossing it with ours.
+    pub fn handshake_arrived_within(&self, devices: &[String], window_ms: u64) -> bool {
+        let now = self.clock.now_ms();
+        devices.iter().any(|device| {
+            self.pending_queues.get(device).is_some_and(|queue| {
+                queue.iter().any(|m| {
+                    opens_session(m)
+                        && self
+                            .arrived_at
+                            .get(&m.message_id)
+                            .is_some_and(|at| now.saturating_sub(*at) <= window_ms)
+                })
+            })
+        })
     }
 
     // ── Primary entry point ───────────────────────────────────────────────────
@@ -320,6 +370,7 @@ impl MessageRouter {
                 queue.push_front(msg);
             }
         }
+        self.prune_arrivals();
         results
     }
 
@@ -371,6 +422,8 @@ impl MessageRouter {
             return;
         }
         if queue.len() < self.max_pending_per_user {
+            self.arrived_at
+                .insert(msg.message_id.clone(), self.clock.now_ms());
             queue.push_back(msg);
         }
     }
@@ -391,14 +444,18 @@ impl MessageRouter {
                 self.pending_queues.remove(contact_id);
             }
         }
+        self.prune_arrivals();
     }
 
     /// Take `contact_id`'s whole queue.
     pub fn take_pending(&mut self, contact_id: &str) -> Vec<IncomingMessage> {
-        self.pending_queues
+        let taken = self
+            .pending_queues
             .remove(contact_id)
             .map(|q| q.into_iter().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.prune_arrivals();
+        taken
     }
 
     /// Move what waits under `from` to `to`, renamed. The sender certificate named `from`; the
@@ -426,6 +483,7 @@ impl MessageRouter {
     /// add to take the RESPONDER path.
     pub fn forget_contact(&mut self, contact_id: &str) {
         self.pending_queues.remove(contact_id);
+        self.prune_arrivals();
         self.pending_ack_checks
             .retain(|_, msg| msg.contact_id != contact_id);
     }
@@ -591,10 +649,13 @@ impl MessageRouter {
         }
 
         queue.push_back(msg.clone());
+        let queued_count = queue.len();
+        self.arrived_at
+            .insert(msg.message_id.clone(), self.clock.now_ms());
 
         RoutingDecision::NeedSessionInit {
             contact_id: msg.contact_id.clone(),
-            queued_count: queue.len(),
+            queued_count,
         }
     }
 }

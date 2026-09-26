@@ -3690,6 +3690,44 @@ impl OrchestratorCore {
         self.init_receiving(&contact_id, &public_bundle, &first_msg)
     }
 
+    /// Queue a SESSION_RESET_INIT to open a session from. See `Orchestrator::queue_for_open`.
+    pub fn queue_for_open(
+        &self,
+        device_id: String,
+        message_id: String,
+        wire_payload: Vec<u8>,
+        content_type: u8,
+    ) -> Vec<CfeAction> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let msg_number = crate::wire_payload::unpack(&wire_payload)
+            .map(|d| d.message_number)
+            .unwrap_or(0);
+        orch.queue_for_open(crate::orchestration::message_router::IncomingMessage {
+            contact_id: device_id,
+            wire_payload,
+            message_id,
+            msg_number,
+            is_control: false,
+            content_type,
+        })
+        .into_iter()
+        .map(CfeAction::from_action)
+        .collect()
+    }
+
+    /// Whether any of `devices` is opening a session with us right now. See
+    /// `Orchestrator::peer_handshake_held`.
+    pub fn peer_handshake_held(&self, devices: Vec<String>) -> bool {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.peer_handshake_held(&devices)
+    }
+
+    /// How many messages wait for a session with `contact_id`.
+    pub fn pending_message_count(&self, contact_id: String) -> u32 {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.pending_message_count(&contact_id) as u32
+    }
+
     /// Open a receiving session from what the core holds under `claimed_device`. See
     /// `Orchestrator::open_receiving`.
     pub fn open_receiving(
@@ -4379,6 +4417,11 @@ pub enum CfeAction {
     HeldPendingAck {
         contact_id: String,
     },
+    /// See `Action::PendingDropped`.
+    PendingDropped {
+        contact_id: String,
+        message_ids: Vec<String>,
+    },
     /// See `Action::ReplayHeld`.
     ReplayHeld {
         message_id: String,
@@ -4545,6 +4588,13 @@ impl CfeAction {
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
             HeldPendingAck { contact_id } => Self::HeldPendingAck { contact_id },
+            PendingDropped {
+                contact_id,
+                message_ids,
+            } => Self::PendingDropped {
+                contact_id,
+                message_ids,
+            },
             ReplayHeld { message_id } => Self::ReplayHeld { message_id },
             HeldSuperseded { message_id } => Self::HeldSuperseded { message_id },
             HealAttemptAllowed {

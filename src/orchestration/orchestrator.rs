@@ -252,7 +252,7 @@ impl Orchestrator {
     ) -> Self {
         Self {
             lifecycle: SessionLifecycleManager::new_with_clock(client, my_user_id, clock.clone()),
-            router: MessageRouter::new(),
+            router: MessageRouter::with_clock(clock.clone()),
             sessions: SessionMachine::new(clock.clone()),
             prewarm_done: HashSet::new(),
             kyber_prekeys_dirty: false,
@@ -855,6 +855,45 @@ impl Orchestrator {
     /// `reopen_session`. Idempotent: a device not in `Opening` is left as it is.
     pub fn reopen_refused(&mut self, contact_id: &str) {
         self.sessions.handle(contact_id, SessionEvent::OpenFailed);
+    }
+
+    /// Drop what waits under `contact_id`, and say so.
+    fn drop_pending(&mut self, contact_id: &str) -> Option<Action> {
+        let dropped: Vec<String> = self
+            .router
+            .take_pending(contact_id)
+            .into_iter()
+            .map(|m| m.message_id)
+            .collect();
+        (!dropped.is_empty()).then(|| Action::PendingDropped {
+            contact_id: contact_id.to_string(),
+            message_ids: dropped,
+        })
+    }
+
+    /// Queue a SESSION_RESET_INIT to open a session from, superseding what its sender queued
+    /// before it.
+    ///
+    /// The one carrier that does not arrive through `MessageReceived`: the platform acknowledges a
+    /// SESSION_RESET_INIT before acting on it, so routed through the ACK check it would read as its
+    /// own duplicate. A reset begins a new generation, so what the same device queued before it —
+    /// handshakes and traffic of the session being replaced — is dropped (`PendingDropped`); the
+    /// platform did the same to its own queue until 2026-09-26.
+    pub fn queue_for_open(&mut self, carrier: IncomingMessage) -> Vec<Action> {
+        let device = carrier.contact_id.clone();
+        let actions: Vec<Action> = self.drop_pending(&device).into_iter().collect();
+        self.router.hold_for_open(carrier);
+        actions
+    }
+
+    /// Whether any of `devices` is opening a session with us right now — a handshake of theirs
+    /// queued within `PEER_INIT_FRESH_MS`. The platform passes an account's devices, including
+    /// ones known so far only from a sender certificate.
+    pub fn peer_handshake_held(&self, devices: &[String]) -> bool {
+        self.router.handshake_arrived_within(
+            devices,
+            crate::orchestration::message_router::PEER_INIT_FRESH_MS,
+        )
     }
 
     /// Open a receiving session from what waits under `claimed`, against `bundles`.
@@ -2710,9 +2749,14 @@ impl Orchestrator {
                 }]
             }
             RoutingDecision::EndSessionReceived {
-                contact_id: _,
-                actions,
-            } => actions,
+                contact_id: cid,
+                mut actions,
+            } => {
+                // What waited for this ratchet waits for nothing now: the sender tore it down,
+                // and its next handshake is the carrier of whatever comes next.
+                actions.extend(self.drop_pending(&cid));
+                actions
+            }
             RoutingDecision::Error { message } => {
                 vec![Action::NotifyError {
                     code: "ROUTING_ERROR".to_string(),
@@ -5198,6 +5242,90 @@ mod pqxdh_v2_tests {
             "{last:?}"
         );
         assert!(bob.router.pending_messages(&alice_id).is_empty());
+    }
+
+    /// A SESSION_RESET_INIT starts a new generation: what its sender queued before it goes, and
+    /// the platform is told which messages so it can let the cursor past them.
+    ///
+    /// Mutation: drop the `drop_pending` from `queue_for_open` — this reddens.
+    #[test]
+    fn a_reset_init_supersedes_what_its_sender_queued() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        deliver(&mut bob, &alice_id, "old", alice.encrypt_bytes_for(&bob_id, b"old").unwrap(), 0);
+
+        alice.remove_session_by_contact(&bob_id);
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let sri = alice.encrypt_bytes_for(&bob_id, b"reset").unwrap();
+        let actions = bob.queue_for_open(IncomingMessage {
+            contact_id: alice_id.clone(),
+            wire_payload: sri,
+            message_id: "sri".to_string(),
+            msg_number: 0,
+            is_control: false,
+            content_type: 24,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::PendingDropped { message_ids, .. } if message_ids == &vec!["old".to_string()]
+        )), "{actions:?}");
+
+        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        assert_eq!(opened.opener_message_id.as_deref(), Some("sri"));
+        assert_eq!(decrypted(&opened.actions), vec![("sri".to_string(), b"reset".to_vec())]);
+    }
+
+    /// The peer's own init counts as in flight only while it is fresh — an unopenable handshake
+    /// must stop answering "in flight" (2026-09-04 18:08).
+    #[test]
+    fn a_queued_handshake_is_in_flight_only_while_fresh() {
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000));
+        let (mut alice, alice_id) = named_device();
+        let mut bob = Orchestrator::new_with_clock(
+            ClassicClient::<ClassicSuiteProvider>::new().unwrap(),
+            "pending".to_string(),
+            clock.clone(),
+        );
+        bob.lifecycle.client.key_manager_mut().ensure_hybrid_signature_key().unwrap();
+        bob.begin_kyber_spk_rotation().unwrap();
+        assert!(bob.commit_kyber_spk_rotation());
+        let bob_id = crate::device_id::derive_device_id(
+            &bob.get_registration_bundle_fields().unwrap().identity_public,
+        );
+        bob.set_my_user_id(bob_id.clone());
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        deliver(&mut bob, &alice_id, "m0", alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(), 0);
+
+        assert!(bob.peer_handshake_held(std::slice::from_ref(&alice_id)));
+        assert!(!bob.peer_handshake_held(&["someone-else".to_string()]));
+        clock.set_ms(1_000 + crate::orchestration::message_router::PEER_INIT_FRESH_MS + 1);
+        assert!(!bob.peer_handshake_held(&[alice_id]), "stale is not in flight");
+    }
+
+    /// An END_SESSION drops what waited for the ratchet it tears down.
+    #[test]
+    fn an_end_session_drops_what_waited_for_its_ratchet() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        deliver(&mut bob, &alice_id, "m0", alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(), 0);
+        let actions = bob.handle_event(IncomingEvent::MessageReceived {
+            message_id: "end".to_string(),
+            from: alice_id.clone(),
+            data: b"__END_SESSION__".to_vec(),
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: true,
+            content_type: 0,
+        });
+        assert!(actions.iter().any(|a| matches!(a, Action::PendingDropped { .. })), "{actions:?}");
+        assert_eq!(bob.pending_message_count(&alice_id), 0);
     }
 
     /// A redelivery of a message that waits is not a second carrier.

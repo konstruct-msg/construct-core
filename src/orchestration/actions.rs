@@ -118,6 +118,15 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Messages the core had queued for a session with `contact_id` and has now dropped, because
+    /// what they waited for is gone: the sender tore the session down (END_SESSION), or began a
+    /// new one that supersedes them (`queue_for_open` with its SESSION_RESET_INIT). The platform
+    /// releases their envelopes and lets the stream cursor past them.
+    PendingDropped {
+        contact_id: String,
+        message_ids: Vec<String>,
+    },
+
     /// Route a message the confirm gate held, now that the gate is down.
     ///
     /// The core keeps the hold — which message, against which ratchet epoch — and decides when it

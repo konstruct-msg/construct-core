@@ -873,6 +873,7 @@ interface CfeAction {
     /// Our own SESSION_RESET_INIT to this device is unacknowledged, so neither heal nor tear
     /// down on the message that provoked this: buffer it and replay it when the wait ends.
     HeldPendingAck(string contact_id);
+    PendingDropped(string contact_id, sequence<string> message_ids);
     ReplayHeld(string message_id);
     HeldSuperseded(string message_id);
     /// The heal budget allows this attempt; `attempt` is its 1-based index.
@@ -1064,6 +1065,19 @@ interface OrchestratorCore {
     // device the opening bundle derives to. See decisions/first-contact-queue-keyed-by-claimed-device.
     [Throws=CryptoError]
     ReceivingOpenResult open_receiving(string claimed_device, sequence<BinaryKeyBundle> bundles);
+
+    // Queue a SESSION_RESET_INIT — already acknowledged by the platform, so it cannot pass the
+    // ACK check — to open a session from; drops what the same device queued before it
+    // (PendingDropped in the answer).
+    sequence<CfeAction> queue_for_open(string device_id, string message_id, sequence<u8> wire_payload, u8 content_type);
+
+    // Whether any of `devices` has a session-opening message queued within the last 20 s — the
+    // peer opening a session with us right now. Pass every device of the account known so far,
+    // including ones named only by a sender certificate.
+    boolean peer_handshake_held(sequence<string> devices);
+
+    // How many messages wait for a session with `contact_id`.
+    u32 pending_message_count(string contact_id);
 
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
