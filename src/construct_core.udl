@@ -145,6 +145,20 @@ dictionary EncryptedMessageComponents {
     u32 kyber_prekey_id;
 };
 
+// What `open_receiving` did. On success `opened_device` and `opener_message_id` are set and
+// `actions` carries the rest (archive of a replaced session, the opener's own decrypt answer, the
+// save, the drain, the notice). On failure they are null, `tried_message_ids` lists every carrier
+// proven unopenable, `dropped_message_ids` the rest of the queue, `last_error` the last refusal.
+dictionary ReceivingOpenResult {
+    string? opened_device;
+    string? opener_message_id;
+    sequence<CfeAction> actions;
+    sequence<string> tried_message_ids;
+    sequence<string> dropped_message_ids;
+    string? last_error;
+    sequence<u8>? kyber_prekeys;
+};
+
 dictionary SessionInitResult {
     string session_id;
     sequence<u8> decrypted_message;  // raw plaintext bytes — may be binary or UTF-8
@@ -1043,6 +1057,13 @@ interface OrchestratorCore {
     // lost in a platform copy. Prefer it to init_receiving_session.
     [Throws=CryptoError]
     SessionInitResult init_receiving_session_from_wire_payload(string contact_id, BinaryKeyBundle recipient_bundle, sequence<u8> wire_payload);
+
+    // Open a receiving session from the messages the core holds under `claimed_device` — the
+    // device the sender certificate named — against `bundles`, the whole device set of that
+    // account. The core plans and makes every attempt itself; the session is filed under the
+    // device the opening bundle derives to. See decisions/first-contact-queue-keyed-by-claimed-device.
+    [Throws=CryptoError]
+    ReceivingOpenResult open_receiving(string claimed_device, sequence<BinaryKeyBundle> bundles);
 
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);

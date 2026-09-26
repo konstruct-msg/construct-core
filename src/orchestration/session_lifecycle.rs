@@ -361,6 +361,20 @@ impl SessionLifecycleManager {
         }]
     }
 
+    /// Archive a session already taken out of the client (`take_session`) and exported, now that
+    /// a new one has replaced it. The same record and the same action as `archive_session`, for
+    /// the case where the session to archive is no longer the one held.
+    pub fn record_archive(&mut self, contact_id: &str, cfe_bytes: Vec<u8>) -> Action {
+        self.archives
+            .insert(contact_id.to_string(), cfe_bytes.clone().into());
+        self.archive_timestamps
+            .insert(contact_id.to_string(), self.clock.now_secs());
+        Action::SessionTerminated {
+            contact_id: contact_id.to_string(),
+            archive_bytes: cfe_bytes.into(),
+        }
+    }
+
     /// Restore the latest archive for `contact_id` into the active session map.
     ///
     /// The archive bytes must already be in memory, via a previous

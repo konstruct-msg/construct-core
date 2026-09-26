@@ -192,6 +192,17 @@ pub struct OfflineBatchResult {
 
 // Session initialization result with decrypted first message
 // Note: We use UDL definition for UniFFI
+/// Mirrors the UDL `ReceivingOpenResult`; see `Orchestrator::open_receiving`.
+pub struct ReceivingOpenResult {
+    pub opened_device: Option<String>,
+    pub opener_message_id: Option<String>,
+    pub actions: Vec<CfeAction>,
+    pub tried_message_ids: Vec<String>,
+    pub dropped_message_ids: Vec<String>,
+    pub last_error: Option<String>,
+    pub kyber_prekeys: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionInitResult {
     pub session_id: String,
@@ -3677,6 +3688,30 @@ impl OrchestratorCore {
             kem_ciphertext: first_message.kem_ciphertext,
         };
         self.init_receiving(&contact_id, &public_bundle, &first_msg)
+    }
+
+    /// Open a receiving session from what the core holds under `claimed_device`. See
+    /// `Orchestrator::open_receiving`.
+    pub fn open_receiving(
+        &self,
+        claimed_device: String,
+        bundles: Vec<BinaryKeyBundle>,
+    ) -> Result<ReceivingOpenResult, CryptoError> {
+        let bundles = bundles
+            .iter()
+            .map(binary_bundle_to_x3dh)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let open = orch.open_receiving(&claimed_device, &bundles);
+        Ok(ReceivingOpenResult {
+            opened_device: open.opened_device,
+            opener_message_id: open.opener_message_id,
+            actions: open.actions.into_iter().map(CfeAction::from_action).collect(),
+            tried_message_ids: open.tried_message_ids,
+            dropped_message_ids: open.dropped_message_ids,
+            last_error: open.last_error,
+            kyber_prekeys: orch.take_kyber_prekeys_to_persist(),
+        })
     }
 
     /// RESPONDER init from the envelope's `encrypted_payload`, unpacked by the core. Prefer it to

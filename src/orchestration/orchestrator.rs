@@ -20,7 +20,8 @@ use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::message_router::{
-    IncomingMessage, MessageRouter, Refused, Role, RoutingDecision, tie_break_role,
+    CT_SESSION_RESET_INIT, IncomingMessage, MessageRouter, Refused, Role, RoutingDecision,
+    tie_break_role,
 };
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
@@ -180,6 +181,23 @@ pub struct Orchestrator {
     /// which gets it back through `Action::ReplayHeld`. In memory on purpose: a held message is
     /// never acknowledged to the server, so after a restart it is redelivered and judged again.
     confirm_holds: HashMap<String, Vec<ConfirmHold>>,
+}
+
+/// What `Orchestrator::open_receiving` did.
+#[derive(Debug)]
+pub struct ReceivingOpen {
+    /// The device the session opened with — derived from the bundle that opened, not the claim.
+    pub opened_device: Option<String>,
+    /// The message the session opened from.
+    pub opener_message_id: Option<String>,
+    /// The archive of a replaced session, the opener's own answer, the save, the drain, the notice.
+    pub actions: Vec<Action>,
+    /// On failure: every carrier attempted — each proven unopenable against every bundle given.
+    pub tried_message_ids: Vec<String>,
+    /// On failure: the rest of the queue, dropped with it.
+    pub dropped_message_ids: Vec<String>,
+    /// On failure: the last attempt's refusal, for the platform's key-repair and 3-DH hint.
+    pub last_error: Option<String>,
 }
 
 /// Whether a held message belongs to a handshake that concluded while it waited.
@@ -553,6 +571,14 @@ impl Orchestrator {
                 }]
             }
             HealingDecision::MaxAttemptsReached | HealingDecision::NotFound => {
+                // The heal's carriers wait for a rebuild that is no longer coming; the platform
+                // answers this with END_SESSION, and the peer's next handshake is a new carrier.
+                // Left queued, every reconnect's drain would route them into the same refusal
+                // and raise the heal again. Only under a session held: without one, what waits
+                // is a first contact, and an exhausted heal says nothing about it.
+                if self.lifecycle.has_active_session(&contact_id) {
+                    self.router.take_pending(&contact_id);
+                }
                 vec![Action::HealExhausted { contact_id }]
             }
         }
@@ -829,6 +855,176 @@ impl Orchestrator {
     /// `reopen_session`. Idempotent: a device not in `Opening` is left as it is.
     pub fn reopen_refused(&mut self, contact_id: &str) {
         self.sessions.handle(contact_id, SessionEvent::OpenFailed);
+    }
+
+    /// Open a receiving session from what waits under `claimed`, against `bundles`.
+    ///
+    /// `claimed` is the device the sender certificate named — a claim, vouched by the server and
+    /// proven only by decryption (`decisions/first-contact-queue-keyed-by-claimed-device.md`).
+    /// `bundles` are the whole device set of the account the claim belongs to, which only the
+    /// platform can name. The carriers are the core's own: everything queued under `claimed`,
+    /// first contact and heal alike (`MessageRouter::hold_for_open`). The attempts are
+    /// `plan_receiving_init` over carriers × bundles, and the core makes them itself — until
+    /// 2026-09-26 the platform held the carriers and made the attempts, and the heal path's copy
+    /// of that walk had already diverged from the first-message path's.
+    ///
+    /// A failed attempt leaves nothing behind: a session already held for the bundle's device is
+    /// taken aside first and put back unless the attempt opens. One that opens replaces it, and
+    /// the old one is archived (`SessionTerminated`). The session is filed under the device the
+    /// bundle's identity key derives to; if that is not `claimed`, the rest of `claimed`'s queue
+    /// moves with it and the mismatch is reported — a certificate named a device that did not
+    /// write the message.
+    pub fn open_receiving(
+        &mut self,
+        claimed: &str,
+        bundles: &[crate::crypto::handshake::x3dh::X3DHPublicKeyBundle],
+    ) -> ReceivingOpen {
+        use crate::orchestration::receiving_init_plan::{ReceivingInitCarrier, plan_receiving_init};
+
+        let queued = self.router.pending_messages(claimed);
+        let headers: Vec<Option<IncomingFirstMessage>> = queued
+            .iter()
+            .map(|m| IncomingFirstMessage::from_wire_payload(&m.wire_payload).ok())
+            .collect();
+        let carriers: Vec<ReceivingInitCarrier> = queued
+            .iter()
+            .zip(&headers)
+            .map(|(m, h)| match h {
+                Some(h) => ReceivingInitCarrier {
+                    message_number: h.message_number,
+                    one_time_prekey_id: h.one_time_prekey_id,
+                    kem_ciphertext_bytes: h.kem_ciphertext.len() as u32,
+                    pq_message_epoch: h.pq_message_epoch,
+                    is_session_reset_init: m.content_type == CT_SESSION_RESET_INIT,
+                },
+                // Unparseable: shaped so the plan skips it.
+                None => ReceivingInitCarrier {
+                    message_number: u32::MAX,
+                    one_time_prekey_id: 0,
+                    kem_ciphertext_bytes: 0,
+                    pq_message_epoch: 0,
+                    is_session_reset_init: false,
+                },
+            })
+            .collect();
+        let plan = plan_receiving_init(&carriers, bundles.len() as u32);
+
+        let mut last_error = None;
+        let mut tried: Vec<String> = Vec::new();
+        for attempt in &plan {
+            let carrier = &queued[attempt.carrier_index as usize];
+            let Some(first) = &headers[attempt.carrier_index as usize] else {
+                continue;
+            };
+            if !tried.contains(&carrier.message_id) {
+                tried.push(carrier.message_id.clone());
+            }
+            let bundle = &bundles[attempt.bundle_index as usize];
+            let device = crate::device_id::derive_device_id(&bundle.identity_public);
+
+            let held_bytes = self
+                .lifecycle
+                .client
+                .has_session(&device)
+                .then(|| self.lifecycle.export_session_bytes_for(&device).ok())
+                .flatten();
+            let held = self.lifecycle.client.take_session(&device);
+            match self.init_receiving_session_with_msg(&device, bundle, first) {
+                Ok((_, plaintext)) => {
+                    return self.receiving_opened(
+                        claimed,
+                        &device,
+                        carrier.clone(),
+                        plaintext,
+                        held_bytes,
+                    );
+                }
+                Err(e) => {
+                    if let Some(session) = held {
+                        self.lifecycle.client.put_back_session(&device, session);
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // Nothing opened. What was tried is proven unopenable against every device the account
+        // has; the rest cannot open without a session either. The queue goes, and the opening
+        // the queue asked for ends with it.
+        let dropped = self
+            .router
+            .take_pending(claimed)
+            .into_iter()
+            .map(|m| m.message_id)
+            .filter(|id| !tried.contains(id))
+            .collect();
+        self.sessions.handle(claimed, SessionEvent::OpenFailed);
+        ReceivingOpen {
+            opened_device: None,
+            opener_message_id: None,
+            actions: Vec::new(),
+            tried_message_ids: tried,
+            dropped_message_ids: dropped,
+            last_error,
+        }
+    }
+
+    /// The success half of `open_receiving`.
+    fn receiving_opened(
+        &mut self,
+        claimed: &str,
+        device: &str,
+        opener: IncomingMessage,
+        plaintext: Vec<u8>,
+        replaced: Option<Vec<u8>>,
+    ) -> ReceivingOpen {
+        let mut actions = Vec::new();
+        if let Some(bytes) = replaced {
+            actions.push(self.lifecycle.record_archive(device, bytes));
+        }
+
+        self.router.remove_pending(claimed, &opener.message_id);
+        if claimed != device {
+            tracing::warn!(
+                target: "crypto::orchestrator",
+                claimed = %claimed,
+                opened = %device,
+                "sender certificate named a device that did not write the message"
+            );
+            self.router.rekey_pending(claimed, device);
+            self.sessions.handle(claimed, SessionEvent::OpenFailed);
+            actions.push(Action::NotifyError {
+                code: "sender_device_mismatch".to_string(),
+                message: format!("certificate named {claimed}, the session opened with {device}"),
+            });
+        }
+
+        // The opener is a message like any other from here on: recorded as processed, and
+        // answered with what a live decrypt of it would be answered with.
+        let processed = self.lifecycle.ack_store.mark_processed(&opener.message_id);
+        actions.extend(self.decide_actions(
+            RoutingDecision::Decrypted {
+                contact_id: device.to_string(),
+                message_id: opener.message_id.clone(),
+                plaintext,
+                content_type: opener.content_type,
+                actions: processed,
+            },
+            device,
+        ));
+
+        self.sessions.handle(device, SessionEvent::OpenFinished);
+        self.lifecycle.healing_queue.settle(device);
+        actions.extend(self.after_session_opened(device));
+
+        ReceivingOpen {
+            opened_device: Some(device.to_string()),
+            opener_message_id: Some(opener.message_id),
+            actions,
+            tried_message_ids: Vec::new(),
+            dropped_message_ids: Vec::new(),
+            last_error: None,
+        }
     }
 
     /// PQXDH v2 responder: the ML-KEM part of a first message, decapsulated with our own Kyber
@@ -1932,24 +2128,32 @@ impl Orchestrator {
             return actions;
         }
 
-        // Save the session to secure store.
-        if let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
+        actions.extend(self.after_session_opened(&contact_id));
+        actions
+    }
+
+    /// Everything a session that now exists settles: the save, the queue behind it, the notice.
+    ///
+    /// Shared by the platform's `SessionInitCompleted` and `open_receiving`. The machine's phase
+    /// and the heal episode are settled by the caller before the import, as the import can fail.
+    fn after_session_opened(&mut self, contact_id: &str) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if let Ok(bytes) = self.lifecycle.export_session_bytes_for(contact_id) {
             actions.push(Action::SaveToSecureStore {
                 slot: SecureStoreSlot::Session {
-                    contact_id: contact_id.clone(),
+                    contact_id: contact_id.to_string(),
                 },
                 data: bytes.into(),
             });
         }
 
-        // Drain the pending queue.
-        let drained = self.router.drain_pending(&contact_id, &mut self.lifecycle);
+        let drained = self.router.drain_pending(contact_id, &mut self.lifecycle);
         for decision in drained {
-            actions.extend(self.decision_to_actions(decision, &contact_id));
+            actions.extend(self.decision_to_actions(decision, contact_id));
         }
 
         actions.push(Action::NotifySessionCreated {
-            contact_id: contact_id.clone(),
+            contact_id: contact_id.to_string(),
         });
 
         actions
@@ -2259,10 +2463,13 @@ impl Orchestrator {
                         contact_id: cid,
                         retry_after_ms,
                     }],
-                    _ => vec![Action::SessionHealNeeded {
-                        contact_id: cid,
-                        role: role.as_wire().to_string(),
-                    }],
+                    _ => {
+                        self.router.hold_for_open(refused.message);
+                        vec![Action::SessionHealNeeded {
+                            contact_id: cid,
+                            role: role.as_wire().to_string(),
+                        }]
+                    }
                 };
                 actions.push(decrypt_failed(reason));
                 actions
@@ -2422,10 +2629,15 @@ impl Orchestrator {
                             },
                         ]
                     }
-                    _ => vec![Action::SessionHealNeeded {
-                        contact_id: cid,
-                        role: role.as_wire().to_string(),
-                    }],
+                    _ => {
+                        // The heal rebuilds the session from this message; it waits for that
+                        // with everything else waiting for a session (`open_receiving`).
+                        self.router.hold_for_open(refused.message);
+                        vec![Action::SessionHealNeeded {
+                            contact_id: cid,
+                            role: role.as_wire().to_string(),
+                        }]
+                    }
                 }
             }
             RoutingDecision::EndSessionNeeded {
@@ -2919,6 +3131,14 @@ mod tests {
         Refused {
             message_id: message_id.to_string(),
             opens_session,
+            message: IncomingMessage {
+                contact_id: "bob".to_string(),
+                wire_payload: vec![],
+                message_id: message_id.to_string(),
+                msg_number: 0,
+                is_control: false,
+                content_type: 0,
+            },
         }
     }
 
@@ -4689,5 +4909,214 @@ mod pqxdh_v2_tests {
             bob.get_session_health("zed").unwrap().pq_handshake,
             PqHandshake::InitialV2
         );
+    }
+
+    // ── open_receiving: the walk is the core's ─────────────────────────────────
+
+    /// A device named the way the seam names it: by the id its identity key derives to. The AD
+    /// binds a pair of device ids, so a session opened under the derived id only reads messages
+    /// encrypted between derived ids.
+    fn named_device() -> (Orchestrator, String) {
+        let mut o = device("pending");
+        let id = crate::device_id::derive_device_id(
+            &o.get_registration_bundle_fields().unwrap().identity_public,
+        );
+        o.set_my_user_id(id.clone());
+        (o, id)
+    }
+
+    fn deliver(bob: &mut Orchestrator, from: &str, id: &str, wire: Vec<u8>, ct: u8) -> Vec<Action> {
+        bob.handle_event(IncomingEvent::MessageReceived {
+            message_id: id.to_string(),
+            from: from.to_string(),
+            data: wire,
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: false,
+            content_type: ct,
+        })
+    }
+
+    fn decrypted(actions: &[Action]) -> Vec<(String, Vec<u8>)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::MessageDecrypted {
+                    message_id,
+                    plaintext,
+                    ..
+                } => Some((message_id.clone(), plaintext.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// First contact: the message waits in the core's queue under the claimed device, the
+    /// platform hands over the account's bundles, and the core opens the session, answers the
+    /// opener like a live decrypt, and drains what queued behind it.
+    ///
+    /// Mutation: skip `after_session_opened` in `receiving_opened` — the second message is not
+    /// drained and this reddens.
+    #[test]
+    fn a_first_contact_opens_from_the_cores_own_queue() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        let msg1 = alice.encrypt_bytes_for(&bob_id, b"second").unwrap();
+
+        let queued = deliver(&mut bob, &alice_id, "m0", msg0, 0);
+        assert!(queued.iter().any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })), "{queued:?}");
+        deliver(&mut bob, &alice_id, "m1", msg1, 0);
+
+        let alice_bundle = alice.get_registration_bundle_fields().unwrap();
+        let opened = bob.open_receiving(&alice_id, &[alice_bundle]);
+
+        assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
+        assert_eq!(opened.opener_message_id.as_deref(), Some("m0"));
+        assert_eq!(
+            decrypted(&opened.actions),
+            vec![("m0".to_string(), b"first".to_vec()), ("m1".to_string(), b"second".to_vec())]
+        );
+        assert!(opened.actions.iter().any(|a| matches!(a, Action::SaveToSecureStore { slot: SecureStoreSlot::Session { .. }, .. })));
+        assert!(bob.router.pending_messages(&alice_id).is_empty());
+        assert_eq!(bob.get_session_health(&alice_id).unwrap().pq_handshake, PqHandshake::InitialV2);
+    }
+
+    /// The account has two devices and the certificate names the wrong one. The walk still finds
+    /// the writer, files the session under it, and says the claim was wrong.
+    ///
+    /// Mutation: file the session under `claimed` instead of the derived device — this reddens.
+    #[test]
+    fn a_wrong_claim_costs_an_attempt_and_is_reported() {
+        let (mut alice, alice_id) = named_device();
+        let (sibling, sibling_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+
+        deliver(&mut bob, &sibling_id, "m0", msg0, 0);
+        let bundles = [
+            sibling.get_registration_bundle_fields().unwrap(),
+            alice.get_registration_bundle_fields().unwrap(),
+        ];
+        let opened = bob.open_receiving(&sibling_id, &bundles);
+
+        assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
+        assert!(bob.lifecycle.client.has_session(&alice_id) && !bob.lifecycle.client.has_session(&sibling_id));
+        assert!(opened.actions.iter().any(
+            |a| matches!(a, Action::NotifyError { code, .. } if code == "sender_device_mismatch")
+        ));
+        assert_eq!(decrypted(&opened.actions), vec![("m0".to_string(), b"hello".to_vec())]);
+    }
+
+    /// Nothing opens: the session already held is exactly as it was, the queue is gone, and the
+    /// platform is told which carriers were tried.
+    ///
+    /// Mutation: drop the `put_back_session` on a failed attempt — this reddens.
+    #[test]
+    fn a_walk_that_opens_nothing_keeps_the_session_it_found() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+            .unwrap();
+        let before = bob.get_session_health(&alice_id).unwrap().session_id;
+
+        // A second handshake from Alice that fails on the session Bob holds is a heal carrier.
+        let (mut alice2, _) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice2.set_my_user_id(alice_id.clone());
+        alice2.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let reinit = alice2.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        let healed = deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
+        assert!(healed.iter().any(|a| matches!(a, Action::SessionHealNeeded { .. })), "{healed:?}");
+        assert_eq!(bob.router.pending_messages(&alice_id).len(), 1, "the heal's carrier waits in the queue");
+
+        // The bundle of the device whose session Bob holds, which did not write this handshake
+        // (another key under the same id): the attempt takes that session aside and fails.
+        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        assert!(opened.opened_device.is_none());
+        assert_eq!(opened.tried_message_ids, vec!["m-heal".to_string()]);
+        assert_eq!(bob.get_session_health(&alice_id).unwrap().session_id, before, "the held session is untouched");
+        assert!(bob.router.pending_messages(&alice_id).is_empty());
+    }
+
+    /// The heal: the session held is replaced by the one the carrier opens, and the old one is
+    /// archived rather than lost.
+    #[test]
+    fn a_heal_opens_from_its_queued_carrier_and_archives_the_old_session() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+            .unwrap();
+        let before = bob.get_session_health(&alice_id).unwrap().session_id;
+
+        // Alice lost her session and re-initialises with the same identity.
+        alice.remove_session_by_contact(&bob_id);
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
+
+        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
+        assert_eq!(decrypted(&opened.actions), vec![("m-heal".to_string(), b"again".to_vec())]);
+        assert!(opened.actions.iter().any(
+            |a| matches!(a, Action::SessionTerminated { contact_id, .. } if *contact_id == alice_id)
+        ), "the replaced session is archived");
+        assert_ne!(bob.get_session_health(&alice_id).unwrap().session_id, before);
+    }
+
+    /// An exhausted heal takes its carriers with it; otherwise each reconnect's drain routes them
+    /// into the same refusal and raises the heal again.
+    ///
+    /// Mutation: drop the `take_pending` from `handle_heal_attempted` — this reddens.
+    #[test]
+    fn an_exhausted_heal_drops_its_carriers() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+            .unwrap();
+        let (mut other, _) = named_device();
+        other.set_my_user_id(alice_id.clone());
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        other.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        deliver(&mut bob, &alice_id, "m-heal", other.encrypt_bytes_for(&bob_id, b"x").unwrap(), 0);
+        assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
+
+        let mut last = Vec::new();
+        for _ in 0..10 {
+            last = bob.handle_event(IncomingEvent::HealAttempted { contact_id: alice_id.clone() });
+            if last.iter().any(|a| matches!(a, Action::HealExhausted { .. })) {
+                break;
+            }
+        }
+        assert!(last.iter().any(|a| matches!(a, Action::HealExhausted { .. })), "{last:?}");
+        assert!(bob.router.pending_messages(&alice_id).is_empty());
+    }
+
+    /// A redelivery of a message that waits is not a second carrier.
+    #[test]
+    fn a_redelivered_first_message_queues_once() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        deliver(&mut bob, &alice_id, "m0", msg0.clone(), 0);
+        deliver(&mut bob, &alice_id, "m0", msg0, 0);
+        assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
     }
 }

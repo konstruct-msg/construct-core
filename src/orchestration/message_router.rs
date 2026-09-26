@@ -53,7 +53,7 @@ const END_SESSION_MARKER: &str = "__END_SESSION__";
 /// listing it costs nothing next to the alternative of a reader wondering which of the two is
 /// meant.
 const CT_SESSION_RESET: u8 = 21;
-const CT_SESSION_RESET_INIT: u8 = 24;
+pub(crate) const CT_SESSION_RESET_INIT: u8 = 24;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ pub enum RoutingDecision {
 /// the message: `decide_actions` sees a verdict, and a verdict that does not name its message
 /// cannot be held by anyone but the platform — which is how the hold buffer came to live in the
 /// client, keyed by account, beside a gate the core keeps per device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Refused {
     pub message_id: String,
     /// The header says this message could open a session (`receiving_init_kind` is
@@ -167,6 +167,9 @@ pub struct Refused {
     /// the gate applies at all, this one whether a held message outlives a session that replaced
     /// the one it was held against.
     pub opens_session: bool,
+    /// The message itself. A heal that is granted rebuilds the session *from* it, so it waits in
+    /// the pending queue with everything else that waits for a session (`hold_for_open`).
+    pub message: IncomingMessage,
 }
 
 impl Refused {
@@ -174,13 +177,14 @@ impl Refused {
         Self {
             message_id: msg.message_id.clone(),
             opens_session: opens_session(msg),
+            message: msg.clone(),
         }
     }
 }
 
 /// Whether `msg`'s header is a session opener — the classifier `plan_receiving_init` uses, over
 /// the header the core parses itself. An unparseable payload opens nothing.
-fn opens_session(msg: &IncomingMessage) -> bool {
+pub(crate) fn opens_session(msg: &IncomingMessage) -> bool {
     use crate::orchestration::receiving_init_plan::{
         ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind,
     };
@@ -352,6 +356,57 @@ impl MessageRouter {
             .map(|msg| msg.message_id)
     }
 
+    /// Queue `msg` to wait for its session to be rebuilt — a heal's carrier. Idempotent by id.
+    ///
+    /// A heal opens a new receiving session from the handshake that failed on the old one, so the
+    /// handshake waits where every message waiting for a session waits. One list of carriers for
+    /// `Orchestrator::open_receiving`, whichever way it was reached; the heal record keeps only
+    /// the budget.
+    pub fn hold_for_open(&mut self, msg: IncomingMessage) {
+        let queue = self.pending_queues.entry(msg.contact_id.clone()).or_default();
+        if queue.iter().any(|q| q.message_id == msg.message_id) {
+            return;
+        }
+        if queue.len() < self.max_pending_per_user {
+            queue.push_back(msg);
+        }
+    }
+
+    /// The messages waiting for a session with `contact_id`, oldest first.
+    pub fn pending_messages(&self, contact_id: &str) -> Vec<IncomingMessage> {
+        self.pending_queues
+            .get(contact_id)
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Take one message out of `contact_id`'s queue by id.
+    pub fn remove_pending(&mut self, contact_id: &str, message_id: &str) {
+        if let Some(queue) = self.pending_queues.get_mut(contact_id) {
+            queue.retain(|m| m.message_id != message_id);
+            if queue.is_empty() {
+                self.pending_queues.remove(contact_id);
+            }
+        }
+    }
+
+    /// Take `contact_id`'s whole queue.
+    pub fn take_pending(&mut self, contact_id: &str) -> Vec<IncomingMessage> {
+        self.pending_queues
+            .remove(contact_id)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Move what waits under `from` to `to`, renamed. The sender certificate named `from`; the
+    /// session that opened says the writer was `to`.
+    pub fn rekey_pending(&mut self, from: &str, to: &str) {
+        for mut msg in self.take_pending(from) {
+            msg.contact_id = to.to_string();
+            self.hold_for_open(msg);
+        }
+    }
+
     /// All contact IDs that currently have at least one queued message.
     pub fn contacts_with_pending(&self) -> Vec<String> {
         self.pending_queues
@@ -516,6 +571,15 @@ impl MessageRouter {
             .pending_queues
             .entry(msg.contact_id.clone())
             .or_default();
+
+        // A queued message is not acknowledged, so the server redelivers it while it waits; each
+        // copy must not become another carrier to try.
+        if queue.iter().any(|q| q.message_id == msg.message_id) {
+            return RoutingDecision::NeedSessionInit {
+                contact_id: msg.contact_id.clone(),
+                queued_count: queue.len(),
+            };
+        }
 
         if queue.len() >= self.max_pending_per_user {
             return RoutingDecision::QueueFull {
