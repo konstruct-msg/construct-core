@@ -782,8 +782,6 @@ interface CfeIncomingEvent {
     TimerFired(string timer_id);
     /// Platform ACK DB lookup result — response to `CheckAckInDb` action.
     AckDbResult(string message_id, boolean is_processed);
-    /// Signal that the user opened or closed a chat — controls heartbeat scheduling.
-    ActiveChatChanged(string contact_id, boolean is_active);
     /// A heartbeat message was received from the peer.
     HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
     /// The platform is about to tear down the ratchet with `contact_id` and asks whether it may.
@@ -896,7 +894,6 @@ interface CfeAction {
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
     /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
     SaveToSecureStore(CfeSecureStoreSlot slot, bytes data);
-    PersistMessage(string message_json);
     PersistAck(string message_id, u64 timestamp);
     PruneAckStore(u64 cutoff_ts);
     MarkMessageDelivered(string message_id);
@@ -912,9 +909,6 @@ interface CfeAction {
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
     /// Platform must query its persistent ACK store for `message_id` and reply with `AckDbResult`.
     CheckAckInDb(string message_id);
-    /// Encrypt and send a heartbeat to `contact_id` using the current DR session.
-    /// If no session exists, treat as a desync signal and trigger heal.
-    SendHeartbeat(string contact_id);
     /// Broadcast to all linked devices that the session with `contact_id` was reset.
     NotifyLinkedDevicesOfSessionReset(string contact_id);
     /// Rust archived and removed the session for `contact_id`.

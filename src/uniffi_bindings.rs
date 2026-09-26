@@ -4039,10 +4039,6 @@ pub enum CfeIncomingEvent {
         message_id: String,
         is_processed: bool,
     },
-    ActiveChatChanged {
-        contact_id: String,
-        is_active: bool,
-    },
     HeartbeatReceived {
         contact_id: String,
         message_id: String,
@@ -4178,13 +4174,6 @@ impl CfeIncomingEvent {
                 message_id,
                 is_processed,
             },
-            Self::ActiveChatChanged {
-                contact_id,
-                is_active,
-            } => ActiveChatChanged {
-                contact_id,
-                is_active,
-            },
             Self::HeartbeatReceived {
                 contact_id,
                 message_id,
@@ -4270,9 +4259,6 @@ pub enum CfeAction {
     SaveToSecureStore {
         slot: CfeSecureStoreSlot,
         data: Vec<u8>,
-    },
-    PersistMessage {
-        message_json: String,
     },
     PersistAck {
         message_id: String,
@@ -4406,10 +4392,6 @@ pub enum CfeAction {
         contact_id: String,
         queued_count: u32,
     },
-    /// Platform should encrypt and send a heartbeat to this contact.
-    SendHeartbeat {
-        contact_id: String,
-    },
     /// Platform should notify all linked devices of session reset with this contact.
     NotifyLinkedDevicesOfSessionReset {
         contact_id: String,
@@ -4464,7 +4446,6 @@ impl CfeAction {
                 slot: slot.into(),
                 data: data.into_vec(),
             },
-            PersistMessage { message_json } => Self::PersistMessage { message_json },
             PersistAck {
                 message_id,
                 timestamp,
@@ -4562,7 +4543,6 @@ impl CfeAction {
                 contact_id,
                 queued_count,
             },
-            SendHeartbeat { contact_id } => Self::SendHeartbeat { contact_id },
             NotifyLinkedDevicesOfSessionReset { contact_id } => {
                 Self::NotifyLinkedDevicesOfSessionReset { contact_id }
             }

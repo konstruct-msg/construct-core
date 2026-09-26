@@ -211,8 +211,12 @@ mod tests {
     fn test_mark_processed_returns_persist_action() {
         let mut store = AckStore::default();
         let actions = store.mark_processed("msg-001");
-        assert_eq!(actions.len(), 1);
-        matches!(&actions[0], Action::PersistMessage { message_json } if message_json.contains("msg-001"));
+        // Asserted, not just matched: this line was a bare `matches!` whose result went nowhere,
+        // naming an action (`PersistMessage`) the store never returned.
+        assert!(
+            matches!(actions.as_slice(), [Action::PersistAck { message_id, .. }] if message_id == "msg-001"),
+            "{actions:?}"
+        );
     }
 
     #[test]

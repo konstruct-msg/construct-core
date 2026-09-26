@@ -231,9 +231,6 @@ pub enum Action {
         /// is `SecretBytes` — zeroed on drop, and a `{:?}` of the action prints its length.
         data: crate::crypto::SecretBytes,
     },
-    PersistMessage {
-        message_json: String,
-    },
     /// Persist an ACK deduplication record across app restarts.
     /// The platform must store `(message_id, timestamp)` and load them back
     /// via `ack_mark_processed` on next launch to pre-populate the in-memory cache.
@@ -297,16 +294,6 @@ pub enum Action {
     },
     CancelTimer {
         timer_id: String,
-    },
-
-    // ── Session health ────────────────────────────────────────────────────────
-    /// Platform should encrypt a lightweight heartbeat payload and send it to
-    /// `contact_id` using the existing DR session. If encryption fails (no
-    /// session), the platform should treat this as a desync signal and trigger
-    /// a heal. Using a regular encrypted message with `content_type = HEARTBEAT`
-    /// means the server forwards it without modification — no server changes needed.
-    SendHeartbeat {
-        contact_id: String,
     },
 
     // ── Multi-device ──────────────────────────────────────────────────────────
@@ -413,13 +400,6 @@ pub enum IncomingEvent {
     AckDbResult {
         message_id: String,
         is_processed: bool,
-    },
-    /// Platform signals that the user opened or closed a specific chat.
-    /// When `is_active = true`, the orchestrator schedules a heartbeat timer for
-    /// `contact_id`. When `false`, the timer is cancelled.
-    ActiveChatChanged {
-        contact_id: String,
-        is_active: bool,
     },
     /// The platform is about to tear down the ratchet with `contact_id` and is asking whether
     /// it may.

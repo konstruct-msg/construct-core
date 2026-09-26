@@ -164,9 +164,6 @@ pub struct Orchestrator {
     /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
     #[allow(dead_code)]
     prewarm_done: HashSet<String>,
-    /// Contacts whose chat is currently open in the UI. The orchestrator
-    /// schedules periodic heartbeat timers for these contacts.
-    active_chats: HashSet<String>,
     /// A responder init burned a Kyber one-time prekey since `take_kyber_prekeys_to_persist`.
     kyber_prekeys_dirty: bool,
     /// Devices the PQXDH v2 upgrade sweep has already asked to reopen since launch.
@@ -212,7 +209,6 @@ impl Orchestrator {
             router: MessageRouter::new(),
             sessions: SessionMachine::new(clock.clone()),
             prewarm_done: HashSet::new(),
-            active_chats: HashSet::new(),
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
         }
@@ -273,10 +269,6 @@ impl Orchestrator {
                 message_id,
                 is_processed,
             } => self.handle_ack_db_result(message_id, is_processed),
-            IncomingEvent::ActiveChatChanged {
-                contact_id,
-                is_active,
-            } => self.handle_active_chat_changed(contact_id, is_active),
             IncomingEvent::HeartbeatReceived {
                 contact_id,
                 message_id,
@@ -496,7 +488,6 @@ impl Orchestrator {
         self.lifecycle.forget_contact_state(contact_id);
         self.sessions.handle(contact_id, SessionEvent::Forget);
         self.prewarm_done.remove(contact_id);
-        self.active_chats.remove(contact_id);
     }
 
     pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
@@ -2118,40 +2109,7 @@ impl Orchestrator {
                     _ => vec![],
                 }
             }
-            _ if timer_id.starts_with("heartbeat:") => {
-                let contact_id = &timer_id["heartbeat:".len()..];
-                if self.active_chats.contains(contact_id) {
-                    // Re-schedule heartbeat for the next interval.
-                    vec![
-                        Action::SendHeartbeat {
-                            contact_id: contact_id.to_string(),
-                        },
-                        Action::ScheduleTimer {
-                            timer_id: timer_id.clone(),
-                            delay_ms: 6 * 60 * 60 * 1_000, // 6 hours
-                        },
-                    ]
-                } else {
-                    vec![] // Chat closed — timer fires once more, then stops.
-                }
-            }
             _ => vec![],
-        }
-    }
-
-    fn handle_active_chat_changed(&mut self, contact_id: String, is_active: bool) -> Vec<Action> {
-        if is_active {
-            self.active_chats.insert(contact_id.clone());
-            // Schedule initial heartbeat after 6 hours.
-            vec![Action::ScheduleTimer {
-                timer_id: format!("heartbeat:{}", contact_id),
-                delay_ms: 6 * 60 * 60 * 1_000,
-            }]
-        } else {
-            self.active_chats.remove(&contact_id);
-            vec![Action::CancelTimer {
-                timer_id: format!("heartbeat:{}", contact_id),
-            }]
         }
     }
 
