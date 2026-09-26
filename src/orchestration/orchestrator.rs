@@ -2505,7 +2505,9 @@ impl Orchestrator {
                         retry_after_ms,
                     }],
                     _ => {
-                        self.router.hold_for_open(refused.message);
+                        if role == Role::Responder {
+                            self.router.hold_for_open(refused.message);
+                        }
                         vec![Action::SessionHealNeeded {
                             contact_id: cid,
                             role: role.as_wire().to_string(),
@@ -2672,8 +2674,13 @@ impl Orchestrator {
                     }
                     _ => {
                         // The heal rebuilds the session from this message; it waits for that
-                        // with everything else waiting for a session (`open_receiving`).
-                        self.router.hold_for_open(refused.message);
+                        // with everything else waiting for a session (`open_receiving`). Only
+                        // as RESPONDER: the INITIATOR keeps its own session and the peer's
+                        // handshake is superseded, so queued it would come back on every drain
+                        // and raise the same decision again.
+                        if role == Role::Responder {
+                            self.router.hold_for_open(refused.message);
+                        }
                         vec![Action::SessionHealNeeded {
                             contact_id: cid,
                             role: role.as_wire().to_string(),
@@ -4971,6 +4978,19 @@ mod pqxdh_v2_tests {
         (o, id)
     }
 
+    /// Alice and Bob with Bob the RESPONDER of any heal between them (lower id — see
+    /// `tie_break_role`). Device ids are random, so a heal test that does not fix this passes or
+    /// fails with the draw.
+    fn responder_pair() -> ((Orchestrator, String), (Orchestrator, String)) {
+        loop {
+            let a = named_device();
+            let b = named_device();
+            if b.1 < a.1 {
+                return (a, b);
+            }
+        }
+    }
+
     fn deliver(bob: &mut Orchestrator, from: &str, id: &str, wire: Vec<u8>, ct: u8) -> Vec<Action> {
         bob.handle_event(IncomingEvent::MessageReceived {
             message_id: id.to_string(),
@@ -5092,8 +5112,7 @@ mod pqxdh_v2_tests {
     /// Mutation: drop the `put_back_session` on a failed attempt — this reddens.
     #[test]
     fn a_walk_that_opens_nothing_keeps_the_session_it_found() {
-        let (mut alice, alice_id) = named_device();
-        let (mut bob, bob_id) = named_device();
+        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
@@ -5148,8 +5167,7 @@ mod pqxdh_v2_tests {
     /// archived rather than lost.
     #[test]
     fn a_heal_opens_from_its_queued_carrier_and_archives_the_old_session() {
-        let (mut alice, alice_id) = named_device();
-        let (mut bob, bob_id) = named_device();
+        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
@@ -5196,8 +5214,7 @@ mod pqxdh_v2_tests {
     /// Mutation: drop the `take_pending` from `handle_heal_attempted` — this reddens.
     #[test]
     fn an_exhausted_heal_drops_its_carriers() {
-        let (mut alice, alice_id) = named_device();
-        let (mut bob, bob_id) = named_device();
+        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
@@ -5325,6 +5342,29 @@ mod pqxdh_v2_tests {
             content_type: 0,
         });
         assert!(actions.iter().any(|a| matches!(a, Action::PendingDropped { .. })), "{actions:?}");
+        assert_eq!(bob.pending_message_count(&alice_id), 0);
+    }
+
+    /// As INITIATOR the heal keeps its own session and the peer's handshake is superseded; queued,
+    /// it would come back on every drain and raise the same decision.
+    ///
+    /// Mutation: drop the `role == Role::Responder` guard — this reddens.
+    #[test]
+    fn an_initiator_does_not_queue_the_superseded_handshake() {
+        let ((mut bob, bob_id), (mut alice, alice_id)) = responder_pair();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+            .unwrap();
+        let (mut other, _) = named_device();
+        other.set_my_user_id(alice_id.clone());
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        other.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        let actions = deliver(&mut bob, &alice_id, "m", other.encrypt_bytes_for(&bob_id, b"x").unwrap(), 0);
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::SessionHealNeeded { role, .. } if role == "Initiator")
+        ), "{actions:?}");
         assert_eq!(bob.pending_message_count(&alice_id), 0);
     }
 
