@@ -245,6 +245,18 @@ pub enum Action {
     MarkMessageDelivered {
         message_id: String,
     },
+    /// The routing verdict for a message already handled: in the ACK cache, confirmed processed
+    /// by the platform's DB, or carrying a ratchet position whose key is already used
+    /// (`MESSAGE_KEY_CONSUMED`). Terminal: record it as processed, advance past it.
+    ///
+    /// Before this the verdict was an empty list, and an empty list also means "no decision".
+    /// The platform could not tell them apart — a duplicate it had answered "not processed"
+    /// for (a control message after a restart has no transcript row) read as a message held
+    /// for redelivery, and held the stream cursor on a message that would come back as the
+    /// same duplicate every time.
+    DuplicateDropped {
+        message_id: String,
+    },
 
     // ── Network ───────────────────────────────────────────────────────────────
     FetchPublicKeyBundle {

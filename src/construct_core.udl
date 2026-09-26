@@ -897,6 +897,9 @@ interface CfeAction {
     PersistAck(string message_id, u64 timestamp);
     PruneAckStore(u64 cutoff_ts);
     MarkMessageDelivered(string message_id);
+    /// A message already handled (ACK cache, platform DB, or its ratchet key already used).
+    /// Terminal: record it as processed and advance the stream cursor past it.
+    DuplicateDropped(string message_id);
     FetchPublicKeyBundle(string user_id);
     SendEncryptedMessage(string to, bytes payload, string message_id, u8 content_type);
     SendReceipt(string message_id, string status);

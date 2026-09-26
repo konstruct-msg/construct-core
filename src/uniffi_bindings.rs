@@ -4270,6 +4270,9 @@ pub enum CfeAction {
     MarkMessageDelivered {
         message_id: String,
     },
+    DuplicateDropped {
+        message_id: String,
+    },
     FetchPublicKeyBundle {
         user_id: String,
     },
@@ -4455,6 +4458,7 @@ impl CfeAction {
             },
             PruneAckStore { cutoff_ts } => Self::PruneAckStore { cutoff_ts },
             MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
+            DuplicateDropped { message_id } => Self::DuplicateDropped { message_id },
             FetchPublicKeyBundle { user_id } => Self::FetchPublicKeyBundle { user_id },
             SendEncryptedMessage {
                 to,

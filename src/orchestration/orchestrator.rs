@@ -2377,7 +2377,9 @@ impl Orchestrator {
                     ],
                 }
             }
-            RoutingDecision::Duplicate { .. } => vec![],
+            RoutingDecision::Duplicate { message_id } => {
+                vec![Action::DuplicateDropped { message_id }]
+            }
             RoutingDecision::PendingAckCheck { message_id } => {
                 vec![Action::CheckAckInDb { message_id }]
             }
@@ -4034,6 +4036,12 @@ mod pqxdh_v2_tests {
                     | Action::NotifyError { .. }
             )),
             "a copy of the carrier must not heal or tear down: {again:?}"
+        );
+        assert!(
+            again.iter().any(
+                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "carrier")
+            ),
+            "and it is named a duplicate, not answered with silence: {again:?}"
         );
         assert_eq!(bob.lifecycle.active_session_id("alice").unwrap(), session);
 
