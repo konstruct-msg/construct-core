@@ -118,6 +118,22 @@ pub enum Action {
         contact_id: String,
     },
 
+    /// Route a message the confirm gate held, now that the gate is down.
+    ///
+    /// The core keeps the hold — which message, against which ratchet epoch — and decides when it
+    /// ends; the platform keeps the envelope, as it does for every message it has not finished
+    /// with, and routes it again from the top. Until 2026-09-26 the platform kept the whole
+    /// buffer and its own replay rule (`confirm_replay`) beside a gate the core decided.
+    ReplayHeld { message_id: String },
+
+    /// A held message that opens a session, whose ratchet was replaced while it waited.
+    ///
+    /// It belongs to a handshake that has already concluded: replayed, it cannot decrypt, the
+    /// heal it provokes archives the session that replaced it (build 579, 2026-08-05, three times
+    /// in an hour). The platform records it as processed and lets the cursor past it. Only an
+    /// opener is ever judged this way — held content always replays, whatever its age.
+    HeldSuperseded { message_id: String },
+
     /// An `EndSessionNeeded` decision was suppressed by the per-contact cooldown, and the
     /// orchestrator has taken ownership of sending it once the cooldown clears (in
     /// `retry_after_ms`). The platform must NOT acknowledge the message.

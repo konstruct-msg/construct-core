@@ -11,7 +11,7 @@
 /// - `SessionLifecycleManager` (sessions, archives, ACK, healing, PQ)
 /// - `MessageRouter` (routing decisions)
 /// - Coordinator state: init locks, cooldowns, prewarm tracking
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::crypto::client_api::ClassicClient;
@@ -20,7 +20,7 @@ use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 use crate::orchestration::message_router::{
-    IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role,
+    IncomingMessage, MessageRouter, Refused, Role, RoutingDecision, tie_break_role,
 };
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
@@ -173,6 +173,34 @@ pub struct Orchestrator {
     /// in place, and the next launch is when to try again — the peer may have updated by then.
     /// Within a launch, a second ask is the loop the batch timer would otherwise become.
     pq_upgrade_asked: HashSet<String>,
+    /// Messages the confirm gate is holding, per device, in arrival order.
+    ///
+    /// See `Action::HeldPendingAck`: the gate is this machine's, and so is the buffer behind it.
+    /// Only ids and the epoch they were held against — the envelope stays with the platform,
+    /// which gets it back through `Action::ReplayHeld`. In memory on purpose: a held message is
+    /// never acknowledged to the server, so after a restart it is redelivered and judged again.
+    confirm_holds: HashMap<String, Vec<ConfirmHold>>,
+}
+
+/// Whether a held message belongs to a handshake that concluded while it waited.
+///
+/// Only an opener, and only against a session that exists: with none, nothing has replaced it and
+/// it may be the very handshake that builds one. Any other epoch than the one it was held against
+/// — "held with no session, one exists now" included — is a replacement.
+fn held_opener_superseded(hold: &ConfirmHold, current: Option<&str>) -> bool {
+    match current {
+        Some(current) => hold.opens_session && hold.epoch.as_deref() != Some(current),
+        None => false,
+    }
+}
+
+/// One message held behind an unacknowledged SESSION_RESET_INIT.
+#[derive(Debug, Clone)]
+struct ConfirmHold {
+    message_id: String,
+    /// The ratchet's `session_id` when the message was held; `None` if there was no session.
+    epoch: Option<String>,
+    opens_session: bool,
 }
 
 /// How long after `AppLaunched` the PQXDH v2 upgrade sweep runs (ms).
@@ -211,6 +239,7 @@ impl Orchestrator {
             prewarm_done: HashSet::new(),
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
+            confirm_holds: HashMap::new(),
         }
     }
 
@@ -222,6 +251,73 @@ impl Orchestrator {
     /// After executing I/O actions (network, storage), the platform feeds
     /// results back via further `handle_event` calls.
     pub fn handle_event(&mut self, event: IncomingEvent) -> Vec<Action> {
+        let mut actions = self.dispatch_event(event);
+        actions.extend(self.release_confirm_holds());
+        actions
+    }
+
+    /// Hold `refused` behind the confirm gate for `contact_id`.
+    ///
+    /// Idempotent per message: a held message is not acknowledged, so the server redelivers it
+    /// while it waits, and each copy reaches the gate again.
+    fn hold_behind_confirm(&mut self, contact_id: &str, refused: Refused) {
+        let epoch = self
+            .get_session_health(contact_id)
+            .map(|health| health.session_id);
+        let holds = self.confirm_holds.entry(contact_id.to_string()).or_default();
+        if holds.iter().any(|h| h.message_id == refused.message_id) {
+            return;
+        }
+        holds.push(ConfirmHold {
+            message_id: refused.message_id,
+            epoch,
+            opens_session: refused.opens_session,
+        });
+    }
+
+    /// Hand back everything held for a device whose gate is down.
+    ///
+    /// Run after **every** event, not from the handful that end an opening today (`PeerAcked`,
+    /// `SessionInitCompleted`, the `open_confirm:` give-up). A hold released only from named exits
+    /// is released by none of the exits added later, and a gate that falls with nothing replayed
+    /// is the 2026-08-04 defect in its other form. The one exit outside `handle_event` —
+    /// `reopen_refused` — is caught by the next event of any kind.
+    ///
+    /// An opener whose ratchet was replaced while it waited is superseded: it belongs to a
+    /// handshake that already concluded. Anything else replays, whatever its age — dropping
+    /// content on a guess is what the hold exists to prevent. Epochs compare by equality: they
+    /// are identities, and "held with no session, one exists now" is a replacement too.
+    fn release_confirm_holds(&mut self) -> Vec<Action> {
+        let open: Vec<String> = self
+            .confirm_holds
+            .keys()
+            .filter(|device| !self.sessions.awaits_acknowledgement(device))
+            .cloned()
+            .collect();
+        let mut actions = Vec::new();
+        for device in open {
+            let Some(holds) = self.confirm_holds.remove(&device) else {
+                continue;
+            };
+            let current = self
+                .get_session_health(&device)
+                .map(|health| health.session_id);
+            for hold in holds {
+                actions.push(if held_opener_superseded(&hold, current.as_deref()) {
+                    Action::HeldSuperseded {
+                        message_id: hold.message_id,
+                    }
+                } else {
+                    Action::ReplayHeld {
+                        message_id: hold.message_id,
+                    }
+                });
+            }
+        }
+        actions
+    }
+
+    fn dispatch_event(&mut self, event: IncomingEvent) -> Vec<Action> {
         match event {
             IncomingEvent::MessageReceived {
                 message_id,
@@ -488,6 +584,7 @@ impl Orchestrator {
         self.lifecycle.forget_contact_state(contact_id);
         self.sessions.handle(contact_id, SessionEvent::Forget);
         self.prewarm_done.remove(contact_id);
+        self.confirm_holds.remove(contact_id);
     }
 
     pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
@@ -2144,9 +2241,11 @@ impl Orchestrator {
                 // heartbeat carrying something else has to come back through here.
                 is_handshake: false,
                 reason,
+                refused,
             } => {
                 // Decrypt failed on heartbeat msgNum=0 — proactively trigger heal.
                 if self.sessions.awaits_acknowledgement(&cid) {
+                    self.hold_behind_confirm(&cid, refused);
                     return vec![
                         Action::HeldPendingAck { contact_id: cid },
                         decrypt_failed(reason),
@@ -2284,6 +2383,7 @@ impl Orchestrator {
                 is_handshake,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
+                refused,
             } => {
                 // Our own announcement to this device is still unanswered, so this failure is
                 // our re-init's own consequence. Healing on it archives the session we built in
@@ -2300,6 +2400,7 @@ impl Orchestrator {
                 // device held a genuine heal for its sibling; a ratchet is between two devices
                 // and our SRI to one says nothing about the other.
                 if !is_handshake && self.sessions.awaits_acknowledgement(&cid) {
+                    self.hold_behind_confirm(&cid, refused);
                     return vec![Action::HeldPendingAck { contact_id: cid }];
                 }
                 match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
@@ -2328,6 +2429,7 @@ impl Orchestrator {
                 contact_id: cid,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
+                refused,
             } => {
                 // The same hold as the heal above, and there is no exemption to make here: a
                 // real END_SESSION is short-circuited as a control frame before any decrypt is
@@ -2336,6 +2438,7 @@ impl Orchestrator {
                 // is the improvement — tearing down on it crosses our own unanswered SRI, which
                 // is the defect the gate exists for.
                 if self.sessions.awaits_acknowledgement(&cid) {
+                    self.hold_behind_confirm(&cid, refused);
                     return vec![Action::HeldPendingAck { contact_id: cid }];
                 }
                 // Evidence, and the decision that produced it says so: `EndSessionNeeded`
@@ -2795,6 +2898,7 @@ mod tests {
         RoutingDecision::EndSessionNeeded {
             contact_id: cid.to_string(),
             reason: "AEAD decryption failed".to_string(),
+            refused: refused("m-held", false),
         }
     }
 
@@ -2804,6 +2908,14 @@ mod tests {
             role: crate::orchestration::message_router::Role::Responder,
             is_handshake,
             reason: "AEAD decryption failed".to_string(),
+            refused: refused("m-held", is_handshake),
+        }
+    }
+
+    fn refused(message_id: &str, opens_session: bool) -> Refused {
+        Refused {
+            message_id: message_id.to_string(),
+            opens_session,
         }
     }
 
@@ -3017,6 +3129,116 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SendEndSession { .. })),
         );
+    }
+
+    fn held_ids(actions: &[Action]) -> Vec<(&'static str, String)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ReplayHeld { message_id } => Some(("replay", message_id.clone())),
+                Action::HeldSuperseded { message_id } => Some(("superseded", message_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The core keeps what its gate holds and hands it back when the gate falls. Until
+    /// 2026-09-26 the buffer was the platform's, keyed by account, with its own replay rule; the
+    /// platform now keeps only the envelope.
+    ///
+    /// Mutation: drop `hold_behind_confirm` from the `EndSessionNeeded` arm, or the
+    /// `release_confirm_holds` call in `handle_event` — this reddens.
+    #[test]
+    fn what_the_gate_held_is_handed_back_when_the_peer_acknowledges() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(end_session_needed("bob"), "");
+        assert!(o.release_confirm_holds().is_empty(), "nothing leaves while the gate is up");
+
+        let actions = o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(held_ids(&actions), vec![("replay", "m-held".to_string())]);
+        let again = o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        assert!(held_ids(&again).is_empty(), "handed back once");
+    }
+
+    /// The give-up ends the wait as surely as the acknowledgement does. A gate that expires with
+    /// nothing replayed is the 2026-08-04 defect in its other form.
+    #[test]
+    fn what_the_gate_held_is_handed_back_when_the_window_runs_out() {
+        let clock = Arc::new(MockClock::new(0));
+        let mut o = make_orchestrator_with_clock("alice", clock.clone());
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(heal_needed("bob", false), "");
+        clock.advance_ms(crate::orchestration::session_machine::OPENING_CONFIRM_WINDOW_MS + 1);
+        let actions = o.handle_event(IncomingEvent::TimerFired {
+            timer_id: "open_confirm:bob".to_string(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpeningGaveUp { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(held_ids(&actions), vec![("replay", "m-held".to_string())]);
+    }
+
+    /// A held message is not acknowledged, so the server redelivers it while it waits. Each copy
+    /// reaches the gate; one replay comes out.
+    #[test]
+    fn a_redelivered_held_message_is_held_once() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(end_session_needed("bob"), "");
+        o.decision_to_actions(end_session_needed("bob"), "");
+        let actions = o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(held_ids(&actions).len(), 1);
+    }
+
+    /// Forgetting a contact forgets what was held for it; replaying into a contact the user
+    /// deleted would resurrect it.
+    #[test]
+    fn forgetting_a_contact_drops_its_holds() {
+        let mut o = make_orchestrator("alice");
+        o.handle_event(IncomingEvent::SriAnnounced {
+            contact_id: "bob".to_string(),
+        });
+        o.decision_to_actions(end_session_needed("bob"), "");
+        o.forget_contact_state("bob");
+        let actions = o.handle_event(IncomingEvent::PeerAcked {
+            contact_id: "bob".to_string(),
+        });
+        assert!(held_ids(&actions).is_empty());
+    }
+
+    /// Only an opener is judged superseded, and only against a session that exists and is not
+    /// the one it was held against. This was `SessionReducer.heldReplayDisposition` on iOS.
+    ///
+    /// Mutation: drop `hold.opens_session &&` — content would be dropped; return `true` on
+    /// `None` — the handshake that builds the session would be.
+    #[test]
+    fn only_an_opener_whose_ratchet_was_replaced_is_superseded() {
+        let hold = |opens_session: bool, epoch: Option<&str>| ConfirmHold {
+            message_id: "m".to_string(),
+            epoch: epoch.map(str::to_string),
+            opens_session,
+        };
+        assert!(held_opener_superseded(&hold(true, Some("e1")), Some("e2")));
+        assert!(held_opener_superseded(&hold(true, None), Some("e2")), "held with none, one exists now");
+        assert!(!held_opener_superseded(&hold(true, Some("e1")), Some("e1")));
+        assert!(!held_opener_superseded(&hold(true, Some("e1")), None));
+        assert!(!held_opener_superseded(&hold(false, Some("e1")), Some("e2")), "content always replays");
     }
 
     /// And a heal is held for the sharper version of the same reason: healing as RESPONDER runs

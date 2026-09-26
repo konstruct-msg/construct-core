@@ -859,6 +859,8 @@ interface CfeAction {
     /// Our own SESSION_RESET_INIT to this device is unacknowledged, so neither heal nor tear
     /// down on the message that provoked this: buffer it and replay it when the wait ends.
     HeldPendingAck(string contact_id);
+    ReplayHeld(string message_id);
+    HeldSuperseded(string message_id);
     /// The heal budget allows this attempt; `attempt` is its 1-based index.
     HealAttemptAllowed(string contact_id, u32 attempt);
     /// The heal budget for this device is spent, or nothing is queued to spend it from — give up

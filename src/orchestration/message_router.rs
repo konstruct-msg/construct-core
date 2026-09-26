@@ -128,9 +128,16 @@ pub enum RoutingDecision {
         /// Why the decrypt refused, as the ratchet said it. Carried so the platform log can say
         /// it — see `Orchestrator::decision_to_actions`.
         reason: String,
+        /// The message refused — what the confirm gate holds when it holds this decision.
+        refused: Refused,
     },
     /// Session is irrecoverably broken — send END_SESSION.
-    EndSessionNeeded { contact_id: String, reason: String },
+    EndSessionNeeded {
+        contact_id: String,
+        reason: String,
+        /// The message refused — what the confirm gate holds when it holds this decision.
+        refused: Refused,
+    },
     /// Message already processed — discard.
     Duplicate { message_id: String },
     /// ACK status unknown — buffered pending a DB check (platform feeds back `AckDbResult`).
@@ -144,6 +151,49 @@ pub enum RoutingDecision {
     },
     /// Unrecoverable routing error.
     Error { message: String },
+}
+
+/// The message a refusal is about, as the confirm gate needs to hold it.
+///
+/// Carried on the decision rather than looked up afterwards because the gate is decided far from
+/// the message: `decide_actions` sees a verdict, and a verdict that does not name its message
+/// cannot be held by anyone but the platform — which is how the hold buffer came to live in the
+/// client, keyed by account, beside a gate the core keeps per device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub message_id: String,
+    /// The header says this message could open a session (`receiving_init_kind` is
+    /// `Handshake`). Not `is_handshake`, which reads the content type: that one decides whether
+    /// the gate applies at all, this one whether a held message outlives a session that replaced
+    /// the one it was held against.
+    pub opens_session: bool,
+}
+
+impl Refused {
+    fn of(msg: &IncomingMessage) -> Self {
+        Self {
+            message_id: msg.message_id.clone(),
+            opens_session: opens_session(msg),
+        }
+    }
+}
+
+/// Whether `msg`'s header is a session opener — the classifier `plan_receiving_init` uses, over
+/// the header the core parses itself. An unparseable payload opens nothing.
+fn opens_session(msg: &IncomingMessage) -> bool {
+    use crate::orchestration::receiving_init_plan::{
+        ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind,
+    };
+    let Ok(header) = crate::wire_payload::unpack(&msg.wire_payload) else {
+        return false;
+    };
+    receiving_init_kind(&ReceivingInitCarrier {
+        message_number: header.message_number,
+        one_time_prekey_id: header.one_time_prekey_id,
+        kem_ciphertext_bytes: header.kem_ciphertext.as_ref().map_or(0, |k| k.len() as u32),
+        pq_message_epoch: header.pq_message_epoch,
+        is_session_reset_init: msg.content_type == CT_SESSION_RESET_INIT,
+    }) == ReceivingInitKind::Handshake
 }
 
 /// A raw incoming message before decryption.
@@ -426,6 +476,7 @@ impl MessageRouter {
                                 "incoming heal throttled for {} — possible heal exhaustion attack; decrypt: {e}",
                                 &msg.contact_id
                             ),
+                            refused: Refused::of(msg),
                         };
                     }
                     lifecycle.healing_queue.enqueue(
@@ -441,11 +492,13 @@ impl MessageRouter {
                             CT_SESSION_RESET | CT_SESSION_RESET_INIT
                         ),
                         reason: e,
+                        refused: Refused::of(msg),
                     }
                 } else {
                     RoutingDecision::EndSessionNeeded {
                         contact_id: msg.contact_id.clone(),
                         reason: e,
+                        refused: Refused::of(msg),
                     }
                 }
             }

@@ -4340,6 +4340,14 @@ pub enum CfeAction {
     HeldPendingAck {
         contact_id: String,
     },
+    /// See `Action::ReplayHeld`.
+    ReplayHeld {
+        message_id: String,
+    },
+    /// See `Action::HeldSuperseded`.
+    HeldSuperseded {
+        message_id: String,
+    },
     /// END_SESSION suppressed by cooldown — the core owes it and will send it in
     /// `retry_after_ms`. Platform must NOT ACK.
     EndSessionSuppressed {
@@ -4498,6 +4506,8 @@ impl CfeAction {
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
             HeldPendingAck { contact_id } => Self::HeldPendingAck { contact_id },
+            ReplayHeld { message_id } => Self::ReplayHeld { message_id },
+            HeldSuperseded { message_id } => Self::HeldSuperseded { message_id },
             HealAttemptAllowed {
                 contact_id,
                 attempt,
