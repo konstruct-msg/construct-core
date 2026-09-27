@@ -1542,22 +1542,24 @@ impl Orchestrator {
         self.lifecycle.export_session_bytes_for(contact_id)
     }
 
-    /// Import a session from a `CfeSessionStateV1` binary blob.
+    /// Import a session record from a `CfeSessionStateV1` binary blob — the platforms' restore.
+    ///
+    /// The whole record: its previous states, and whether its top state is retired
+    /// (`SessionLifecycleManager::import_session_bytes`). Until 2026-09-28 this read the top state
+    /// alone and installed it as current, so every restart dropped the previous states, and a
+    /// state the peer's decryption error had retired came back as current and the next message
+    /// went out on it again (stand 2026-09-28). The lifecycle's own import, which the tests
+    /// exercised, was right; this path, which the apps use, did not call it.
+    ///
+    /// Returns the current state's session id, or an empty string for a record with none.
     pub fn import_session_cfe(&mut self, contact_id: &str, data: &[u8]) -> Result<String, String> {
-        use crate::cfe::{CfeMessageType, decode_as};
-        use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
-
-        let cfe_state =
-            decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState)
-                .map_err(|e| e.to_string())?;
-        let serializable = SerializableSession::from_cfe_v1(cfe_state)
-            .map_err(|e| format!("from_cfe_v1: {}", e))?;
-        serializable.verify_identity(contact_id, self.lifecycle.client.local_user_id())?;
-        let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
-            .map_err(|e| format!("from_serializable: {}", e))?;
-        let session_id = self.lifecycle.client.import_session(contact_id, ratchet);
-        Ok(session_id)
+        self.lifecycle.import_session_bytes(contact_id, data)?;
+        Ok(self
+            .lifecycle
+            .active_session_id(contact_id)
+            .unwrap_or_default())
     }
+
     pub fn rotate_spk(&mut self) -> Result<(u32, Vec<u8>, Vec<u8>), String> {
         self.lifecycle
             .client
@@ -2513,6 +2515,48 @@ mod tests {
             crate::orchestration::AckCheckResult::NotProcessed
                 | crate::orchestration::AckCheckResult::NeedDbCheck
         ));
+    }
+
+    /// The platforms restore a session through `import_session_cfe`: it must keep the record's
+    /// previous states and a retired top, or a restart undoes both.
+    ///
+    /// Mutation: import only the top state as current in `import_session_cfe` — this reddens.
+    #[test]
+    fn the_platform_restore_keeps_previous_states_and_the_retire() {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+
+        let mut o = make_orchestrator("alice");
+        let peer = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let bundle = peer.get_registration_bundle().unwrap();
+        let identity = peer.key_manager().identity_public_key().unwrap().clone();
+        let device = crate::device_id::derive_device_id(&bundle.identity_public);
+        let x3dh = X3DHPublicKeyBundle {
+            identity_public: bundle.identity_public.clone(),
+            signed_prekey_public: bundle.signed_prekey_public.clone(),
+            signature: bundle.signature.clone(),
+            verifying_key: bundle.verifying_key.clone(),
+            suite_id: bundle.suite_id,
+            one_time_prekey_public: None,
+            one_time_prekey_id: None,
+            spk_uploaded_at: 0,
+            spk_rotation_epoch: 0,
+            kyber_spk_uploaded_at: 0,
+            kyber_spk_rotation_epoch: 0,
+        };
+        o.lifecycle
+            .client
+            .init_session(&device, &x3dh, &identity, 0)
+            .unwrap();
+        assert!(o.lifecycle.retire_current(&device));
+        let saved = o.export_session_cfe(&device).unwrap();
+
+        // A fresh core under the same local user stands in for the restart.
+        let mut restored = make_orchestrator("alice");
+        let id = restored.import_session_cfe(&device, &saved).unwrap();
+
+        assert!(id.is_empty(), "a retired top is not a current state");
+        assert!(!restored.lifecycle.has_active_session(&device));
+        assert_eq!(restored.lifecycle.previous_state_count(&device), 1);
     }
 
     /// A refused decrypt says why, beside the decryption error it produced.
