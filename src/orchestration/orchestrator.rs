@@ -5270,12 +5270,22 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        deliver(&mut bob, &alice_id, "old", alice.encrypt_bytes_for(&bob_id, b"old").unwrap(), 0);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        deliver(
+            &mut bob,
+            &alice_id,
+            "old",
+            alice.encrypt_bytes_for(&bob_id, b"old").unwrap(),
+            0,
+        );
 
         alice.remove_session_by_contact(&bob_id);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
         let sri = alice.encrypt_bytes_for(&bob_id, b"reset").unwrap();
         let actions = bob.queue_for_open(IncomingMessage {
             contact_id: alice_id.clone(),
@@ -5290,9 +5300,15 @@ mod pqxdh_v2_tests {
             Action::PendingDropped { message_ids, .. } if message_ids == &vec!["old".to_string()]
         )), "{actions:?}");
 
-        let opened = bob.open_receiving(&alice_id, &[alice.get_registration_bundle_fields().unwrap()]);
+        let opened = bob.open_receiving(
+            &alice_id,
+            &[alice.get_registration_bundle_fields().unwrap()],
+        );
         assert_eq!(opened.opener_message_id.as_deref(), Some("sri"));
-        assert_eq!(decrypted(&opened.actions), vec![("sri".to_string(), b"reset".to_vec())]);
+        assert_eq!(
+            decrypted(&opened.actions),
+            vec![("sri".to_string(), b"reset".to_vec())]
+        );
     }
 
     /// The peer's own init counts as in flight only while it is fresh — an unopenable handshake
@@ -5306,21 +5322,38 @@ mod pqxdh_v2_tests {
             "pending".to_string(),
             clock.clone(),
         );
-        bob.lifecycle.client.key_manager_mut().ensure_hybrid_signature_key().unwrap();
+        bob.lifecycle
+            .client
+            .key_manager_mut()
+            .ensure_hybrid_signature_key()
+            .unwrap();
         bob.begin_kyber_spk_rotation().unwrap();
         assert!(bob.commit_kyber_spk_rotation());
         let bob_id = crate::device_id::derive_device_id(
-            &bob.get_registration_bundle_fields().unwrap().identity_public,
+            &bob.get_registration_bundle_fields()
+                .unwrap()
+                .identity_public,
         );
         bob.set_my_user_id(bob_id.clone());
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        deliver(&mut bob, &alice_id, "m0", alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(), 0);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        deliver(
+            &mut bob,
+            &alice_id,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+            0,
+        );
 
         assert!(bob.peer_handshake_held(std::slice::from_ref(&alice_id)));
         assert!(!bob.peer_handshake_held(&["someone-else".to_string()]));
         clock.set_ms(1_000 + crate::orchestration::message_router::PEER_INIT_FRESH_MS + 1);
-        assert!(!bob.peer_handshake_held(&[alice_id]), "stale is not in flight");
+        assert!(
+            !bob.peer_handshake_held(&[alice_id]),
+            "stale is not in flight"
+        );
     }
 
     /// An END_SESSION drops what waited for the ratchet it tears down.
@@ -5329,8 +5362,16 @@ mod pqxdh_v2_tests {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        deliver(&mut bob, &alice_id, "m0", alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(), 0);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        deliver(
+            &mut bob,
+            &alice_id,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+            0,
+        );
         let actions = bob.handle_event(IncomingEvent::MessageReceived {
             message_id: "end".to_string(),
             from: alice_id.clone(),
@@ -5341,7 +5382,12 @@ mod pqxdh_v2_tests {
             is_control: true,
             content_type: 0,
         });
-        assert!(actions.iter().any(|a| matches!(a, Action::PendingDropped { .. })), "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::PendingDropped { .. })),
+            "{actions:?}"
+        );
         assert_eq!(bob.pending_message_count(&alice_id), 0);
     }
 
@@ -5353,18 +5399,35 @@ mod pqxdh_v2_tests {
     fn an_initiator_does_not_queue_the_superseded_handshake() {
         let ((mut bob, bob_id), (mut alice, alice_id)) = responder_pair();
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(&alice_id, &initiator_bundle_json(&alice), &msg0)
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
+        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.init_receiving_session_from_wire_payload(
+            &alice_id,
+            &initiator_bundle_json(&alice),
+            &msg0,
+        )
+        .unwrap();
         let (mut other, _) = named_device();
         other.set_my_user_id(alice_id.clone());
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        other.init_session_with_bundle(&bob_id, x3dh, kyber, false).unwrap();
-        let actions = deliver(&mut bob, &alice_id, "m", other.encrypt_bytes_for(&bob_id, b"x").unwrap(), 0);
-        assert!(actions.iter().any(
-            |a| matches!(a, Action::SessionHealNeeded { role, .. } if role == "Initiator")
-        ), "{actions:?}");
+        other
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let actions = deliver(
+            &mut bob,
+            &alice_id,
+            "m",
+            other.encrypt_bytes_for(&bob_id, b"x").unwrap(),
+            0,
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::SessionHealNeeded { role, .. } if role == "Initiator")
+            ),
+            "{actions:?}"
+        );
         assert_eq!(bob.pending_message_count(&alice_id), 0);
     }
 
