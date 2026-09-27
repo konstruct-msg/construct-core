@@ -35,9 +35,11 @@ const EPH_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
-/// Derive the ChaChaPoly key from an X25519 shared secret.
-fn derive_key(shared: &[u8; 32]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(SEALED_SALT), shared);
+/// Derive the ChaChaPoly key from an X25519 shared secret, under `salt` — the domain a box is
+/// sealed for. A box sealed under one salt does not open under another, so a box meant as one
+/// thing cannot be replayed as another.
+fn derive_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), shared);
     let mut key = [0u8; 32];
     hk.expand(&[], &mut key)
         .expect("HKDF-SHA256 with 32-byte output always succeeds");
@@ -66,6 +68,15 @@ pub fn seal_to_x25519_public(
     plaintext: &[u8],
     recipient_public: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    seal_in_domain(plaintext, recipient_public, SEALED_SALT)
+}
+
+/// `seal_to_x25519_public` under another domain salt. The box format is the same.
+pub(crate) fn seal_in_domain(
+    plaintext: &[u8],
+    recipient_public: &[u8],
+    salt: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let recipient_pub = PublicKey::from(as_key32(recipient_public, "recipient public key")?);
 
     let mut eph_seed = [0u8; 32];
@@ -74,7 +85,7 @@ pub fn seal_to_x25519_public(
     let ephemeral_pub = PublicKey::from(&ephemeral);
 
     let shared = ephemeral.diffie_hellman(&recipient_pub);
-    let key = derive_key(shared.as_bytes());
+    let key = derive_key(shared.as_bytes(), salt);
 
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
@@ -101,6 +112,15 @@ pub fn open_with_x25519_secret(
     sealed_box: &[u8],
     our_secret: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    open_in_domain(sealed_box, our_secret, SEALED_SALT)
+}
+
+/// `open_with_x25519_secret` for a box sealed by `seal_in_domain` under `salt`.
+pub(crate) fn open_in_domain(
+    sealed_box: &[u8],
+    our_secret: &[u8],
+    salt: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if sealed_box.len() < EPH_LEN + NONCE_LEN + TAG_LEN {
         return Err(CryptoError::InvalidInputError(format!(
             "sealed box too short: {} bytes",
@@ -114,7 +134,7 @@ pub fn open_with_x25519_secret(
 
     let our_priv = StaticSecret::from(as_key32(our_secret, "private key")?);
     let shared = our_priv.diffie_hellman(&ephemeral_pub);
-    let key = derive_key(shared.as_bytes());
+    let key = derive_key(shared.as_bytes(), salt);
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     cipher

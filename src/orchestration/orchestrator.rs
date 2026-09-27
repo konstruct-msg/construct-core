@@ -8,7 +8,7 @@
 /// ```
 ///
 /// The `Orchestrator` holds the full orchestration state:
-/// - `SessionLifecycleManager` (sessions current and previous, archives, ACK, PQ)
+/// - `SessionLifecycleManager` (sessions current and previous, ACK, PQ)
 /// - `MessageRouter` (routing decisions)
 /// - Coordinator state: init locks, cooldowns, prewarm tracking
 use std::collections::HashSet;
@@ -19,10 +19,12 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
+use crate::orchestration::decryption_error::{DecryptionError, DecryptionErrorHint};
 use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
+use crate::orchestration::session_lifecycle::RatchetKeyOwner;
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
-    Effect as SessionEffect, Event as SessionEvent, SessionMachine, TearDownCause,
+    Effect as SessionEffect, Event as SessionEvent, SessionMachine,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -171,6 +173,9 @@ pub struct Orchestrator {
     /// in place, and the next launch is when to try again — the peer may have updated by then.
     /// Within a launch, a second ask is the loop the batch timer would otherwise become.
     pq_upgrade_asked: HashSet<String>,
+    /// Messages already resent after a peer's decryption error. In memory: it bounds a loop within
+    /// a run, and a restart that forgets it costs at most one more resend of each.
+    resent_after_error: HashSet<String>,
     /// The server keys a sender certificate is checked against before it opens a session
     /// (`set_trusted_server_keys`). In memory: the platform sets them at every launch.
     trusted_server_keys: Vec<Vec<u8>>,
@@ -185,7 +190,8 @@ pub struct ReceivingOpen {
     pub opened_device: Option<String>,
     /// The message the session opened from.
     pub opener_message_id: Option<String>,
-    /// The archive of a replaced session, the opener's own answer, the save, the drain, the notice.
+    /// The opener's own answer, the save, the drain, the notice; on failure, a decryption error
+    /// for each message given up.
     pub actions: Vec<Action>,
     /// On failure: every carrier attempted or refused — each proven unable to open.
     pub tried_message_ids: Vec<String>,
@@ -234,6 +240,7 @@ impl Orchestrator {
             prewarm_done: HashSet::new(),
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
+            resent_after_error: HashSet::new(),
             trusted_server_keys: Vec::new(),
             clock,
         }
@@ -259,7 +266,6 @@ impl Orchestrator {
                 msg_num,
                 kem_ct,
                 otpk_id,
-                is_control,
                 content_type,
                 sender_certificate,
             } => self.handle_message_received(
@@ -269,7 +275,6 @@ impl Orchestrator {
                 msg_num,
                 kem_ct,
                 otpk_id,
-                is_control,
                 content_type,
                 sender_certificate,
             ),
@@ -306,55 +311,133 @@ impl Orchestrator {
                 data,
                 msg_num,
             } => self.handle_heartbeat_received(contact_id, message_id, data, msg_num),
-            IncomingEvent::TeardownRequested { contact_id, cause } => {
-                self.handle_teardown_requested(contact_id, cause)
-            }
-            IncomingEvent::PeerToreDown { contact_id } => {
-                self.sessions
-                    .handle(&contact_id, SessionEvent::PeerToreDown);
-                Vec::new()
-            }
+            IncomingEvent::DecryptionErrorReceived {
+                contact_id,
+                payload,
+            } => self.handle_decryption_error_received(contact_id, payload),
         }
     }
 
-    /// Answer the platform's "may I tear this ratchet down?".
+    /// A peer could not read something we sent it: `payload` is its sealed DECRYPTION_ERROR.
     ///
-    /// The answer is the same one `EndSessionNeeded` gets, from the same machine and the same
-    /// window, which is the point: before this the platform held a second window of its own and
-    /// the two could not see each other. A refusal is not a drop — the debt is recorded and the
-    /// timer pays it, exactly as it does for a teardown the core concluded itself.
-    fn handle_teardown_requested(
+    /// The error names the ratchet key of the message it could not read, and two questions are
+    /// answered from it separately:
+    ///
+    /// - **Retire?** Only when the key is our current state's. The next send then opens a new
+    ///   state. A key of a state already replaced is a stale error — redelivered, reordered, or one
+    ///   of several about the same state — and retires nothing: the exactness END_SESSION lacked
+    ///   and made up for with time windows.
+    /// - **Resend?** Whenever the key is one of ours, current or previous — every error of a burst
+    ///   names a different lost message — and once per message: a resend that fails too brings a
+    ///   second error, which does not send it a third time. That is the loop's bound.
+    ///
+    /// A key that is none of ours asks nothing of us.
+    fn handle_decryption_error_received(
         &mut self,
         contact_id: String,
-        cause: TearDownCause,
+        payload: Vec<u8>,
     ) -> Vec<Action> {
-        match self
-            .sessions
-            .handle(&contact_id, SessionEvent::WantToTearDown { cause })
+        let secret = match self
+            .lifecycle
+            .client
+            .key_manager()
+            .identity_secret_key_bytes()
         {
-            SessionEffect::DeferTearDown { retry_after_ms } => {
-                self.condemn_active_session(&contact_id);
-                vec![
-                    Action::EndSessionSuppressed {
-                        contact_id: contact_id.clone(),
-                        retry_after_ms,
-                    },
-                    Action::ScheduleTimer {
-                        timer_id: format!("cooldown_expired:{contact_id}"),
-                        delay_ms: retry_after_ms,
-                    },
-                ]
+            Ok(secret) => secret,
+            Err(e) => {
+                return vec![Action::NotifyError {
+                    code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
+                    message: format!("no identity key to open it with: {e:?}"),
+                }];
             }
-            // No timer: nothing is owed. The peer tore this ratchet down and knows it is gone,
-            // so the ask is answered rather than postponed — arming a retry here would be the
-            // 20 s grace's opposite, a guaranteed teardown back at a peer that already reset.
-            SessionEffect::TearDownNotNeeded => {
-                vec![Action::EndSessionNotNeeded { contact_id }]
+        };
+        let error = match DecryptionError::open(&payload, &secret) {
+            Ok(error) => error,
+            Err(e) => {
+                return vec![Action::NotifyError {
+                    code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
+                    message: format!("{e} (from {contact_id})"),
+                }];
             }
-            // No `NotifyLinkedDevicesOfSessionReset` here, unlike `EndSessionNeeded`. The caller
-            // is the platform, which reaches its own linked devices through the paths it already
-            // owns; emitting it would broadcast the same reset twice.
-            _ => vec![Action::SendEndSession { contact_id }],
+        };
+        let owner = self
+            .lifecycle
+            .ratchet_key_owner(&contact_id, &error.ratchet_key);
+        tracing::info!(
+            target: "orchestration",
+            contact_id = %contact_id,
+            message_id = %error.message_id,
+            ?owner,
+            "decryption error received"
+        );
+
+        let mut actions = Vec::new();
+        match owner {
+            RatchetKeyOwner::Unknown => return actions,
+            RatchetKeyOwner::Previous => {}
+            RatchetKeyOwner::Current => {
+                self.lifecycle.retire_current(&contact_id);
+                if let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
+                    actions.push(Action::SaveToSecureStore {
+                        slot: SecureStoreSlot::Session {
+                            contact_id: contact_id.clone(),
+                        },
+                        data: bytes.into(),
+                    });
+                }
+                actions.push(Action::SessionRetired {
+                    contact_id: contact_id.clone(),
+                    without_one_time_prekey: error.hint == DecryptionErrorHint::PrekeyUnavailable,
+                });
+            }
+        }
+        if self.resent_after_error.insert(error.message_id.clone()) {
+            actions.push(Action::ResendMessage {
+                contact_id,
+                message_id: error.message_id,
+            });
+        }
+        actions
+    }
+
+    /// Build the DECRYPTION_ERROR for a message from `contact_id` we could not read.
+    ///
+    /// `None` when the message does not carry what the error needs: a header to name the writer's
+    /// state by, and a sender certificate to seal it to. An unsealed message has no certificate
+    /// — only DEBUG builds send one — and the writer then learns nothing; there is no address to
+    /// tell it at that the relay could not also read.
+    fn decryption_error_for(
+        &self,
+        contact_id: &str,
+        message_id: &str,
+        ratchet_key: Option<Vec<u8>>,
+        writer_identity: Option<Vec<u8>>,
+        hint: DecryptionErrorHint,
+    ) -> Option<Action> {
+        let (Some(ratchet_key), Some(writer_identity)) = (ratchet_key, writer_identity) else {
+            tracing::warn!(
+                target: "orchestration",
+                contact_id = %contact_id,
+                message_id = %message_id,
+                "unreadable message carries no ratchet key or no certificate — no error can be sent"
+            );
+            return None;
+        };
+        let error = DecryptionError {
+            ratchet_key,
+            message_id: message_id.to_string(),
+            hint,
+        };
+        match error.seal(&writer_identity) {
+            Ok(payload) => Some(Action::SendDecryptionError {
+                contact_id: contact_id.to_string(),
+                message_id: message_id.to_string(),
+                payload,
+            }),
+            Err(e) => {
+                tracing::warn!(target: "orchestration", contact_id = %contact_id, "{e}");
+                None
+            }
         }
     }
 
@@ -378,6 +461,29 @@ impl Orchestrator {
     /// This is not a protocol reset and does not emit END_SESSION. It exists so
     /// local delete/re-add cannot reuse stale pending/control state and
     /// force the next add down the RESPONDER path.
+    /// The person reset the session with `contact_id`: retire the current state, as a peer's
+    /// decryption error would, and let the next send open a new one. Nothing is sent — the peer
+    /// opens the new state from its header beside the one it holds. What the peer still sends on
+    /// the retired state decrypts.
+    ///
+    /// Returns the save of the record, or nothing when there was no current state.
+    pub fn retire_session(&mut self, contact_id: &str) -> Vec<Action> {
+        if !self.lifecycle.retire_current(contact_id) {
+            return Vec::new();
+        }
+        self.lifecycle
+            .export_session_bytes_for(contact_id)
+            .map(|bytes| {
+                vec![Action::SaveToSecureStore {
+                    slot: SecureStoreSlot::Session {
+                        contact_id: contact_id.to_string(),
+                    },
+                    data: bytes.into(),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     pub fn forget_contact_state(&mut self, contact_id: &str) {
         self.router.forget_contact(contact_id);
         self.lifecycle.forget_contact_state(contact_id);
@@ -395,7 +501,7 @@ impl Orchestrator {
 
     /// Export the full orchestrator coordination state as a CFE binary blob.
     ///
-    /// Captures init locks, archive index, and
+    /// Captures init locks and the
     /// prekey tracker.  Persist under `SecureStoreSlot::OrchestratorState`.
     pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
         // Serialise only the device ids — timestamps are ephemeral, and the machine re-dates
@@ -631,20 +737,6 @@ impl Orchestrator {
         self.sessions.handle(contact_id, SessionEvent::OpenFailed);
     }
 
-    /// Drop what waits under `contact_id`, and say so.
-    fn drop_pending(&mut self, contact_id: &str) -> Option<Action> {
-        let dropped: Vec<String> = self
-            .router
-            .take_pending(contact_id)
-            .into_iter()
-            .map(|m| m.message_id)
-            .collect();
-        (!dropped.is_empty()).then(|| Action::PendingDropped {
-            contact_id: contact_id.to_string(),
-            message_ids: dropped,
-        })
-    }
-
     /// Whether any of `devices` is opening a session with us right now — a handshake of theirs
     /// queued within `PEER_INIT_FRESH_MS`. The platform passes an account's devices, including
     /// ones known so far only from a sender certificate.
@@ -673,7 +765,7 @@ impl Orchestrator {
     ///
     /// A failed attempt leaves nothing behind: a session already held with `device` is taken aside
     /// first and put back unless the attempt opens. One that opens replaces it, and the old one is
-    /// archived (`SessionTerminated`).
+    /// kept as a previous state.
     ///
     /// A certificate that could not be checked because no server key is set yet is not a failure:
     /// nothing is dropped and the answer says so (`awaiting_server_key`), so the platform retries
@@ -687,6 +779,7 @@ impl Orchestrator {
         let now = self.clock.now_secs() as i64;
         let mut last_error = None;
         let mut tried: Vec<String> = Vec::new();
+        let mut prekey_missing: HashSet<String> = HashSet::new();
         let mut awaiting_server_key = false;
         for carrier in self.router.pending_messages(device) {
             let Ok(first) = IncomingFirstMessage::from_wire_payload(&carrier.wire_payload) else {
@@ -748,6 +841,9 @@ impl Orchestrator {
                     if let Some(session) = held {
                         self.lifecycle.client.put_back_session(device, session);
                     }
+                    if e.starts_with("OTPK id=") || e.starts_with("PQXDH_KEY_UNAVAILABLE") {
+                        prekey_missing.insert(carrier.message_id.clone());
+                    }
                     last_error = Some(e);
                 }
             }
@@ -767,10 +863,38 @@ impl Orchestrator {
             };
         }
         // Nothing opened. What was tried is proven unopenable; the rest cannot open without a
-        // session either. The queue goes.
-        let dropped = self
-            .router
-            .take_pending(device)
+        // session either. The queue goes, and the writer is told about each message in it — by a
+        // decryption error it can act on, where it used to get a blind END_SESSION.
+        let given_up = self.router.take_pending(device);
+        let mut actions = Vec::new();
+        for message in &given_up {
+            let hint = if prekey_missing.contains(&message.message_id) {
+                DecryptionErrorHint::PrekeyUnavailable
+            } else {
+                DecryptionErrorHint::None
+            };
+            // Only to a writer the server vouches for: a certificate that fails its check names
+            // nobody we should answer.
+            let writer_identity = message
+                .sender_certificate
+                .as_ref()
+                .and_then(|c| c.identity_for_opening(&self.trusted_server_keys, now).ok())
+                .map(|key| key.to_vec())
+                .filter(|key| crate::device_id::derive_device_id(key) == device);
+            let ratchet_key = crate::wire_payload::unpack(&message.wire_payload)
+                .ok()
+                .map(|header| header.dh_public_key);
+            actions.extend(self.decryption_error_for(
+                device,
+                &message.message_id,
+                ratchet_key,
+                writer_identity,
+                hint,
+            ));
+            // Given up is answered: a redelivery is a duplicate, not a second open or error.
+            actions.extend(self.lifecycle.ack_store.mark_processed(&message.message_id));
+        }
+        let dropped = given_up
             .into_iter()
             .map(|m| m.message_id)
             .filter(|id| !tried.contains(id))
@@ -778,7 +902,7 @@ impl Orchestrator {
         ReceivingOpen {
             opened_device: None,
             opener_message_id: None,
-            actions: Vec::new(),
+            actions,
             tried_message_ids: tried,
             dropped_message_ids: dropped,
             last_error,
@@ -1601,7 +1725,6 @@ impl Orchestrator {
         msg_num: u32,
         kem_ct: Vec<u8>,
         _otpk_id: u32,
-        is_control: bool,
         content_type: u8,
         sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
     ) -> Vec<Action> {
@@ -1609,11 +1732,8 @@ impl Orchestrator {
         // parser instead of trusting the platform's copy of the header parse.
         // Android passes zeros (it has no wire-format knowledge at all); the event's
         // msg_num/kem_ct stay only as a fallback for callers that still fill them
-        // (iOS). Control messages are routed before decrypt, so their `data` is not
-        // required to be a wire payload.
-        let (msg_num, kem_ct) = if is_control {
-            (msg_num, kem_ct)
-        } else {
+        // (iOS).
+        let (msg_num, kem_ct) = {
             match crate::wire_payload::unpack(&data) {
                 Ok(d) => (d.message_number, d.kem_ciphertext.unwrap_or_default()),
                 // Legacy caller supplied fields — keep its exact routing behavior.
@@ -1638,7 +1758,6 @@ impl Orchestrator {
             wire_payload: data,
             message_id,
             msg_number: msg_num,
-            is_control,
             content_type,
         };
 
@@ -1656,7 +1775,7 @@ impl Orchestrator {
             // on restart, creating duplicate-processing risk before the DB check fires).
             RoutingDecision::Decrypted { .. }
                 | RoutingDecision::NeedSessionInit { .. }
-                | RoutingDecision::EndSessionNeeded { .. }
+                | RoutingDecision::DecryptionErrorNeeded { .. }
         );
         actions.extend(self.decision_to_actions(decision, &from));
         // Persist coordination state (ACK cache, init_locks) for
@@ -1955,64 +2074,11 @@ impl Orchestrator {
     fn handle_timer_fired(&mut self, timer_id: String) -> Vec<Action> {
         match timer_id.as_str() {
             "gc_sweep" => {
-                let mut actions = self.lifecycle.gc_old_archives();
-                actions.extend(self.lifecycle.ack_store.prune_expired());
+                let actions = self.lifecycle.ack_store.prune_expired();
                 self.sessions.prune_expired();
                 actions
             }
             "pq_upgrade_sweep" if cfg!(feature = "post-quantum") => self.pq_upgrade_sweep(),
-            _ if timer_id.starts_with("cooldown_expired:") => {
-                let contact_id = timer_id["cooldown_expired:".len()..].to_string();
-                let mut actions = vec![Action::ScheduleTimer {
-                    timer_id: "gc_sweep".to_string(),
-                    delay_ms: 100,
-                }];
-
-                // Pay out an END_SESSION this contact is owed.
-                //
-                // The old comment here said "the server will re-deliver any unACKed messages" and
-                // left it at that. It is not the server's to do: re-delivery only happens while
-                // the client holds its stream cursor back, and a message that arrived through
-                // GetPendingMessages is not tracked by any cursor at all. Both layers deferred to
-                // a third that was not holding anything.
-                // The machine decides whether the window's debt is paid; `Timeout` is the one
-                // alarm it asks for, and this is where the client's clock wakes it.
-                // Read before `Timeout`: paying the debt starts a fresh window, which carries none.
-                let condemned = self.sessions.condemned(&contact_id);
-                if self.sessions.handle(&contact_id, SessionEvent::Timeout)
-                    == SessionEffect::TearDown
-                {
-                    // Unless the session came back meanwhile. This is the case that MUST NOT
-                    // fire: tearing down a session established during the cooldown is the
-                    // crossing-teardown defect, and it is exactly what an unconditional
-                    // re-send would cause here.
-                    //
-                    // "Came back" is a *different* session, not any session. Until 2026-09-24
-                    // this asked `has_active_session`, and the debt is almost always owed against
-                    // a session that is still held — a diverged ratchet stays in place until the
-                    // END_SESSION that condemns it goes out, which is the thing being owed. So
-                    // the check dropped exactly the debts it was meant to pay (device logs: two
-                    // phones, one divergence, no teardown for an hour). A debt with no session
-                    // named — a restart dropped it, or none was held — keeps the old answer:
-                    // any session now present is treated as new.
-                    let current = self.lifecycle.active_session_id(&contact_id);
-                    if current.is_some() && current != condemned {
-                        tracing::info!(
-                            target: "orchestration",
-                            contact_id = %contact_id,
-                            "cooldown expired — owed END_SESSION dropped, session was re-established meanwhile"
-                        );
-                    } else {
-                        actions.push(Action::SendEndSession {
-                            contact_id: contact_id.clone(),
-                        });
-                        actions.push(Action::NotifyLinkedDevicesOfSessionReset {
-                            contact_id: contact_id.clone(),
-                        });
-                    }
-                }
-                actions
-            }
             _ => vec![],
         }
     }
@@ -2033,7 +2099,6 @@ impl Orchestrator {
             wire_payload: data,
             msg_number: msg_num,
             content_type: 13, // HEARTBEAT content type
-            is_control: false,
         };
         let decision = self.router.route_message(&mut self.lifecycle, &msg);
         match decision {
@@ -2047,16 +2112,9 @@ impl Orchestrator {
 
     // ── Decision → Actions ────────────────────────────────────────────────────
 
-    /// Name the ratchet a just-deferred teardown condemns, so the alarm that pays it can tell it
-    /// from one established in the meantime.
-    fn condemn_active_session(&mut self, contact_id: &str) {
-        let session = self.lifecycle.active_session_id(contact_id);
-        self.sessions.condemn(contact_id, session);
-    }
-
     /// Every decision a refused decrypt produced also says *why* it was refused.
     ///
-    /// The decision itself is a teardown, and it is the same for every cause; the
+    /// The decision itself is a decryption error, and it is the same for every cause; the
     /// cause is what a divergence is diagnosed from. Until 2026-09-24 it was dropped here
     /// (`reason: _`) and on the heal path (gone since 2026-09-27) never left the router, so a device log could
     /// show two phones answering every message with END_SESSION and not one word on what the
@@ -2064,7 +2122,7 @@ impl Orchestrator {
     /// action is the only channel that reaches the log.
     fn decision_to_actions(&mut self, decision: RoutingDecision, contact_id: &str) -> Vec<Action> {
         let refused = match &decision {
-            RoutingDecision::EndSessionNeeded { reason, .. } => Some(reason.clone()),
+            RoutingDecision::DecryptionErrorNeeded { reason, .. } => Some(reason.clone()),
             _ => None,
         };
         let mut actions = self.decide_actions(decision, contact_id);
@@ -2131,44 +2189,27 @@ impl Orchestrator {
                     _ => vec![Action::OpenReceiving { contact_id: cid }],
                 }
             }
-            RoutingDecision::EndSessionNeeded {
+            RoutingDecision::DecryptionErrorNeeded {
                 contact_id: cid,
+                message_id,
+                ratchet_key,
+                writer_identity,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
             } => {
-                // Evidence, and the decision that produced it says so: nothing we hold decrypts
-                // it and it carries no handshake — the peer is talking on a state we do not have.
-                // That is what buys the fast retry instead of the full window.
-                match self.sessions.handle(
+                // Nothing held reads it and it carries no handshake: the writer is on a state we
+                // do not have. Tell it, by the key it wrote with, and let the message go — the
+                // writer resends it on the state it opens next. Recorded as processed, so a
+                // redelivery is a duplicate and sends no second error: one per unread message.
+                let mut actions = self.lifecycle.ack_store.mark_processed(&message_id);
+                actions.extend(self.decryption_error_for(
                     &cid,
-                    SessionEvent::WantToTearDown {
-                        cause: TearDownCause::Unacknowledged,
-                    },
-                ) {
-                    SessionEffect::DeferTearDown { retry_after_ms } => {
-                        // Owed, not dropped: build 585 lost three media messages to a swallowed
-                        // teardown. The debt is a flag, so every suppression in the window folds
-                        // into the single teardown the timer pays.
-                        self.condemn_active_session(&cid);
-                        vec![
-                            Action::EndSessionSuppressed {
-                                contact_id: cid.clone(),
-                                retry_after_ms,
-                            },
-                            Action::ScheduleTimer {
-                                timer_id: format!("cooldown_expired:{cid}"),
-                                delay_ms: retry_after_ms,
-                            },
-                        ]
-                    }
-                    _ => vec![
-                        Action::SendEndSession {
-                            contact_id: cid.clone(),
-                        },
-                        // Notify linked devices so they can proactively heal with this contact.
-                        Action::NotifyLinkedDevicesOfSessionReset { contact_id: cid },
-                    ],
-                }
+                    &message_id,
+                    ratchet_key,
+                    writer_identity,
+                    DecryptionErrorHint::None,
+                ));
+                actions
             }
             RoutingDecision::Duplicate { message_id } => {
                 vec![Action::DuplicateDropped { message_id }]
@@ -2181,15 +2222,6 @@ impl Orchestrator {
                     code: "QUEUE_FULL".to_string(),
                     message: format!("Message queue full for {}", cid),
                 }]
-            }
-            RoutingDecision::EndSessionReceived {
-                contact_id: cid,
-                mut actions,
-            } => {
-                // What waited for this ratchet waits for nothing now: the sender tore it down,
-                // and its next handshake is the carrier of whatever comes next.
-                actions.extend(self.drop_pending(&cid));
-                actions
             }
             RoutingDecision::Error { message } => {
                 vec![Action::NotifyError {
@@ -2204,11 +2236,11 @@ impl Orchestrator {
 
     /// Build a `SaveToSecureStore` action that persists the full
     /// orchestrator coordination state (ACK cache, init_locks,
-    /// archive index, prekey tracker) to the platform's secure store.
+    /// prekey tracker) to the platform's secure store.
     ///
     /// Must be called after any event that mutates coordination state and does
     /// NOT already trigger a session-keyed save (e.g. NeedSessionInit,
-    /// EndSessionNeeded).  The `Decrypted` path already causes
+    /// DecryptionErrorNeeded).  The `Decrypted` path already causes
     /// Swift to call `saveOrchestratorStateCFE()` as a side-effect of the
     /// session save, so it does not need this action.
     fn orchestrator_state_action(&self) -> Option<Action> {
@@ -2259,8 +2291,6 @@ mod tests {
     use super::*;
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
-    use crate::orchestration::clock::MockClock;
-    use crate::orchestration::session_machine::END_SESSION_COOLDOWN_MS;
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
@@ -2297,7 +2327,6 @@ mod tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
         });
         // A handshake with no session: open from it (no active session → NeedSessionInit).
@@ -2319,7 +2348,6 @@ mod tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
         });
         assert!(
@@ -2353,7 +2381,6 @@ mod tests {
             msg_num: 0,
             kem_ct: kem.to_vec(),
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
         });
         let printed = format!("{actions:?}");
@@ -2374,7 +2401,6 @@ mod tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
         });
         assert!(
@@ -2448,327 +2474,29 @@ mod tests {
         );
     }
 
-    /// The window a teardown enters is the machine's, and a second teardown inside it is
-    /// deferred rather than sent. The transitions themselves are covered in `session_machine`;
-    /// this asserts the orchestrator asks.
-    #[test]
-    fn test_cooldown_deduplicates_end_session() {
-        let mut o = make_orchestrator("alice");
-        let first = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            first
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. }))
-        );
-        let second = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            second
-                .iter()
-                .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
-            "the second teardown inside the window is deferred, not sent"
-        );
-    }
-
-    /// The platform's teardown and the core's own share one window. They did not: the iOS
-    /// coordinator held `endSessionSentAt` (30 s) and the core held `cooldowns` (5 s), for the
-    /// same envelope to the same device, and neither could see the other's.
-    ///
-    /// Mutation: give `TeardownRequested` its own gate instead of `self.sessions` — this reddens.
-    #[test]
-    fn a_platform_teardown_shares_the_window_with_the_cores_own() {
-        let mut o = make_orchestrator("alice");
-        let first = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            first
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. }))
-        );
-        let asked = o.handle_event(IncomingEvent::TeardownRequested {
-            contact_id: "bob".to_string(),
-            cause: TearDownCause::Blind,
-        });
-        assert!(
-            asked
-                .iter()
-                .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
-            "the platform's ask lands inside the window the core's own teardown opened"
-        );
-        assert!(
-            asked.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "cooldown_expired:bob")
-            ),
-            "and it is owed, so the alarm that pays it is armed"
-        );
-    }
-
-    /// The peer's own teardown answers a blind ask of ours, and answers it **finally**: no
-    /// suppression action, no timer. This is the iOS 20 s `lastInboundEndSessionAt` grace, folded
-    /// into the one window that already decides whether a teardown may go out.
-    #[test]
-    fn the_peers_teardown_answers_a_blind_ask_without_owing_one() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::TeardownRequested {
-            contact_id: "bob".to_string(),
-            cause: TearDownCause::Blind,
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(&actions[0], Action::EndSessionNotNeeded { contact_id } if contact_id == "bob")
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::ScheduleTimer { .. })),
-            "nothing is owed, so nothing may arm a retry — a timer here is the grace inverted"
-        );
-    }
-
-    /// An explained teardown survives it. The peer cannot work out for itself that the one-time
-    /// pre-key it chose is unreproducible, so silence is the retry loop continuing.
-    #[test]
-    fn the_peers_teardown_does_not_answer_an_explained_ask() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::TeardownRequested {
-            contact_id: "bob".to_string(),
-            cause: TearDownCause::Explained,
-        });
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::EndSessionNotNeeded { .. })),
-            "an explained teardown is never answered away"
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::EndSessionSuppressed { .. })),
-            "it is held to the ordinary window, and owed"
-        );
-    }
-
-    /// The first ask of a quiet device is granted, and it is a plain `SendEndSession` — the
-    /// platform reaches its own linked devices through the paths it already owns, so the
-    /// broadcast that rides on `EndSessionNeeded` is not repeated here.
-    #[test]
-    fn a_platform_teardown_of_a_quiet_device_is_granted_alone() {
-        let mut o = make_orchestrator("alice");
-        let actions = o.handle_event(IncomingEvent::TeardownRequested {
-            contact_id: "bob".to_string(),
-            cause: TearDownCause::Blind,
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(&actions[0], Action::SendEndSession { contact_id } if contact_id == "bob")
-        );
-    }
-
-    // ── Suppression is a debt, not a drop ─────────────────────────────────────
-    //
-    // Build 585, iOS device 6bf51980, one five-second window:
-    //
-    //     msgNum=4  ackDbResult … actions=2 flags=end_session
-    //               SESSION_STATE[rust_end_session]: DR diverged for 0a1c609f… — sending END_SESSION
-    //     msgNum=5  ackDbResult … actions=0
-    //     msgNum=6  ackDbResult … actions=0
-    //     msgNum=7  ackDbResult … actions=0
-    //
-    // msgNum 4 set the cooldown; 5, 6 and 7 each produced `EndSessionNeeded` and each was
-    // answered with `vec![]`. Three media messages (3910 B, content_type 1) were never seen
-    // again. A message that fails to decrypt at msgNum > 0 is bound to a ratchet we no longer
-    // hold — it is not recoverable by re-reading it. What recovers it is the peer tearing down
-    // and re-sending, which is what END_SESSION asks for; suppressing the END_SESSION removed
-    // the only recovery there was, and said nothing about it.
-
-    fn make_orchestrator_with_clock(user_id: &str, clock: Arc<dyn Clock>) -> Orchestrator {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        Orchestrator::new_with_clock(client, user_id.to_string(), clock)
-    }
-
-    fn end_session_needed(cid: &str) -> RoutingDecision {
-        RoutingDecision::EndSessionNeeded {
+    fn decryption_error_needed(cid: &str) -> RoutingDecision {
+        RoutingDecision::DecryptionErrorNeeded {
             contact_id: cid.to_string(),
+            message_id: "unread".to_string(),
+            ratchet_key: None,
+            writer_identity: None,
             reason: "AEAD decryption failed".to_string(),
         }
     }
 
-    fn need_session_init(cid: &str) -> RoutingDecision {
-        RoutingDecision::NeedSessionInit {
-            contact_id: cid.to_string(),
-            queued_count: 1,
-        }
-    }
-
-    // ── Opening after the peer's teardown ───────────────────────────────────
-
-    /// A message that can open a session opens at once after the peer's teardown. Until
-    /// 2026-09-27 it waited the peer's flush out, so its open would not cross the peer's rebuild;
-    /// a record that keeps both states converges on the crossing by itself.
-    ///
-    /// Mutation: bring back a quiet in `WantToOpen` after `PeerToreDown` — this reddens.
-    #[test]
-    fn a_message_needing_a_session_opens_at_once_after_the_peers_teardown() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.decision_to_actions(need_session_init("bob"), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenReceiving { contact_id } if contact_id == "bob"))
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::ScheduleTimer { .. })),
-            "nothing waits, so nothing is armed"
-        );
-    }
-
-    /// A refused decrypt says why, beside the teardown it produced.
+    /// A refused decrypt says why, beside the decryption error it produced.
     #[test]
     fn a_refused_decrypt_reports_its_cause() {
         let mut o = make_orchestrator("alice");
-        let actions = o.decision_to_actions(end_session_needed("bob"), "");
+        let actions = o.decision_to_actions(decryption_error_needed("bob"), "");
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 Action::NotifyError { code, message }
                     if code == DECRYPT_FAILED && message == "AEAD decryption failed"
             )),
-            "the teardown lost the ratchet's reason: {actions:?}"
+            "the error lost the ratchet's reason: {actions:?}"
         );
-    }
-
-    #[test]
-    fn test_end_session_suppressed_by_cooldown_is_owed_not_dropped() {
-        let mut o = make_orchestrator("alice");
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-
-        let actions = o.decision_to_actions(end_session_needed("bob"), "");
-
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::EndSessionSuppressed { contact_id, .. } if contact_id == "bob")),
-            "the platform must be told, not handed an empty list it has to guess about"
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "cooldown_expired:bob")),
-            "nothing else will wake the orchestrator to pay the debt"
-        );
-        assert!(o.sessions.owes_teardown("bob"));
-    }
-
-    #[test]
-    fn test_owed_end_session_is_sent_when_the_cooldown_expires() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-
-        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "cooldown_expired:bob".to_string(),
-        });
-
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == "bob")),
-            "the teardown the cooldown deferred must actually go out"
-        );
-        assert!(!o.sessions.owes_teardown("bob"), "and only once");
-    }
-
-    #[test]
-    fn test_three_suppressions_in_one_window_collapse_into_one_teardown() {
-        // msgNum 5, 6, 7 — the incident. The cooldown must still damp the storm it was
-        // written for: three debts, one payment.
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-        for _ in 0..3 {
-            let _ = o.decision_to_actions(end_session_needed("bob"), "");
-        }
-
-        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "cooldown_expired:bob".to_string(),
-        });
-
-        let sends = actions
-            .iter()
-            .filter(|a| matches!(a, Action::SendEndSession { .. }))
-            .count();
-        assert_eq!(sends, 1);
-    }
-
-    // ── What must NOT fire ────────────────────────────────────────────────────
-    //
-    // An owed teardown paid out unconditionally is worse than the bug it fixes: it destroys
-    // whatever session exists when the timer happens to land. That is the crossing-teardown
-    // defect this project has been chasing all week from the other end.
-
-    #[test]
-    fn test_owed_end_session_is_void_once_the_session_is_re_established() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-        let _ = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(o.sessions.owes_teardown("bob"));
-
-        // A new session is built during the cooldown (iOS: proactive_init_success → SRI).
-        let _ = o.handle_event(IncomingEvent::SessionInitCompleted {
-            contact_id: "bob".to_string(),
-            session_data: vec![],
-        });
-
-        clock.advance_ms(END_SESSION_COOLDOWN_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "cooldown_expired:bob".to_string(),
-        });
-
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. })),
-            "the session that replaced the broken one must not be torn down by its debt"
-        );
-    }
-
-    #[test]
-    fn test_a_timer_for_a_contact_with_no_debt_sends_nothing() {
-        let mut o = make_orchestrator("alice");
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "cooldown_expired:bob".to_string(),
-        });
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. }))
-        );
-    }
-
-    #[test]
-    fn test_end_session_off_cooldown_is_still_sent_immediately() {
-        // The unchanged path. If this ever starts deferring, every teardown is a round trip late.
-        let mut o = make_orchestrator("alice");
-        let actions = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == "bob"))
-        );
-        assert!(!o.sessions.owes_teardown("bob"));
     }
 
     // ── The init lock says what it did ────────────────────────────────────────
@@ -2794,151 +2522,6 @@ mod tests {
             [Action::MessageQueuedPendingInit { contact_id, queued_count }]
                 if contact_id == "bob" && *queued_count == 2
         ));
-    }
-
-    /// A ratchet nobody has touched is `Absent`, so the first teardown goes out immediately.
-    /// If this ever starts deferring, every teardown is a round trip late.
-    #[test]
-    fn test_no_cooldown_initially() {
-        let mut o = make_orchestrator("alice");
-        assert_eq!(o.sessions.phase("bob"), crate::orchestration::Phase::Absent);
-        assert!(
-            o.decision_to_actions(end_session_needed("bob"), "")
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. }))
-        );
-    }
-
-    // ── The owed teardown names the session it condemns (2026-09-24) ─────────
-
-    /// Give `o` an initiator session with a fresh peer device, the way `init_session` leaves one.
-    fn hold_session_with_new_peer(o: &mut Orchestrator) -> String {
-        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-        use crate::device_id::derive_device_id;
-
-        let peer = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let bundle = peer.get_registration_bundle().unwrap();
-        let identity = peer.key_manager().identity_public_key().unwrap().clone();
-        let device = derive_device_id(&bundle.identity_public);
-        let x3dh = X3DHPublicKeyBundle {
-            identity_public: bundle.identity_public.clone(),
-            signed_prekey_public: bundle.signed_prekey_public.clone(),
-            signature: bundle.signature.clone(),
-            verifying_key: bundle.verifying_key.clone(),
-            suite_id: bundle.suite_id,
-            one_time_prekey_public: None,
-            one_time_prekey_id: None,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        };
-        o.lifecycle
-            .client
-            .init_session(&device, &x3dh, &identity, 0)
-            .unwrap();
-        device
-    }
-
-    fn pays_teardown(actions: &[Action], device: &str) -> bool {
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendEndSession { contact_id } if contact_id == device))
-    }
-
-    /// The device logs of 2026-09-24: a diverged ratchet stays held until the END_SESSION that
-    /// condemns it goes out, so the debt is owed against a session that is still there — and the
-    /// payout, asking only "is there a session?", read it as re-established and dropped itself.
-    ///
-    /// Mutation: restore `has_active_session` as the payout's check — this reddens.
-    #[test]
-    fn an_owed_teardown_against_the_session_still_held_is_paid() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        let device = hold_session_with_new_peer(&mut o);
-
-        let granted = o.decision_to_actions(end_session_needed(&device), "");
-        assert!(
-            pays_teardown(&granted, &device),
-            "the first teardown goes out"
-        );
-        let deferred = o.decision_to_actions(end_session_needed(&device), "");
-        assert!(o.sessions.owes_teardown(&device), "the second is owed");
-        assert!(!pays_teardown(&deferred, &device));
-        assert!(
-            o.lifecycle.has_active_session(&device),
-            "the premise: still held"
-        );
-
-        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
-        let paid = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: format!("cooldown_expired:{device}"),
-        });
-        assert!(
-            pays_teardown(&paid, &device),
-            "the debt was owed against the session that is still held, and was dropped"
-        );
-    }
-
-    /// The case the check exists for, kept: a session established during the cooldown is a
-    /// different ratchet, and tearing it down is the crossing-teardown defect.
-    ///
-    /// Mutation: pay whenever a debt is owed, ignoring the session — this reddens.
-    #[test]
-    fn an_owed_teardown_is_void_once_a_different_session_holds_the_device() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        let device = hold_session_with_new_peer(&mut o);
-
-        let _ = o.decision_to_actions(end_session_needed(&device), "");
-        let _ = o.decision_to_actions(end_session_needed(&device), "");
-        let condemned = o.lifecycle.active_session_id(&device);
-        assert!(condemned.is_some());
-
-        // A new ratchet with the same device, arrived without the event that cancels the debt.
-        o.lifecycle.client.remove_session(&device);
-        let replaced = hold_session_with_new_peer_as(&mut o, &device);
-        assert!(replaced);
-        assert_ne!(
-            o.lifecycle.active_session_id(&device),
-            condemned,
-            "the premise: a new session"
-        );
-
-        clock.advance_ms(END_SESSION_COOLDOWN_MS + 1);
-        let paid = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: format!("cooldown_expired:{device}"),
-        });
-        assert!(
-            !pays_teardown(&paid, &device),
-            "a session established during the cooldown was torn down by a debt owed to its predecessor"
-        );
-    }
-
-    /// Re-open a session under an existing device id, as a crossing re-init would.
-    fn hold_session_with_new_peer_as(o: &mut Orchestrator, device: &str) -> bool {
-        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-
-        let peer = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let bundle = peer.get_registration_bundle().unwrap();
-        let identity = peer.key_manager().identity_public_key().unwrap().clone();
-        let x3dh = X3DHPublicKeyBundle {
-            identity_public: bundle.identity_public.clone(),
-            signed_prekey_public: bundle.signed_prekey_public.clone(),
-            signature: bundle.signature.clone(),
-            verifying_key: bundle.verifying_key.clone(),
-            suite_id: bundle.suite_id,
-            one_time_prekey_public: None,
-            one_time_prekey_id: None,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        };
-        o.lifecycle
-            .client
-            .init_session(device, &x3dh, &identity, 0)
-            .is_ok()
     }
 }
 
@@ -3446,7 +3029,6 @@ mod pqxdh_v2_tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: ct,
         })
     }
@@ -3504,7 +3086,6 @@ mod pqxdh_v2_tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
         })
     }
@@ -3739,13 +3320,6 @@ mod pqxdh_v2_tests {
             decrypted(&opened.actions),
             vec![("m-reinit".to_string(), b"again".to_vec())]
         );
-        assert!(
-            !opened
-                .actions
-                .iter()
-                .any(|a| matches!(a, Action::SessionTerminated { .. })),
-            "the replaced state is kept, not archived"
-        );
         assert_ne!(
             bob.get_session_health(&alice_id).unwrap().session_id,
             before
@@ -3775,13 +3349,12 @@ mod pqxdh_v2_tests {
         actions
     }
 
-    fn tears_down(actions: &[Action]) -> bool {
-        actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::SendEndSession { .. } | Action::EndSessionSuppressed { .. }
-            )
-        })
+    /// Whether the answer tells the peer a message could not be read — what a converging exchange
+    /// never needs.
+    fn reports_unreadable(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendDecryptionError { .. }))
     }
 
     /// Both sides open at once, each by sending — the crossing the tie-break and the SRI confirm
@@ -3835,7 +3408,7 @@ mod pqxdh_v2_tests {
             "both records settled on one state"
         );
         for actions in [&at_bob, &at_alice] {
-            assert!(!tears_down(actions), "{actions:?}");
+            assert!(!reports_unreadable(actions), "{actions:?}");
         }
     }
 
@@ -3860,7 +3433,210 @@ mod pqxdh_v2_tests {
         assert_eq!(decrypted(&first), vec![("m1".to_string(), b"m1".to_vec())]);
         let next = receive(&mut bob, &alice, &alice_id, &server, "m2", m2);
         assert_eq!(decrypted(&next), vec![("m2".to_string(), b"m2".to_vec())]);
-        assert!(!tears_down(&first) && !tears_down(&next));
+        assert!(!reports_unreadable(&first) && !reports_unreadable(&next));
+    }
+
+    // ── A decryption error instead of END_SESSION (variant B) ─────────────────
+
+    /// Alice and Bob hold one state, both directions used (Alice's header is gone).
+    fn converged(
+        alice: &mut Orchestrator,
+        alice_id: &str,
+        bob: &mut Orchestrator,
+        bob_id: &str,
+        server: &TestServer,
+    ) {
+        let (x3dh, kyber) = bundle_of(bob, true);
+        alice
+            .init_session_with_bundle(bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(bob_id, b"hello").unwrap();
+        receive(bob, alice, alice_id, server, "m0", m0);
+        let reply = bob.encrypt_bytes_for(alice_id, b"hi").unwrap();
+        alice.decrypt_bytes_for(bob_id, &reply).unwrap();
+    }
+
+    fn error_payload(actions: &[Action], about: &str) -> Vec<u8> {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendDecryptionError {
+                    message_id,
+                    payload,
+                    ..
+                } if message_id == about => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no decryption error about {about}: {actions:?}"))
+    }
+
+    /// Bob lost the state; Alice's next message cannot be read. Bob tells her, by the key she
+    /// wrote with; she retires the state and resends, and the resend opens a new one Bob reads.
+    /// What END_SESSION did, with the state named instead of guessed.
+    ///
+    /// Mutation: skip `retire_current` in `handle_decryption_error_received` — the resend goes out
+    /// on the state Bob cannot read, and this reddens.
+    #[test]
+    fn an_unread_message_retires_the_writers_state_and_the_resend_opens_a_new_one() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        bob.forget_contact_state(&alice_id);
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        let payload = error_payload(&answer, "lost");
+
+        let retired = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload,
+        });
+        assert!(retired.iter().any(|a| matches!(
+            a,
+            Action::SessionRetired { contact_id, without_one_time_prekey: false } if *contact_id == bob_id
+        )), "{retired:?}");
+        assert!(
+            retired.iter().any(|a| matches!(
+                a,
+                Action::ResendMessage { message_id, .. } if message_id == "lost"
+            )),
+            "{retired:?}"
+        );
+        assert!(!alice.has_active_session(&bob_id));
+
+        // What the platform does with `ResendMessage` and no session: open by sending.
+        if !alice.has_active_session(&bob_id) {
+            let (x3dh, kyber) = bundle_of(&mut bob, true);
+            alice
+                .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+                .unwrap();
+        }
+        let again = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let got = receive(&mut bob, &alice, &alice_id, &server, "lost-again", again);
+        assert_eq!(
+            decrypted(&got),
+            vec![("lost-again".to_string(), b"lost".to_vec())]
+        );
+        assert!(!reports_unreadable(&got));
+    }
+
+    /// The same error twice, or an error about a state already replaced, retires nothing: the key
+    /// is no longer the current state's. And the message is resent once. This is what the 30 s
+    /// END_SESSION window, the retry budget and the stale-by-timestamp check stood in for.
+    ///
+    /// Mutation: retire on `RatchetKeyOwner::Previous` too — this reddens.
+    #[test]
+    fn a_stale_error_retires_nothing_and_resends_nothing_twice() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        bob.forget_contact_state(&alice_id);
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        let payload = error_payload(&answer, "lost");
+        alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload: payload.clone(),
+        });
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let fresh = alice.lifecycle.active_session_id(&bob_id);
+
+        let again = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload,
+        });
+        assert!(again.is_empty(), "a stale error acted: {again:?}");
+        assert_eq!(alice.lifecycle.active_session_id(&bob_id), fresh);
+    }
+
+    /// An error naming a key that is none of ours — forged, or about a state long pruned — does
+    /// nothing at all.
+    #[test]
+    fn an_error_about_no_state_of_ours_does_nothing() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let identity = alice
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        let forged = crate::orchestration::decryption_error::DecryptionError {
+            ratchet_key: vec![5; 32],
+            message_id: "anything".to_string(),
+            hint: DecryptionErrorHint::None,
+        }
+        .seal(&identity)
+        .unwrap();
+        let answer = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload: forged,
+        });
+        assert!(answer.is_empty(), "{answer:?}");
+        assert!(alice.has_active_session(&bob_id));
+    }
+
+    /// One error per unread message: a redelivery is a duplicate by then.
+    ///
+    /// Mutation: drop the `mark_processed` in the `DecryptionErrorNeeded` arm — this reddens.
+    #[test]
+    fn a_redelivered_unread_message_sends_no_second_error() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        bob.forget_contact_state(&alice_id);
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let first = receive(&mut bob, &alice, &alice_id, &server, "lost", lost.clone());
+        assert!(reports_unreadable(&first));
+        let second = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        assert!(!reports_unreadable(&second), "{second:?}");
+    }
+
+    /// A handshake Bob cannot open because the one-time Kyber key it names is gone: the error
+    /// says so, and Alice's next open goes without a one-time prekey. What END_SESSION's
+    /// `OTPK_UNREPRODUCIBLE` reason carried, now inside the sealed error.
+    ///
+    /// Mutation: always send `DecryptionErrorHint::None` from `open_receiving` — this reddens.
+    #[test]
+    fn a_handshake_whose_prekey_is_gone_asks_for_an_open_without_one() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let burned = kyber
+            .one_time_prekey_id
+            .expect("the bundle carries a one-time key");
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        bob.lifecycle
+            .client
+            .key_manager_mut()
+            .kyber_prekeys_mut()
+            .remove_otpk(burned);
+
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "m0", m0);
+        let payload = error_payload(&answer, "m0");
+
+        let retired = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload,
+        });
+        assert!(
+            retired.iter().any(|a| matches!(
+                a,
+                Action::SessionRetired {
+                    without_one_time_prekey: true,
+                    ..
+                }
+            )),
+            "{retired:?}"
+        );
     }
 
     /// Alice reopens over the session they hold. What she sent on the old state before the reopen
@@ -3904,7 +3680,7 @@ mod pqxdh_v2_tests {
             vec![("late".to_string(), b"late".to_vec())]
         );
         for actions in [&opened, &earlier, &old] {
-            assert!(!tears_down(actions), "{actions:?}");
+            assert!(!reports_unreadable(actions), "{actions:?}");
         }
     }
 
@@ -4009,7 +3785,7 @@ mod pqxdh_v2_tests {
             ),
             "{again:?}"
         );
-        assert!(!tears_down(&again));
+        assert!(!reports_unreadable(&again));
         assert!(
             !again
                 .iter()
@@ -4068,42 +3844,6 @@ mod pqxdh_v2_tests {
             !bob.peer_handshake_held(&[alice_id]),
             "stale is not in flight"
         );
-    }
-
-    /// An END_SESSION drops what waited for the ratchet it tears down.
-    #[test]
-    fn an_end_session_drops_what_waited_for_its_ratchet() {
-        let (mut alice, alice_id) = named_device();
-        let (mut bob, bob_id) = named_device();
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        deliver(
-            &mut bob,
-            &alice_id,
-            "m0",
-            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
-            0,
-        );
-        let actions = bob.handle_event(IncomingEvent::MessageReceived {
-            sender_certificate: None,
-            message_id: "end".to_string(),
-            from: alice_id.clone(),
-            data: b"__END_SESSION__".to_vec(),
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
-            is_control: true,
-            content_type: 0,
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::PendingDropped { .. })),
-            "{actions:?}"
-        );
-        assert_eq!(bob.pending_message_count(&alice_id), 0);
     }
 
     /// A redelivery of a message that waits is not a second carrier.

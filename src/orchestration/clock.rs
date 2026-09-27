@@ -1,11 +1,10 @@
 /// Monotonic-safe clock abstraction for the orchestration layer.
 ///
-/// All TTL checks (cooldowns, init-lock timeouts, archive GC, ACK expiry,
-/// heal-attempt TTLs) go through this trait instead of calling
-/// `SystemTime::now()` directly.  This protects against:
+/// All TTL checks (init-lock timeouts, previous-state expiry, ACK expiry) go through this trait
+/// instead of calling `SystemTime::now()` directly.  This protects against:
 ///
-/// - **NTP jump backwards** — cooldown resets, flood-protection disabled.
-/// - **NTP jump forwards** — all archives/heals/ACKs instantly expire.
+/// - **NTP jump backwards** — an init lock or a previous state outlives its window.
+/// - **NTP jump forwards** — previous states and ACKs instantly expire.
 /// - **Testability** — `MockClock` lets unit tests control time without sleep.
 ///
 /// Platform code uses `SystemClock`.  Integration tests inject `MockClock`.

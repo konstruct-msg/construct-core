@@ -352,6 +352,21 @@ pub struct CfeSessionStateV1 {
     /// `decisions/sessions-renew-by-sending.md`.
     #[serde(rename = "prev", default, skip_serializing_if = "Vec::is_empty")]
     pub previous: Vec<CfePreviousStateV1>,
+    /// Set when the record holds no current state: the top-level state is then the newest
+    /// previous one, retired as this says. A record retired by the peer's decryption error has
+    /// only previous states until the next send opens a new one, and must survive a restart
+    /// meanwhile.
+    #[serde(rename = "ret", default, skip_serializing_if = "Option::is_none")]
+    pub retired: Option<CfeRetiredMarkV1>,
+}
+
+/// How the top-level state of a record with no current state was retired.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeRetiredMarkV1 {
+    #[serde(rename = "at")]
+    pub retired_at: u64,
+    #[serde(rename = "hb", default)]
+    pub held_back: bool,
 }
 
 /// A session state a newer one replaced, and when.
@@ -362,6 +377,10 @@ pub struct CfePreviousStateV1 {
     pub retired_at: u64,
     #[serde(rename = "s")]
     pub state: CfeSessionStateV1,
+    /// Retired because the peer could not read it: it still decrypts what arrives on it, but is
+    /// never made current again (`SessionLifecycleManager::retire_current`).
+    #[serde(rename = "hb", default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_back: bool,
 }
 
 /// One completed PQ-ratchet epoch: id + 32-byte ML-KEM-768 shared secret.
@@ -579,12 +598,9 @@ pub struct CfeOrchestratorStateV1 {
     /// Contact IDs for which a session-init RPC is currently in flight.
     #[serde(rename = "locks")]
     pub init_locks: Vec<String>,
-    /// contactId → archived session CFE binary (latest archive per contact).
-    #[serde(rename = "arcs")]
-    pub archives: Vec<(String, SecretBytes)>,
-    /// contactId → Unix timestamp of the archive (for GC).
-    #[serde(rename = "arc_ts")]
-    pub archive_timestamps: Vec<(String, u64)>,
+    // `arcs` and `arc_ts` (the core's archive of a session an END_SESSION tore down) were here
+    // until 2026-09-27; END_SESSION is gone and a record keeps its previous states instead. The
+    // named-map codec ignores the keys in older blobs. Do not reuse the names.
     /// contactId → last seen OTPK ID (reinstall detection).
     #[serde(rename = "ptk")]
     pub prekey_tracker: Vec<(String, u32)>,

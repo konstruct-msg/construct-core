@@ -1,9 +1,8 @@
-/// Action — платформенная операция, которую Rust-ядро просит выполнить Swift/Kotlin.
-///
-/// Rust принимает события, вычисляет решения и возвращает `Vec<Action>`.
-/// Платформенный слой исполняет каждое действие и при необходимости передаёт
-/// результат обратно через `IncomingEvent`.
-use crate::orchestration::session_machine::TearDownCause;
+//! Action — платформенная операция, которую Rust-ядро просит выполнить Swift/Kotlin.
+//!
+//! Rust принимает события, вычисляет решения и возвращает `Vec<Action>`.
+//! Платформенный слой исполняет каждое действие и при необходимости передаёт
+//! результат обратно через `IncomingEvent`.
 
 /// Which durable slot a `SaveToSecureStore` payload belongs in.
 ///
@@ -23,8 +22,6 @@ use crate::orchestration::session_machine::TearDownCause;
 pub enum SecureStoreSlot {
     /// Double Ratchet state for one contact. Empty payload means delete.
     Session { contact_id: String },
-    /// A terminated session, kept for late-arriving messages. Empty payload means delete.
-    SessionArchive { contact_id: String },
     /// Orchestrator coordination state.
     OrchestratorState,
 }
@@ -65,38 +62,6 @@ pub enum Action {
         message_id: String,
         /// Serialised `WebRTCSignal` protobuf bytes.
         proto_bytes: Vec<u8>,
-    },
-
-    /// Messages the core had queued for a session with `contact_id` and has now dropped, because
-    /// what they waited for is gone: the sender tore the session down (END_SESSION). The platform
-    /// releases their envelopes and lets the stream cursor past them.
-    PendingDropped {
-        contact_id: String,
-        message_ids: Vec<String>,
-    },
-
-    /// An `EndSessionNeeded` decision was suppressed by the per-contact cooldown, and the
-    /// orchestrator has taken ownership of sending it once the cooldown clears (in
-    /// `retry_after_ms`). The platform must NOT acknowledge the message.
-    ///
-    /// This used to be `return vec![]` — indistinguishable from `Duplicate`'s empty verdict,
-    /// so iOS guessed ("dropped, pending redelivery") and the teardown was never sent at all.
-    /// Recovery for a message that failed to decrypt at msgNum > 0 runs entirely through the
-    /// peer: END_SESSION makes it re-establish and re-send. Suppressing the END_SESSION
-    /// suppresses the recovery, and build 585 lost three media messages that way.
-    EndSessionSuppressed {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-
-    /// A teardown was asked for and is **not** being sent, now or later: the peer tore this
-    /// ratchet down itself and a blind teardown back tells it what it just told us.
-    ///
-    /// Distinct from `EndSessionSuppressed`, which owes the send and arms a timer. This owes
-    /// nothing, so a platform that schedules a retry on it is scheduling the storm. It replaced
-    /// the platform's own 20 s `lastInboundEndSessionAt` grace.
-    EndSessionNotNeeded {
-        contact_id: String,
     },
 
     /// Open a new session with `contact_id` as INITIATOR, over the one held: fetch the bundle and
@@ -178,8 +143,36 @@ pub enum Action {
         message_id: String,
         status: ReceiptStatus,
     },
-    SendEndSession {
+    /// We could not read `message_id` from `contact_id`: send `payload` to that device as a
+    /// DECRYPTION_ERROR (content type 28) envelope, sealed-sender, and acknowledge the message.
+    ///
+    /// `payload` is complete — the core built and sealed it to the writer's identity key. It names
+    /// the unread message's ratchet key, so the writer can tell whether its current state is the
+    /// one that failed (`decryption_error`). One per unread message; a redelivery of the same one
+    /// is a duplicate by then and sends nothing.
+    SendDecryptionError {
         contact_id: String,
+        message_id: String,
+        payload: Vec<u8>,
+    },
+
+    /// The peer could not read what we sent on the current state with `contact_id`, and the state
+    /// is retired (`SessionLifecycleManager::retire_current`). There is no current state until
+    /// the next send opens one; what the peer still sends on the retired one decrypts.
+    ///
+    /// `without_one_time_prekey`: the peer does not hold the one-time prekey it would be given,
+    /// so the next open should not use one.
+    SessionRetired {
+        contact_id: String,
+        without_one_time_prekey: bool,
+    },
+
+    /// The peer could not read `message_id`: send it again to `contact_id`, as a new message on
+    /// whatever state is current — after a `SessionRetired` in the same answer, that resend is what
+    /// opens the new one. Asked once per message.
+    ResendMessage {
+        contact_id: String,
+        message_id: String,
     },
 
     // ── UI ────────────────────────────────────────────────────────────────────
@@ -210,29 +203,6 @@ pub enum Action {
     CancelTimer {
         timer_id: String,
     },
-
-    // ── Multi-device ──────────────────────────────────────────────────────────
-    /// Notify all linked devices that the session with `contact_id` was reset.
-    /// Each device should independently trigger a heal with that contact.
-    /// The platform broadcasts this via the existing "send to own devices" path.
-    NotifyLinkedDevicesOfSessionReset {
-        contact_id: String,
-    },
-
-    /// Rust has archived and removed the session for `contact_id`.
-    ///
-    /// Platform MUST:
-    ///   1. Store `archive_bytes` in the archive store (keyed by `contact_id`).
-    ///   2. Delete the hot session Keychain/Keystore entry for `contact_id`.
-    ///
-    /// Replaces the two-action pattern of `SaveSessionToSecureStore("archive_<id>", bytes)`
-    /// + `SaveSessionToSecureStore("session_<id>", [])` with a single semantic action.
-    ///   Android can implement the identical behaviour against Android Keystore.
-    SessionTerminated {
-        contact_id: String,
-        /// The archived session record — root and chain keys included, so `SecretBytes`.
-        archive_bytes: crate::crypto::SecretBytes,
-    },
 }
 
 /// Delivery / read receipt status.
@@ -258,8 +228,6 @@ pub enum IncomingEvent {
         /// ML-KEM-768 ciphertext (empty if no PQ contribution in this message).
         kem_ct: Vec<u8>,
         otpk_id: u32,
-        /// `true` when this is a control message (e.g. END_SESSION).
-        is_control: bool,
         /// Content-type from the server envelope (proto ContentType enum value).
         /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
         content_type: u8,
@@ -322,36 +290,17 @@ pub enum IncomingEvent {
         message_id: String,
         is_processed: bool,
     },
-    /// The platform is about to tear down the ratchet with `contact_id` and is asking whether
-    /// it may.
-    ///
-    /// Every other teardown in this file is the core's own conclusion from a message it routed.
-    /// This one is the platform's: an init that failed terminally, a DR
-    /// divergence noticed outside the routing path. Those are facts only the platform has, and
-    /// before this event existed it answered them with a second cooldown of its own — a 30 s
-    /// window in `SessionCoordinator` beside the core's 5 s, neither aware of the other. See
-    /// `construct-docs/decisions/session-is-one-state-machine.md`, step 2.
-    ///
-    /// `cause` says what this teardown knows, which is what decides how soon it may go — and
-    /// whether the peer's own teardown silences it. It replaced a `peer_on_dead_session: bool`
-    /// that the platform also fed to `plan_teardown`, where it answers a different question; one
-    /// value carrying two meanings is how the blind and the explained teardown ended up
-    /// indistinguishable here.
-    TeardownRequested {
+    /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id` — the device its sender
+    /// certificate names. `payload` is the envelope's sealed box, opened here with our identity
+    /// key. Answered with `SessionRetired` when the error is about our current state, and with
+    /// nothing when it is stale.
+    DecryptionErrorReceived {
         contact_id: String,
-        cause: TearDownCause,
-    },
-    /// The **peer** tore down the ratchet with `contact_id`, and the platform has applied it.
-    ///
-    /// A report, not a request: nothing is asked and nothing is returned but the phase. It opens
-    /// the same window a teardown of ours opens, which is what folds the platform's 20 s inbound
-    /// grace into the machine — the second of step 2's five timers.
-    PeerToreDown {
-        contact_id: String,
+        payload: Vec<u8>,
     },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if nothing held decrypts it,
-    /// the answer is the one any message gets (a receiving open or a teardown).
+    /// the answer is the one any message gets (a receiving open or a decryption error).
     HeartbeatReceived {
         contact_id: String,
         message_id: String,

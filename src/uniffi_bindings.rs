@@ -1626,7 +1626,6 @@ mod tests {
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
-            is_control: false,
             content_type: 0,
             sender_certificate: None,
         }
@@ -1636,7 +1635,7 @@ mod tests {
     ///
     /// `forget_contact_state` was implemented, unit-tested at two levels, and absent from the
     /// UDL — so the only deletion a platform could reach was `remove_session`, which drops the
-    /// ratchet and leaves the queue, the init lock, the archive, the prekey counter and the PQ
+    /// ratchet and leaves the queue, the init lock, the prekey counter and the PQ
     /// contribution behind. iOS shipped that for months: "delete this
     /// contact" removed the session and the next add was steered by the deleted contact's
     /// leftovers.
@@ -2891,33 +2890,6 @@ impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier 
     }
 }
 
-/// Mirror of the UDL `TeardownAction` enum (must match UDL name exactly).
-///
-/// See `orchestration::teardown_plan` for why the decision is made here rather than in a client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TeardownAction {
-    SendAndArchive,
-    SendOnly,
-    Skip,
-}
-
-/// Mirror of the UDL `TeardownDecision` dictionary.
-#[derive(Debug, Clone)]
-pub struct TeardownDecision {
-    pub device_id: String,
-    pub action: TeardownAction,
-}
-
-impl From<crate::orchestration::TeardownAction> for TeardownAction {
-    fn from(a: crate::orchestration::TeardownAction) -> Self {
-        match a {
-            crate::orchestration::TeardownAction::SendAndArchive => TeardownAction::SendAndArchive,
-            crate::orchestration::TeardownAction::SendOnly => TeardownAction::SendOnly,
-            crate::orchestration::TeardownAction::Skip => TeardownAction::Skip,
-        }
-    }
-}
-
 /// The UDL `InitiationDecision` / `InitiationContext` types, re-exported rather than mirrored.
 ///
 /// The neighbours above define a second copy of an orchestration type and convert between them.
@@ -3165,28 +3137,6 @@ impl OrchestratorCore {
         orch.get_all_session_contact_ids()
     }
 
-    /// Which of `candidate_device_ids` a session teardown goes to, and what to do with each.
-    ///
-    /// The caller translates its own id space into the device set and passes the set; the decision
-    /// over it is made here, because "which sessions does this operation touch" is protocol and a
-    /// client that answers it answers it differently from the next client. See
-    /// `orchestration::teardown_plan`.
-    pub fn plan_teardown(
-        &self,
-        candidate_device_ids: Vec<String>,
-        peer_on_dead_session: bool,
-    ) -> Vec<TeardownDecision> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let active = orch.get_all_session_contact_ids();
-        crate::orchestration::plan_teardown(&candidate_device_ids, &active, peer_on_dead_session)
-            .into_iter()
-            .map(|d| TeardownDecision {
-                device_id: d.device_id,
-                action: d.action.into(),
-            })
-            .collect()
-    }
-
     pub fn has_session(&self, contact_id: String) -> bool {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.has_active_session(&contact_id)
@@ -3413,8 +3363,8 @@ impl OrchestratorCore {
     ///
     /// Designed for `BackgroundFetchManager`: decrypts N messages in a single lock
     /// acquisition, returning a per-message result without aborting on individual
-    /// failures.  Session is never archived on decrypt failure — the foreground
-    /// stream owns all recovery logic (END_SESSION, re-init, healing).
+    /// failures.  Nothing is retired or reported on a decrypt failure here — the
+    /// foreground stream owns recovery (the decryption error to the writer).
     pub fn decrypt_offline_batch(
         &self,
         messages: Vec<OfflineBatchMessage>,
@@ -3455,6 +3405,16 @@ impl OrchestratorCore {
         orch.remove_session_by_contact(&contact_id)
     }
 
+    /// The person reset the session with `contact_id`. See `Orchestrator::retire_session`: local,
+    /// nothing is sent, the next send opens a new state. Execute the returned save.
+    pub fn retire_session(&self, contact_id: String) -> Vec<CfeAction> {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.retire_session(&contact_id)
+            .into_iter()
+            .map(CfeAction::from_action)
+            .collect()
+    }
+
     /// Drop every piece of local orchestration state this core holds about `contact_id`.
     ///
     /// `remove_session` is not this. It removes the ratchet and nothing else, so an archive, a
@@ -3463,9 +3423,8 @@ impl OrchestratorCore {
     /// has already forgotten. The platform has no way to reach any of them: they are private to
     /// this crate, which is why "delete the contact" could not be expressed until now.
     ///
-    /// Deliberately silent on the wire. This is a local deletion boundary, not a protocol reset:
-    /// it archives nothing and sends no END_SESSION, because the caller that wants a peer told
-    /// has already told them (`plan_teardown`) before forgetting them.
+    /// Deliberately silent on the wire. This is a local deletion boundary, not a protocol reset;
+    /// since 2026-09-27 nothing tells a peer about one (`decisions/sessions-renew-by-sending.md`).
     pub fn forget_contact_state(&self, contact_id: String) {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.forget_contact_state(&contact_id);
@@ -3607,8 +3566,8 @@ impl OrchestratorCore {
         })
     }
 
-    /// Export the full orchestrator coordination state (ACK cache, healing queue,
-    /// init locks, archive index, prekey tracker) as a CFE binary blob.
+    /// Export the full orchestrator coordination state (init locks, prekey tracker, pins)
+    /// as a CFE binary blob.
     ///
     /// Persist under `SecureStoreSlot::OrchestratorState` via
     /// `SaveToSecureStore`.  Import at app startup to restore all queues.
@@ -3643,7 +3602,6 @@ pub enum CfeIncomingEvent {
         msg_num: u32,
         kem_ct: Vec<u8>,
         otpk_id: u32,
-        is_control: bool,
         content_type: u8,
         sender_certificate: Option<SenderCertificate>,
     },
@@ -3685,41 +3643,11 @@ pub enum CfeIncomingEvent {
         data: Vec<u8>,
         msg_num: u32,
     },
-    /// The platform asks whether it may tear down the ratchet with `contact_id`.
-    TeardownRequested {
+    /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id`; `payload` is its sealed box.
+    DecryptionErrorReceived {
         contact_id: String,
-        cause: CfeTearDownCause,
+        payload: Vec<u8>,
     },
-    /// The peer tore down the ratchet with `contact_id`, and the platform has applied it.
-    PeerToreDown {
-        contact_id: String,
-    },
-}
-
-/// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
-///
-/// Mirrors `session_machine::TearDownCause`. It is a separate type at the boundary for the same
-/// reason every other CFE type is: the UDL is a wire the platform compiles against, and a core
-/// enum that grows a variant would otherwise change it silently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CfeTearDownCause {
-    /// Nothing is known beyond "this ratchet will not open".
-    Blind,
-    /// A message arrived on a ratchet we no longer hold — the last teardown never landed.
-    Unacknowledged,
-    /// The teardown carries a reason the peer cannot work out for itself.
-    Explained,
-}
-
-impl From<CfeTearDownCause> for crate::orchestration::session_machine::TearDownCause {
-    fn from(cause: CfeTearDownCause) -> Self {
-        use crate::orchestration::session_machine::TearDownCause as Core;
-        match cause {
-            CfeTearDownCause::Blind => Core::Blind,
-            CfeTearDownCause::Unacknowledged => Core::Unacknowledged,
-            CfeTearDownCause::Explained => Core::Explained,
-        }
-    }
 }
 
 impl CfeIncomingEvent {
@@ -3733,7 +3661,6 @@ impl CfeIncomingEvent {
                 msg_num,
                 kem_ct,
                 otpk_id,
-                is_control,
                 content_type,
                 sender_certificate,
             } => MessageReceived {
@@ -3743,7 +3670,6 @@ impl CfeIncomingEvent {
                 msg_num,
                 kem_ct,
                 otpk_id,
-                is_control,
                 content_type,
                 sender_certificate,
             },
@@ -3803,11 +3729,13 @@ impl CfeIncomingEvent {
                 data,
                 msg_num,
             },
-            Self::TeardownRequested { contact_id, cause } => TeardownRequested {
+            Self::DecryptionErrorReceived {
                 contact_id,
-                cause: cause.into(),
+                payload,
+            } => DecryptionErrorReceived {
+                contact_id,
+                payload,
             },
-            Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
         }
     }
 }
@@ -3818,7 +3746,6 @@ impl CfeIncomingEvent {
 /// decides where they live. See that type for why the string key it replaced was a defect.
 pub enum CfeSecureStoreSlot {
     Session { contact_id: String },
-    SessionArchive { contact_id: String },
     OrchestratorState,
 }
 
@@ -3827,7 +3754,6 @@ impl From<crate::orchestration::SecureStoreSlot> for CfeSecureStoreSlot {
         use crate::orchestration::SecureStoreSlot as S;
         match slot {
             S::Session { contact_id } => Self::Session { contact_id },
-            S::SessionArchive { contact_id } => Self::SessionArchive { contact_id },
             S::OrchestratorState => Self::OrchestratorState,
         }
     }
@@ -3885,9 +3811,6 @@ pub enum CfeAction {
         message_id: String,
         status: String,
     },
-    SendEndSession {
-        contact_id: String,
-    },
     NotifyNewMessage {
         chat_id: String,
         preview: String,
@@ -3915,26 +3838,9 @@ pub enum CfeAction {
     CheckAckInDb {
         message_id: String,
     },
-    /// See `Action::PendingDropped`.
-    PendingDropped {
-        contact_id: String,
-        message_ids: Vec<String>,
-    },
-    /// END_SESSION suppressed by cooldown — the core owes it and will send it in
-    /// `retry_after_ms`. Platform must NOT ACK.
-    EndSessionSuppressed {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-    /// A teardown was asked for and will not be sent, now or later: the peer tore this ratchet
-    /// down itself. Nothing is owed and no timer is armed — do not schedule a retry.
-    EndSessionNotNeeded {
-        contact_id: String,
-    },
-    /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
-    /// SESSION_RESET_INIT). Not a bare local init — the peer must be told. Build it with
-    /// `reopen_session`, which also covers a session still held: the PQXDH v2 upgrade sweep asks
-    /// this for classical sessions.
+    /// Open a session with `contact_id` now, as INITIATOR, over the one held: `reopen_session`.
+    /// Nothing is announced — the handshake header rides on the next message. The PQXDH v2
+    /// upgrade sweep asks this for classical sessions.
     OpenSession {
         contact_id: String,
     },
@@ -3944,16 +3850,22 @@ pub enum CfeAction {
         contact_id: String,
         queued_count: u32,
     },
-    /// Platform should notify all linked devices of session reset with this contact.
-    NotifyLinkedDevicesOfSessionReset {
+    /// See `Action::SendDecryptionError`: send `payload` to `contact_id` as a DECRYPTION_ERROR
+    /// (content type 28) envelope and acknowledge `message_id`.
+    SendDecryptionError {
         contact_id: String,
+        message_id: String,
+        payload: Vec<u8>,
     },
-    /// Rust archived and removed the session for `contact_id`.
-    /// Platform MUST: (1) store `archive_bytes` in the archive store, (2) delete the
-    /// hot session Keychain/Keystore entry for `contact_id`.
-    SessionTerminated {
+    /// See `Action::SessionRetired`.
+    SessionRetired {
         contact_id: String,
-        archive_bytes: Vec<u8>,
+        without_one_time_prekey: bool,
+    },
+    /// See `Action::ResendMessage`.
+    ResendMessage {
+        contact_id: String,
+        message_id: String,
     },
 }
 
@@ -4029,7 +3941,29 @@ impl CfeAction {
                 }
                 .to_string(),
             },
-            SendEndSession { contact_id } => Self::SendEndSession { contact_id },
+            SendDecryptionError {
+                contact_id,
+                message_id,
+                payload,
+            } => Self::SendDecryptionError {
+                contact_id,
+                message_id,
+                payload,
+            },
+            SessionRetired {
+                contact_id,
+                without_one_time_prekey,
+            } => Self::SessionRetired {
+                contact_id,
+                without_one_time_prekey,
+            },
+            ResendMessage {
+                contact_id,
+                message_id,
+            } => Self::ResendMessage {
+                contact_id,
+                message_id,
+            },
             NotifyNewMessage { chat_id, preview } => Self::NotifyNewMessage { chat_id, preview },
             NotifySessionCreated { contact_id } => Self::NotifySessionCreated { contact_id },
             NotifyError { code, message } => Self::NotifyError { code, message },
@@ -4045,21 +3979,6 @@ impl CfeAction {
                 proto_bytes,
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
-            PendingDropped {
-                contact_id,
-                message_ids,
-            } => Self::PendingDropped {
-                contact_id,
-                message_ids,
-            },
-            EndSessionSuppressed {
-                contact_id,
-                retry_after_ms,
-            } => Self::EndSessionSuppressed {
-                contact_id,
-                retry_after_ms,
-            },
-            EndSessionNotNeeded { contact_id } => Self::EndSessionNotNeeded { contact_id },
             OpenSession { contact_id } => Self::OpenSession { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
@@ -4067,16 +3986,6 @@ impl CfeAction {
             } => Self::MessageQueuedPendingInit {
                 contact_id,
                 queued_count,
-            },
-            NotifyLinkedDevicesOfSessionReset { contact_id } => {
-                Self::NotifyLinkedDevicesOfSessionReset { contact_id }
-            }
-            SessionTerminated {
-                contact_id,
-                archive_bytes,
-            } => Self::SessionTerminated {
-                contact_id,
-                archive_bytes: archive_bytes.into_vec(),
             },
         }
     }

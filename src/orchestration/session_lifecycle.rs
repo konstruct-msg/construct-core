@@ -1,8 +1,8 @@
 /// Session Lifecycle Manager — Rust port of Swift `CryptoManager`.
 ///
 /// Owns the `ClassicClient` and orchestrates:
-/// - Encrypt / Decrypt with automatic session restore from archive
-/// - Session archiving (retire → store binary → GC)
+/// - Encrypt / Decrypt
+/// - Retiring the current state when the peer could not read it (`retire_current`)
 /// - Prekey change detection (reinstall)
 /// - Previous session states, tried on decrypt (`decrypt_ratchet_message`)
 /// - Integration of AckStore
@@ -21,8 +21,6 @@ use crate::orchestration::actions::{Action, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-const ARCHIVE_GC_AGE_SECONDS: u64 = 24 * 60 * 60; // 24 h
 
 /// How many states a device's record keeps besides the current one.
 ///
@@ -49,6 +47,21 @@ struct PreviousState {
     session: HeldSession,
     /// Unix seconds when it stopped being current.
     retired_at: u64,
+    /// Retired because the peer could not read it (`retire_current`). It still decrypts what
+    /// arrives on it, and is never made current again: our next message on it would fail the
+    /// same way, so the next send opens a new state instead.
+    held_back: bool,
+}
+
+/// Which state held with a device a ratchet key belongs to, as a sending key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatchetKeyOwner {
+    /// The current state sends with it: what the peer could not read is what we send now.
+    Current,
+    /// A state already replaced — whatever the peer could not read, we no longer send on it.
+    Previous,
+    /// No state held. Nothing of ours to retire.
+    Unknown,
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -133,10 +146,6 @@ pub struct SessionLifecycleManager {
     /// Device → the states its current one replaced, newest first. Part of the device's session
     /// record: saved and loaded with the current state (`export_session_bytes_for`).
     previous: HashMap<String, Vec<PreviousState>>,
-    /// contactId → archived session CFE binary (latest archive only).
-    archives: HashMap<String, crate::crypto::SecretBytes>,
-    /// contactId → Unix timestamp of the archive (for GC).
-    archive_timestamps: HashMap<String, u64>,
     /// contactId → last seen OTPK ID (used to detect reinstall).
     prekey_tracker: HashMap<String, u32>,
     /// Device → SHA-256 of the hybrid identity key it presented the first time a session to it
@@ -169,8 +178,6 @@ impl SessionLifecycleManager {
             client,
             ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
             previous: HashMap::new(),
-            archives: HashMap::new(),
-            archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
             my_user_id,
@@ -190,10 +197,6 @@ impl SessionLifecycleManager {
         self.client.get_session_id(contact_id)
     }
 
-    pub fn has_archive(&self, contact_id: &str) -> bool {
-        self.archives.contains_key(contact_id)
-    }
-
     pub fn my_user_id(&self) -> &str {
         &self.my_user_id
     }
@@ -207,8 +210,6 @@ impl SessionLifecycleManager {
     pub fn forget_contact_state(&mut self, contact_id: &str) {
         self.client.remove_session(contact_id);
         self.previous.remove(contact_id);
-        self.archives.remove(contact_id);
-        self.archive_timestamps.remove(contact_id);
         self.prekey_tracker.remove(contact_id);
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
@@ -244,19 +245,12 @@ impl SessionLifecycleManager {
 
     /// Encrypt `plaintext` for `contact_id`.
     ///
-    /// If no active session exists but an archive is available, it is restored
-    /// in-memory (the caller must have pre-loaded the archive JSON via
-    /// `restore_latest_archive`).
-    ///
     /// Returns `EncryptResult` with ciphertext JSON and follow-up `Action`s
     /// (always includes `SaveToSecureStore` to persist the updated session).
     pub fn encrypt(&mut self, contact_id: &str, plaintext: &[u8]) -> Result<EncryptResult, String> {
         // Ensure session is loaded.
         if !self.client.has_session(contact_id) {
-            return Err(format!(
-                "No active session for {}: call restore_latest_archive first",
-                contact_id
-            ));
+            return Err(format!("No active session for {}", contact_id));
         }
 
         let encrypted = self.client.encrypt_message(contact_id, plaintext)?;
@@ -287,7 +281,7 @@ impl SessionLifecycleManager {
     ///
     /// On success, returns `DecryptResult` with plaintext and follow-up actions
     /// (save updated session). On failure, returns `Err` so the caller (Phase 4
-    /// `MessageRouter`) can decide between opening a new state and END_SESSION.
+    /// `MessageRouter`) can decide between opening a new state and a decryption error.
     pub fn decrypt(&mut self, contact_id: &str, wire_json: &str) -> Result<DecryptResult, String> {
         let wire: WireMessage =
             serde_json::from_str(wire_json).map_err(|e| format!("parse wire: {}", e))?;
@@ -406,6 +400,10 @@ impl SessionLifecycleManager {
                 current_error.unwrap_or_else(|| format!("No active session for {}", contact_id))
             );
         };
+        if self.previous[contact_id][index].held_back {
+            // Read, and left where it is: the peer said it cannot read this state.
+            return Ok(plaintext);
+        }
         let promoted = self
             .previous
             .get_mut(contact_id)
@@ -444,9 +442,56 @@ impl SessionLifecycleManager {
                 PreviousState {
                     session,
                     retired_at,
+                    held_back: false,
                 },
             );
         self.prune_previous(contact_id);
+    }
+
+    /// Retire the current state because the peer could not read it: it becomes the newest
+    /// previous state, held back from promotion, and the device has no current state until the
+    /// next send opens one. True when there was a current state to retire.
+    ///
+    /// Signal's `archiveCurrentState`, with the hold added: there a late message on the archived
+    /// state promotes it back, and the next reply goes out on the state the peer just said it
+    /// cannot read.
+    pub fn retire_current(&mut self, contact_id: &str) -> bool {
+        let Some(session) = self.client.take_session(contact_id) else {
+            return false;
+        };
+        self.retire(contact_id, session);
+        if let Some(newest) = self
+            .previous
+            .get_mut(contact_id)
+            .and_then(|s| s.first_mut())
+        {
+            newest.held_back = true;
+        }
+        true
+    }
+
+    /// Whose sending key `key` is among the states held with `contact_id`.
+    pub fn ratchet_key_owner(&self, contact_id: &str, key: &[u8]) -> RatchetKeyOwner {
+        if let Some(current) = self.client.get_session(contact_id)
+            && current.messaging_session().sending_ratchet_key() == key
+        {
+            return RatchetKeyOwner::Current;
+        }
+        let previous = self.previous.get(contact_id).is_some_and(|states| {
+            states
+                .iter()
+                .any(|s| s.session.messaging_session().sending_ratchet_key() == key)
+        });
+        if previous {
+            RatchetKeyOwner::Previous
+        } else {
+            RatchetKeyOwner::Unknown
+        }
+    }
+
+    /// Whether anything at all is held with `contact_id` — a current state or a previous one.
+    pub fn has_record(&self, contact_id: &str) -> bool {
+        self.client.has_session(contact_id) || self.previous.contains_key(contact_id)
     }
 
     /// Drop the previous states past `PREVIOUS_STATE_TTL_SECONDS` or beyond `MAX_PREVIOUS_STATES`.
@@ -467,78 +512,6 @@ impl SessionLifecycleManager {
         self.previous.get(contact_id).map_or(0, Vec::len)
     }
 
-    // ── Archive lifecycle ─────────────────────────────────────────────────────
-
-    /// Serialize the active session for `contact_id` into the in-memory archive
-    /// and remove it from the active session map.
-    ///
-    /// Returns `Action`s to persist the archive and delete the hot session.
-    pub fn archive_session(&mut self, contact_id: &str) -> Vec<Action> {
-        let cfe_bytes = match self.export_session_bytes_for(contact_id) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("archive_session: {e} — session NOT archived");
-                return vec![];
-            }
-        };
-
-        self.archives
-            .insert(contact_id.to_string(), cfe_bytes.clone().into());
-        self.archive_timestamps
-            .insert(contact_id.to_string(), self.clock.now_secs());
-        self.client.remove_session(contact_id);
-        // The peer tore the ratchet down, and what it replaced goes with it: nothing the peer
-        // sends from here on is on any of them.
-        self.previous.remove(contact_id);
-
-        vec![Action::SessionTerminated {
-            contact_id: contact_id.to_string(),
-            archive_bytes: cfe_bytes.into(),
-        }]
-    }
-
-    /// Restore the latest archive for `contact_id` into the active session map.
-    ///
-    /// The archive bytes must already be in memory, via a previous
-    /// `archive_session` call or an `import_orchestrator_state_cfe` restore.
-    pub fn restore_latest_archive(&mut self, contact_id: &str) -> Result<(), String> {
-        let cfe_bytes = self
-            .archives
-            .get(contact_id)
-            .cloned()
-            .ok_or_else(|| format!("No archive for {}", contact_id))?;
-        self.import_session_bytes(contact_id, cfe_bytes.expose())
-    }
-
-    /// Garbage-collect archives older than 24 h.
-    ///
-    /// Returns `Action`s requesting the platform to delete the stale records.
-    pub fn gc_old_archives(&mut self) -> Vec<Action> {
-        let cutoff = self.clock.now_secs().saturating_sub(ARCHIVE_GC_AGE_SECONDS);
-        let expired: Vec<String> = self
-            .archive_timestamps
-            .iter()
-            .filter(|&(_, &ts)| ts < cutoff)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        let mut actions = Vec::new();
-        for contact_id in &expired {
-            self.archives.remove(contact_id);
-            self.archive_timestamps.remove(contact_id);
-            actions.push(Action::SaveToSecureStore {
-                slot: SecureStoreSlot::SessionArchive {
-                    contact_id: contact_id.to_string(),
-                },
-                data: vec![].into(), // empty = delete sentinel
-            });
-        }
-        actions
-    }
-
-    // ── Prekey tracking ───────────────────────────────────────────────────────
-
-    /// Record the OTPK ID used to initiate a session with `contact_id`.
     pub fn track_prekey(&mut self, contact_id: &str, otpk_id: u32) {
         self.prekey_tracker.insert(contact_id.to_string(), otpk_id);
     }
@@ -555,8 +528,7 @@ impl SessionLifecycleManager {
 
     // ── State persistence ─────────────────────────────────────────────────────
 
-    /// Export the full orchestrator coordination state (archive
-    /// index, prekey tracker) as a CFE binary blob — msg_type 0x05.
+    /// Export the full orchestrator coordination state (prekey tracker, pins) as a CFE binary blob — msg_type 0x05.
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
     /// The caller should persist the blob under `SecureStoreSlot::OrchestratorState`
@@ -587,16 +559,6 @@ impl SessionLifecycleManager {
             my_user_id: self.my_user_id.clone(),
             processed_ids: Vec::new(),
             init_locks: init_locks.iter().cloned().collect(),
-            archives: self
-                .archives
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            archive_timestamps: self
-                .archive_timestamps
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect(),
             prekey_tracker: self
                 .prekey_tracker
                 .iter()
@@ -640,9 +602,7 @@ impl SessionLifecycleManager {
                 .collect(),
         );
 
-        // Restore archive index and prekey tracker.
-        self.archives = state.archives.into_iter().collect();
-        self.archive_timestamps = state.archive_timestamps.into_iter().collect();
+        // Restore the prekey tracker.
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
         // A pin that is not 32 bytes cannot be compared with anything; dropping it re-pins on the
         // next session, which is where a device with no pin starts anyway.
@@ -674,22 +634,40 @@ impl SessionLifecycleManager {
     /// Export the session as a CFE binary blob (MessagePack, no JSON intermediate).
     /// Prefer this over `export_session_json_for` wherever bytes are needed.
     pub fn export_session_bytes_for(&self, contact_id: &str) -> Result<Vec<u8>, String> {
-        let session = self
-            .client
-            .get_session(contact_id)
-            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
-        let mut cfe_state = session.messaging_session().to_serializable().to_cfe_v1()?;
-        if let Some(states) = self.previous.get(contact_id) {
-            for state in states {
-                cfe_state.previous.push(crate::cfe::CfePreviousStateV1 {
-                    retired_at: state.retired_at,
-                    state: state
-                        .session
-                        .messaging_session()
-                        .to_serializable()
-                        .to_cfe_v1()?,
+        let previous: &[PreviousState] = self.previous.get(contact_id).map_or(&[], Vec::as_slice);
+        // No current state: the newest previous one stands at the top of the record, marked
+        // retired, so a record the peer's decryption error emptied survives a restart.
+        let (mut cfe_state, rest) = match self.client.get_session(contact_id) {
+            Some(session) => (
+                session.messaging_session().to_serializable().to_cfe_v1()?,
+                previous,
+            ),
+            None => {
+                let (newest, rest) = previous
+                    .split_first()
+                    .ok_or_else(|| format!("Session not found: {}", contact_id))?;
+                let mut top = newest
+                    .session
+                    .messaging_session()
+                    .to_serializable()
+                    .to_cfe_v1()?;
+                top.retired = Some(crate::cfe::CfeRetiredMarkV1 {
+                    retired_at: newest.retired_at,
+                    held_back: newest.held_back,
                 });
+                (top, rest)
             }
+        };
+        for state in rest {
+            cfe_state.previous.push(crate::cfe::CfePreviousStateV1 {
+                retired_at: state.retired_at,
+                state: state
+                    .session
+                    .messaging_session()
+                    .to_serializable()
+                    .to_cfe_v1()?,
+                held_back: state.held_back,
+            });
         }
         crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &cfe_state)
             .map_err(|e| e.to_string())
@@ -700,19 +678,20 @@ impl SessionLifecycleManager {
         use crate::cfe::{CfeError, CfeMessageType, decode_as};
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
-        let (serializable, previous) =
+        let (serializable, previous, retired) =
             match decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState) {
                 Ok(mut cfe_state) => {
                     let previous = std::mem::take(&mut cfe_state.previous);
+                    let retired = cfe_state.retired.take();
                     let current = SerializableSession::from_cfe_v1(cfe_state)
                         .map_err(|e| format!("from_cfe_v1: {}", e))?;
-                    (current, previous)
+                    (current, previous, retired)
                 }
                 Err(CfeError::LegacyJson) => {
                     let s = std::str::from_utf8(data).map_err(|_| "not utf8".to_string())?;
                     let current =
                         serde_json::from_str(s).map_err(|e| format!("json fallback: {}", e))?;
-                    (current, Vec::new())
+                    (current, Vec::new(), None)
                 }
                 Err(e) => return Err(format!("decode_as: {}", e)),
             };
@@ -732,12 +711,32 @@ impl SessionLifecycleManager {
             states.push(PreviousState {
                 session: HeldSession::from_messaging_session(contact_id.to_string(), ratchet),
                 retired_at: entry.retired_at,
+                held_back: entry.held_back,
             });
         }
 
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
-        self.client.import_session(contact_id, ratchet);
+        match retired {
+            // The top of the record is a retired state, not a current one.
+            Some(mark) => {
+                let _ = self.client.take_session(contact_id);
+                states.insert(
+                    0,
+                    PreviousState {
+                        session: HeldSession::from_messaging_session(
+                            contact_id.to_string(),
+                            ratchet,
+                        ),
+                        retired_at: mark.retired_at,
+                        held_back: mark.held_back,
+                    },
+                );
+            }
+            None => {
+                self.client.import_session(contact_id, ratchet);
+            }
+        }
         if states.is_empty() {
             self.previous.remove(contact_id);
         } else {
@@ -749,15 +748,6 @@ impl SessionLifecycleManager {
 }
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-fn unix_now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -781,7 +771,6 @@ mod tests {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mgr = SessionLifecycleManager::new(client, "alice".to_string());
         assert!(!mgr.has_active_session("bob"));
-        assert!(!mgr.has_archive("bob"));
         assert_eq!(mgr.my_user_id(), "alice");
     }
 
@@ -803,47 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_archive_without_archive_returns_error() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        assert!(mgr.restore_latest_archive("bob").is_err());
-    }
-
-    #[test]
-    fn test_gc_empty_archives_is_noop() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        let actions = mgr.gc_old_archives();
-        assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn test_gc_removes_old_archives() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        // Inject an archive with a stale timestamp.
-        mgr.archives
-            .insert("bob".to_string(), b"placeholder".to_vec().into());
-        mgr.archive_timestamps.insert("bob".to_string(), 0);
-
-        let actions = mgr.gc_old_archives();
-        assert!(!actions.is_empty());
-        assert!(!mgr.has_archive("bob"));
-    }
-
-    #[test]
-    fn test_gc_keeps_fresh_archives() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.archives
-            .insert("bob".to_string(), b"placeholder".to_vec().into());
-        mgr.archive_timestamps.insert("bob".to_string(), unix_now());
-
-        mgr.gc_old_archives();
-        assert!(mgr.has_archive("bob"));
-    }
-
-    #[test]
     fn test_prekey_tracking() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
@@ -854,18 +802,14 @@ mod tests {
     }
 
     #[test]
-    fn forget_contact_state_clears_archive_prekey_and_pq_state() {
+    fn forget_contact_state_clears_prekey_and_pq_state() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.archives
-            .insert("bob".to_string(), b"archive".to_vec().into());
-        mgr.archive_timestamps.insert("bob".to_string(), unix_now());
         mgr.track_prekey("bob", 42);
         mgr.pin_hybrid_identity("bob", [7; 32]);
 
         mgr.forget_contact_state("bob");
 
-        assert!(!mgr.has_archive("bob"));
         assert!(!mgr.is_reinstall("bob", 99));
         assert!(mgr.pinned_hybrid_identity("bob").is_none());
     }
@@ -1131,13 +1075,82 @@ mod tests {
         );
     }
 
-    /// The peer tore the ratchet down: the states it replaced go with it.
+    // ── Retiring on the peer's decryption error (variant B) ──────────────────
+
+    fn sending_key(mgr: &SessionLifecycleManager, peer: &str) -> Vec<u8> {
+        mgr.client
+            .get_session(peer)
+            .unwrap()
+            .messaging_session()
+            .sending_ratchet_key()
+            .to_vec()
+    }
+
+    /// A decryption error is acted on only when its key is the current state's. Mutation: answer
+    /// `Current` for a previous state's key — this reddens.
     #[test]
-    fn a_teardown_drops_the_previous_states_too() {
+    fn a_ratchet_key_names_the_state_that_sends_with_it() {
+        let (mut alice, _bob, _alice_id, bob_id) = make_session_pair();
+        let key = sending_key(&alice, &bob_id);
+        assert_eq!(
+            alice.ratchet_key_owner(&bob_id, &key),
+            RatchetKeyOwner::Current
+        );
+        assert_eq!(
+            alice.ratchet_key_owner(&bob_id, &[1; 32]),
+            RatchetKeyOwner::Unknown
+        );
+
+        assert!(alice.retire_current(&bob_id));
+        assert_eq!(
+            alice.ratchet_key_owner(&bob_id, &key),
+            RatchetKeyOwner::Previous
+        );
+        assert!(
+            !alice.retire_current(&bob_id),
+            "nothing current is left to retire"
+        );
+    }
+
+    /// The peer said it cannot read the retired state; a late message on it still reads, and the
+    /// state stays retired, so the next send opens a new one. Mutation: drop the `held_back`
+    /// check in `decrypt_ratchet_message` — this reddens.
+    #[test]
+    fn a_retired_state_reads_but_is_not_made_current_again() {
         let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
-        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
-        bob.archive_session(&alice_id);
-        assert_eq!(bob.previous_state_count(&alice_id), 0);
+        let late = bob.client.encrypt_message(&alice_id, b"late").unwrap();
+        alice.retire_current(&bob_id);
+
+        assert_eq!(
+            alice.decrypt_ratchet_message(&bob_id, &late).unwrap(),
+            b"late"
+        );
+        assert!(!alice.has_active_session(&bob_id));
+        assert!(alice.has_record(&bob_id));
+    }
+
+    /// Until the next send opens a state, the record is only previous states, and it must survive
+    /// a restart that way. Mutation: export the retired state as current — this reddens.
+    #[test]
+    fn a_record_with_no_current_state_survives_save_and_load() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let late = bob.client.encrypt_message(&alice_id, b"late").unwrap();
+        alice.retire_current(&bob_id);
+
+        let saved = alice.export_session_bytes_for(&bob_id).unwrap();
+        alice.previous.remove(&bob_id);
+        alice.import_session_bytes(&bob_id, &saved).unwrap();
+
+        assert!(!alice.has_active_session(&bob_id));
+        assert_eq!(alice.previous_state_count(&bob_id), 1);
+        assert_eq!(
+            alice.decrypt_ratchet_message(&bob_id, &late).unwrap(),
+            b"late"
+        );
+        assert!(
+            !alice.has_active_session(&bob_id),
+            "still held back after the reload"
+        );
     }
 
     #[test]
@@ -1411,8 +1424,6 @@ mod tests {
                 },
             ],
             init_locks: vec![],
-            archives: vec![],
-            archive_timestamps: vec![],
             prekey_tracker: vec![],
             hybrid_identity_pins: vec![],
         };

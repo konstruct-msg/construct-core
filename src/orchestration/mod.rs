@@ -8,10 +8,10 @@
 ///   actions          — Action + IncomingEvent enums
 ///   clock            — Clock trait + SystemClock + MockClock (time injection)
 ///   ack_store        — ACK deduplication
-///   session_lifecycle— The sessions held, current and previous states: encrypt/decrypt, archive
+///   session_lifecycle— The sessions held, current and previous states: encrypt/decrypt, retire
 ///   session_machine  — What phase a ratchet is in, and what may happen to it next
 ///   message_router   — Incoming message → dedup, session lookup, decrypt → RoutingDecision
-///   teardown_plan    — Which of a peer's devices a teardown touches
+///   decryption_error — "I could not read your message": the sealed error that replaced END_SESSION
 ///   initiation_plan  — Whether to open a session with a device now
 ///   receiving_init_plan — Which message can open a session
 ///   send_plan        — Who gets a copy of an outgoing message
@@ -22,6 +22,7 @@
 pub mod ack_store;
 pub mod actions;
 pub mod clock;
+pub mod decryption_error;
 pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
@@ -33,7 +34,6 @@ pub mod receiving_init_plan;
 pub mod send_plan;
 pub mod session_lifecycle;
 pub mod session_machine;
-pub mod teardown_plan;
 
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
@@ -51,7 +51,5 @@ pub use receiving_init_plan::{ReceivingInitCarrier, ReceivingInitKind, receiving
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
 pub use session_lifecycle::{DecryptResult, EncryptResult, SessionLifecycleManager};
 pub use session_machine::{
-    END_SESSION_COOLDOWN_MS, Effect as SessionEffect, Event as SessionEvent, OPENING_TTL_MS, Phase,
-    SessionMachine,
+    Effect as SessionEffect, Event as SessionEvent, OPENING_TTL_MS, Phase, SessionMachine,
 };
-pub use teardown_plan::{TeardownAction, TeardownDecision, plan_teardown};

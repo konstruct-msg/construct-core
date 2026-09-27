@@ -15,8 +15,6 @@
 ///   │
 ///   ├─ is_duplicate? → Duplicate
 ///   │
-///   ├─ is END_SESSION? → EndSessionReceived
-///   │
 ///   ├─ no session, carries the handshake header?
 ///   │     └─ enqueue → NeedSessionInit (open from it)
 ///   │
@@ -25,7 +23,7 @@
 ///         ├─ key already used → Duplicate
 ///         └─ fail
 ///               ├─ carries the header → NeedSessionInit (a new state opens from it)
-///               └─ carries none      → EndSessionNeeded
+///               └─ carries none      → DecryptionErrorNeeded (tell the writer, by its key)
 /// ```
 use std::collections::{HashMap, VecDeque};
 
@@ -53,19 +51,24 @@ pub enum RoutingDecision {
         contact_id: String,
         queued_count: usize,
     },
-    /// Nothing held decrypts it and it carries no handshake header — send END_SESSION.
-    EndSessionNeeded { contact_id: String, reason: String },
+    /// Nothing held decrypts it and it carries no handshake header: tell the device that wrote it
+    /// (`decryption_error`). `ratchet_key` is the key in the message's header and
+    /// `writer_identity` the key its sender certificate names — what the error is addressed by
+    /// and sealed to. Either is `None` when the message does not carry it, and then no error can
+    /// be built.
+    DecryptionErrorNeeded {
+        contact_id: String,
+        message_id: String,
+        ratchet_key: Option<Vec<u8>>,
+        writer_identity: Option<Vec<u8>>,
+        reason: String,
+    },
     /// Message already processed — discard.
     Duplicate { message_id: String },
     /// ACK status unknown — buffered pending a DB check (platform feeds back `AckDbResult`).
     PendingAckCheck { message_id: String },
     /// Pending queue for this contact is full — apply backpressure.
     QueueFull { contact_id: String },
-    /// END_SESSION control message received.
-    EndSessionReceived {
-        contact_id: String,
-        actions: Vec<Action>,
-    },
     /// Unrecoverable routing error.
     Error { message: String },
 }
@@ -95,8 +98,6 @@ pub struct IncomingMessage {
     pub wire_payload: Vec<u8>,
     pub message_id: String,
     pub msg_number: u32,
-    /// When `true` this is a KEY_SYNC / END_SESSION control frame.
-    pub is_control: bool,
     /// Original content_type from the wire envelope (e.g. 12 = CALL_SIGNAL).
     pub content_type: u8,
     /// The sender certificate this message was sealed with, unchecked. What lets it open a
@@ -186,15 +187,6 @@ impl MessageRouter {
         lifecycle: &mut SessionLifecycleManager,
         msg: &IncomingMessage,
     ) -> RoutingDecision {
-        // Control messages (END_SESSION) bypass ACK deduplication entirely.
-        // They are synthetic — generated with a unique-per-invocation ID — so
-        // they will always be cache-miss in post_restart_mode, which would cause
-        // `archive_session()` to never be called and leave the Rust in-memory
-        // session alive, recreating a desync loop on the next incoming message.
-        if msg.is_control {
-            return self.route_after_ack_check(lifecycle, msg);
-        }
-
         // ── 1. ACK deduplication ──────────────────────────────────────────────
         use crate::orchestration::ack_store::AckCheckResult;
         match lifecycle.ack_store.is_processed(&msg.message_id) {
@@ -223,9 +215,8 @@ impl MessageRouter {
     /// Process all queued messages for `contact_id` now that a session exists.
     ///
     /// Returns one `RoutingDecision` per queued message.
-    /// Returns one `RoutingDecision` per queued message, stopping early on
-    /// the first error decision (EndSessionNeeded) to
-    /// avoid cascading 50+ failures from a single broken session.
+    /// Returns one `RoutingDecision` per queued message, stopping early on the first message
+    /// nothing held reads (`DecryptionErrorNeeded`); the rest stay queued for the next open.
     pub fn drain_pending(
         &mut self,
         contact_id: &str,
@@ -241,7 +232,7 @@ impl MessageRouter {
         let mut remaining_start = queued.len(); // index after which messages should be re-queued
         for (i, msg) in queued.iter().enumerate() {
             let decision = self.route_message(lifecycle, msg);
-            let is_error = matches!(&decision, RoutingDecision::EndSessionNeeded { .. });
+            let is_error = matches!(&decision, RoutingDecision::DecryptionErrorNeeded { .. });
             results.push(decision);
             if is_error {
                 remaining_start = i + 1;
@@ -354,31 +345,11 @@ impl MessageRouter {
         lifecycle: &mut SessionLifecycleManager,
         msg: &IncomingMessage,
     ) -> RoutingDecision {
-        // ── 2. END_SESSION control message ────────────────────────────────────
-        if msg.is_control {
-            let actions = lifecycle.archive_session(&msg.contact_id);
-            return RoutingDecision::EndSessionReceived {
-                contact_id: msg.contact_id.clone(),
-                actions,
-            };
-        }
-
         // ── 3. A handshake with nothing to open it on ────────────────────────
         let opener = opens_session(msg);
         if opener && !lifecycle.has_active_session(&msg.contact_id) {
             return self.enqueue_or_reject(lifecycle, msg);
         }
-        if !lifecycle.has_active_session(&msg.contact_id)
-            && lifecycle.has_archive(&msg.contact_id)
-            && lifecycle.restore_latest_archive(&msg.contact_id).is_err()
-        {
-            tracing::warn!(
-                target: "crypto::router",
-                contact_id = %msg.contact_id,
-                "archived session did not restore"
-            );
-        }
-
         // ── 4. Decrypt on any state held ──────────────────────────────────────
         match lifecycle.decrypt_wire_payload(&msg.contact_id, &msg.wire_payload) {
             Ok(result) => {
@@ -412,8 +383,16 @@ impl MessageRouter {
             // the peer opened a new session. It waits for the open like any first message, and
             // the state it opens becomes current, the old one previous.
             Err(_) if opener => self.enqueue_or_reject(lifecycle, msg),
-            Err(e) => RoutingDecision::EndSessionNeeded {
+            Err(e) => RoutingDecision::DecryptionErrorNeeded {
                 contact_id: msg.contact_id.clone(),
+                message_id: msg.message_id.clone(),
+                ratchet_key: crate::wire_payload::unpack(&msg.wire_payload)
+                    .ok()
+                    .map(|header| header.dh_public_key),
+                writer_identity: msg
+                    .sender_certificate
+                    .as_ref()
+                    .map(|c| c.identity_key.clone()),
                 reason: e,
             },
         }
@@ -500,7 +479,6 @@ mod tests {
             wire_payload,
             message_id: msg_id.to_string(),
             msg_number: msg_num,
-            is_control: false,
             content_type: 0,
         }
     }
@@ -583,7 +561,6 @@ mod tests {
             wire_payload: vec![],
             message_id: "dup-msg".to_string(),
             msg_number: 1,
-            is_control: false,
             content_type: 0,
         };
         let decision = router.route_message(&mut lifecycle, &m);
@@ -609,7 +586,6 @@ mod tests {
             wire_payload: vec![],
             message_id: "dup-across-restart".to_string(),
             msg_number: 1,
-            is_control: false,
             content_type: 0,
         };
 
@@ -639,7 +615,6 @@ mod tests {
             wire_payload: vec![],
             message_id: "fresh-after-restart".to_string(),
             msg_number: 1,
-            is_control: false,
             content_type: 0,
         };
         router.route_message(&mut lifecycle, &m);
@@ -649,27 +624,6 @@ mod tests {
             !matches!(resumed, RoutingDecision::Duplicate { .. }),
             "a message the durable store has never seen must not be dropped"
         );
-    }
-
-    #[test]
-    fn test_end_session_control_message() {
-        let mut router = MessageRouter::new();
-        let mut lifecycle = make_lifecycle("alice");
-
-        let m = IncomingMessage {
-            sender_certificate: None,
-            contact_id: "bob".to_string(),
-            wire_payload: vec![],
-            message_id: "ctrl-1".to_string(),
-            msg_number: 0,
-            is_control: true,
-            content_type: 0,
-        };
-        let decision = router.route_message(&mut lifecycle, &m);
-        assert!(matches!(
-            decision,
-            RoutingDecision::EndSessionReceived { .. }
-        ));
     }
 
     #[test]
@@ -690,12 +644,11 @@ mod tests {
     }
 
     /// Nothing held and no header to open from: the message was written on a state we do not
-    /// have, and only the peer can start a new one. Until 2026-09-27 this was queued to wait for
-    /// an open that nothing in the queue could perform, and then dropped.
+    /// have, and only the writer can start a new one — which it does when told, by its key.
     ///
     /// Mutation: enqueue on "no session" regardless of the header — this reddens.
     #[test]
-    fn a_message_without_a_header_and_no_state_asks_for_a_teardown() {
+    fn a_message_without_a_header_and_no_state_asks_for_a_decryption_error() {
         let mut router = MessageRouter::new();
         let mut lifecycle = make_lifecycle("alice");
         let m = IncomingMessage {
@@ -704,12 +657,56 @@ mod tests {
             wire_payload: vec![],
             message_id: "bad-msg".to_string(),
             msg_number: 5,
-            is_control: false,
             content_type: 0,
         };
         let decision = router.route_message(&mut lifecycle, &m);
-        assert!(matches!(decision, RoutingDecision::EndSessionNeeded { .. }));
+        assert!(matches!(
+            decision,
+            RoutingDecision::DecryptionErrorNeeded { .. }
+        ));
         assert_eq!(router.pending_count("bob"), 0);
+    }
+
+    /// The error is addressed by the key in the unread message's header and sealed to the key in
+    /// its certificate; both come from the message, not from anything we hold.
+    ///
+    /// Mutation: take the ratchet key from anywhere but the header — this reddens.
+    #[test]
+    fn the_error_names_the_headers_key_and_the_certificates_identity() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        let wire_payload =
+            crate::wire_payload::pack(&[4; 32], 5, 0, 0, 0, 1, None, &[9; 40], 0, None).unwrap();
+        let certificate = crate::crypto::sealed_sender::SenderCertificate {
+            user_id: "bob-account".to_string(),
+            domain: "konstruct.cc".to_string(),
+            identity_key: vec![6; 32],
+            device_id: "bob".to_string(),
+            issued_at: 0,
+            expires_at: 0,
+            signature: vec![],
+        };
+        let m = IncomingMessage {
+            sender_certificate: Some(certificate),
+            contact_id: "bob".to_string(),
+            wire_payload,
+            message_id: "unread".to_string(),
+            msg_number: 5,
+            content_type: 0,
+        };
+        match router.route_message(&mut lifecycle, &m) {
+            RoutingDecision::DecryptionErrorNeeded {
+                message_id,
+                ratchet_key,
+                writer_identity,
+                ..
+            } => {
+                assert_eq!(message_id, "unread");
+                assert_eq!(ratchet_key, Some(vec![4; 32]));
+                assert_eq!(writer_identity, Some(vec![6; 32]));
+            }
+            other => panic!("expected a decryption error, got {other:?}"),
+        }
     }
 
     /// A header on message 5 opens, like one on message 0 — the first flight repeats it, and a

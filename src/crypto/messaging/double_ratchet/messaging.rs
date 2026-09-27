@@ -456,6 +456,12 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 // Internal implementation details
 
 impl<P: CryptoProvider> DoubleRatchetSession<P> {
+    /// Our DH ratchet public key — the one every message we send now carries in its header, and
+    /// the one a peer's decryption error names when it could not read one of them.
+    pub fn sending_ratchet_key(&self) -> &[u8] {
+        self.dh_ratchet_public.as_ref()
+    }
+
     /// The ratchet's decrypt; `SecureMessaging::decrypt` wraps it.
     fn decrypt_message(&mut self, encrypted: &EncryptedRatchetMessage) -> Result<Vec<u8>, String> {
         use tracing::{debug, trace};

@@ -656,6 +656,7 @@ impl SerializableSession {
             // The ratchet knows only itself; the record's previous states are the lifecycle
             // manager's, which attaches them (`SessionLifecycleManager::export_session_bytes_for`).
             previous: Vec::new(),
+            retired: None,
         })
     }
 

@@ -150,9 +150,10 @@ dictionary SenderCertificate {
 };
 
 // What `open_receiving` did. On success `opened_device` and `opener_message_id` are set and
-// `actions` carries the rest (archive of a replaced session, the opener's own decrypt answer, the
-// save, the drain, the notice). On failure they are null, `tried_message_ids` lists every carrier
-// proven unopenable, `dropped_message_ids` the rest of the queue, `last_error` the last refusal.
+// `actions` carries the rest (the opener's own decrypt answer, the save, the drain, the notice). On
+// failure they are null, `tried_message_ids` lists every carrier proven unopenable,
+// `dropped_message_ids` the rest of the queue, `last_error` the last refusal, and `actions` a
+// `SendDecryptionError` for each message given up whose writer the server vouches for.
 // `awaiting_server_key`: a carrier could not be checked because no server key was set — nothing
 // was tried or dropped, and the same open can succeed after `set_trusted_server_keys`.
 dictionary ReceivingOpenResult {
@@ -671,23 +672,6 @@ dictionary ReceivingInitCarrier {
     u32 pq_message_epoch;
 };
 
-/// What to do about one device when tearing down a session with a peer.
-/// See orchestration::teardown_plan — the decision lives in the core because it is a plan,
-/// and a plan is protocol.
-enum TeardownAction {
-    /// We hold a session with this device: send, then archive ours.
-    "SendAndArchive",
-    /// No session of ours, but the peer is demonstrably still on one — send, archive nothing.
-    "SendOnly",
-    /// Nothing to condemn, no evidence anyone is on a dead session — say nothing.
-    "Skip",
-};
-
-dictionary TeardownDecision {
-    string device_id;
-    TeardownAction action;
-};
-
 /// Whether to open a session with a device right now. See orchestration::initiation_plan.
 enum InitiationDecision {
     /// Open a fresh session as INITIATOR now.
@@ -758,7 +742,7 @@ interface RustAckStore {
 /// Platform creates one of these variants and passes to `handle_event()`.
 [Enum]
 interface CfeIncomingEvent {
-    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type, SenderCertificate? sender_certificate);
+    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, u8 content_type, SenderCertificate? sender_certificate);
     OutgoingMessage(string contact_id, string message_id, bytes plaintext, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
@@ -771,29 +755,10 @@ interface CfeIncomingEvent {
     AckDbResult(string message_id, boolean is_processed);
     /// A heartbeat message was received from the peer.
     HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
-    /// The platform is about to tear down the ratchet with `contact_id` and asks whether it may.
-    /// Answered with `SendEndSession`, `EndSessionSuppressed` + `ScheduleTimer`, or
-    /// `EndSessionNotNeeded` — from the same window the core's own teardowns use. `cause` says
-    /// what this teardown knows, which decides how soon it may go and whether the peer's own
-    /// teardown silences it.
-    TeardownRequested(string contact_id, CfeTearDownCause cause);
-    /// The peer tore down the ratchet with `contact_id` and the platform has applied it. A
-    /// report, not a request: it opens the window that keeps our own teardown quiet, and returns
-    /// no actions.
-    PeerToreDown(string contact_id);
-};
-
-/// Why a teardown is being asked for.
-enum CfeTearDownCause {
-    /// Nothing is known beyond "this ratchet will not open". The only cause the peer's own
-    /// teardown silences: a blind teardown back tells it what it just told us.
-    "Blind",
-    /// A message arrived on a ratchet we no longer hold — proof the last teardown never landed.
-    /// Buys the short retry window while the budget lasts, and is never silenced.
-    "Unacknowledged",
-    /// The teardown carries a reason the peer cannot work out for itself (today: the one-time
-    /// pre-key we could not reproduce). Ordinary window, never silenced.
-    "Explained",
+    /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id` — the device its sender
+    /// certificate names; `payload` is the envelope's sealed box. Answered with `SessionRetired` +
+    /// `ResendMessage`, `ResendMessage` alone, or nothing when the error is stale.
+    DecryptionErrorReceived(string contact_id, bytes payload);
 };
 
 /// Which durable slot a `SaveToSecureStore` payload belongs in.
@@ -805,8 +770,6 @@ enum CfeTearDownCause {
 interface CfeSecureStoreSlot {
     /// Double Ratchet state for one contact. Empty payload means delete.
     Session(string contact_id);
-    /// A terminated session, kept for late-arriving messages. Empty payload means delete.
-    SessionArchive(string contact_id);
     /// Orchestrator coordination state.
     OrchestratorState();
 };
@@ -820,13 +783,6 @@ interface CfeAction {
     InitSession(string contact_id, string bundle_json);
     ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, bytes plaintext);
-    PendingDropped(string contact_id, sequence<string> message_ids);
-    /// END_SESSION suppressed by cooldown — the core owes it and sends it in retry_after_ms.
-    /// Platform must NOT ACK.
-    EndSessionSuppressed(string contact_id, u64 retry_after_ms);
-    /// A teardown was asked for and will not be sent, now or later — the peer tore this ratchet
-    /// down itself. Nothing is owed; do NOT schedule a retry.
-    EndSessionNotNeeded(string contact_id);
     /// Open a new session with `contact_id` as INITIATOR over the one held: build it with
     /// `reopen_session`, which keeps the held state as a previous one. Nothing is sent for it —
     /// the handshake header rides on the next message. Raised by the PQXDH v2 upgrade sweep.
@@ -846,7 +802,15 @@ interface CfeAction {
     OpenReceiving(string contact_id);
     SendEncryptedMessage(string to, bytes payload, string message_id, u8 content_type);
     SendReceipt(string message_id, string status);
-    SendEndSession(string contact_id);
+    /// We could not read `message_id` from `contact_id`: send `payload` to that device as a
+    /// DECRYPTION_ERROR (content type 28) envelope, sealed-sender, and acknowledge the message.
+    /// The core built and sealed `payload`; one per unread message.
+    SendDecryptionError(string contact_id, string message_id, bytes payload);
+    /// The peer could not read our current state with `contact_id`; it is retired and the next
+    /// send opens a new one — without a one-time prekey when `without_one_time_prekey`.
+    SessionRetired(string contact_id, boolean without_one_time_prekey);
+    /// The peer could not read `message_id`: send it again to `contact_id` as a new message.
+    ResendMessage(string contact_id, string message_id);
     NotifyNewMessage(string chat_id, string preview);
     NotifySessionCreated(string contact_id);
     NotifyError(string code, string message);
@@ -855,12 +819,6 @@ interface CfeAction {
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
     /// Platform must query its persistent ACK store for `message_id` and reply with `AckDbResult`.
     CheckAckInDb(string message_id);
-    /// Broadcast to all linked devices that the session with `contact_id` was reset.
-    NotifyLinkedDevicesOfSessionReset(string contact_id);
-    /// Rust archived and removed the session for `contact_id`.
-    /// Platform MUST: (1) store `archive_bytes` in the archive store, (2) delete the
-    /// hot session Keychain/Keystore entry for `contact_id`.
-    SessionTerminated(string contact_id, bytes archive_bytes);
 };
 
 /// Top-level orchestration facade.
@@ -939,11 +897,6 @@ interface OrchestratorCore {
 
     sequence<string> get_all_session_contact_ids();
 
-    /// Which of `candidate_device_ids` a teardown goes to, and what to do with each.
-    /// The caller passes the device set (it owns the account→devices translation, which this
-    /// crate deliberately cannot do); the decision over the set is made here.
-    sequence<TeardownDecision> plan_teardown(sequence<string> candidate_device_ids, boolean peer_on_dead_session);
-
     boolean has_session(string contact_id);
 
     SessionHealthReport? get_session_health(string contact_id);
@@ -1002,19 +955,20 @@ interface OrchestratorCore {
     boolean remove_session(string contact_id);
 
     /// Drop every piece of local orchestration state this core holds about `contact_id`:
-    /// the ratchet and its previous states, the archive and its timestamp, the prekey counter, the PQ
-    /// contribution, the init lock, the cooldown, the pending END_SESSION, the prewarm mark and
-    /// the active-chat mark.
+    /// the ratchet and its previous states, the prekey counter, the PQ contribution, the init lock,
+    /// the queue, the prewarm mark and the active-chat mark.
     ///
     /// `remove_session` removes the ratchet **and nothing else**, so all of the above outlive it
     /// and steer the next add for the same device — a contact the platform has already forgotten.
     /// None of them is reachable from outside this crate, which is why "the platform deleted this
     /// contact" had no expression here until now.
     ///
-    /// Silent on the wire on purpose: a local deletion boundary, not a protocol reset. It archives
-    /// nothing and emits no END_SESSION. A caller that wants the peer told does that first, with
-    /// `plan_teardown`, and forgets afterwards.
+    /// Silent on the wire on purpose: a local deletion boundary, not a protocol reset.
     void forget_contact_state(string contact_id);
+
+    /// The person reset the session with `contact_id`: the current state is retired locally and
+    /// the next send opens a new one. Nothing is sent. Execute the returned save.
+    sequence<CfeAction> retire_session(string contact_id);
 
     u32 prekeys_available_count();
 
@@ -1074,8 +1028,8 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     RotatedSpkBundle rotate_signed_prekey();
 
-    /// Export the full orchestrator coordination state (init locks, archive index,
-    /// prekey tracker) as a CFE binary blob.
+    /// Export the full orchestrator coordination state (init locks, prekey tracker, pins) as a
+    /// CFE binary blob.
     /// Persist under CfeSecureStoreSlot::OrchestratorState.
     [Throws=CryptoError]
     sequence<u8> export_orchestrator_state();
