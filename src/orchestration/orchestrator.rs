@@ -1015,6 +1015,9 @@ impl Orchestrator {
     /// RESPONDER init of one message that does not wait in the queue — a sibling's SENDER_SYNC.
     /// Opens with the key `certificate` names once it passes `identity_for_opening`, under the
     /// device it names. Returns that device and the first message's plaintext.
+    ///
+    /// A state already held with that device is set aside while the new one is built: put back
+    /// if the open fails, kept as a previous state if it succeeds — the same as `open_receiving`.
     pub fn receiving_from_certificate(
         &mut self,
         certificate: &crate::crypto::sealed_sender::SenderCertificate,
@@ -1026,8 +1029,21 @@ impl Orchestrator {
             .to_vec();
         let first = IncomingFirstMessage::from_wire_payload(wire_payload)?;
         let device = certificate.device_id.clone();
-        let plaintext = self.init_receiving_with_identity(&device, &identity, &first)?;
-        Ok((device, plaintext))
+        let held = self.lifecycle.client.take_session(&device);
+        match self.init_receiving_with_identity(&device, &identity, &first) {
+            Ok(plaintext) => {
+                if let Some(session) = held {
+                    self.lifecycle.retire(&device, session);
+                }
+                Ok((device, plaintext))
+            }
+            Err(e) => {
+                if let Some(session) = held {
+                    self.lifecycle.client.put_back_session(&device, session);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
@@ -3890,6 +3906,37 @@ mod pqxdh_v2_tests {
         for actions in [&opened, &earlier, &old] {
             assert!(!tears_down(actions), "{actions:?}");
         }
+    }
+
+    /// A sibling's copy opens outside the queue (`receiving_from_certificate`), and a state held
+    /// with that sibling is kept as a previous one, not dropped — what it still has in flight
+    /// decrypts.
+    ///
+    /// Mutation: drop the `retire` in `receiving_from_certificate` — the late message reddens.
+    #[test]
+    fn a_siblings_new_state_opened_outside_the_queue_keeps_the_old_one() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"m0").unwrap();
+        bob.receiving_from_certificate(&certificate(&server, &alice), &m0)
+            .unwrap();
+        let late = alice.encrypt_bytes_for(&bob_id, b"late").unwrap();
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let n0 = alice.encrypt_bytes_for(&bob_id, b"n0").unwrap();
+        let (_, plaintext) = bob
+            .receiving_from_certificate(&certificate(&server, &alice), &n0)
+            .unwrap();
+        assert_eq!(plaintext, b"n0");
+        assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 1);
+        assert_eq!(bob.decrypt_bytes_for(&alice_id, &late).unwrap(), b"late");
     }
 
     /// A handshake that does not open leaves the session Bob holds exactly as it was; the queue
