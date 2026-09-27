@@ -652,12 +652,11 @@ where
         // message to fail AEAD. We return an explicit error so the caller can
         // trigger session healing rather than creating a permanently broken session.
         //
-        // This used to consume before the attempt, which is correct only while a carrier is
-        // tried once. It is not: an account is a set of devices, the caller does not always know
-        // which of them wrote the message, and `plan_receiving_init` hands us the same carrier
-        // once per candidate. Burning up front meant the first wrong candidate destroyed the key
-        // the right one needed, and the message became permanently unreadable — with two devices
-        // on one account, whether it arrived depended on which device sent it. See
+        // This used to consume before the attempt. Until 2026-09-27 the same carrier was tried
+        // once per device of the sender's account, and burning up front meant the first wrong
+        // candidate destroyed the key the right one needed. The walk is gone — the sender
+        // certificate names the key — but a failed attempt must still leave the key: a damaged or
+        // mis-filed carrier is not the last one that may use it. See
         // `KeyManager::peek_one_time_prekey`.
         let consumed_otpk = if one_time_prekey_id != 0 {
             let key = self.key_manager.peek_one_time_prekey(one_time_prekey_id);
@@ -1201,8 +1200,8 @@ mod tests {
     /// A failed responder init must not destroy the one-time prekey.
     ///
     /// The field failure this pins (2026-09-06, three devices on two accounts): an account is a
-    /// set of devices, so `plan_receiving_init` hands the same carrier to one attempt per
-    /// candidate device. The old code burned the OTPK before the first attempt, so the wrong
+    /// set of devices, and until 2026-09-27 the same carrier went to one attempt per candidate
+    /// device. The old code burned the OTPK before the first attempt, so the wrong
     /// candidate consumed the key the right one needed and the message was unreadable from then
     /// on — the sender's device decided whether it arrived.
     ///

@@ -50,10 +50,7 @@ pub use pq_prekey_plan::{
     KyberPrekeyOffer, PqxdhChoice, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,
 };
 pub use receiving_decrypt_plan::plan_receiving_decrypt;
-pub use receiving_init_plan::{
-    ReceivingInitAttempt, ReceivingInitCarrier, ReceivingInitKind, plan_receiving_init,
-    receiving_init_kind,
-};
+pub use receiving_init_plan::{ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind};
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
 pub use session_lifecycle::{DecryptResult, EncryptResult, SessionLifecycleManager};
 pub use session_machine::{

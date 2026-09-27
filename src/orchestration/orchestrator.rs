@@ -181,23 +181,31 @@ pub struct Orchestrator {
     /// which gets it back through `Action::ReplayHeld`. In memory on purpose: a held message is
     /// never acknowledged to the server, so after a restart it is redelivered and judged again.
     confirm_holds: HashMap<String, Vec<ConfirmHold>>,
+    /// The server keys a sender certificate is checked against before it opens a session
+    /// (`set_trusted_server_keys`). In memory: the platform sets them at every launch.
+    trusted_server_keys: Vec<Vec<u8>>,
+    /// Read for a certificate's age; the same clock as the router's and the machine's.
+    clock: Arc<dyn Clock>,
 }
 
 /// What `Orchestrator::open_receiving` did.
 #[derive(Debug)]
 pub struct ReceivingOpen {
-    /// The device the session opened with — derived from the bundle that opened, not the claim.
+    /// The device the session opened with.
     pub opened_device: Option<String>,
     /// The message the session opened from.
     pub opener_message_id: Option<String>,
     /// The archive of a replaced session, the opener's own answer, the save, the drain, the notice.
     pub actions: Vec<Action>,
-    /// On failure: every carrier attempted — each proven unopenable against every bundle given.
+    /// On failure: every carrier attempted or refused — each proven unable to open.
     pub tried_message_ids: Vec<String>,
     /// On failure: the rest of the queue, dropped with it.
     pub dropped_message_ids: Vec<String>,
     /// On failure: the last attempt's refusal, for the platform's key-repair and 3-DH hint.
     pub last_error: Option<String>,
+    /// A certificate could not be checked for want of a server key: nothing was dropped, and the
+    /// same open may succeed once `set_trusted_server_keys` has been called.
+    pub awaiting_server_key: bool,
 }
 
 /// Whether a held message belongs to a handshake that concluded while it waited.
@@ -258,6 +266,8 @@ impl Orchestrator {
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
             confirm_holds: HashMap::new(),
+            trusted_server_keys: Vec::new(),
+            clock,
         }
     }
 
@@ -349,6 +359,7 @@ impl Orchestrator {
                 otpk_id,
                 is_control,
                 content_type,
+                sender_certificate,
             } => self.handle_message_received(
                 message_id,
                 from,
@@ -358,6 +369,7 @@ impl Orchestrator {
                 otpk_id,
                 is_control,
                 content_type,
+                sender_certificate,
             ),
             IncomingEvent::OutgoingMessage {
                 contact_id,
@@ -896,110 +908,130 @@ impl Orchestrator {
         )
     }
 
-    /// Open a receiving session from what waits under `claimed`, against `bundles`.
+    /// The server's certificate-signing keys, as the platform holds them: the well-known key and
+    /// its pins. Replaced whole; nothing opens a receiving session before the first call.
+    pub fn set_trusted_server_keys(&mut self, keys: Vec<Vec<u8>>) {
+        self.trusted_server_keys = keys;
+    }
+
+    /// Open a receiving session from what waits under `device`.
     ///
-    /// `claimed` is the device the sender certificate named — a claim, vouched by the server and
-    /// proven only by decryption (`decisions/first-contact-queue-keyed-by-claimed-device.md`).
-    /// `bundles` are the whole device set of the account the claim belongs to, which only the
-    /// platform can name. The carriers are the core's own: everything queued under `claimed`,
-    /// first contact and heal alike (`MessageRouter::hold_for_open`). The attempts are
-    /// `plan_receiving_init` over carriers × bundles, and the core makes them itself — until
-    /// 2026-09-26 the platform held the carriers and made the attempts, and the heal path's copy
-    /// of that walk had already diverged from the first-message path's.
+    /// Each carrier opens with the key its own sender certificate names, once that certificate
+    /// passes `SenderCertificate::identity_for_opening` against the server keys held now. One
+    /// attempt per carrier, in arrival order, handshakes only: the key names the device, so there
+    /// is no set of bundles to search (`decisions/first-message-opens-without-the-server.md`).
+    /// Until 2026-09-27 the platform fetched the account's bundles and the core walked carriers ×
+    /// bundles, because nothing the recipient held said which device had written the message —
+    /// while the certificate beside it said so, signed.
     ///
-    /// A failed attempt leaves nothing behind: a session already held for the bundle's device is
-    /// taken aside first and put back unless the attempt opens. One that opens replaces it, and
-    /// the old one is archived (`SessionTerminated`). The session is filed under the device the
-    /// bundle's identity key derives to; if that is not `claimed`, the rest of `claimed`'s queue
-    /// moves with it and the mismatch is reported — a certificate named a device that did not
-    /// write the message.
-    pub fn open_receiving(
-        &mut self,
-        claimed: &str,
-        bundles: &[crate::crypto::handshake::x3dh::X3DHPublicKeyBundle],
-    ) -> ReceivingOpen {
+    /// A failed attempt leaves nothing behind: a session already held with `device` is taken aside
+    /// first and put back unless the attempt opens. One that opens replaces it, and the old one is
+    /// archived (`SessionTerminated`).
+    ///
+    /// A certificate that could not be checked because no server key is set yet is not a failure:
+    /// nothing is dropped and the answer says so (`awaiting_server_key`), so the platform retries
+    /// instead of telling the peer to start over.
+    pub fn open_receiving(&mut self, device: &str) -> ReceivingOpen {
+        use crate::crypto::sealed_sender::SenderRefusal;
         use crate::orchestration::receiving_init_plan::{
-            ReceivingInitCarrier, plan_receiving_init,
+            ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind,
         };
 
-        let queued = self.router.pending_messages(claimed);
-        let headers: Vec<Option<IncomingFirstMessage>> = queued
-            .iter()
-            .map(|m| IncomingFirstMessage::from_wire_payload(&m.wire_payload).ok())
-            .collect();
-        let carriers: Vec<ReceivingInitCarrier> = queued
-            .iter()
-            .zip(&headers)
-            .map(|(m, h)| match h {
-                Some(h) => ReceivingInitCarrier {
-                    message_number: h.message_number,
-                    one_time_prekey_id: h.one_time_prekey_id,
-                    kem_ciphertext_bytes: h.kem_ciphertext.len() as u32,
-                    pq_message_epoch: h.pq_message_epoch,
-                    is_session_reset_init: m.content_type == CT_SESSION_RESET_INIT,
-                },
-                // Unparseable: shaped so the plan skips it.
-                None => ReceivingInitCarrier {
-                    message_number: u32::MAX,
-                    one_time_prekey_id: 0,
-                    kem_ciphertext_bytes: 0,
-                    pq_message_epoch: 0,
-                    is_session_reset_init: false,
-                },
-            })
-            .collect();
-        let plan = plan_receiving_init(&carriers, bundles.len() as u32);
-
+        let now = self.clock.now_secs() as i64;
         let mut last_error = None;
         let mut tried: Vec<String> = Vec::new();
-        for attempt in &plan {
-            let carrier = &queued[attempt.carrier_index as usize];
-            let Some(first) = &headers[attempt.carrier_index as usize] else {
+        let mut awaiting_server_key = false;
+        for carrier in self.router.pending_messages(device) {
+            let Ok(first) = IncomingFirstMessage::from_wire_payload(&carrier.wire_payload) else {
                 continue;
             };
-            if !tried.contains(&carrier.message_id) {
-                tried.push(carrier.message_id.clone());
+            let shape = ReceivingInitCarrier {
+                message_number: first.message_number,
+                one_time_prekey_id: first.one_time_prekey_id,
+                kem_ciphertext_bytes: first.kem_ciphertext.len() as u32,
+                pq_message_epoch: first.pq_message_epoch,
+                is_session_reset_init: carrier.content_type == CT_SESSION_RESET_INIT,
+            };
+            if receiving_init_kind(&shape) != ReceivingInitKind::Handshake {
+                continue;
             }
-            let bundle = &bundles[attempt.bundle_index as usize];
-            let device = crate::device_id::derive_device_id(&bundle.identity_public);
+            let checked = carrier
+                .sender_certificate
+                .as_ref()
+                .map(|c| c.identity_for_opening(&self.trusted_server_keys, now));
+            let identity = match checked {
+                Some(Ok(key)) => key.to_vec(),
+                Some(Err(SenderRefusal::NoTrustedKey)) => {
+                    awaiting_server_key = true;
+                    continue;
+                }
+                Some(Err(refusal)) => {
+                    tried.push(carrier.message_id.clone());
+                    last_error = Some(format!("SENDER_CERTIFICATE_REFUSED: {refusal:?}"));
+                    continue;
+                }
+                None => {
+                    tried.push(carrier.message_id.clone());
+                    last_error = Some(
+                        "SENDER_CERTIFICATE_MISSING: an unsealed message cannot open a session"
+                            .to_string(),
+                    );
+                    continue;
+                }
+            };
+            tried.push(carrier.message_id.clone());
+            // The certificate is consistent (its key derives to the device it names); what is
+            // checked here is that the platform filed the message under that device.
+            let named = crate::device_id::derive_device_id(&identity);
+            if named != device {
+                last_error = Some(format!(
+                    "SENDER_DEVICE_MISMATCH: queued under {device}, the certificate names {named}"
+                ));
+                continue;
+            }
 
             let held_bytes = self
                 .lifecycle
                 .client
-                .has_session(&device)
-                .then(|| self.lifecycle.export_session_bytes_for(&device).ok())
+                .has_session(device)
+                .then(|| self.lifecycle.export_session_bytes_for(device).ok())
                 .flatten();
-            let held = self.lifecycle.client.take_session(&device);
-            match self.init_receiving_session_with_msg(&device, bundle, first) {
-                Ok((_, plaintext)) => {
-                    return self.receiving_opened(
-                        claimed,
-                        &device,
-                        carrier.clone(),
-                        plaintext,
-                        held_bytes,
-                    );
+            let held = self.lifecycle.client.take_session(device);
+            match self.init_receiving_with_identity(device, &identity, &first) {
+                Ok(plaintext) => {
+                    return self.receiving_opened(device, carrier, plaintext, held_bytes);
                 }
                 Err(e) => {
                     if let Some(session) = held {
-                        self.lifecycle.client.put_back_session(&device, session);
+                        self.lifecycle.client.put_back_session(device, session);
                     }
                     last_error = Some(e);
                 }
             }
         }
 
-        // Nothing opened. What was tried is proven unopenable against every device the account
-        // has; the rest cannot open without a session either. The queue goes, and the opening
-        // the queue asked for ends with it.
+        // The opening the queue asked for ends either way; what differs is the queue.
+        self.sessions.handle(device, SessionEvent::OpenFailed);
+        if awaiting_server_key {
+            return ReceivingOpen {
+                opened_device: None,
+                opener_message_id: None,
+                actions: Vec::new(),
+                tried_message_ids: Vec::new(),
+                dropped_message_ids: Vec::new(),
+                last_error,
+                awaiting_server_key: true,
+            };
+        }
+        // Nothing opened. What was tried is proven unopenable; the rest cannot open without a
+        // session either. The queue goes.
         let dropped = self
             .router
-            .take_pending(claimed)
+            .take_pending(device)
             .into_iter()
             .map(|m| m.message_id)
             .filter(|id| !tried.contains(id))
             .collect();
-        self.sessions.handle(claimed, SessionEvent::OpenFailed);
         ReceivingOpen {
             opened_device: None,
             opener_message_id: None,
@@ -1007,13 +1039,13 @@ impl Orchestrator {
             tried_message_ids: tried,
             dropped_message_ids: dropped,
             last_error,
+            awaiting_server_key: false,
         }
     }
 
     /// The success half of `open_receiving`.
     fn receiving_opened(
         &mut self,
-        claimed: &str,
         device: &str,
         opener: IncomingMessage,
         plaintext: Vec<u8>,
@@ -1023,22 +1055,7 @@ impl Orchestrator {
         if let Some(bytes) = replaced {
             actions.push(self.lifecycle.record_archive(device, bytes));
         }
-
-        self.router.remove_pending(claimed, &opener.message_id);
-        if claimed != device {
-            tracing::warn!(
-                target: "crypto::orchestrator",
-                claimed = %claimed,
-                opened = %device,
-                "sender certificate named a device that did not write the message"
-            );
-            self.router.rekey_pending(claimed, device);
-            self.sessions.handle(claimed, SessionEvent::OpenFailed);
-            actions.push(Action::NotifyError {
-                code: "sender_device_mismatch".to_string(),
-                message: format!("certificate named {claimed}, the session opened with {device}"),
-            });
-        }
+        self.router.remove_pending(device, &opener.message_id);
 
         // The opener is a message like any other from here on: recorded as processed, and
         // answered with what a live decrypt of it would be answered with.
@@ -1065,6 +1082,7 @@ impl Orchestrator {
             tried_message_ids: Vec::new(),
             dropped_message_ids: Vec::new(),
             last_error: None,
+            awaiting_server_key: false,
         }
     }
 
@@ -1141,13 +1159,19 @@ impl Orchestrator {
         self.export_kyber_prekeys_cfe().ok()
     }
 
-    pub fn init_receiving_session_with_msg(
+    /// RESPONDER init of `first_message` against `remote_identity` — the key a checked sender
+    /// certificate named — filed under `contact_id`, the device that key derives to.
+    ///
+    /// The initiator's identity key is the one thing the responder side of X3DH takes from the
+    /// peer, and it is all this asks for. Until 2026-09-27 it took the initiator's whole bundle and
+    /// verified the signature on the initiator's signed prekey, which authenticated nothing: that
+    /// prekey takes no part in the responder's derivation.
+    pub fn init_receiving_with_identity(
         &mut self,
         contact_id: &str,
-        public_bundle: &crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        remote_identity: &[u8],
         first_message: &IncomingFirstMessage,
-    ) -> Result<(String, Vec<u8>), String> {
-        use crate::crypto::keys::build_prologue;
+    ) -> Result<Vec<u8>, String> {
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
         use crate::crypto::provider::CryptoProvider;
 
@@ -1179,23 +1203,8 @@ impl Orchestrator {
             pq_ratchet_field: first_message.pq_ratchet_field.clone(),
         };
 
-        // Verify the initiator's signed prekey signature before doing any crypto. This prologue
-        // uses the BUNDLE's crypto suite (how the SPK signature was produced), which is a
-        // different concept from the DR message suite above.
-        let suite_id = public_bundle.suite_id;
-        let verifying_key = ClassicSuiteProvider::signature_public_key_from_bytes(
-            public_bundle.verifying_key.clone(),
-        );
-        let prologue = build_prologue(suite_id);
-        let mut spk_msg =
-            Vec::with_capacity(prologue.len() + public_bundle.signed_prekey_public.len());
-        spk_msg.extend_from_slice(&prologue);
-        spk_msg.extend_from_slice(&public_bundle.signed_prekey_public);
-        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &public_bundle.signature)
-            .map_err(|_| "invalid signed prekey signature from initiator".to_string())?;
-
         let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
+            ClassicSuiteProvider::kem_public_key_from_bytes(remote_identity.to_vec());
         let remote_ephemeral = ClassicSuiteProvider::kem_public_key_from_bytes(
             first_message.ephemeral_public_key.clone(),
         );
@@ -1212,7 +1221,7 @@ impl Orchestrator {
                 kem_ciphertext: &first_message.kem_ciphertext,
             },
         )?;
-        Ok((contact_id.to_string(), plaintext))
+        Ok(plaintext)
     }
 
     /// The step both responder entry points end in: the KEM part (`responder_kem`), the X3DH +
@@ -1265,118 +1274,22 @@ impl Orchestrator {
         Ok(plaintext)
     }
 
-    /// RESPONDER X3DH init from a raw CFE wire payload.
-    ///
-    /// Drop-in replacement for `init_receiving_session_with_msg` when the caller
-    /// has the raw binary WirePayload rather than a JSON-decoded first message.
-    /// Used by non-UniFFI platforms (TUI, Android) in `Action::InitSession` when
-    /// `pending_message_count(contact_id) > 0`, i.e. the local node is the RESPONDER.
-    ///
-    /// Returns `(contact_id, plaintext_of_first_message)` on success.
-    pub fn init_receiving_session_from_wire_payload(
+    /// RESPONDER init of one message that does not wait in the queue — a sibling's SENDER_SYNC.
+    /// Opens with the key `certificate` names once it passes `identity_for_opening`, under the
+    /// device it names. Returns that device and the first message's plaintext.
+    pub fn receiving_from_certificate(
         &mut self,
-        contact_id: &str,
-        recipient_bundle: &[u8],
+        certificate: &crate::crypto::sealed_sender::SenderCertificate,
         wire_payload: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
-        use crate::crypto::SuiteID;
-        use crate::crypto::keys::build_prologue;
-        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
-        use crate::crypto::provider::CryptoProvider;
-
-        #[derive(serde::Deserialize)]
-        struct KeyBundle {
-            identity_public: Vec<u8>,
-            signed_prekey_public: Vec<u8>,
-            signature: Vec<u8>,
-            verifying_key: Vec<u8>,
-            suite_id: u16,
-        }
-
-        let key_bundle: KeyBundle = serde_json::from_slice(recipient_bundle)
-            .map_err(|_| "invalid key bundle JSON".to_string())?;
-
-        let decoded = crate::wire_payload::unpack(wire_payload)
-            .map_err(|e| format!("wire_payload unpack failed: {e:?}"))?;
-
-        if decoded.sealed_box.len() < 12 {
-            return Err("sealed_box too short in wire_payload".to_string());
-        }
-        let nonce = decoded.sealed_box[..12].to_vec();
-        let ciphertext = decoded.sealed_box[12..].to_vec();
-
-        let dh_public_key: [u8; 32] = decoded
-            .dh_public_key
-            .clone()
-            .try_into()
-            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
-
-        let encrypted_first_message = EncryptedRatchetMessage {
-            dh_public_key,
-            message_number: decoded.message_number,
-            ciphertext,
-            nonce,
-            previous_chain_length: decoded.previous_chain_length,
-            // The wire payload already carries the DR message's negotiated suite + PQ section;
-            // use them (not the bundle's crypto suite) so suite-3 first messages decrypt (task #12).
-            suite_id: decoded.suite_id,
-            pq_message_epoch: decoded.pq_message_epoch,
-            pq_ratchet_field: decoded.pq_ratchet_field,
-        };
-
-        // Verify the initiator's SPK signature — same check as init_receiving_session_with_msg.
-        let suite_id =
-            SuiteID::new(key_bundle.suite_id).map_err(|_| "invalid suite_id".to_string())?;
-        let verifying_key =
-            ClassicSuiteProvider::signature_public_key_from_bytes(key_bundle.verifying_key.clone());
-        let prologue = build_prologue(suite_id);
-        let mut spk_msg =
-            Vec::with_capacity(prologue.len() + key_bundle.signed_prekey_public.len());
-        spk_msg.extend_from_slice(&prologue);
-        spk_msg.extend_from_slice(&key_bundle.signed_prekey_public);
-        ClassicSuiteProvider::verify(&verifying_key, &spk_msg, &key_bundle.signature)
-            .map_err(|_| "invalid signed prekey signature from initiator".to_string())?;
-
-        let remote_identity =
-            ClassicSuiteProvider::kem_public_key_from_bytes(key_bundle.identity_public.clone());
-        let remote_ephemeral =
-            ClassicSuiteProvider::kem_public_key_from_bytes(decoded.dh_public_key);
-
-        let kem_ciphertext = decoded.kem_ciphertext.unwrap_or_default();
-        let plaintext = self.complete_responder_init(
-            contact_id,
-            &remote_identity,
-            &remote_ephemeral,
-            &encrypted_first_message,
-            decoded.one_time_prekey_id,
-            ResponderKem {
-                pqxdh_v2: decoded.pqxdh_v2,
-                kyber_prekey_id: decoded.kyber_otpk_id,
-                kem_ciphertext: &kem_ciphertext,
-            },
-        )?;
-        Ok((contact_id.to_string(), plaintext))
-    }
-
-    /// Return the raw WirePayload bytes of the first queued incoming message
-    /// for `contact_id` without removing it from the queue.
-    ///
-    /// Use this in `Action::InitSession` to detect RESPONDER case:
-    /// if this returns `Some(_)`, call `init_receiving_session_from_wire_payload()`
-    /// instead of `init_session_with_bundle()`.
-    pub fn peek_first_pending_wire_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
-        self.router.peek_first_pending_wire_payload(contact_id)
-    }
-
-    /// Consume the first pending wire payload for a contact without processing it.
-    ///
-    /// Call this after a successful RESPONDER `init_receiving_session_from_wire_payload`
-    /// so that `drain_pending` does not attempt to re-decrypt the init message (msg_num=0),
-    /// which would fail because the Double-Ratchet key was already consumed during X3DH.
-    ///
-    /// Returns `Some(message_id)` of the removed message, or `None` if the queue was empty.
-    pub fn pop_first_pending(&mut self, contact_id: &str) -> Option<String> {
-        self.router.pop_first_pending(contact_id)
+        let identity = certificate
+            .identity_for_opening(&self.trusted_server_keys, self.clock.now_secs() as i64)
+            .map_err(|refusal| format!("SENDER_CERTIFICATE_REFUSED: {refusal:?}"))?
+            .to_vec();
+        let first = IncomingFirstMessage::from_wire_payload(wire_payload)?;
+        let device = certificate.device_id.clone();
+        let plaintext = self.init_receiving_with_identity(&device, &identity, &first)?;
+        Ok((device, plaintext))
     }
 
     pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
@@ -1385,19 +1298,6 @@ impl Orchestrator {
 
     pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
         self.lifecycle.client.remove_session(contact_id)
-    }
-
-    /// Return the queued heal payload for `contact_id` (the raw wire bytes of the
-    /// failed msgNum=0 message), or `None` if no heal record exists.
-    ///
-    /// Used by the TUI / other non-UniFFI platforms to implement the RESPONDER
-    /// healing path: fetch the contact's bundle, then call
-    /// `init_receiving_session_with_msg(contact_id, bundle, wire_payload)`.
-    pub fn take_heal_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
-        self.lifecycle
-            .healing_queue
-            .get(contact_id)
-            .map(|r| r.message_payload.clone())
     }
 
     /// Store a failed msgNum=0 wire payload in the healing queue for later retry.
@@ -1977,6 +1877,7 @@ impl Orchestrator {
         _otpk_id: u32,
         is_control: bool,
         content_type: u8,
+        sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
     ) -> Vec<Action> {
         // `data` IS the wire payload — derive the routing fields from the canonical
         // parser instead of trusting the platform's copy of the header parse.
@@ -2006,6 +1907,7 @@ impl Orchestrator {
         // All content types — including CALL_SIGNAL (12) — go through the full
         // routing pipeline (ACK dedup, session check, heal path, PQ contribution).
         let incoming = IncomingMessage {
+            sender_certificate,
             contact_id: from.clone(),
             wire_payload: data,
             message_id,
@@ -2468,6 +2370,7 @@ impl Orchestrator {
         // Route the heartbeat through the normal decrypt path.
         // A content_type we treat as "heartbeat" — content type 13.
         let msg = crate::orchestration::message_router::IncomingMessage {
+            sender_certificate: None,
             message_id,
             contact_id: contact_id.clone(),
             wire_payload: data,
@@ -2612,11 +2515,10 @@ impl Orchestrator {
                     // — unlike a deferred heal, which the peer's next carrier re-raises.
                     //
                     // Same timer as the platform's, and it pays out `OpenSession` rather than the
-                    // `FetchPublicKeyBundle` this arm grants directly. They are not two answers:
-                    // after a teardown the recovery is an announced X3DH, and the bundle fetch is
-                    // the first half of one. The bundle fetch is also message-bound on the
-                    // platform — it re-queues *this* carrier — and a timer has no message, so
-                    // granting it later would be a producer with no reader.
+                    // `OpenReceiving` this arm grants directly. They are not two answers: after a
+                    // teardown the recovery is an announced X3DH, which is ours to start; opening
+                    // from the peer's carrier is the other half, and it is re-raised by that
+                    // carrier's redelivery, which a timer does not have.
                     SessionEffect::DeferOpen { retry_after_ms } => vec![
                         Action::MessageQueuedPendingInit {
                             contact_id: cid.clone(),
@@ -2627,7 +2529,7 @@ impl Orchestrator {
                             delay_ms: retry_after_ms,
                         },
                     ],
-                    _ => vec![Action::FetchPublicKeyBundle { user_id: cid }],
+                    _ => vec![Action::OpenReceiving { contact_id: cid }],
                 }
             }
             RoutingDecision::SessionHealNeeded {
@@ -2866,6 +2768,7 @@ mod tests {
     fn test_message_received_no_session_fetches_bundle() {
         let mut o = make_orchestrator("alice");
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: "msg-001".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, None),
@@ -2878,15 +2781,16 @@ mod tests {
         // Should ask to fetch bundle (no active session → NeedSessionInit).
         let fetches: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, Action::FetchPublicKeyBundle { .. }))
+            .filter(|a| matches!(a, Action::OpenReceiving { .. }))
             .collect();
-        assert!(!fetches.is_empty(), "expected FetchPublicKeyBundle action");
+        assert!(!fetches.is_empty(), "expected OpenReceiving action");
     }
 
     #[test]
     fn forget_contact_state_clears_pending_router_state_before_re_add() {
         let mut o = make_orchestrator("alice");
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: "old-backlog".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, None),
@@ -2899,7 +2803,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::FetchPublicKeyBundle { user_id } if user_id == "bob"))
+                .any(|a| matches!(a, Action::OpenReceiving { contact_id } if contact_id == "bob"))
         );
         assert_eq!(o.pending_message_count("bob"), 1);
 
@@ -2920,6 +2824,7 @@ mod tests {
         let mut o = make_orchestrator("alice");
         let kem = [1_u8, 2, 3];
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: "msg-002".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, Some(&kem)),
@@ -2940,6 +2845,7 @@ mod tests {
     fn test_message_received_malformed_payload_notifies_without_heal() {
         let mut o = make_orchestrator("alice");
         let actions = o.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: "msg-003".to_string(),
             from: "bob".to_string(),
             data: vec![0u8; 4], // not a wire payload
@@ -3185,6 +3091,7 @@ mod tests {
             message_id: message_id.to_string(),
             opens_session,
             message: IncomingMessage {
+                sender_certificate: None,
                 contact_id: "bob".to_string(),
                 wire_payload: vec![],
                 message_id: message_id.to_string(),
@@ -3806,7 +3713,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })),
+                .any(|a| matches!(a, Action::OpenReceiving { .. })),
             "the bundle fetch is what starts the crossing init"
         );
         assert!(
@@ -4367,6 +4274,8 @@ mod pqxdh_v2_tests {
     use super::*;
     use crate::crypto::keys::KeyManager;
     use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
+    use crate::crypto::sealed_sender::SenderCertificate;
+    use crate::crypto::sealed_sender::test_support::TestServer;
 
     /// A device with core-owned Kyber keys: hybrid identity, a committed SPK, one-time keys.
     fn device(name: &str) -> Orchestrator {
@@ -4417,17 +4326,21 @@ mod pqxdh_v2_tests {
         (x3dh, kyber)
     }
 
-    /// The initiator's registration bundle as a responder receives it (JSON, the wire path).
-    fn initiator_bundle_json(initiator: &Orchestrator) -> Vec<u8> {
-        let b = initiator.get_registration_bundle_fields().unwrap();
-        serde_json::to_vec(&serde_json::json!({
-            "identity_public": b.identity_public,
-            "signed_prekey_public": b.signed_prekey_public,
-            "signature": b.signature,
-            "verifying_key": b.verifying_key,
-            "suite_id": b.suite_id.as_u16(),
-        }))
-        .unwrap()
+    /// The responder's init against the initiator's identity key, filed under `as_id`. These tests
+    /// are about the handshake, not the certificate that names the key — that is
+    /// `open_receiving_tests` — so they hand the key over directly and keep their readable ids.
+    fn respond(
+        responder: &mut Orchestrator,
+        initiator: &Orchestrator,
+        as_id: &str,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let identity = initiator
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        let first = IncomingFirstMessage::from_wire_payload(wire)?;
+        responder.init_receiving_with_identity(as_id, &identity, &first)
     }
 
     fn open(alice: &mut Orchestrator, bob: &mut Orchestrator, with_otpk: bool) {
@@ -4457,13 +4370,7 @@ mod pqxdh_v2_tests {
             "the one-time key"
         );
 
-        let (_, plaintext) = bob
-            .init_receiving_session_from_wire_payload(
-                "alice",
-                &initiator_bundle_json(&alice),
-                &msg0,
-            )
-            .unwrap();
+        let plaintext = respond(&mut bob, &alice, "alice", &msg0).unwrap();
         assert_eq!(plaintext, b"first");
         assert_eq!(
             bob.kyber_one_time_prekey_count(),
@@ -4503,12 +4410,7 @@ mod pqxdh_v2_tests {
         open(&mut alice, &mut bob, true);
         let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
         let msg1 = alice.encrypt_bytes_for("bob", b"second").unwrap();
-        bob.init_receiving_session_from_wire_payload(
-            "alice",
-            &initiator_bundle_json(&alice),
-            &msg0,
-        )
-        .unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
         let session = bob.lifecycle.active_session_id("alice").unwrap();
 
         // The ratchet names what happened.
@@ -4523,6 +4425,7 @@ mod pqxdh_v2_tests {
 
         let received = |bob: &mut Orchestrator, id: &str, data: &[u8], msg_num: u32| {
             bob.handle_event(IncomingEvent::MessageReceived {
+                sender_certificate: None,
                 message_id: id.to_string(),
                 from: "alice".to_string(),
                 data: data.to_vec(),
@@ -4577,13 +4480,7 @@ mod pqxdh_v2_tests {
             "no one-time key: the SPK"
         );
 
-        let (_, plaintext) = bob
-            .init_receiving_session_from_wire_payload(
-                "alice",
-                &initiator_bundle_json(&alice),
-                &msg1,
-            )
-            .unwrap();
+        let plaintext = respond(&mut bob, &alice, "alice", &msg1).unwrap();
         assert_eq!(plaintext, b"second", "opened from the second message");
 
         let reply = bob.encrypt_bytes_for("bob-to-alice-unused", b"x");
@@ -4620,14 +4517,7 @@ mod pqxdh_v2_tests {
         let mut msg0 = alice.encrypt_bytes_for("bob", b"secret").unwrap();
         // The ciphertext starts right after the 52-byte header.
         msg0[crate::wire_payload::HEADER_SIZE + 10] ^= 0x01;
-        assert!(
-            bob.init_receiving_session_from_wire_payload(
-                "alice",
-                &initiator_bundle_json(&alice),
-                &msg0
-            )
-            .is_err()
-        );
+        assert!(respond(&mut bob, &alice, "alice", &msg0).is_err());
         assert!(
             bob.get_session_health("alice").is_none(),
             "no session left behind"
@@ -4693,13 +4583,9 @@ mod pqxdh_v2_tests {
         let (mut alice, mut bob) = (device("alice"), device("bob"));
         open(&mut alice, &mut bob, true);
         let msg0 = alice.encrypt_bytes_for("bob", b"once").unwrap();
-        let json = initiator_bundle_json(&alice);
-        bob.init_receiving_session_from_wire_payload("alice", &json, &msg0)
-            .unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
         bob.lifecycle.client.remove_session("alice");
-        let err = bob
-            .init_receiving_session_from_wire_payload("alice", &json, &msg0)
-            .unwrap_err();
+        let err = respond(&mut bob, &alice, "alice", &msg0).unwrap_err();
         assert!(err.starts_with("PQXDH_KEY_UNAVAILABLE"), "{err}");
     }
 
@@ -4715,13 +4601,7 @@ mod pqxdh_v2_tests {
         }
         .pack()
         .unwrap();
-        let err = bob
-            .init_receiving_session_from_wire_payload(
-                "alice",
-                &initiator_bundle_json(&alice),
-                &stripped,
-            )
-            .unwrap_err();
+        let err = respond(&mut bob, &alice, "alice", &stripped).unwrap_err();
         assert!(err.starts_with("PQXDH_REQUIRED"), "{err}");
     }
 
@@ -4736,13 +4616,7 @@ mod pqxdh_v2_tests {
         alice.lifecycle.import_session_bytes("bob", &saved).unwrap();
         let msg0 = alice.encrypt_bytes_for("bob", b"after restart").unwrap();
         assert!(crate::wire_payload::unpack(&msg0).unwrap().pqxdh_v2);
-        let (_, plaintext) = bob
-            .init_receiving_session_from_wire_payload(
-                "alice",
-                &initiator_bundle_json(&alice),
-                &msg0,
-            )
-            .unwrap();
+        let plaintext = respond(&mut bob, &alice, "alice", &msg0).unwrap();
         assert_eq!(plaintext, b"after restart");
         assert_eq!(
             alice.get_session_health("bob").unwrap().pq_handshake,
@@ -4954,9 +4828,7 @@ mod pqxdh_v2_tests {
         assert!(zed.pq_upgrade_candidates().is_empty());
 
         let msg0 = zed.encrypt_bytes_for("bob", b"upgraded").unwrap();
-        let (_, plaintext) = bob
-            .init_receiving_session_from_wire_payload("zed", &initiator_bundle_json(&zed), &msg0)
-            .unwrap();
+        let plaintext = respond(&mut bob, &zed, "zed", &msg0).unwrap();
         assert_eq!(plaintext, b"upgraded");
         assert_eq!(
             bob.get_session_health("zed").unwrap().pq_handshake,
@@ -4993,6 +4865,7 @@ mod pqxdh_v2_tests {
 
     fn deliver(bob: &mut Orchestrator, from: &str, id: &str, wire: Vec<u8>, ct: u8) -> Vec<Action> {
         bob.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: id.to_string(),
             from: from.to_string(),
             data: wire,
@@ -5018,16 +4891,61 @@ mod pqxdh_v2_tests {
             .collect()
     }
 
-    /// First contact: the message waits in the core's queue under the claimed device, the
-    /// platform hands over the account's bundles, and the core opens the session, answers the
-    /// opener like a live decrypt, and drains what queued behind it.
+    /// The server that signs sender certificates in these tests, trusted by `bob`.
+    fn trusting_server(bob: &mut Orchestrator) -> TestServer {
+        let server = TestServer::new();
+        bob.set_trusted_server_keys(vec![server.verifying_key()]);
+        server
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// `sender`'s certificate as `server` would issue it now.
+    fn certificate(server: &TestServer, sender: &Orchestrator) -> SenderCertificate {
+        let identity = sender
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        server.certify(&identity, now_secs())
+    }
+
+    /// A message as a sealed delivery reaches the core: filed under `from`, with its certificate.
+    fn deliver_sealed(
+        bob: &mut Orchestrator,
+        from: &str,
+        certificate: SenderCertificate,
+        id: &str,
+        wire: Vec<u8>,
+    ) -> Vec<Action> {
+        bob.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: Some(certificate),
+            message_id: id.to_string(),
+            from: from.to_string(),
+            data: wire,
+            msg_num: 0,
+            kem_ct: vec![],
+            otpk_id: 0,
+            is_control: false,
+            content_type: 0,
+        })
+    }
+
+    /// First contact: the message waits in the core's queue, and the core opens the session from
+    /// the key its certificate names — no bundle — answers the opener like a live decrypt, and
+    /// drains what queued behind it.
     ///
     /// Mutation: skip `after_session_opened` in `receiving_opened` — the second message is not
     /// drained and this reddens.
     #[test]
-    fn a_first_contact_opens_from_the_cores_own_queue() {
+    fn a_first_contact_opens_from_the_certificate_alone() {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
+        let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, true);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
@@ -5035,17 +4953,17 @@ mod pqxdh_v2_tests {
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
         let msg1 = alice.encrypt_bytes_for(&bob_id, b"second").unwrap();
 
-        let queued = deliver(&mut bob, &alice_id, "m0", msg0, 0);
+        let cert = certificate(&server, &alice);
+        let queued = deliver_sealed(&mut bob, &alice_id, cert.clone(), "m0", msg0);
         assert!(
-            queued
-                .iter()
-                .any(|a| matches!(a, Action::FetchPublicKeyBundle { .. })),
+            queued.iter().any(
+                |a| matches!(a, Action::OpenReceiving { contact_id } if *contact_id == alice_id)
+            ),
             "{queued:?}"
         );
-        deliver(&mut bob, &alice_id, "m1", msg1, 0);
+        deliver_sealed(&mut bob, &alice_id, cert, "m1", msg1);
 
-        let alice_bundle = alice.get_registration_bundle_fields().unwrap();
-        let opened = bob.open_receiving(&alice_id, &[alice_bundle]);
+        let opened = bob.open_receiving(&alice_id);
 
         assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
         assert_eq!(opened.opener_message_id.as_deref(), Some("m0"));
@@ -5070,71 +4988,174 @@ mod pqxdh_v2_tests {
         );
     }
 
-    /// The account has two devices and the certificate names the wrong one. The walk still finds
-    /// the writer, files the session under it, and says the claim was wrong.
-    ///
-    /// Mutation: file the session under `claimed` instead of the derived device — this reddens.
+    /// An unsealed message names no key the server vouched for: it cannot open, and the queue goes.
     #[test]
-    fn a_wrong_claim_costs_an_attempt_and_is_reported() {
+    fn a_message_without_a_certificate_does_not_open() {
         let (mut alice, alice_id) = named_device();
-        let (sibling, sibling_id) = named_device();
         let (mut bob, bob_id) = named_device();
+        trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
-
-        deliver(&mut bob, &sibling_id, "m0", msg0, 0);
-        let bundles = [
-            sibling.get_registration_bundle_fields().unwrap(),
-            alice.get_registration_bundle_fields().unwrap(),
-        ];
-        let opened = bob.open_receiving(&sibling_id, &bundles);
-
-        assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
-        assert!(
-            bob.lifecycle.client.has_session(&alice_id)
-                && !bob.lifecycle.client.has_session(&sibling_id)
+        deliver(
+            &mut bob,
+            &alice_id,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+            0,
         );
-        assert!(opened.actions.iter().any(
-            |a| matches!(a, Action::NotifyError { code, .. } if code == "sender_device_mismatch")
-        ));
+
+        let opened = bob.open_receiving(&alice_id);
+        assert!(opened.opened_device.is_none());
+        assert_eq!(opened.tried_message_ids, vec!["m0".to_string()]);
+        assert!(
+            opened
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("SENDER_CERTIFICATE_MISSING")),
+            "{:?}",
+            opened.last_error
+        );
+        assert!(!bob.lifecycle.client.has_session(&alice_id));
+        assert!(bob.router.pending_messages(&alice_id).is_empty());
+    }
+
+    /// Anyone who knows Bob's public identity key can seal an envelope to him. A certificate the
+    /// server did not sign would let them open a session as any account; it opens nothing.
+    ///
+    /// Mutation: open from `sender_certificate.identity_key` without `identity_for_opening` —
+    /// this reddens.
+    #[test]
+    fn a_certificate_the_server_did_not_sign_does_not_open() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        trusting_server(&mut bob);
+        let forger = TestServer::new();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let forged = certificate(&forger, &alice);
+        deliver_sealed(
+            &mut bob,
+            &alice_id,
+            forged,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+        );
+
+        let opened = bob.open_receiving(&alice_id);
+        assert!(opened.opened_device.is_none());
+        assert_eq!(
+            opened.last_error.as_deref(),
+            Some("SENDER_CERTIFICATE_REFUSED: BadSignature")
+        );
+        assert!(!bob.lifecycle.client.has_session(&alice_id));
+    }
+
+    /// The certificate is sound, but the platform filed the message under another device. The
+    /// session would be filed under a device the key does not name; nothing opens.
+    #[test]
+    fn a_message_filed_under_another_device_does_not_open() {
+        let (mut alice, _) = named_device();
+        let (_, sibling_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let cert = certificate(&server, &alice);
+        deliver_sealed(
+            &mut bob,
+            &sibling_id,
+            cert,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+        );
+
+        let opened = bob.open_receiving(&sibling_id);
+        assert!(opened.opened_device.is_none());
+        assert!(
+            opened
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("SENDER_DEVICE_MISMATCH")),
+            "{:?}",
+            opened.last_error
+        );
+        assert!(!bob.lifecycle.client.has_session(&sibling_id));
+    }
+
+    /// Before the platform has handed over a server key nothing can be checked, and that is not a
+    /// failure: the queue stays, and the same open succeeds once the key is there.
+    ///
+    /// Mutation: fall through to the drop when `awaiting_server_key` — this reddens.
+    #[test]
+    fn a_certificate_waits_for_the_server_key() {
+        let (mut alice, alice_id) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let server = TestServer::new();
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let cert = certificate(&server, &alice);
+        deliver_sealed(
+            &mut bob,
+            &alice_id,
+            cert,
+            "m0",
+            alice.encrypt_bytes_for(&bob_id, b"hi").unwrap(),
+        );
+
+        let early = bob.open_receiving(&alice_id);
+        assert!(early.awaiting_server_key);
+        assert!(early.tried_message_ids.is_empty() && early.dropped_message_ids.is_empty());
+        assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
+
+        bob.set_trusted_server_keys(vec![server.verifying_key()]);
+        let opened = bob.open_receiving(&alice_id);
+        assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
         assert_eq!(
             decrypted(&opened.actions),
-            vec![("m0".to_string(), b"hello".to_vec())]
+            vec![("m0".to_string(), b"hi".to_vec())]
         );
     }
 
-    /// Nothing opens: the session already held is exactly as it was, the queue is gone, and the
-    /// platform is told which carriers were tried.
+    /// A handshake that does not open leaves the session Bob holds exactly as it was; the queue
+    /// goes, and the platform is told which carriers were tried.
     ///
     /// Mutation: drop the `put_back_session` on a failed attempt — this reddens.
     #[test]
-    fn a_walk_that_opens_nothing_keeps_the_session_it_found() {
+    fn an_attempt_that_opens_nothing_keeps_the_session_it_found() {
         let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
+        let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(
-            &alice_id,
-            &initiator_bundle_json(&alice),
-            &msg0,
-        )
-        .unwrap();
+        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
         let before = bob.get_session_health(&alice_id).unwrap().session_id;
 
-        // A second handshake from Alice that fails on the session Bob holds is a heal carrier.
-        let (mut alice2, _) = named_device();
+        // Alice re-initialises; her handshake arrives damaged in the KEM ciphertext, so it fails
+        // on the session Bob holds (a heal carrier) and cannot open a new one either.
+        alice.remove_session_by_contact(&bob_id);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice2.set_my_user_id(alice_id.clone());
-        alice2
+        alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
-        let reinit = alice2.encrypt_bytes_for(&bob_id, b"again").unwrap();
-        let healed = deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
+        let mut reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        reinit[crate::wire_payload::HEADER_SIZE + 10] ^= 0x01;
+        let healed = deliver_sealed(
+            &mut bob,
+            &alice_id,
+            certificate(&server, &alice),
+            "m-heal",
+            reinit,
+        );
         assert!(
             healed
                 .iter()
@@ -5147,12 +5168,7 @@ mod pqxdh_v2_tests {
             "the heal's carrier waits in the queue"
         );
 
-        // The bundle of the device whose session Bob holds, which did not write this handshake
-        // (another key under the same id): the attempt takes that session aside and fails.
-        let opened = bob.open_receiving(
-            &alice_id,
-            &[alice.get_registration_bundle_fields().unwrap()],
-        );
+        let opened = bob.open_receiving(&alice_id);
         assert!(opened.opened_device.is_none());
         assert_eq!(opened.tried_message_ids, vec!["m-heal".to_string()]);
         assert_eq!(
@@ -5168,17 +5184,13 @@ mod pqxdh_v2_tests {
     #[test]
     fn a_heal_opens_from_its_queued_carrier_and_archives_the_old_session() {
         let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
+        let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(
-            &alice_id,
-            &initiator_bundle_json(&alice),
-            &msg0,
-        )
-        .unwrap();
+        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
         let before = bob.get_session_health(&alice_id).unwrap().session_id;
 
         // Alice lost her session and re-initialises with the same identity.
@@ -5188,12 +5200,15 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
-        deliver(&mut bob, &alice_id, "m-heal", reinit, 0);
-
-        let opened = bob.open_receiving(
+        deliver_sealed(
+            &mut bob,
             &alice_id,
-            &[alice.get_registration_bundle_fields().unwrap()],
+            certificate(&server, &alice),
+            "m-heal",
+            reinit,
         );
+
+        let opened = bob.open_receiving(&alice_id);
         assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
         assert_eq!(
             decrypted(&opened.actions),
@@ -5220,12 +5235,7 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(
-            &alice_id,
-            &initiator_bundle_json(&alice),
-            &msg0,
-        )
-        .unwrap();
+        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
         let (mut other, _) = named_device();
         other.set_my_user_id(alice_id.clone());
         let (x3dh, kyber) = bundle_of(&mut bob, false);
@@ -5269,6 +5279,7 @@ mod pqxdh_v2_tests {
     fn a_reset_init_supersedes_what_its_sender_queued() {
         let (mut alice, alice_id) = named_device();
         let (mut bob, bob_id) = named_device();
+        let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
@@ -5288,6 +5299,7 @@ mod pqxdh_v2_tests {
             .unwrap();
         let sri = alice.encrypt_bytes_for(&bob_id, b"reset").unwrap();
         let actions = bob.queue_for_open(IncomingMessage {
+            sender_certificate: Some(certificate(&server, &alice)),
             contact_id: alice_id.clone(),
             wire_payload: sri,
             message_id: "sri".to_string(),
@@ -5300,10 +5312,7 @@ mod pqxdh_v2_tests {
             Action::PendingDropped { message_ids, .. } if message_ids == &vec!["old".to_string()]
         )), "{actions:?}");
 
-        let opened = bob.open_receiving(
-            &alice_id,
-            &[alice.get_registration_bundle_fields().unwrap()],
-        );
+        let opened = bob.open_receiving(&alice_id);
         assert_eq!(opened.opener_message_id.as_deref(), Some("sri"));
         assert_eq!(
             decrypted(&opened.actions),
@@ -5373,6 +5382,7 @@ mod pqxdh_v2_tests {
             0,
         );
         let actions = bob.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
             message_id: "end".to_string(),
             from: alice_id.clone(),
             data: b"__END_SESSION__".to_vec(),
@@ -5403,12 +5413,7 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        bob.init_receiving_session_from_wire_payload(
-            &alice_id,
-            &initiator_bundle_json(&alice),
-            &msg0,
-        )
-        .unwrap();
+        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
         let (mut other, _) = named_device();
         other.set_my_user_id(alice_id.clone());
         let (x3dh, kyber) = bundle_of(&mut bob, false);

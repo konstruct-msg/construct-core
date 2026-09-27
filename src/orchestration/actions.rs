@@ -288,8 +288,13 @@ pub enum Action {
     },
 
     // ── Network ───────────────────────────────────────────────────────────────
-    FetchPublicKeyBundle {
-        user_id: String,
+    /// A message waits for a session with `contact_id` and can open one: the platform calls
+    /// `open_receiving(contact_id)`. Nothing is fetched — the key the session opens with comes from
+    /// the message's sender certificate. It stays a round trip, rather than an open inside this
+    /// event, because the platform's bookkeeping after an open (prekey replenishment, the
+    /// handshake controls, the queued sends) still hangs off the open's answer.
+    OpenReceiving {
+        contact_id: String,
     },
     SendEncryptedMessage {
         to: String,
@@ -389,6 +394,11 @@ pub enum IncomingEvent {
         /// Content-type from the server envelope (proto ContentType enum value).
         /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
         content_type: u8,
+        /// The sender certificate the envelope was sealed with, as unsealed and not yet checked.
+        /// `None` for a message that was not sealed. The only thing a first message can open a
+        /// session from — see `SenderCertificate::identity_for_opening`.
+        #[serde(default)]
+        sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
     },
     /// Platform-side outgoing regular message.
     /// Rust orchestrator encrypts `plaintext` bytes with the Double Ratchet session,
@@ -425,7 +435,8 @@ pub enum IncomingEvent {
     AckReceived {
         message_id: String,
     },
-    /// Server returned a key bundle in response to `FetchPublicKeyBundle`.
+    /// A key bundle the platform fetched to open a session as INITIATOR. Sent only by
+    /// construct-tui, whose JSON path (`InitSession`) predates `OpenSession`; see TODO 70.
     KeyBundleFetched {
         user_id: String,
         bundle_json: String,

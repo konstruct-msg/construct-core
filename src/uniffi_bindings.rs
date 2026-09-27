@@ -117,6 +117,8 @@ pub struct SessionHealthReport {
 }
 
 pub use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
+/// The sender certificate as a platform unsealed it. UDL `dictionary SenderCertificate`.
+pub use crate::crypto::sealed_sender::SenderCertificate;
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
@@ -201,6 +203,7 @@ pub struct ReceivingOpenResult {
     pub dropped_message_ids: Vec<String>,
     pub last_error: Option<String>,
     pub kyber_prekeys: Option<Vec<u8>>,
+    pub awaiting_server_key: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -241,26 +244,6 @@ pub struct BinaryKeyBundle {
     pub kyber_one_time_prekey_hybrid_signature: Option<Vec<u8>>,
     pub hybrid_identity_key: Option<Vec<u8>>,
     pub hybrid_identity_signature: Option<Vec<u8>>,
-}
-
-/// Binary first-message bundle — mirrors the UDL `BinaryFirstMessage` dictionary.
-/// Replaces the JSON-encoded first-message bytes in init_receiving_session.
-#[derive(Debug, Clone)]
-pub struct BinaryFirstMessage {
-    pub ephemeral_public_key: Vec<u8>,
-    pub message_number: u32,
-    pub content: Vec<u8>, // raw sealed box: nonce[12] ++ ciphertext
-    pub one_time_prekey_id: u32,
-    /// Negotiated DR suite the initiator encrypted with (task #12). 1/CLASSIC for non-PQ_RATCHET.
-    pub suite_id: u16,
-    /// Suite-3 PQ epoch tag (0 otherwise).
-    pub pq_message_epoch: u32,
-    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
-    pub pq_ratchet_field: Vec<u8>,
-    /// The PQXDH v2 handshake, as `wire_payload_unpack` returned it.
-    pub pqxdh_v2: bool,
-    pub kyber_prekey_id: u32,
-    pub kem_ciphertext: Vec<u8>,
 }
 
 /// Mirrors the UDL `WirePayload` dictionary and `wire_payload::DecodedWirePayload`.
@@ -621,143 +604,6 @@ impl ClassicCryptoCore {
             })?;
 
         Ok(contact_id)
-    }
-
-    /// Initialize a receiving session (for responder) with first message
-    ///
-    /// Returns SessionInitResult with session_id and decrypted first message
-    pub fn init_receiving_session(
-        &self,
-        contact_id: String,
-        recipient_bundle: BinaryKeyBundle,
-        first_message: BinaryFirstMessage,
-    ) -> Result<SessionInitResult, CryptoError> {
-        tracing::debug!("init_receiving_session called for contact: {}", contact_id);
-
-        let _public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
-
-        let sealed_box = first_message.content;
-        tracing::debug!("sealed_box length: {}", sealed_box.len());
-
-        if sealed_box.len() < 12 {
-            return Err(CryptoError::InvalidCiphertext);
-        }
-        let nonce = sealed_box[..12].to_vec();
-        let ciphertext = sealed_box[12..].to_vec();
-
-        tracing::debug!(
-            "Extracted components - nonce length: {}, ciphertext length: {}",
-            nonce.len(),
-            ciphertext.len()
-        );
-
-        let dh_public_key: [u8; 32] = first_message
-            .ephemeral_public_key
-            .clone()
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        let encrypted_first_message = EncryptedRatchetMessage {
-            dh_public_key,
-            message_number: first_message.message_number,
-            ciphertext,
-            nonce,
-            previous_chain_length: 0,
-            // Carry the DR message's negotiated suite + PQ tags from the wire, not the bundle's
-            // crypto suite — otherwise a suite-3 first message fails to decrypt (task #12).
-            suite_id: first_message.suite_id,
-            pq_message_epoch: first_message.pq_message_epoch,
-            pq_ratchet_field: pq_field_from_bytes(&first_message.pq_ratchet_field),
-        };
-
-        let remote_identity = ClassicSuiteProvider::kem_public_key_from_bytes(
-            recipient_bundle.identity_public.clone(),
-        );
-
-        let remote_ephemeral = ClassicSuiteProvider::kem_public_key_from_bytes(
-            first_message.ephemeral_public_key.clone(),
-        );
-
-        tracing::debug!(
-            target: "crypto::uniffi",
-            contact_id = %contact_id,
-            remote_identity_len = recipient_bundle.identity_public.len(),
-            remote_ephemeral_len = first_message.ephemeral_public_key.len(),
-            dh_public_key_len = encrypted_first_message.dh_public_key.len(),
-            "Initializing receiving session (receiver side)"
-        );
-
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let local_bundle = client
-            .key_manager()
-            .export_registration_bundle()
-            .map_err(|_| CryptoError::InitializationFailed)?;
-
-        tracing::debug!(
-            target: "crypto::uniffi",
-            contact_id = %contact_id,
-            local_identity_len = local_bundle.identity_public.len(),
-            local_signed_prekey_len = local_bundle.signed_prekey_public.len(),
-            remote_identity_len = recipient_bundle.identity_public.len(),
-            remote_ephemeral_len = first_message.ephemeral_public_key.len(),
-            message_number = first_message.message_number,
-            "Initializing receiving session (receiver side)"
-        );
-        tracing::info!(
-            target: "crypto::uniffi",
-            local_ik_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&local_bundle.identity_public),
-            local_spk_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&local_bundle.signed_prekey_public),
-            remote_ik_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&recipient_bundle.identity_public),
-            remote_ek_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&first_message.ephemeral_public_key),
-            otpk_id = first_message.one_time_prekey_id,
-            "[RESPONDER keys] local_ik_pub, local_spk_pub, remote_ik_pub, remote_ek_pub, otpk_id"
-        );
-
-        let (_internal_session_id, plaintext_bytes) = client
-            .init_receiving_session_with_ephemeral(
-                &contact_id,
-                &remote_identity,
-                &remote_ephemeral,
-                &encrypted_first_message,
-                first_message.one_time_prekey_id,
-                None,
-            )
-            .map_err(|e| {
-                tracing::error!(
-                    target: "crypto::uniffi",
-                    contact_id = %contact_id,
-                    error = %e,
-                    remote_identity_len = recipient_bundle.identity_public.len(),
-                    remote_ephemeral_len = first_message.ephemeral_public_key.len(),
-                    message_number = first_message.message_number,
-                    "init_receiving_session_with_ephemeral failed"
-                );
-                CryptoError::SessionInitializationFailed {
-                    message: e.to_string(),
-                }
-            })?;
-
-        // Keep plaintext as raw bytes — UTF-8 conversion is the caller's responsibility.
-        // Binary content (e.g. old clients sending protobuf as msgNum=0) must NOT prevent
-        // session establishment; the X3DH handshake completed successfully.
-        let decrypted_message = plaintext_bytes;
-
-        tracing::info!(
-            "Session initialized, plaintext length: {}",
-            decrypted_message.len()
-        );
-
-        Ok(SessionInitResult {
-            session_id: contact_id,
-            decrypted_message,
-            storage_key: gen_storage_key(),
-            // This core holds no Kyber prekeys (classic bootstrap core).
-            kyber_prekeys: None,
-        })
     }
 
     /// Encrypt a message for a session - returns wire format components
@@ -1690,6 +1536,59 @@ mod tests {
     /// Build an `OrchestratorCore` (the core the iOS app actually uses) for a given user id.
     /// Keys are generated via the classic core and re-imported as CFE bytes, matching the
     /// production `create_orchestrator_core_from_keys` path.
+    /// An orchestrator core named by the device id its identity key derives to — what a real
+    /// device is called, and what a session opened from a sender certificate is filed under.
+    fn named_core() -> (std::sync::Arc<OrchestratorCore>, String) {
+        let classic = create_crypto_core().unwrap();
+        let id = crate::device_id::derive_device_id(
+            &classic
+                .get_registration_bundle_fields()
+                .unwrap()
+                .identity_public,
+        );
+        let keys = classic.export_private_keys().unwrap();
+        (
+            create_orchestrator_core_from_keys(keys, id.clone()).unwrap(),
+            id,
+        )
+    }
+
+    /// `sender`'s sender certificate as `server` issues it now, and `recipient` trusting `server`.
+    fn certified(
+        server: &crate::crypto::sealed_sender::test_support::TestServer,
+        sender: &OrchestratorCore,
+        recipient: &OrchestratorCore,
+    ) -> SenderCertificate {
+        recipient.set_trusted_server_keys(vec![server.verifying_key()]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let identity = sender
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        server.certify(&identity, now)
+    }
+
+    /// The wire payload of an encrypted message, packed the way the platforms pack it.
+    fn wire_of(encrypted: EncryptedMessageComponents) -> Vec<u8> {
+        wire_payload_pack(WirePayload {
+            dh_public_key: encrypted.ephemeral_public_key,
+            message_number: encrypted.message_number,
+            one_time_prekey_id: encrypted.one_time_prekey_id,
+            kyber_otpk_id: encrypted.kyber_prekey_id,
+            previous_chain_length: 0,
+            suite_id: encrypted.suite_id,
+            kem_ciphertext: Some(encrypted.kem_ciphertext).filter(|k| !k.is_empty()),
+            sealed_box: encrypted.content,
+            pq_message_epoch: encrypted.pq_message_epoch,
+            pq_ratchet_field: encrypted.pq_ratchet_field,
+            pqxdh_v2: false,
+        })
+        .unwrap()
+    }
+
     fn make_orchestrator(user_id: &str) -> std::sync::Arc<OrchestratorCore> {
         let classic = create_crypto_core().unwrap();
         let keys = classic.export_private_keys().unwrap();
@@ -1721,6 +1620,7 @@ mod tests {
             otpk_id: 0,
             is_control: false,
             content_type: 0,
+            sender_certificate: None,
         }
     }
 
@@ -1747,7 +1647,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                CfeAction::FetchPublicKeyBundle { user_id } if user_id == "bob"
+                CfeAction::OpenReceiving { contact_id } if contact_id == "bob"
             )),
             "a first message with no session must ask for bob's bundle"
         );
@@ -1893,38 +1793,29 @@ mod tests {
 
     /// A session established via the degraded path must be fully functional when the peer still
     /// holds the matching SPK private key: Alice degraded-inits against Bob's (faked-stale) bundle,
-    /// encrypts, and Bob decrypts via init_receiving_session. (The lost-SPK case is exercised by
-    /// the iOS healing integration tests.)
+    /// encrypts, and Bob opens from the wire payload with Alice's sender certificate. (The lost-SPK
+    /// case is exercised by the iOS healing integration tests.)
     #[test]
     fn test_degraded_session_encrypts_and_decrypts() {
-        let alice = make_orchestrator("alice_user_id");
-        let bob = make_orchestrator("bob_user_id");
+        let (alice, _) = named_core();
+        let (bob, bob_id) = named_core();
+        let server = crate::crypto::sealed_sender::test_support::TestServer::new();
 
-        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
         let mut bob_bundle = pq_bundle(&bob);
         bob_bundle.spk_uploaded_at = unix_secs_days_ago(35); // stale → only degraded init works
 
         let session = alice
-            .init_session_allowing_stale("bob_user_id".to_string(), bob_bundle)
+            .init_session_allowing_stale(bob_id, bob_bundle)
             .expect("degraded init should succeed");
 
         let plaintext = b"reachable while offline".to_vec();
         let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
 
-        let first_msg = BinaryFirstMessage {
-            ephemeral_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            content: encrypted.content,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            suite_id: encrypted.suite_id,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
-            kyber_prekey_id: encrypted.kyber_prekey_id,
-            kem_ciphertext: encrypted.kem_ciphertext,
-        };
         let bob_result = bob
-            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .init_receiving_session_from_wire_payload(
+                certified(&server, &alice, &bob),
+                wire_of(encrypted),
+            )
             .expect("Bob should establish receiving session from a degraded-init first message");
 
         assert_eq!(
@@ -1999,9 +1890,9 @@ mod tests {
     fn test_pqxdh_v2_through_the_exported_api() {
         use crate::crypto::SuiteID;
 
-        let alice = make_orchestrator("alice_user_id");
-        let bob = make_orchestrator("bob_user_id");
-        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
+        let (alice, alice_id) = named_core();
+        let (bob, bob_id) = named_core();
+        let server = crate::crypto::sealed_sender::test_support::TestServer::new();
 
         let bob_otpk = bob.generate_one_time_prekeys(1).unwrap().pop().unwrap();
         let mut bob_bundle = pq_bundle(&bob);
@@ -2028,36 +1919,31 @@ mod tests {
         bob_bundle.kyber_spk_rotation_epoch = 5;
 
         alice
-            .init_session("bob_user_id".to_string(), bob_bundle)
+            .init_session(bob_id.clone(), bob_bundle)
             .expect("device-shaped init_session should succeed");
         assert_eq!(
-            alice.get_session_suite_id("bob_user_id".to_string()),
+            alice.get_session_suite_id(bob_id.clone()),
             SuiteID::PQ_RATCHET.as_u16(),
             "suite 3 is mandatory"
         );
 
         let encrypted = alice
-            .encrypt_message("bob_user_id".to_string(), b"hello".to_vec())
+            .encrypt_message(bob_id.clone(), b"hello".to_vec())
             .unwrap();
         assert_eq!(encrypted.kyber_prekey_id, kyber_otpk.key_id);
         assert_eq!(encrypted.kem_ciphertext.len(), 1568);
         assert_eq!(encrypted.one_time_prekey_id, bob_otpk.key_id);
 
-        let first_msg = BinaryFirstMessage {
-            ephemeral_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            content: encrypted.content,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            suite_id: encrypted.suite_id,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: true,
-            kyber_prekey_id: encrypted.kyber_prekey_id,
-            kem_ciphertext: encrypted.kem_ciphertext,
-        };
         let result = bob
-            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .init_receiving_session_from_wire_payload(
+                certified(&server, &alice, &bob),
+                wire_of(encrypted),
+            )
             .unwrap();
+        assert_eq!(
+            result.session_id, alice_id,
+            "filed under the certified device"
+        );
         assert_eq!(result.decrypted_message, b"hello");
         assert!(
             result.kyber_prekeys.is_some(),
@@ -2065,60 +1951,17 @@ mod tests {
         );
         assert_eq!(bob.kyber_one_time_prekey_count(), 0);
 
-        let health = alice.get_session_health("bob_user_id".to_string()).unwrap();
+        let health = alice.get_session_health(bob_id).unwrap();
         assert_eq!(health.pq_handshake, PqHandshake::InitialV2);
         assert_eq!(health.pq_authentication, PqAuthentication::Authenticated);
-    }
-
-    /// The responder's other entry: the envelope's payload as packed, unpacked by the core. What
-    /// `init_receiving_session` needs copied into `BinaryFirstMessage` — the v2 flag, the Kyber
-    /// prekey id, the ciphertext — the platform never touches here.
-    #[test]
-    fn test_pqxdh_v2_responder_from_the_wire_payload() {
-        let alice = make_orchestrator("alice_user_id");
-        let bob = make_orchestrator("bob_user_id");
-        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-        let mut bob_bundle = pq_bundle(&bob);
-        bob_bundle.suite_id = 1;
-
-        alice
-            .init_session("bob_user_id".to_string(), bob_bundle)
-            .unwrap();
-        let encrypted = alice
-            .encrypt_message("bob_user_id".to_string(), b"hello".to_vec())
-            .unwrap();
-        let wire = wire_payload_pack(WirePayload {
-            dh_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            kyber_otpk_id: encrypted.kyber_prekey_id,
-            previous_chain_length: 0,
-            suite_id: encrypted.suite_id,
-            kem_ciphertext: Some(encrypted.kem_ciphertext),
-            sealed_box: encrypted.content,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: false,
-        })
-        .unwrap();
-
-        let result = bob
-            .init_receiving_session_from_wire_payload(
-                "alice_user_id".to_string(),
-                alice_bundle.clone(),
-                wire,
-            )
-            .unwrap();
-        assert_eq!(result.decrypted_message, b"hello");
-        let health = bob.get_session_health("alice_user_id".to_string()).unwrap();
+        let health = bob.get_session_health(alice_id).unwrap();
         assert_eq!(health.pq_handshake, PqHandshake::InitialV2);
 
         // Not a payload at all: refused, and no session is left behind.
-        let carol = make_orchestrator("carol_user_id");
+        let (carol, _) = named_core();
         let err = carol
             .init_receiving_session_from_wire_payload(
-                "alice_user_id".to_string(),
-                alice_bundle,
+                certified(&server, &alice, &carol),
                 vec![0u8; 8],
             )
             .unwrap_err();
@@ -2127,38 +1970,62 @@ mod tests {
                 if message.starts_with("wire_payload unpack failed")),
             "{err:?}"
         );
-        assert!(!carol.has_session("alice_user_id".to_string()));
+    }
+
+    /// Before the platform has set the server keys, a certificate cannot be checked, and nothing
+    /// opens from it — whatever it names.
+    #[test]
+    fn test_responder_refuses_before_the_server_keys_are_set() {
+        let (alice, _) = named_core();
+        let (bob, bob_id) = named_core();
+        let server = crate::crypto::sealed_sender::test_support::TestServer::new();
+        alice.init_session(bob_id.clone(), pq_bundle(&bob)).unwrap();
+        let encrypted = alice.encrypt_message(bob_id, b"hi".to_vec()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cert = server.certify(
+            &alice
+                .get_registration_bundle_fields()
+                .unwrap()
+                .identity_public,
+            now,
+        );
+        let err = bob
+            .init_receiving_session_from_wire_payload(cert, wire_of(encrypted))
+            .unwrap_err();
+        assert!(
+            matches!(&err, CryptoError::SessionInitializationFailed { message }
+                if message == "SENDER_CERTIFICATE_REFUSED: NoTrustedKey"),
+            "{err:?}"
+        );
     }
 
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
-    /// FIRST message through the uniffi wire types the iOS app uses.
-    ///
-    /// The wire now carries the DR message's `suite_id` / `pq_message_epoch` / `pq_ratchet_field`
-    /// (on `EncryptedMessageComponents` / `BinaryFirstMessage`), so the responder rebuilds the
-    /// exact AEAD associated data and decrypts. Before the fix this failed with
-    /// `"All 1 prekey(s) failed. AEAD decryption failed"` because `init_receiving_session`
-    /// defaulted `suite_id` to the bundle's crypto suite (1/2, never 3) and the AD omitted the
-    /// suite-3 epoch tag. This test locks that in — the pure-core
-    /// `test_client_negotiates_pq_ratchet_from_bundle_capability` can't catch it because it hands
-    /// the full struct straight across, bypassing this boundary (which is why the bug shipped).
+    /// FIRST message through the uniffi wire types the apps use — `EncryptedMessageComponents`
+    /// packed with `wire_payload_pack`, opened from the payload. The responder rebuilds the exact
+    /// AEAD associated data from the suite and the suite-3 tags on the wire; before task #12 it
+    /// defaulted the suite to the bundle's crypto suite and failed with
+    /// `"All 1 prekey(s) failed. AEAD decryption failed"`. The pure-core
+    /// `test_client_negotiates_pq_ratchet_from_bundle_capability` cannot catch this: it hands the
+    /// full struct straight across, bypassing this boundary (which is why the bug shipped).
     #[cfg(feature = "post-quantum")]
     #[test]
     fn test_pq_ratchet_first_message_survives_uniffi_wire() {
         use crate::crypto::SuiteID;
 
-        let alice = make_orchestrator("alice_user_id");
-        let bob = make_orchestrator("bob_user_id");
-
-        let alice_bundle = bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-        let bob_bundle = pq_bundle(&bob);
+        let (alice, _) = named_core();
+        let (bob, bob_id) = named_core();
+        let server = crate::crypto::sealed_sender::test_support::TestServer::new();
 
         let session = alice
-            .init_session("bob_user_id".to_string(), bob_bundle)
+            .init_session(bob_id.clone(), pq_bundle(&bob))
             .expect("init_session should succeed");
 
         // Precondition: the sending session must really be suite 3, else this test proves nothing.
         assert_eq!(
-            alice.get_session_suite_id("bob_user_id".to_string()),
+            alice.get_session_suite_id(bob_id),
             SuiteID::PQ_RATCHET.as_u16(),
             "setup must negotiate suite 3 (PQ_RATCHET_ENABLED is on in test builds)"
         );
@@ -2166,29 +2033,14 @@ mod tests {
         let plaintext = b"pq ratchet over the wire".to_vec();
         let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
 
-        // Serialize exactly as the iOS app does — now carrying the negotiated suite + PQ section.
-        let first_msg = BinaryFirstMessage {
-            ephemeral_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            content: encrypted.content,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            suite_id: encrypted.suite_id,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
-            kyber_prekey_id: encrypted.kyber_prekey_id,
-            kem_ciphertext: encrypted.kem_ciphertext,
-        };
-
         let bob_result = bob
-            .init_receiving_session("alice_user_id".to_string(), alice_bundle, first_msg)
+            .init_receiving_session_from_wire_payload(
+                certified(&server, &alice, &bob),
+                wire_of(encrypted),
+            )
             .expect("Bob must establish a receiving session from a suite-3 first message");
 
-        assert_eq!(
-            bob_result.decrypted_message, plaintext,
-            "suite-3 first message must decrypt across the uniffi wire — currently FAILS because \
-             suite_id/pq_message_epoch are dropped and the responder builds a classic AEAD AD"
-        );
+        assert_eq!(bob_result.decrypted_message, plaintext);
     }
 
     /// Variant-2 guard: the suite-3 fields must survive the SAME `wire_payload_pack`
@@ -2241,114 +2093,6 @@ mod tests {
         );
     }
 
-    /// Test full end-to-end encryption/decryption flow
-    /// Verifies that sessions are created consistently and messages can be exchanged
-    #[test]
-    fn test_full_e2e_encryption_flow() {
-        let alice = create_crypto_core().unwrap();
-        let bob = create_crypto_core().unwrap();
-        alice.set_local_user_id("alice_user_id".to_string());
-        bob.set_local_user_id("bob_user_id".to_string());
-
-        // Get registration bundles and convert them
-        let alice_bundle_bytes =
-            bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-
-        let bob_bundle_bytes =
-            bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-
-        // Alice initializes session with Bob
-        let alice_to_bob_session = alice
-            .init_session("bob_user_id".to_string(), bob_bundle_bytes)
-            .unwrap();
-
-        assert_eq!(
-            alice_to_bob_session, "bob_user_id",
-            "Alice's session_id for Bob should be bob's user_id"
-        );
-
-        // Alice encrypts a message for Bob
-        let plaintext = "Hello Bob!".to_string();
-        let encrypted = alice
-            .encrypt_message(alice_to_bob_session.clone(), plaintext.clone())
-            .unwrap();
-
-        // Verify encrypted message has required components
-        assert!(
-            !encrypted.ephemeral_public_key.is_empty(),
-            "Ephemeral key should not be empty"
-        );
-        assert!(!encrypted.content.is_empty(), "Content should not be empty");
-        assert_eq!(
-            encrypted.message_number, 0,
-            "First message should have message_number 0"
-        );
-
-        // Bob initializes receiving session with Alice's first message
-        let first_msg = BinaryFirstMessage {
-            ephemeral_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            content: encrypted.content,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            suite_id: encrypted.suite_id,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: !encrypted.kem_ciphertext.is_empty(),
-            kyber_prekey_id: encrypted.kyber_prekey_id,
-            kem_ciphertext: encrypted.kem_ciphertext,
-        };
-
-        let bob_session_result = bob
-            .init_receiving_session("alice_user_id".to_string(), alice_bundle_bytes, first_msg)
-            .unwrap();
-
-        // CRITICAL: Bob's session_id should be alice_user_id
-        assert_eq!(
-            bob_session_result.session_id, "alice_user_id",
-            "Bob's session_id for Alice should be alice's user_id"
-        );
-
-        // First message should be decrypted automatically
-        assert_eq!(
-            bob_session_result.decrypted_message,
-            plaintext.as_bytes(),
-            "First message should be decrypted correctly by init_receiving_session"
-        );
-
-        // Bob encrypts a reply
-        let reply_plaintext = "Hi Alice!".to_string();
-        let reply_encrypted = bob
-            .encrypt_message(
-                bob_session_result.session_id.clone(),
-                reply_plaintext.clone(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            reply_encrypted.message_number, 0,
-            "Bob's first message should also have message_number 0"
-        );
-
-        // Alice decrypts Bob's reply
-        let decrypted_reply = alice
-            .decrypt_message(
-                alice_to_bob_session,
-                reply_encrypted.ephemeral_public_key,
-                reply_encrypted.message_number,
-                reply_encrypted.content,
-                reply_encrypted.suite_id,
-                reply_encrypted.pq_message_epoch,
-                reply_encrypted.pq_ratchet_field,
-            )
-            .unwrap();
-
-        assert_eq!(
-            decrypted_reply.plaintext,
-            reply_plaintext.as_bytes(),
-            "Alice should decrypt Bob's reply correctly"
-        );
-    }
-
     /// Test that encryption fails with proper error when session doesn't exist
     #[test]
     fn test_encrypt_without_session_fails() {
@@ -2365,74 +2109,6 @@ mod tests {
             Err(CryptoError::EncryptionFailed { .. }) => {} // Expected
             _ => panic!("Should return EncryptionFailed error"),
         }
-    }
-
-    /// Test session attribute consistency
-    /// Verifies that both participants have matching session attributes
-    #[test]
-    fn test_session_attribute_consistency() {
-        let alice = create_crypto_core().unwrap();
-        let bob = create_crypto_core().unwrap();
-        alice.set_local_user_id("alice_contact".to_string());
-        bob.set_local_user_id("bob_contact".to_string());
-
-        let bob_bundle_bytes =
-            bundle_fields_to_binary(bob.get_registration_bundle_fields().unwrap());
-        let alice_bundle_bytes =
-            bundle_fields_to_binary(alice.get_registration_bundle_fields().unwrap());
-
-        // Convert bundles to KeyBundle format
-
-        // Alice initializes session
-        let alice_session_id = alice
-            .init_session("bob_contact".to_string(), bob_bundle_bytes)
-            .unwrap();
-
-        // Alice sends first message
-        let msg1 = alice
-            .encrypt_message(alice_session_id.clone(), "Test message".to_string())
-            .unwrap();
-
-        // Bob initializes receiving session
-        let first_msg = BinaryFirstMessage {
-            ephemeral_public_key: msg1.ephemeral_public_key,
-            message_number: msg1.message_number,
-            content: msg1.content,
-            one_time_prekey_id: msg1.one_time_prekey_id,
-            suite_id: msg1.suite_id,
-            pq_message_epoch: msg1.pq_message_epoch,
-            pq_ratchet_field: msg1.pq_ratchet_field,
-            pqxdh_v2: !msg1.kem_ciphertext.is_empty(),
-            kyber_prekey_id: msg1.kyber_prekey_id,
-            kem_ciphertext: msg1.kem_ciphertext,
-        };
-
-        let bob_session_result = bob
-            .init_receiving_session("alice_contact".to_string(), alice_bundle_bytes, first_msg)
-            .unwrap();
-
-        // Verify session IDs are the contact IDs
-        assert_eq!(alice_session_id, "bob_contact");
-        assert_eq!(bob_session_result.session_id, "alice_contact");
-
-        // Both should be able to continue communication
-        let msg2 = bob
-            .encrypt_message(bob_session_result.session_id.clone(), "Reply".to_string())
-            .unwrap();
-
-        let decrypted = alice
-            .decrypt_message(
-                alice_session_id,
-                msg2.ephemeral_public_key,
-                msg2.message_number,
-                msg2.content,
-                msg2.suite_id,
-                msg2.pq_message_epoch,
-                msg2.pq_ratchet_field,
-            )
-            .unwrap();
-
-        assert_eq!(decrypted.plaintext, b"Reply");
     }
 
     /// Simple test using Client API directly (bypassing UniFFI)
@@ -3216,13 +2892,6 @@ pub struct ReceivingInitCarrier {
     pub is_session_reset_init: bool,
 }
 
-/// Mirror of the UDL `ReceivingInitAttempt` dictionary — indices into the caller's own arrays.
-#[derive(Debug, Clone, Copy)]
-pub struct ReceivingInitAttempt {
-    pub carrier_index: u32,
-    pub bundle_index: u32,
-}
-
 impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier {
     fn from(c: &ReceivingInitCarrier) -> Self {
         crate::orchestration::ReceivingInitCarrier {
@@ -3542,31 +3211,6 @@ impl OrchestratorCore {
         orch.awaits_acknowledgement(&contact_id)
     }
 
-    /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
-    ///
-    /// Both dimensions vary. A caller that fixes the carrier and rotates only the bundle — which is
-    /// what the iOS client did — can only find the session if it happened to fix the right carrier,
-    /// and a wrong guess is indistinguishable from a broken bundle. See
-    /// `orchestration::receiving_init_plan`.
-    ///
-    /// Pure: no key material is touched and no state changes. The caller executes the attempts with
-    /// `init_receiving_session` and stops at the first that succeeds.
-    pub fn plan_receiving_init(
-        &self,
-        carriers: Vec<ReceivingInitCarrier>,
-        bundle_count: u32,
-    ) -> Vec<ReceivingInitAttempt> {
-        let mapped: Vec<crate::orchestration::ReceivingInitCarrier> =
-            carriers.iter().map(Into::into).collect();
-        crate::orchestration::plan_receiving_init(&mapped, bundle_count)
-            .into_iter()
-            .map(|a| ReceivingInitAttempt {
-                carrier_index: a.carrier_index,
-                bundle_index: a.bundle_index,
-            })
-            .collect()
-    }
-
     pub fn init_session(
         &self,
         contact_id: String,
@@ -3667,29 +3311,6 @@ impl OrchestratorCore {
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
     }
 
-    pub fn init_receiving_session(
-        &self,
-        contact_id: String,
-        recipient_bundle: BinaryKeyBundle,
-        first_message: BinaryFirstMessage,
-    ) -> Result<SessionInitResult, CryptoError> {
-        use crate::orchestration::orchestrator::IncomingFirstMessage;
-        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
-        let first_msg = IncomingFirstMessage {
-            ephemeral_public_key: first_message.ephemeral_public_key,
-            message_number: first_message.message_number,
-            content: first_message.content,
-            one_time_prekey_id: first_message.one_time_prekey_id,
-            suite_id: first_message.suite_id,
-            pq_message_epoch: first_message.pq_message_epoch,
-            pq_ratchet_field: pq_field_from_bytes(&first_message.pq_ratchet_field),
-            pqxdh_v2: first_message.pqxdh_v2,
-            kyber_prekey_id: first_message.kyber_prekey_id,
-            kem_ciphertext: first_message.kem_ciphertext,
-        };
-        self.init_receiving(&contact_id, &public_bundle, &first_msg)
-    }
-
     /// Queue a SESSION_RESET_INIT to open a session from. See `Orchestrator::queue_for_open`.
     pub fn queue_for_open(
         &self,
@@ -3697,12 +3318,14 @@ impl OrchestratorCore {
         message_id: String,
         wire_payload: Vec<u8>,
         content_type: u8,
+        sender_certificate: Option<SenderCertificate>,
     ) -> Vec<CfeAction> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let msg_number = crate::wire_payload::unpack(&wire_payload)
             .map(|d| d.message_number)
             .unwrap_or(0);
         orch.queue_for_open(crate::orchestration::message_router::IncomingMessage {
+            sender_certificate,
             contact_id: device_id,
             wire_payload,
             message_id,
@@ -3728,20 +3351,18 @@ impl OrchestratorCore {
         orch.pending_message_count(&contact_id) as u32
     }
 
-    /// Open a receiving session from what the core holds under `claimed_device`. See
-    /// `Orchestrator::open_receiving`.
-    pub fn open_receiving(
-        &self,
-        claimed_device: String,
-        bundles: Vec<BinaryKeyBundle>,
-    ) -> Result<ReceivingOpenResult, CryptoError> {
-        let bundles = bundles
-            .iter()
-            .map(binary_bundle_to_x3dh)
-            .collect::<Result<Vec<_>, _>>()?;
+    /// The server's certificate-signing keys. See `Orchestrator::set_trusted_server_keys`.
+    pub fn set_trusted_server_keys(&self, keys: Vec<Vec<u8>>) {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let open = orch.open_receiving(&claimed_device, &bundles);
-        Ok(ReceivingOpenResult {
+        orch.set_trusted_server_keys(keys);
+    }
+
+    /// Open a receiving session from what the core holds under `device`. See
+    /// `Orchestrator::open_receiving`.
+    pub fn open_receiving(&self, device: String) -> ReceivingOpenResult {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let open = orch.open_receiving(&device);
+        ReceivingOpenResult {
             opened_device: open.opened_device,
             opener_message_id: open.opener_message_id,
             actions: open
@@ -3753,33 +3374,20 @@ impl OrchestratorCore {
             dropped_message_ids: open.dropped_message_ids,
             last_error: open.last_error,
             kyber_prekeys: orch.take_kyber_prekeys_to_persist(),
-        })
+            awaiting_server_key: open.awaiting_server_key,
+        }
     }
 
-    /// RESPONDER init from the envelope's `encrypted_payload`, unpacked by the core. Prefer it to
-    /// `init_receiving_session`, whose `BinaryFirstMessage` is a platform copy of the same fields.
+    /// RESPONDER init of one message outside the queue, from the key its sender certificate names.
+    /// See `Orchestrator::receiving_from_certificate`.
     pub fn init_receiving_session_from_wire_payload(
         &self,
-        contact_id: String,
-        recipient_bundle: BinaryKeyBundle,
+        sender_certificate: SenderCertificate,
         wire_payload: Vec<u8>,
-    ) -> Result<SessionInitResult, CryptoError> {
-        use crate::orchestration::orchestrator::IncomingFirstMessage;
-        let public_bundle = binary_bundle_to_x3dh(&recipient_bundle)?;
-        let first_msg = IncomingFirstMessage::from_wire_payload(&wire_payload)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
-        self.init_receiving(&contact_id, &public_bundle, &first_msg)
-    }
-
-    fn init_receiving(
-        &self,
-        contact_id: &str,
-        public_bundle: &X3DHPublicKeyBundle,
-        first_msg: &crate::orchestration::orchestrator::IncomingFirstMessage,
     ) -> Result<SessionInitResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
-            .init_receiving_session_with_msg(contact_id, public_bundle, first_msg)
+            .receiving_from_certificate(&sender_certificate, &wire_payload)
             .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
         Ok(SessionInitResult {
             session_id,
@@ -4083,6 +3691,7 @@ pub enum CfeIncomingEvent {
         otpk_id: u32,
         is_control: bool,
         content_type: u8,
+        sender_certificate: Option<SenderCertificate>,
     },
     OutgoingMessage {
         contact_id: String,
@@ -4196,6 +3805,7 @@ impl CfeIncomingEvent {
                 otpk_id,
                 is_control,
                 content_type,
+                sender_certificate,
             } => MessageReceived {
                 message_id,
                 from,
@@ -4205,6 +3815,7 @@ impl CfeIncomingEvent {
                 otpk_id,
                 is_control,
                 content_type,
+                sender_certificate,
             },
             Self::OutgoingMessage {
                 contact_id,
@@ -4350,8 +3961,8 @@ pub enum CfeAction {
     DuplicateDropped {
         message_id: String,
     },
-    FetchPublicKeyBundle {
-        user_id: String,
+    OpenReceiving {
+        contact_id: String,
     },
     SendEncryptedMessage {
         to: String,
@@ -4549,7 +4160,7 @@ impl CfeAction {
             PruneAckStore { cutoff_ts } => Self::PruneAckStore { cutoff_ts },
             MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
             DuplicateDropped { message_id } => Self::DuplicateDropped { message_id },
-            FetchPublicKeyBundle { user_id } => Self::FetchPublicKeyBundle { user_id },
+            OpenReceiving { contact_id } => Self::OpenReceiving { contact_id },
             SendEncryptedMessage {
                 to,
                 payload,

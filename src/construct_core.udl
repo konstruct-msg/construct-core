@@ -145,10 +145,25 @@ dictionary EncryptedMessageComponents {
     u32 kyber_prekey_id;
 };
 
+// A sender certificate as the platform unsealed it: the fields the server signed and its
+// signature, unchecked. The core decides whether it may open a session
+// (decisions/first-message-opens-without-the-server).
+dictionary SenderCertificate {
+    string user_id;
+    string domain;
+    bytes identity_key;
+    string device_id;
+    i64 issued_at;
+    i64 expires_at;
+    bytes signature;
+};
+
 // What `open_receiving` did. On success `opened_device` and `opener_message_id` are set and
 // `actions` carries the rest (archive of a replaced session, the opener's own decrypt answer, the
 // save, the drain, the notice). On failure they are null, `tried_message_ids` lists every carrier
 // proven unopenable, `dropped_message_ids` the rest of the queue, `last_error` the last refusal.
+// `awaiting_server_key`: a carrier could not be checked because no server key was set — nothing
+// was tried or dropped, and the same open can succeed after `set_trusted_server_keys`.
 dictionary ReceivingOpenResult {
     string? opened_device;
     string? opener_message_id;
@@ -157,6 +172,7 @@ dictionary ReceivingOpenResult {
     sequence<string> dropped_message_ids;
     string? last_error;
     sequence<u8>? kyber_prekeys;
+    boolean awaiting_server_key;
 };
 
 dictionary SessionInitResult {
@@ -202,23 +218,6 @@ dictionary BinaryKeyBundle {
     /// cross-signature binding it to `verifying_key` (field 21). Pinned per device on first use.
     sequence<u8>? hybrid_identity_key = null;
     sequence<u8>? hybrid_identity_signature = null;
-};
-
-/// Binary first-message bundle for init_receiving_session — no JSON encoding.
-dictionary BinaryFirstMessage {
-    sequence<u8> ephemeral_public_key;
-    u32 message_number;
-    sequence<u8> content;
-    u32 one_time_prekey_id;
-    u16 suite_id;              // negotiated DR suite the initiator encrypted with (task #12)
-    u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
-    sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
-    // The PQXDH v2 handshake, as `wire_payload_unpack` returned it. Required: a first message
-    // without it is refused ("PQXDH_REQUIRED"). `init_receiving_session_from_wire_payload` takes
-    // the raw payload and needs none of this copying.
-    boolean pqxdh_v2;
-    u32 kyber_prekey_id;       // WirePayload.kyber_otpk_id
-    sequence<u8> kem_ciphertext;
 };
 
 /// How a session's post-quantum layer started.
@@ -358,9 +357,6 @@ interface ClassicCryptoCore {
 
     [Throws=CryptoError]
     string init_session(string contact_id, BinaryKeyBundle recipient_bundle);
-
-    [Throws=CryptoError]
-    SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
 
     [Throws=CryptoError]
     EncryptedMessageComponents encrypt_message(string session_id, string plaintext);
@@ -677,7 +673,7 @@ enum ReceivingInitKind {
     "MidSessionLeftover",
 };
 
-/// The wire-visible shape of a queued message, for planning a receiving-session init.
+/// The wire-visible shape of a queued message, for `receiving_init_kind`.
 /// No ciphertext: deciding whether a message *could* open a session must not require its body.
 dictionary ReceivingInitCarrier {
     u32 message_number;
@@ -685,13 +681,6 @@ dictionary ReceivingInitCarrier {
     u32 kem_ciphertext_bytes;
     u32 pq_message_epoch;
     boolean is_session_reset_init;
-};
-
-/// One attempt: open carrier `carrier_index` against bundle `bundle_index`.
-/// Indices into the caller's own arrays.
-dictionary ReceivingInitAttempt {
-    u32 carrier_index;
-    u32 bundle_index;
 };
 
 /// What to do about one device when tearing down a session with a peer.
@@ -785,7 +774,7 @@ interface RustAckStore {
 /// Platform creates one of these variants and passes to `handle_event()`.
 [Enum]
 interface CfeIncomingEvent {
-    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type);
+    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, boolean is_control, u8 content_type, SenderCertificate? sender_certificate);
     OutgoingMessage(string contact_id, string message_id, bytes plaintext, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
@@ -917,7 +906,9 @@ interface CfeAction {
     /// A message already handled (ACK cache, platform DB, or its ratchet key already used).
     /// Terminal: record it as processed and advance the stream cursor past it.
     DuplicateDropped(string message_id);
-    FetchPublicKeyBundle(string user_id);
+    // A message waits for a session with `contact_id` and can open one: call
+    // `open_receiving(contact_id)`. Nothing is fetched — the key comes from the sender certificate.
+    OpenReceiving(string contact_id);
     SendEncryptedMessage(string to, bytes payload, string message_id, u8 content_type);
     SendReceipt(string message_id, string status);
     SendEndSession(string contact_id);
@@ -1018,11 +1009,6 @@ interface OrchestratorCore {
     /// crate deliberately cannot do); the decision over the set is made here.
     sequence<TeardownDecision> plan_teardown(sequence<string> candidate_device_ids, boolean peer_on_dead_session);
 
-    /// Every (carrier, bundle) pair worth attempting when opening a receiving session, in order.
-    /// Both dimensions vary: fixing the carrier and rotating only the bundle finds the session
-    /// only if the right carrier was guessed, and a wrong guess looks exactly like a broken bundle.
-    sequence<ReceivingInitAttempt> plan_receiving_init(sequence<ReceivingInitCarrier> carriers, u32 bundle_count);
-
     boolean has_session(string contact_id);
 
     /// Whether the ratchet with this **device** was announced (SESSION_RESET_INIT sent) and the
@@ -1050,26 +1036,25 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     string reopen_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
-    [Throws=CryptoError]
-    SessionInitResult init_receiving_session(string contact_id, BinaryKeyBundle recipient_bundle, BinaryFirstMessage first_message);
+    // The server's certificate-signing keys: the well-known key and any pins. Nothing opens a
+    // receiving session until they are set, because a certificate is what it opens from.
+    void set_trusted_server_keys(sequence<bytes> keys);
 
-    // RESPONDER init from the envelope's encrypted_payload as received. The core unpacks it, so
-    // the PQXDH v2 flag, the Kyber prekey id, the KEM ciphertext and the suite-3 tags cannot be
-    // lost in a platform copy. Prefer it to init_receiving_session.
+    // RESPONDER init of one message outside the queue — a sibling's SENDER_SYNC. The session is
+    // opened with the key `sender_certificate` names, under the device it names, after the core
+    // has checked it; no bundle is fetched.
     [Throws=CryptoError]
-    SessionInitResult init_receiving_session_from_wire_payload(string contact_id, BinaryKeyBundle recipient_bundle, sequence<u8> wire_payload);
+    SessionInitResult init_receiving_session_from_wire_payload(SenderCertificate sender_certificate, sequence<u8> wire_payload);
 
-    // Open a receiving session from the messages the core holds under `claimed_device` — the
-    // device the sender certificate named — against `bundles`, the whole device set of that
-    // account. The core plans and makes every attempt itself; the session is filed under the
-    // device the opening bundle derives to. See decisions/first-contact-queue-keyed-by-claimed-device.
-    [Throws=CryptoError]
-    ReceivingOpenResult open_receiving(string claimed_device, sequence<BinaryKeyBundle> bundles);
+    // Open a receiving session from the messages the core holds under `device`. Each opens with
+    // the key its own sender certificate names, once the core has checked that certificate; one
+    // attempt per carrier, no bundle. See decisions/first-message-opens-without-the-server.
+    ReceivingOpenResult open_receiving(string device);
 
     // Queue a SESSION_RESET_INIT — already acknowledged by the platform, so it cannot pass the
     // ACK check — to open a session from; drops what the same device queued before it
     // (PendingDropped in the answer).
-    sequence<CfeAction> queue_for_open(string device_id, string message_id, sequence<u8> wire_payload, u8 content_type);
+    sequence<CfeAction> queue_for_open(string device_id, string message_id, sequence<u8> wire_payload, u8 content_type, SenderCertificate? sender_certificate);
 
     // Whether any of `devices` has a session-opening message queued within the last 20 s — the
     // peer opening a session with us right now. Pass every device of the account known so far,

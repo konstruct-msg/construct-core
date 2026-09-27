@@ -182,7 +182,7 @@ impl Refused {
     }
 }
 
-/// Whether `msg`'s header is a session opener — the classifier `plan_receiving_init` uses, over
+/// Whether `msg`'s header is a session opener — the classifier `open_receiving` uses, over
 /// the header the core parses itself. An unparseable payload opens nothing.
 pub(crate) fn opens_session(msg: &IncomingMessage) -> bool {
     use crate::orchestration::receiving_init_plan::{
@@ -212,6 +212,11 @@ pub struct IncomingMessage {
     pub is_control: bool,
     /// Original content_type from the wire envelope (e.g. 12 = CALL_SIGNAL).
     pub content_type: u8,
+    /// The sender certificate this message was sealed with, unchecked. What lets it open a
+    /// session: the key the session is opened with is the one it names. Checked where it is used,
+    /// in `Orchestrator::open_receiving`, against the server keys held then — a message that
+    /// arrived before the platform had a key is not spoiled by the order of events.
+    pub sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
 }
 
 // ── MessageRouter ─────────────────────────────────────────────────────────────
@@ -379,34 +384,6 @@ impl MessageRouter {
         self.pending_queues.get(contact_id).map_or(0, |q| q.len())
     }
 
-    /// Return the raw WirePayload bytes of the first queued message for `contact_id`
-    /// without removing it from the queue.
-    ///
-    /// Used by non-UniFFI platforms (TUI, Android) to detect the RESPONDER case
-    /// when handling `Action::InitSession`: if this returns `Some(bytes)`, the
-    /// platform should call `init_receiving_session_from_wire_payload()` instead of
-    /// `init_session_with_bundle()`.
-    pub fn peek_first_pending_wire_payload(&self, contact_id: &str) -> Option<Vec<u8>> {
-        self.pending_queues
-            .get(contact_id)
-            .and_then(|q| q.front())
-            .map(|msg| msg.wire_payload.clone())
-    }
-
-    /// Remove the first (oldest) queued message for `contact_id` and return its message_id.
-    ///
-    /// Called after a successful RESPONDER session init so that `drain_pending`
-    /// does not attempt to re-decrypt the session-initiating message (which was
-    /// already consumed during X3DH + Double Ratchet init).
-    ///
-    /// Returns `Some(message_id)` if a message was removed, `None` if the queue was empty.
-    pub fn pop_first_pending(&mut self, contact_id: &str) -> Option<String> {
-        self.pending_queues
-            .get_mut(contact_id)
-            .and_then(|q| q.pop_front())
-            .map(|msg| msg.message_id)
-    }
-
     /// Queue `msg` to wait for its session to be rebuilt — a heal's carrier. Idempotent by id.
     ///
     /// A heal opens a new receiving session from the handshake that failed on the old one, so the
@@ -456,15 +433,6 @@ impl MessageRouter {
             .unwrap_or_default();
         self.prune_arrivals();
         taken
-    }
-
-    /// Move what waits under `from` to `to`, renamed. The sender certificate named `from`; the
-    /// session that opened says the writer was `to`.
-    pub fn rekey_pending(&mut self, from: &str, to: &str) {
-        for mut msg in self.take_pending(from) {
-            msg.contact_id = to.to_string();
-            self.hold_for_open(msg);
-        }
     }
 
     /// All contact IDs that currently have at least one queued message.
@@ -682,6 +650,7 @@ mod tests {
 
     fn msg(contact_id: &str, msg_id: &str, msg_num: u32) -> IncomingMessage {
         IncomingMessage {
+            sender_certificate: None,
             contact_id: contact_id.to_string(),
             wire_payload: vec![],
             message_id: msg_id.to_string(),
@@ -764,6 +733,7 @@ mod tests {
         lifecycle.ack_store.mark_processed("dup-msg");
 
         let m = IncomingMessage {
+            sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "dup-msg".to_string(),
@@ -789,6 +759,7 @@ mod tests {
         lifecycle.ack_store.restore_cache(vec![]);
 
         let m = IncomingMessage {
+            sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "dup-across-restart".to_string(),
@@ -818,6 +789,7 @@ mod tests {
         lifecycle.ack_store.restore_cache(vec![]);
 
         let m = IncomingMessage {
+            sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "fresh-after-restart".to_string(),
@@ -840,6 +812,7 @@ mod tests {
         let mut lifecycle = make_lifecycle("alice");
 
         let m = IncomingMessage {
+            sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "ctrl-1".to_string(),
@@ -934,6 +907,7 @@ mod tests {
         // we test the msg_num>0 path instead (END_SESSION).
         // The msg_num==0 path is covered in integration tests.
         let m = IncomingMessage {
+            sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "bad-msg".to_string(),

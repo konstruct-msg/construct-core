@@ -13,7 +13,7 @@
 //! Attempting is safe, and that is not an assumption: `DoubleRatchetSession::decrypt` snapshots
 //! every mutable field before it touches any of them and restores the snapshot on each failure
 //! path. A wrong guess costs HKDF work and changes nothing. If that ever stops being true, this
-//! function's contract goes with it — the same caveat `plan_receiving_init` carries.
+//! function's contract goes with it.
 //!
 //! The client keeps what this crate cannot have: it maps the account to its devices, because
 //! `ServerUserId` does not exist here. What it hands over is the device ids it holds sessions
@@ -39,7 +39,7 @@
 /// A device id appears at most once, and empty ids are dropped — an empty id names nobody, and it
 /// is what an unresolved translation produces on the client side.
 ///
-/// **Deliberately unbounded**, like `plan_receiving_init` and for the same reason: a cap could
+/// **Deliberately unbounded**: a cap could
 /// only drop a session that might be the right one, and the caller could not tell a cap from an
 /// exhausted search. An account has units of devices. If that stops being true the answer is §D —
 /// have the message name its sending device — not to search less and hope.

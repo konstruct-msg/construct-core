@@ -180,10 +180,220 @@ pub fn verify_sender_cert(
     vk.verify(&payload, &sig).is_ok()
 }
 
+/// How long after its certificate expires a message may still open a session: the time the relay
+/// holds an undelivered message (`MESSAGE_TTL_DAYS=7` in construct-server). A certificate lives 24 h
+/// and a recipient who was offline longer receives a genuine first message with an expired one; the
+/// sender authenticated to the relay when it sent, so refusing on age alone would protect nothing.
+pub const MAX_DELIVERY_AGE_SECS: i64 = 7 * 86_400;
+
+/// A sender certificate as the recipient unsealed it — the fields the server signed, and the
+/// signature. The platform parses the protobuf; every decision about it is made here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SenderCertificate {
+    pub user_id: String,
+    pub domain: String,
+    /// The sending device's X25519 identity key — the `identity_public` of its row in `devices`.
+    pub identity_key: Vec<u8>,
+    pub device_id: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub signature: Vec<u8>,
+}
+
+/// Why a certificate may not open a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderRefusal {
+    /// The platform has not handed over a server key to check against. Transient: the same
+    /// certificate may pass once it has.
+    NoTrustedKey,
+    BadSignature,
+    /// The key does not derive to the device the certificate names, or is not an X25519 key.
+    DeviceMismatch,
+    /// Expired longer ago than a message can wait at the relay.
+    Expired,
+}
+
+impl SenderCertificate {
+    /// The sender's identity key, if this certificate may open a session.
+    ///
+    /// Opening from it is what makes the signature mandatory. Anyone who knows our public identity
+    /// key can seal an envelope to us, so an unsigned certificate is a stranger's claim to be any
+    /// account at all; before 2026-09-27 that was harmless, because the key came from a bundle the
+    /// server served, and now the key comes from here
+    /// (`construct-docs/decisions/first-message-opens-without-the-server.md`). Delivery into an
+    /// existing session does not ask this: the ratchet authenticates those.
+    pub fn identity_for_opening(
+        &self,
+        trusted_server_keys: &[Vec<u8>],
+        now_secs: i64,
+    ) -> Result<&[u8], SenderRefusal> {
+        if trusted_server_keys.is_empty() {
+            return Err(SenderRefusal::NoTrustedKey);
+        }
+        let signed = trusted_server_keys.iter().any(|key| {
+            verify_sender_cert(
+                &self.user_id,
+                &self.domain,
+                &self.identity_key,
+                &self.device_id,
+                self.issued_at,
+                self.expires_at,
+                &self.signature,
+                key,
+            )
+        });
+        if !signed {
+            return Err(SenderRefusal::BadSignature);
+        }
+        if self.identity_key.len() != 32
+            || crate::device_id::derive_device_id(&self.identity_key) != self.device_id
+        {
+            return Err(SenderRefusal::DeviceMismatch);
+        }
+        if self.expires_at.saturating_add(MAX_DELIVERY_AGE_SECS) <= now_secs {
+            return Err(SenderRefusal::Expired);
+        }
+        Ok(&self.identity_key)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// A server key and certificates it signs, for tests that open sessions from a certificate.
+    pub struct TestServer {
+        key: SigningKey,
+    }
+
+    impl TestServer {
+        pub fn new() -> Self {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            Self {
+                key: SigningKey::from_bytes(&seed),
+            }
+        }
+
+        pub fn verifying_key(&self) -> Vec<u8> {
+            self.key.verifying_key().as_bytes().to_vec()
+        }
+
+        /// A certificate for the device `identity_key` derives to, issued now and valid a day.
+        pub fn certify(&self, identity_key: &[u8], now_secs: i64) -> SenderCertificate {
+            let device_id = crate::device_id::derive_device_id(identity_key);
+            self.certify_as(identity_key, &device_id, now_secs, now_secs + 86_400)
+        }
+
+        pub fn certify_as(
+            &self,
+            identity_key: &[u8],
+            device_id: &str,
+            issued_at: i64,
+            expires_at: i64,
+        ) -> SenderCertificate {
+            let payload = build_cert_sign_payload(
+                "account",
+                "example.org",
+                identity_key,
+                device_id,
+                issued_at,
+                expires_at,
+            );
+            SenderCertificate {
+                user_id: "account".to_string(),
+                domain: "example.org".to_string(),
+                identity_key: identity_key.to_vec(),
+                device_id: device_id.to_string(),
+                issued_at,
+                expires_at,
+                signature: self.key.sign(&payload).to_bytes().to_vec(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::TestServer;
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_signed_certificate_opens_with_its_key() {
+        let server = TestServer::new();
+        let cert = server.certify(&[7u8; 32], NOW);
+        assert_eq!(
+            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            Ok(&[7u8; 32][..])
+        );
+    }
+
+    /// Any trusted key will do — the platform holds the well-known key and its pins.
+    #[test]
+    fn any_trusted_server_key_vouches() {
+        let server = TestServer::new();
+        let other = TestServer::new();
+        let cert = server.certify(&[7u8; 32], NOW);
+        let keys = [other.verifying_key(), server.verifying_key()];
+        assert!(cert.identity_for_opening(&keys, NOW).is_ok());
+    }
+
+    #[test]
+    fn a_certificate_signed_by_a_stranger_does_not_open() {
+        let server = TestServer::new();
+        let stranger = TestServer::new();
+        let cert = stranger.certify(&[7u8; 32], NOW);
+        assert_eq!(
+            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            Err(SenderRefusal::BadSignature)
+        );
+    }
+
+    #[test]
+    fn no_trusted_key_is_its_own_refusal() {
+        let server = TestServer::new();
+        let cert = server.certify(&[7u8; 32], NOW);
+        assert_eq!(
+            cert.identity_for_opening(&[], NOW),
+            Err(SenderRefusal::NoTrustedKey)
+        );
+    }
+
+    /// The server signed it, but the key is not the device's: the session would be filed under a
+    /// device the key does not name.
+    #[test]
+    fn a_key_that_does_not_derive_to_the_device_does_not_open() {
+        let server = TestServer::new();
+        let cert = server.certify_as(&[7u8; 32], "someone-else", NOW, NOW + 86_400);
+        assert_eq!(
+            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            Err(SenderRefusal::DeviceMismatch)
+        );
+    }
+
+    #[test]
+    fn an_expired_certificate_opens_while_the_relay_could_still_hold_the_message() {
+        let server = TestServer::new();
+        let cert = server.certify(&[7u8; 32], NOW);
+        let keys = [server.verifying_key()];
+        let expiry = cert.expires_at;
+        assert!(
+            cert.identity_for_opening(&keys, expiry + 3 * 86_400)
+                .is_ok()
+        );
+        assert!(
+            cert.identity_for_opening(&keys, expiry + MAX_DELIVERY_AGE_SECS - 1)
+                .is_ok()
+        );
+        assert_eq!(
+            cert.identity_for_opening(&keys, expiry + MAX_DELIVERY_AGE_SECS),
+            Err(SenderRefusal::Expired)
+        );
+    }
 
     fn keypair() -> ([u8; 32], PublicKey) {
         let mut seed = [0u8; 32];
