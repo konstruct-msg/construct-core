@@ -345,6 +345,23 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "pqr")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pqr: Option<CfePqRatchetStateV1>,
+
+    /// The states this one replaced with the same device, newest first — what a message the peer
+    /// sent before it saw the replacement still decrypts on. Set on the current state of a record
+    /// only; each previous state's own list is empty. See
+    /// `decisions/sessions-renew-by-sending.md`.
+    #[serde(rename = "prev", default, skip_serializing_if = "Vec::is_empty")]
+    pub previous: Vec<CfePreviousStateV1>,
+}
+
+/// A session state a newer one replaced, and when.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePreviousStateV1 {
+    /// Unix seconds when it stopped being the current state.
+    #[serde(rename = "at")]
+    pub retired_at: u64,
+    #[serde(rename = "s")]
+    pub state: CfeSessionStateV1,
 }
 
 /// One completed PQ-ratchet epoch: id + 32-byte ML-KEM-768 shared secret.
@@ -527,37 +544,12 @@ pub struct CfeAckRecordV1 {
     pub message_id: String,
 }
 
-/// A serialised session-healing queue entry.
-/// Stores the original message so it can be replayed after session re-keying.
-///
-/// Part of `CfeOrchestratorStateV1`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeHealingRecordV1 {
-    /// Contact whose session needs healing.
-    #[serde(rename = "cid")]
-    pub contact_id: String,
-    /// Binary WirePayload waiting for replay.
-    #[serde(rename = "msg", with = "serde_bytes")]
-    pub message_bytes: Vec<u8>,
-    /// Number of healing attempts already made (0-based).
-    #[serde(rename = "att")]
-    pub attempts: u32,
-    /// Number of times an incoming msgNum=0 triggered enqueue for this record.
-    /// Used to enforce the `MAX_INCOMING_TRIGGERS` cap across app restarts.
-    #[serde(rename = "itr", default)]
-    pub incoming_triggers: u32,
-    /// Unix timestamp (seconds) when the record was first enqueued.
-    #[serde(rename = "at")]
-    pub created_at: u64,
-}
-
 /// Full CFE snapshot of the orchestrator's transient coordination state.
 ///
 /// msg_type = `OrchestratorState` (0x05).
 ///
 /// Includes:
 /// - ACK dedup cache (in-memory processed message IDs)
-/// - Session healing queue (messages awaiting replay after re-key)
 /// - Session init locks (contacts currently in session-setup)
 /// - Archive index + prekey tracker (from `SessionLifecycleManager`)
 ///
@@ -582,9 +574,8 @@ pub struct CfeOrchestratorStateV1 {
     /// See `SessionLifecycleManager::export_orchestrator_state_cfe`.
     #[serde(rename = "acks")]
     pub processed_ids: Vec<CfeAckRecordV1>,
-    /// Active session-healing queue entries.
-    #[serde(rename = "heals")]
-    pub healing_records: Vec<CfeHealingRecordV1>,
+    // `heals` (the session-healing queue) was here until 2026-09-27; heals are gone and the
+    // named-map codec ignores the key in older blobs. Do not reuse the name.
     /// Contact IDs for which a session-init RPC is currently in flight.
     #[serde(rename = "locks")]
     pub init_locks: Vec<String>,

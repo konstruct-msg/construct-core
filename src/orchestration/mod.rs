@@ -8,13 +8,12 @@
 ///   actions          — Action + IncomingEvent enums
 ///   clock            — Clock trait + SystemClock + MockClock (time injection)
 ///   ack_store        — ACK deduplication
-///   healing_queue    — Messages held for replay once a session is renegotiated
-///   session_lifecycle— The sessions held: encrypt/decrypt, archive, restore
+///   session_lifecycle— The sessions held, current and previous states: encrypt/decrypt, archive
 ///   session_machine  — What phase a ratchet is in, and what may happen to it next
 ///   message_router   — Incoming message → dedup, session lookup, decrypt → RoutingDecision
 ///   teardown_plan    — Which of a peer's devices a teardown touches
-///   initiation_plan  — Whether to open a session with a device now, and as which side
-///   receiving_init_plan — Which queued message opens a session, against which device
+///   initiation_plan  — Whether to open a session with a device now
+///   receiving_init_plan — Which message can open a session
 ///   send_plan        — Who gets a copy of an outgoing message
 ///   receiving_decrypt_plan — Which device session an incoming message is tried against
 ///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, or why no session opens
@@ -23,7 +22,6 @@
 pub mod ack_store;
 pub mod actions;
 pub mod clock;
-pub mod healing_queue;
 pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
@@ -40,9 +38,8 @@ pub mod teardown_plan;
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
-pub use healing_queue::{HealDirection, HealingDecision, HealingQueue, HealingRecord};
 pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation};
-pub use message_router::{IncomingMessage, MessageRouter, Role, RoutingDecision, tie_break_role};
+pub use message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 pub use orchestrator::Orchestrator;
 pub use platform_bridge::PlatformBridge;
 #[cfg(feature = "post-quantum")]

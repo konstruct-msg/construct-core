@@ -37,12 +37,12 @@
 //! happened. Waiting costs nothing there: whatever B eventually wants to send *is* the reason to
 //! open, and it opens then.
 //!
-//! This does not replace the tie-break; it reduces how often the tie-break is needed. Two peers
-//! who both have something to send still collide, and that collision is still ranked.
+//! Two peers who both have something to send still both open. Since 2026-09-27 that is not a
+//! collision to rank: each keeps both states, and the first message either side reads settles on
+//! one (`construct-docs/decisions/sessions-renew-by-sending.md`). The tie-break that ranked the
+//! pair went with the one-state record that needed it.
 //!
 //! See `construct-docs/decisions/a-peer-is-a-set-of-devices.md` for why plans live here at all.
-
-use crate::orchestration::message_router::{Role, tie_break_role};
 
 /// What to do about opening a session with one device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,11 +51,10 @@ pub enum InitiationDecision {
     Initiate,
     /// One of ours is already in flight. Join it — do not start a second.
     ///
-    /// A second init is not a retry: it derives a new root key, spends another one-time prekey,
-    /// and leaves the first one's `SESSION_RESET_INIT` in the air addressing a session that no
-    /// longer exists. The peer then answers the one we discarded.
+    /// A second init is not a retry: it derives a new root key and spends another one-time
+    /// prekey for a state that will not be used.
     JoinInFlight,
-    /// The peer's init is arriving and outranks ours. Take the responder side.
+    /// The peer's handshake is in hand: open from it rather than build a second state.
     YieldToPeer,
     /// Nothing to send and no init in the air. Opening here spends a prekey on a session that
     /// carries nothing, and doubles the chance of colliding with the peer's next one.
@@ -99,34 +98,17 @@ pub struct InitiationContext {
 /// The order of the arms is the content. Each one is a case the 2026-09-04 run produced or would
 /// have produced:
 ///
-/// 1. **Ours is in flight** — join it. Spending a second prekey here is how a recovery becomes a
-///    second divergence.
-/// 2. **Theirs is in flight** — rank the pair. The loser takes the responder side instead of
-///    building a session the winner will never read. This is `tie_break_role`, applied at the one
-///    moment both sides can see the same two ids.
-/// 3. **We have something to send** — initiate. A waiting user outranks prekey economy, and the
-///    peer, seeing our init, reaches case 2.
+/// 1. **Ours is in flight** — join it. A second prekey spent for nothing.
+/// 2. **Theirs is in hand** — open from it. Initiating as well would be harmless — both states are
+///    kept and one wins on the first read — but it spends a prekey for a state that loses.
+/// 3. **We have something to send** — initiate.
 /// 4. **Otherwise** — wait. This is B at 12:30:11.
-///
-/// An unnameable device — either id empty — blocks only the **ranking**, not the decision. First
-/// contact is exactly that case: the peer's device id comes out of the bundle we have not fetched
-/// yet, and refusing to initiate there would mean a person can never be written to for the first
-/// time. Nothing is lost, because a peer we have never addressed has no init of ours in flight to
-/// collide with. When their init *is* in flight and the pair cannot be ranked, the answer is to
-/// yield: taking the responder side is always safe, and opening a session we cannot rank against
-/// theirs guarantees a collision with no rule to settle it.
 pub fn plan_initiation(ctx: &InitiationContext) -> InitiationDecision {
     if ctx.our_init_in_flight {
         return InitiationDecision::JoinInFlight;
     }
     if ctx.peer_init_in_flight {
-        if ctx.my_device_id.is_empty() || ctx.peer_device_id.is_empty() {
-            return InitiationDecision::YieldToPeer;
-        }
-        return match tie_break_role(&ctx.my_device_id, &ctx.peer_device_id) {
-            Role::Initiator => InitiationDecision::Initiate,
-            Role::Responder => InitiationDecision::YieldToPeer,
-        };
+        return InitiationDecision::YieldToPeer;
     }
     if ctx.have_outbound_work {
         return InitiationDecision::Initiate;
@@ -138,7 +120,7 @@ pub fn plan_initiation(ctx: &InitiationContext) -> InitiationDecision {
 mod tests {
     use super::*;
 
-    /// Two ids that rank deterministically: `high` wins the tie-break against `low`.
+    /// Two distinct device ids.
     const HIGH: &str = "ff00000000000000000000000000000f";
     const LOW: &str = "0011111111111111111111111111111f";
 
@@ -173,9 +155,9 @@ mod tests {
 
     // ── Our own init already in flight ───────────────────────────────────────
 
-    /// The plan's first item, stated: a second init spends a second prekey and orphans the first
-    /// `SESSION_RESET_INIT`. Outbound work does not override it — the work goes into the session
-    /// that is already opening.
+    /// The plan's first item, stated: a second init spends a second prekey for a state that will
+    /// not be used. Outbound work does not override it — the work goes into the session that is
+    /// already opening.
     #[test]
     fn a_second_init_is_never_started_while_ours_is_in_flight() {
         let mut c = ctx(HIGH, LOW);
@@ -185,49 +167,27 @@ mod tests {
         c.have_outbound_work = true;
         assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
 
-        // Even against an inbound init: ours went first, and the peer will rank the pair too.
+        // Even against an inbound init: ours went first, and the record keeps both.
         c.peer_init_in_flight = true;
         assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
     }
 
-    // ── Both at once: the tie-break, applied before the divergence ───────────
+    // ── Their handshake in hand ──────────────────────────────────────────────
 
-    /// The two sides must reach opposite answers over the same pair, or the collision survives.
+    /// Both sides open from the other's handshake instead of each building its own — whichever
+    /// ids they hold. Until 2026-09-27 the pair was ranked here and the higher id initiated;
+    /// a record that keeps its previous states converges without the ranking.
+    ///
+    /// Mutation: initiate when `have_outbound_work` even with the peer's handshake in hand — the
+    /// second case reddens.
     #[test]
-    fn a_visible_collision_is_ranked_and_one_side_yields() {
-        let mut mine = ctx(HIGH, LOW);
-        mine.peer_init_in_flight = true;
-        let mut theirs = ctx(LOW, HIGH);
-        theirs.peer_init_in_flight = true;
-
-        assert_eq!(plan_initiation(&mine), InitiationDecision::Initiate);
-        assert_eq!(plan_initiation(&theirs), InitiationDecision::YieldToPeer);
-    }
-
-    /// Yielding does not depend on having nothing to send: the loser's messages go into the
-    /// session the winner opens. Deciding otherwise would make both sides initiate whenever both
-    /// had traffic, which is the case that hurts most.
-    #[test]
-    fn the_lower_id_yields_even_with_something_to_send() {
-        let mut c = ctx(LOW, HIGH);
-        c.peer_init_in_flight = true;
-        c.have_outbound_work = true;
-        assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
-    }
-
-    /// The ranking is `tie_break_role`'s, not a second copy of it. If that function's order ever
-    /// changes, this test changes with it rather than silently disagreeing — which is the exact
-    /// failure the comment on `tie_break_role` describes.
-    #[test]
-    fn the_ranking_is_the_one_tie_break_role_makes() {
-        for (my, peer) in [(HIGH, LOW), (LOW, HIGH)] {
-            let mut c = ctx(my, peer);
+    fn the_peers_handshake_is_opened_from_whichever_side_we_are() {
+        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
+            let mut c = ctx(me, peer);
             c.peer_init_in_flight = true;
-            let expected = match tie_break_role(my, peer) {
-                Role::Initiator => InitiationDecision::Initiate,
-                Role::Responder => InitiationDecision::YieldToPeer,
-            };
-            assert_eq!(plan_initiation(&c), expected);
+            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
+            c.have_outbound_work = true;
+            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
         }
     }
 
@@ -253,11 +213,10 @@ mod tests {
         assert_eq!(plan_initiation(&ctx("", HIGH)), InitiationDecision::Wait);
     }
 
-    /// Their init is in flight and the pair cannot be ranked. Yielding is always safe: their init
-    /// opens the session and our work flows into it. Initiating would guarantee a collision with
-    /// no rule available to settle it — the one outcome neither side can recover from quickly.
+    /// Their init is in flight and neither id is known: nothing is ranked any more, so the answer
+    /// is the same as with ids.
     #[test]
-    fn an_unrankable_collision_yields_rather_than_racing() {
+    fn an_unnameable_peer_with_its_handshake_in_hand_is_opened_from() {
         for c in [ctx(HIGH, ""), ctx("", HIGH), ctx("", "")] {
             let mut c = c;
             c.peer_init_in_flight = true;
@@ -274,16 +233,6 @@ mod tests {
         c.peer_init_in_flight = true;
         c.have_outbound_work = true;
         assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
-    }
-
-    /// A device ranked against itself is not a pair. It cannot happen through the seam, but the
-    /// answer must not be "initiate a session with ourselves".
-    #[test]
-    fn a_device_is_not_its_own_peer() {
-        let mut c = ctx(HIGH, HIGH);
-        c.peer_init_in_flight = true;
-        // `tie_break_role` gives Responder for equal ids, so this yields rather than initiating.
-        assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
     }
 
     /// The wire spellings are compared across clients and printed into logs; pin them.

@@ -4,7 +4,8 @@
 /// - Encrypt / Decrypt with automatic session restore from archive
 /// - Session archiving (retire → store binary → GC)
 /// - Prekey change detection (reinstall)
-/// - Integration of AckStore, HealingQueue, PQContributionManager
+/// - Previous session states, tried on decrypt (`decrypt_ratchet_message`)
+/// - Integration of AckStore
 ///
 /// All I/O is delegated via `Vec<Action>` returns; this struct is pure state.
 use std::collections::HashMap;
@@ -18,11 +19,37 @@ use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::ack_store::AckStore;
 use crate::orchestration::actions::{Action, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
-use crate::orchestration::healing_queue::HealingQueue;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ARCHIVE_GC_AGE_SECONDS: u64 = 24 * 60 * 60; // 24 h
+
+/// How many states a device's record keeps besides the current one.
+///
+/// A previous state exists for the messages the peer sent before it saw the state that replaced
+/// it: both sides opening at once, or a reopen crossing the peer's traffic. That is one or two
+/// states in practice; three leaves room for a reopen during a crossing. Signal keeps forty.
+/// Each one kept is chain keys kept — see `PREVIOUS_STATE_TTL_SECONDS`.
+pub const MAX_PREVIOUS_STATES: usize = 3;
+
+/// How long a replaced state is kept, from the moment it was replaced.
+///
+/// Long enough for what the peer sent on it before it learned of the replacement to reach us —
+/// including a peer that was offline when we reopened and comes back with an outbox — and no
+/// longer: until it is dropped, a compromise of this device also exposes whatever is still in
+/// flight on it. A week; Signal has no bound but the count.
+pub const PREVIOUS_STATE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// The client's session type: one Double Ratchet state with one device.
+type HeldSession = crate::crypto::session_api::ClassicSession<ClassicSuiteProvider>;
+
+/// A state a newer one replaced with the same device, kept to decrypt what is still in flight on
+/// it (`decisions/sessions-renew-by-sending.md`).
+struct PreviousState {
+    session: HeldSession,
+    /// Unix seconds when it stopped being current.
+    retired_at: u64,
+}
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -103,7 +130,9 @@ impl TryFrom<WireMessage> for EncryptedRatchetMessage {
 pub struct SessionLifecycleManager {
     pub(crate) client: ClassicClient<ClassicSuiteProvider>,
     pub ack_store: AckStore,
-    pub healing_queue: HealingQueue,
+    /// Device → the states its current one replaced, newest first. Part of the device's session
+    /// record: saved and loaded with the current state (`export_session_bytes_for`).
+    previous: HashMap<String, Vec<PreviousState>>,
     /// contactId → archived session CFE binary (latest archive only).
     archives: HashMap<String, crate::crypto::SecretBytes>,
     /// contactId → Unix timestamp of the archive (for GC).
@@ -139,7 +168,7 @@ impl SessionLifecycleManager {
         Self {
             client,
             ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
-            healing_queue: HealingQueue::new_with_clock(3, 24 * 60 * 60, clock.clone()),
+            previous: HashMap::new(),
             archives: HashMap::new(),
             archive_timestamps: HashMap::new(),
             prekey_tracker: HashMap::new(),
@@ -173,14 +202,14 @@ impl SessionLifecycleManager {
     /// platform deliberately forgot.
     ///
     /// This is a local deletion boundary, not a protocol reset. It must not
-    /// archive or send END_SESSION; it only prevents stale local retry/heal
-    /// state from steering the next add.
+    /// archive or send END_SESSION; it only prevents stale local state from
+    /// steering the next add.
     pub fn forget_contact_state(&mut self, contact_id: &str) {
         self.client.remove_session(contact_id);
+        self.previous.remove(contact_id);
         self.archives.remove(contact_id);
         self.archive_timestamps.remove(contact_id);
         self.prekey_tracker.remove(contact_id);
-        self.healing_queue.remove(contact_id);
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
         self.hybrid_identity_pins.remove(contact_id);
@@ -258,17 +287,13 @@ impl SessionLifecycleManager {
     ///
     /// On success, returns `DecryptResult` with plaintext and follow-up actions
     /// (save updated session). On failure, returns `Err` so the caller (Phase 4
-    /// `MessageRouter`) can decide on healing or END_SESSION.
+    /// `MessageRouter`) can decide between opening a new state and END_SESSION.
     pub fn decrypt(&mut self, contact_id: &str, wire_json: &str) -> Result<DecryptResult, String> {
         let wire: WireMessage =
             serde_json::from_str(wire_json).map_err(|e| format!("parse wire: {}", e))?;
         let msg = EncryptedRatchetMessage::try_from(wire)?;
 
-        if !self.client.has_session(contact_id) {
-            return Err(format!("No active session for {}", contact_id));
-        }
-
-        let plaintext = self.client.decrypt_message(contact_id, &msg)?;
+        let plaintext = self.decrypt_ratchet_message(contact_id, &msg)?;
 
         // Persist updated session state.
         let session_bytes = self.export_session_bytes_for(contact_id)?;
@@ -317,11 +342,7 @@ impl SessionLifecycleManager {
             pq_ratchet_field: decoded.pq_ratchet_field,
         };
 
-        if !self.client.has_session(contact_id) {
-            return Err(format!("No active session for {}", contact_id));
-        }
-
-        let plaintext = self.client.decrypt_message(contact_id, &msg)?;
+        let plaintext = self.decrypt_ratchet_message(contact_id, &msg)?;
 
         let session_bytes = self.export_session_bytes_for(contact_id)?;
         let actions = vec![Action::SaveToSecureStore {
@@ -332,6 +353,118 @@ impl SessionLifecycleManager {
         }];
 
         Ok(DecryptResult { plaintext, actions })
+    }
+
+    // ── Previous states ───────────────────────────────────────────────────────
+
+    /// Decrypt `msg` on any state held with `contact_id`: the current one, then each previous
+    /// one, newest first. A previous state that decrypts becomes current and the current one
+    /// takes its place among the previous — the peer is talking on it, so it is the one to answer
+    /// on. This is what makes two sides that opened at once converge: each holds both states, and
+    /// the first message either reads picks one for both.
+    ///
+    /// A failed attempt changes nothing (`DoubleRatchetSession::decrypt` restores its snapshot on
+    /// every failure path). A key already consumed in any state is a duplicate, reported as that
+    /// state's `MESSAGE_KEY_CONSUMED` without trying further, and never promotes a state.
+    ///
+    /// The error, when nothing decrypts, is the current state's — the one a platform log is
+    /// about — or "no active session" when there is none.
+    pub fn decrypt_ratchet_message(
+        &mut self,
+        contact_id: &str,
+        msg: &EncryptedRatchetMessage,
+    ) -> Result<Vec<u8>, String> {
+        use crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED;
+
+        let mut current_error = None;
+        if self.client.has_session(contact_id) {
+            match self.client.decrypt_message(contact_id, msg) {
+                Ok(plaintext) => return Ok(plaintext),
+                Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => return Err(e),
+                Err(e) => current_error = Some(e),
+            }
+        }
+
+        self.prune_previous(contact_id);
+        let states = self.previous.get_mut(contact_id);
+        let mut decrypted = None;
+        if let Some(states) = states {
+            for (index, state) in states.iter_mut().enumerate() {
+                match state.session.decrypt(msg) {
+                    Ok(plaintext) => {
+                        decrypted = Some((index, plaintext));
+                        break;
+                    }
+                    Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => return Err(e),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let Some((index, plaintext)) = decrypted else {
+            return Err(
+                current_error.unwrap_or_else(|| format!("No active session for {}", contact_id))
+            );
+        };
+        let promoted = self
+            .previous
+            .get_mut(contact_id)
+            .expect("the state that decrypted is held")
+            .remove(index);
+        tracing::info!(
+            target: "crypto::lifecycle",
+            contact_id = %contact_id,
+            session_id = %promoted.session.session_id(),
+            "a previous state decrypted — promoted to current"
+        );
+        self.install_current(contact_id, promoted.session);
+        Ok(plaintext)
+    }
+
+    /// Make `session` the current state with `contact_id`; the state it replaces, if any, becomes
+    /// the newest previous one.
+    ///
+    /// Every replacement goes through here — a receiving open, a reopen, a promotion — so a state
+    /// is never dropped by being replaced, only by `prune_previous`.
+    pub(crate) fn install_current(&mut self, contact_id: &str, session: HeldSession) {
+        if let Some(replaced) = self.client.take_session(contact_id) {
+            self.retire(contact_id, replaced);
+        }
+        self.client.put_back_session(contact_id, session);
+    }
+
+    /// Keep `session` — taken out of the client, no longer current — as the newest previous state.
+    pub(crate) fn retire(&mut self, contact_id: &str, session: HeldSession) {
+        let retired_at = self.clock.now_secs();
+        self.previous
+            .entry(contact_id.to_string())
+            .or_default()
+            .insert(
+                0,
+                PreviousState {
+                    session,
+                    retired_at,
+                },
+            );
+        self.prune_previous(contact_id);
+    }
+
+    /// Drop the previous states past `PREVIOUS_STATE_TTL_SECONDS` or beyond `MAX_PREVIOUS_STATES`.
+    fn prune_previous(&mut self, contact_id: &str) {
+        let now = self.clock.now_secs();
+        let Some(states) = self.previous.get_mut(contact_id) else {
+            return;
+        };
+        states.retain(|s| now.saturating_sub(s.retired_at) < PREVIOUS_STATE_TTL_SECONDS);
+        states.truncate(MAX_PREVIOUS_STATES);
+        if states.is_empty() {
+            self.previous.remove(contact_id);
+        }
+    }
+
+    /// How many previous states the record with `contact_id` holds.
+    pub fn previous_state_count(&self, contact_id: &str) -> usize {
+        self.previous.get(contact_id).map_or(0, Vec::len)
     }
 
     // ── Archive lifecycle ─────────────────────────────────────────────────────
@@ -354,25 +487,14 @@ impl SessionLifecycleManager {
         self.archive_timestamps
             .insert(contact_id.to_string(), self.clock.now_secs());
         self.client.remove_session(contact_id);
+        // The peer tore the ratchet down, and what it replaced goes with it: nothing the peer
+        // sends from here on is on any of them.
+        self.previous.remove(contact_id);
 
         vec![Action::SessionTerminated {
             contact_id: contact_id.to_string(),
             archive_bytes: cfe_bytes.into(),
         }]
-    }
-
-    /// Archive a session already taken out of the client (`take_session`) and exported, now that
-    /// a new one has replaced it. The same record and the same action as `archive_session`, for
-    /// the case where the session to archive is no longer the one held.
-    pub fn record_archive(&mut self, contact_id: &str, cfe_bytes: Vec<u8>) -> Action {
-        self.archives
-            .insert(contact_id.to_string(), cfe_bytes.clone().into());
-        self.archive_timestamps
-            .insert(contact_id.to_string(), self.clock.now_secs());
-        Action::SessionTerminated {
-            contact_id: contact_id.to_string(),
-            archive_bytes: cfe_bytes.into(),
-        }
     }
 
     /// Restore the latest archive for `contact_id` into the active session map.
@@ -433,7 +555,7 @@ impl SessionLifecycleManager {
 
     // ── State persistence ─────────────────────────────────────────────────────
 
-    /// Export the full orchestrator coordination state (healing queue, archive
+    /// Export the full orchestrator coordination state (archive
     /// index, prekey tracker) as a CFE binary blob — msg_type 0x05.
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
@@ -458,24 +580,12 @@ impl SessionLifecycleManager {
         &self,
         init_locks: &std::collections::HashSet<String>,
     ) -> Result<Vec<u8>, String> {
-        use crate::cfe::{CfeHealingRecordV1, CfeMessageType, CfeOrchestratorStateV1};
+        use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
 
         let state = CfeOrchestratorStateV1 {
             ver: 1,
             my_user_id: self.my_user_id.clone(),
             processed_ids: Vec::new(),
-            healing_records: self
-                .healing_queue
-                .snapshot_records()
-                .into_iter()
-                .map(|r| CfeHealingRecordV1 {
-                    contact_id: r.contact_id.clone(),
-                    message_bytes: r.message_payload.clone(),
-                    attempts: r.attempts,
-                    incoming_triggers: r.incoming_triggers,
-                    created_at: r.created_at,
-                })
-                .collect(),
             init_locks: init_locks.iter().cloned().collect(),
             archives: self
                 .archives
@@ -514,7 +624,6 @@ impl SessionLifecycleManager {
         data: &[u8],
     ) -> Result<std::collections::HashSet<String>, String> {
         use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
-        use crate::orchestration::healing_queue::HealingRecord;
 
         let state = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
             data,
@@ -528,21 +637,6 @@ impl SessionLifecycleManager {
                 .processed_ids
                 .into_iter()
                 .map(|r| r.message_id)
-                .collect(),
-        );
-
-        // Restore healing queue.
-        self.healing_queue.restore_records(
-            state
-                .healing_records
-                .into_iter()
-                .map(|r| HealingRecord {
-                    contact_id: r.contact_id,
-                    message_payload: r.message_bytes,
-                    attempts: r.attempts,
-                    incoming_triggers: r.incoming_triggers,
-                    created_at: r.created_at,
-                })
                 .collect(),
         );
 
@@ -584,8 +678,19 @@ impl SessionLifecycleManager {
             .client
             .get_session(contact_id)
             .ok_or_else(|| format!("Session not found: {}", contact_id))?;
-        let serializable = session.messaging_session().to_serializable();
-        let cfe_state = serializable.to_cfe_v1()?;
+        let mut cfe_state = session.messaging_session().to_serializable().to_cfe_v1()?;
+        if let Some(states) = self.previous.get(contact_id) {
+            for state in states {
+                cfe_state.previous.push(crate::cfe::CfePreviousStateV1 {
+                    retired_at: state.retired_at,
+                    state: state
+                        .session
+                        .messaging_session()
+                        .to_serializable()
+                        .to_cfe_v1()?,
+                });
+            }
+        }
         crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &cfe_state)
             .map_err(|e| e.to_string())
     }
@@ -595,25 +700,50 @@ impl SessionLifecycleManager {
         use crate::cfe::{CfeError, CfeMessageType, decode_as};
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
-        let serializable =
+        let (serializable, previous) =
             match decode_as::<crate::cfe::CfeSessionStateV1>(data, CfeMessageType::SessionState) {
-                Ok(cfe_state) => SerializableSession::from_cfe_v1(cfe_state)
-                    .map_err(|e| format!("from_cfe_v1: {}", e))?,
+                Ok(mut cfe_state) => {
+                    let previous = std::mem::take(&mut cfe_state.previous);
+                    let current = SerializableSession::from_cfe_v1(cfe_state)
+                        .map_err(|e| format!("from_cfe_v1: {}", e))?;
+                    (current, previous)
+                }
                 Err(CfeError::LegacyJson) => {
                     let s = std::str::from_utf8(data).map_err(|_| "not utf8".to_string())?;
-                    serde_json::from_str(s).map_err(|e| format!("json fallback: {}", e))?
+                    let current =
+                        serde_json::from_str(s).map_err(|e| format!("json fallback: {}", e))?;
+                    (current, Vec::new())
                 }
                 Err(e) => return Err(format!("decode_as: {}", e)),
             };
 
         // The record names its own contact and author; the argument is only what the caller
         // believed. Disagreement means the blob is being loaded under a name it was not saved
-        // under, which does not fail here — it fails as a permanent AEAD error later.
+        // under, which does not fail here — it fails as a permanent AEAD error later. Asked of
+        // every state in the record, previous ones included, before any of them is installed.
         serializable.verify_identity(contact_id, self.client.local_user_id())?;
+        let mut states = Vec::with_capacity(previous.len());
+        for entry in previous {
+            let state = SerializableSession::from_cfe_v1(entry.state)
+                .map_err(|e| format!("from_cfe_v1 (previous): {}", e))?;
+            state.verify_identity(contact_id, self.client.local_user_id())?;
+            let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(state)
+                .map_err(|e| format!("from_serializable (previous): {}", e))?;
+            states.push(PreviousState {
+                session: HeldSession::from_messaging_session(contact_id.to_string(), ratchet),
+                retired_at: entry.retired_at,
+            });
+        }
 
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
         self.client.import_session(contact_id, ratchet);
+        if states.is_empty() {
+            self.previous.remove(contact_id);
+        } else {
+            self.previous.insert(contact_id.to_string(), states);
+            self.prune_previous(contact_id);
+        }
         Ok(())
     }
 }
@@ -724,25 +854,19 @@ mod tests {
     }
 
     #[test]
-    fn forget_contact_state_clears_archive_heal_prekey_and_pq_state() {
+    fn forget_contact_state_clears_archive_prekey_and_pq_state() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
         mgr.archives
             .insert("bob".to_string(), b"archive".to_vec().into());
         mgr.archive_timestamps.insert("bob".to_string(), unix_now());
         mgr.track_prekey("bob", 42);
-        mgr.healing_queue.enqueue(
-            "bob",
-            b"heal-payload".to_vec(),
-            crate::orchestration::healing_queue::HealDirection::Incoming,
-        );
         mgr.pin_hybrid_identity("bob", [7; 32]);
 
         mgr.forget_contact_state("bob");
 
         assert!(!mgr.has_archive("bob"));
         assert!(!mgr.is_reinstall("bob", 99));
-        assert!(!mgr.healing_queue.has_pending("bob"));
         assert!(mgr.pinned_hybrid_identity("bob").is_none());
     }
 
@@ -831,6 +955,189 @@ mod tests {
             .unwrap();
 
         (alice, bob, alice_device_id, bob_device_id)
+    }
+
+    // ── Previous states (decisions/sessions-renew-by-sending.md) ─────────────
+    //
+    // A record keeps the states a newer one replaced, and a decrypt tries them all. Each test
+    // below builds real ratchets: a state that "decrypts" only because nothing checked it is the
+    // vacuous pass this file has been bitten by before.
+
+    /// Alice opens a new state over the one she holds, and Bob opens it from her first message,
+    /// each keeping the replaced state as a previous one — what the orchestrator does on a reopen
+    /// and on a receiving open. The new state's first message is consumed by Bob's open.
+    fn reopen(
+        alice: &mut SessionLifecycleManager,
+        bob: &mut SessionLifecycleManager,
+        alice_id: &str,
+        bob_id: &str,
+    ) {
+        use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+
+        let bob_bundle = bob.client.get_registration_bundle().unwrap();
+        let bob_identity = bob
+            .client
+            .key_manager()
+            .identity_public_key()
+            .unwrap()
+            .clone();
+        let alice_bundle = alice.client.get_registration_bundle().unwrap();
+        let old = alice.client.take_session(bob_id).unwrap();
+        alice.retire(bob_id, old);
+        alice
+            .client
+            .init_session(
+                bob_id,
+                &X3DHPublicKeyBundle {
+                    identity_public: bob_bundle.identity_public.clone(),
+                    signed_prekey_public: bob_bundle.signed_prekey_public.clone(),
+                    signature: bob_bundle.signature.clone(),
+                    verifying_key: bob_bundle.verifying_key.clone(),
+                    suite_id: bob_bundle.suite_id,
+                    one_time_prekey_public: None,
+                    one_time_prekey_id: None,
+                    spk_uploaded_at: 0,
+                    spk_rotation_epoch: 0,
+                    kyber_spk_uploaded_at: 0,
+                    kyber_spk_rotation_epoch: 0,
+                },
+                &bob_identity,
+                0,
+            )
+            .unwrap();
+        let first = alice.client.encrypt_message(bob_id, b"new state").unwrap();
+        let old = bob.client.take_session(alice_id).unwrap();
+        bob.client
+            .init_receiving_session(alice_id, &alice_bundle, &first)
+            .unwrap();
+        bob.retire(alice_id, old);
+    }
+
+    fn lifecycle_pair_with_clock(
+        clock: Arc<crate::orchestration::clock::MockClock>,
+    ) -> (
+        SessionLifecycleManager,
+        SessionLifecycleManager,
+        String,
+        String,
+    ) {
+        let (alice, bob, alice_id, bob_id) = make_session_pair();
+        let mut alice = alice;
+        let mut bob = bob;
+        alice.clock = clock.clone();
+        bob.clock = clock;
+        (alice, bob, alice_id, bob_id)
+    }
+
+    /// A message the peer wrote on a state we replaced still decrypts, and the state it decrypted
+    /// on becomes current: the peer is talking on it, so it is the one to answer on.
+    ///
+    /// Mutation: return the current state's error without trying the previous ones — this
+    /// reddens. Mutation: decrypt on a previous state without promoting it — the last assertion
+    /// reddens.
+    #[test]
+    fn a_message_on_a_replaced_state_decrypts_and_promotes_it() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let on_old = alice.client.encrypt_message(&bob_id, b"old").unwrap();
+        let old_state = bob.active_session_id(&alice_id).unwrap();
+
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+        assert_ne!(bob.active_session_id(&alice_id).unwrap(), old_state);
+        assert_eq!(bob.previous_state_count(&alice_id), 1);
+
+        let plaintext = bob.decrypt_ratchet_message(&alice_id, &on_old).unwrap();
+        assert_eq!(plaintext, b"old");
+        assert_eq!(bob.active_session_id(&alice_id).unwrap(), old_state);
+        assert_eq!(
+            bob.previous_state_count(&alice_id),
+            1,
+            "the state it displaced is kept in turn"
+        );
+    }
+
+    /// A key already used in a previous state is a duplicate, and a duplicate promotes nothing —
+    /// a replay must not be able to pull the record back onto an old state.
+    ///
+    /// Mutation: skip the `MESSAGE_KEY_CONSUMED` arm in the previous-state loop — this reddens.
+    #[test]
+    fn a_key_used_in_a_previous_state_is_a_duplicate_and_promotes_nothing() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let on_old = alice.client.encrypt_message(&bob_id, b"old").unwrap();
+        bob.decrypt_ratchet_message(&alice_id, &on_old).unwrap();
+
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+        let current = bob.active_session_id(&alice_id).unwrap();
+
+        let err = bob.decrypt_ratchet_message(&alice_id, &on_old).unwrap_err();
+        assert!(
+            err.starts_with(crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED),
+            "{err}"
+        );
+        assert_eq!(bob.active_session_id(&alice_id).unwrap(), current);
+    }
+
+    /// Previous states are part of the record: saved with the current one and loaded with it.
+    ///
+    /// Mutation: drop the `previous` list in `export_session_bytes_for` — this reddens.
+    #[test]
+    fn previous_states_survive_a_save_and_load() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let on_old = alice.client.encrypt_message(&bob_id, b"old").unwrap();
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+
+        let saved = bob.export_session_bytes_for(&alice_id).unwrap();
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, bob_id.clone());
+        restored.import_session_bytes(&alice_id, &saved).unwrap();
+
+        assert_eq!(restored.previous_state_count(&alice_id), 1);
+        assert_eq!(
+            restored
+                .decrypt_ratchet_message(&alice_id, &on_old)
+                .unwrap(),
+            b"old"
+        );
+    }
+
+    /// A replaced state is kept for `PREVIOUS_STATE_TTL_SECONDS` and no longer.
+    ///
+    /// Mutation: skip the age filter in `prune_previous` — this reddens.
+    #[test]
+    fn a_replaced_state_is_dropped_after_its_ttl() {
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000_000));
+        let (mut alice, mut bob, alice_id, bob_id) = lifecycle_pair_with_clock(clock.clone());
+        let late = alice.client.encrypt_message(&bob_id, b"late").unwrap();
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+
+        clock.advance_ms(PREVIOUS_STATE_TTL_SECONDS * 1000 + 1000);
+        assert!(bob.decrypt_ratchet_message(&alice_id, &late).is_err());
+        assert_eq!(bob.previous_state_count(&alice_id), 0);
+    }
+
+    /// No more than `MAX_PREVIOUS_STATES` are kept; the oldest go first.
+    ///
+    /// Mutation: skip the `truncate` in `prune_previous` — this reddens.
+    #[test]
+    fn no_more_than_the_cap_of_previous_states_is_kept() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let on_first = alice.client.encrypt_message(&bob_id, b"first").unwrap();
+        for _ in 0..=MAX_PREVIOUS_STATES {
+            reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+        }
+        assert_eq!(bob.previous_state_count(&alice_id), MAX_PREVIOUS_STATES);
+        assert!(
+            bob.decrypt_ratchet_message(&alice_id, &on_first).is_err(),
+            "the oldest state went first"
+        );
+    }
+
+    /// The peer tore the ratchet down: the states it replaced go with it.
+    #[test]
+    fn a_teardown_drops_the_previous_states_too() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+        bob.archive_session(&alice_id);
+        assert_eq!(bob.previous_state_count(&alice_id), 0);
     }
 
     #[test]
@@ -1103,7 +1410,6 @@ mod tests {
                     message_id: "old-msg-2".to_string(),
                 },
             ],
-            healing_records: vec![],
             init_locks: vec![],
             archives: vec![],
             archive_timestamps: vec![],

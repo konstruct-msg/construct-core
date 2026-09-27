@@ -8,10 +8,10 @@
 /// ```
 ///
 /// The `Orchestrator` holds the full orchestration state:
-/// - `SessionLifecycleManager` (sessions, archives, ACK, healing, PQ)
+/// - `SessionLifecycleManager` (sessions current and previous, archives, ACK, PQ)
 /// - `MessageRouter` (routing decisions)
 /// - Coordinator state: init locks, cooldowns, prewarm tracking
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::crypto::client_api::ClassicClient;
@@ -19,13 +19,10 @@ use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::orchestration::actions::{Action, IncomingEvent, SecureStoreSlot};
 use crate::orchestration::clock::{Clock, system_clock};
-use crate::orchestration::message_router::{
-    CT_SESSION_RESET_INIT, IncomingMessage, MessageRouter, Refused, Role, RoutingDecision,
-    tie_break_role,
-};
+use crate::orchestration::message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 use crate::orchestration::session_machine::{
-    Effect as SessionEffect, Event as SessionEvent, ResetInitVerdict, SessionMachine, TearDownCause,
+    Effect as SessionEffect, Event as SessionEvent, SessionMachine, TearDownCause,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -174,13 +171,6 @@ pub struct Orchestrator {
     /// in place, and the next launch is when to try again — the peer may have updated by then.
     /// Within a launch, a second ask is the loop the batch timer would otherwise become.
     pq_upgrade_asked: HashSet<String>,
-    /// Messages the confirm gate is holding, per device, in arrival order.
-    ///
-    /// See `Action::HeldPendingAck`: the gate is this machine's, and so is the buffer behind it.
-    /// Only ids and the epoch they were held against — the envelope stays with the platform,
-    /// which gets it back through `Action::ReplayHeld`. In memory on purpose: a held message is
-    /// never acknowledged to the server, so after a restart it is redelivered and judged again.
-    confirm_holds: HashMap<String, Vec<ConfirmHold>>,
     /// The server keys a sender certificate is checked against before it opens a session
     /// (`set_trusted_server_keys`). In memory: the platform sets them at every launch.
     trusted_server_keys: Vec<Vec<u8>>,
@@ -208,32 +198,11 @@ pub struct ReceivingOpen {
     pub awaiting_server_key: bool,
 }
 
-/// Whether a held message belongs to a handshake that concluded while it waited.
-///
-/// Only an opener, and only against a session that exists: with none, nothing has replaced it and
-/// it may be the very handshake that builds one. Any other epoch than the one it was held against
-/// — "held with no session, one exists now" included — is a replacement.
-fn held_opener_superseded(hold: &ConfirmHold, current: Option<&str>) -> bool {
-    match current {
-        Some(current) => hold.opens_session && hold.epoch.as_deref() != Some(current),
-        None => false,
-    }
-}
-
-/// One message held behind an unacknowledged SESSION_RESET_INIT.
-#[derive(Debug, Clone)]
-struct ConfirmHold {
-    message_id: String,
-    /// The ratchet's `session_id` when the message was held; `None` if there was no session.
-    epoch: Option<String>,
-    opens_session: bool,
-}
-
 /// How long after `AppLaunched` the PQXDH v2 upgrade sweep runs (ms).
 ///
-/// After the prewarm sweep and the launch-time fetch of pending messages, not with them: an
-/// SRI raised while the peer's backlog is still arriving replaces the ratchet that backlog was
-/// encrypted on.
+/// After the prewarm sweep and the launch-time fetch of pending messages, not with them: the
+/// backlog then decrypts on the state it was written on without first being tried against the
+/// new one.
 pub const PQ_UPGRADE_SWEEP_DELAY_MS: u64 = 15_000;
 
 /// How many devices one pass of the upgrade sweep reopens.
@@ -265,7 +234,6 @@ impl Orchestrator {
             prewarm_done: HashSet::new(),
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
-            confirm_holds: HashMap::new(),
             trusted_server_keys: Vec::new(),
             clock,
         }
@@ -279,73 +247,7 @@ impl Orchestrator {
     /// After executing I/O actions (network, storage), the platform feeds
     /// results back via further `handle_event` calls.
     pub fn handle_event(&mut self, event: IncomingEvent) -> Vec<Action> {
-        let mut actions = self.dispatch_event(event);
-        actions.extend(self.release_confirm_holds());
-        actions
-    }
-
-    /// Hold `refused` behind the confirm gate for `contact_id`.
-    ///
-    /// Idempotent per message: a held message is not acknowledged, so the server redelivers it
-    /// while it waits, and each copy reaches the gate again.
-    fn hold_behind_confirm(&mut self, contact_id: &str, refused: Refused) {
-        let epoch = self
-            .get_session_health(contact_id)
-            .map(|health| health.session_id);
-        let holds = self
-            .confirm_holds
-            .entry(contact_id.to_string())
-            .or_default();
-        if holds.iter().any(|h| h.message_id == refused.message_id) {
-            return;
-        }
-        holds.push(ConfirmHold {
-            message_id: refused.message_id,
-            epoch,
-            opens_session: refused.opens_session,
-        });
-    }
-
-    /// Hand back everything held for a device whose gate is down.
-    ///
-    /// Run after **every** event, not from the handful that end an opening today (`PeerAcked`,
-    /// `SessionInitCompleted`, the `open_confirm:` give-up). A hold released only from named exits
-    /// is released by none of the exits added later, and a gate that falls with nothing replayed
-    /// is the 2026-08-04 defect in its other form. The one exit outside `handle_event` —
-    /// `reopen_refused` — is caught by the next event of any kind.
-    ///
-    /// An opener whose ratchet was replaced while it waited is superseded: it belongs to a
-    /// handshake that already concluded. Anything else replays, whatever its age — dropping
-    /// content on a guess is what the hold exists to prevent. Epochs compare by equality: they
-    /// are identities, and "held with no session, one exists now" is a replacement too.
-    fn release_confirm_holds(&mut self) -> Vec<Action> {
-        let open: Vec<String> = self
-            .confirm_holds
-            .keys()
-            .filter(|device| !self.sessions.awaits_acknowledgement(device))
-            .cloned()
-            .collect();
-        let mut actions = Vec::new();
-        for device in open {
-            let Some(holds) = self.confirm_holds.remove(&device) else {
-                continue;
-            };
-            let current = self
-                .get_session_health(&device)
-                .map(|health| health.session_id);
-            for hold in holds {
-                actions.push(if held_opener_superseded(&hold, current.as_deref()) {
-                    Action::HeldSuperseded {
-                        message_id: hold.message_id,
-                    }
-                } else {
-                    Action::ReplayHeld {
-                        message_id: hold.message_id,
-                    }
-                });
-            }
-        }
-        actions
+        self.dispatch_event(event)
     }
 
     fn dispatch_event(&mut self, event: IncomingEvent) -> Vec<Action> {
@@ -410,46 +312,7 @@ impl Orchestrator {
             IncomingEvent::PeerToreDown { contact_id } => {
                 self.sessions
                     .handle(&contact_id, SessionEvent::PeerToreDown);
-                // The ratchet a heal was queued against is gone, so the carrier is spent and the
-                // retry budget belongs to an episode that ended. `settle`, not `remove`: the
-                // incoming-trigger cap must not be resettable by tearing down.
-                self.lifecycle.healing_queue.settle(&contact_id);
                 Vec::new()
-            }
-            IncomingEvent::HealAttempted { contact_id } => self.handle_heal_attempted(contact_id),
-            IncomingEvent::ReopenRequested { contact_id } => {
-                self.handle_reopen_requested(contact_id)
-            }
-            IncomingEvent::SriAnnounced { contact_id } => self.handle_sri_announced(contact_id),
-            IncomingEvent::ResetInitArrived {
-                contact_id,
-                init_ephemeral,
-                sent_at_s,
-                established_at_s,
-            } => {
-                let verdict = self.sessions.judge_reset_init(
-                    &contact_id,
-                    &init_ephemeral,
-                    sent_at_s,
-                    established_at_s,
-                );
-                vec![match verdict {
-                    ResetInitVerdict::Apply => Action::ApplyResetInit { contact_id },
-                    ResetInitVerdict::Redelivery => Action::ResetInitSuperseded {
-                        contact_id,
-                        redelivery: true,
-                    },
-                    ResetInitVerdict::PredatesSession => Action::ResetInitSuperseded {
-                        contact_id,
-                        redelivery: false,
-                    },
-                }]
-            }
-            IncomingEvent::PeerAcked { contact_id } => {
-                self.sessions.handle(&contact_id, SessionEvent::PeerAcked);
-                vec![Action::CancelTimer {
-                    timer_id: format!("open_confirm:{contact_id}"),
-                }]
             }
         }
     }
@@ -495,115 +358,10 @@ impl Orchestrator {
         }
     }
 
-    /// Record that a SESSION_RESET_INIT went out, and arm the only thing that ever ends the wait
-    /// for an answer to it.
-    ///
-    /// The platform reports this because it is the one fact about an opening that only the sender
-    /// has: an SRI has no acknowledgement other than the peer's own next carrier, so nothing
-    /// downstream can infer that one was sent. It replaced
-    /// `SessionConfirmationTracker.markPending` — a map of unanswered ratchets kept beside this
-    /// phase, and a `tieBreakWatchdogs` task per account kept beside that.
-    fn handle_sri_announced(&mut self, contact_id: String) -> Vec<Action> {
-        match self
-            .sessions
-            .handle(&contact_id, SessionEvent::SriAnnounced)
-        {
-            SessionEffect::AwaitAck { retry_after_ms } => vec![Action::ScheduleTimer {
-                timer_id: format!("open_confirm:{contact_id}"),
-                delay_ms: retry_after_ms,
-            }],
-            _ => vec![],
-        }
-    }
-
-    /// Answer the platform's "I need a session with this device".
-    ///
-    /// The caller is the platform, on a teardown it has just applied — the peer's, or its own
-    /// after a divergence. It used to be a 1.5 s sleep and a `[String: Task]` map on iOS, and the
-    /// two halves were one rule: a teardown and the rebuild that answers it ride the same server
-    /// flush, so opening the instant the teardown is applied crosses the peer's init — and a
-    /// backlog of N teardowns used to start N re-inits, each destroying the session the previous
-    /// one had just built. Both fall out of one phase per device; see `REOPEN_QUIET_MS`.
-    ///
-    /// **Who rebuilds is ranked here.** On iOS it was `SessionReducer.endSessionReceiptAction`
-    /// over `SessionAddressing.isNaturalInitiator`, which already asked `tie_break_role` — so the
-    /// ranking was never a second copy. The *consequence* was: the RESPONDER arm armed a 60 s
-    /// `[String: Task]` keyed by account, beside the phase the core kept per device, and its
-    /// stand-down condition ("no session, none in flight") was a third reading of what the phase
-    /// already says. See `RESPONDER_OVERRIDE_MS`.
-    fn handle_reopen_requested(&mut self, contact_id: String) -> Vec<Action> {
-        // An unset local id ranks as RESPONDER, and that is the direction to fail in: waiting
-        // costs a minute, while an init raised on a role we guessed costs one of the peer's
-        // one-time pre-keys and builds a session the winner will never read.
-        let peer_rebuilds = matches!(
-            tie_break_role(self.lifecycle.client.local_user_id(), &contact_id),
-            Role::Responder
-        );
-        match self
-            .sessions
-            .handle(&contact_id, SessionEvent::WantToReopen { peer_rebuilds })
-        {
-            SessionEffect::DeferOpen { retry_after_ms } => vec![
-                Action::OpenDeferred {
-                    contact_id: contact_id.clone(),
-                    retry_after_ms,
-                },
-                Action::ScheduleTimer {
-                    timer_id: format!("reopen:{contact_id}"),
-                    delay_ms: retry_after_ms,
-                },
-            ],
-            // Someone is already opening this ratchet — the core's own message path, or an
-            // earlier ask of the platform's. A second announce spends a second one-time pre-key
-            // and replaces the first session, orphaning the SRI already on the wire.
-            SessionEffect::WaitForOpen => vec![],
-            _ => vec![Action::OpenSession { contact_id }],
-        }
-    }
-
-    /// One heal attempt, counted where the queued carrier already lives.
-    ///
-    /// The count had three carriers until 2026-09-23 and the one that decided was the wrong one:
-    /// a **second** `HealingQueue` instance the platform built for itself, keyed by account and
-    /// fed a JSON `ChatMessage`, beside this one, keyed by device and holding the wire payload.
-    /// This one's `attempts` was never incremented at all — `record_attempt` had no caller — so
-    /// the field the `MAX_INCOMING_TRIGGERS` throttle sits next to was permanently zero. The
-    /// third was a Core Data column written and read by nothing.
-    ///
-    /// `NotFound` answers `HealExhausted` rather than "go ahead". There is no record, so there is
-    /// nothing to count against, and an unbounded retry is what the budget exists to prevent —
-    /// it is also what the platform did before, by way of a Core Data lookup that missed.
-    fn handle_heal_attempted(&mut self, contact_id: String) -> Vec<Action> {
-        use crate::orchestration::healing_queue::HealingDecision;
-        match self.lifecycle.healing_queue.record_attempt(&contact_id) {
-            HealingDecision::RetryAllowed { attempt, .. } => {
-                vec![Action::HealAttemptAllowed {
-                    contact_id,
-                    attempt,
-                }]
-            }
-            HealingDecision::MaxAttemptsReached | HealingDecision::NotFound => {
-                // The heal's carriers wait for a rebuild that is no longer coming; the platform
-                // answers this with END_SESSION, and the peer's next handshake is a new carrier.
-                // Left queued, every reconnect's drain would route them into the same refusal
-                // and raise the heal again. Only under a session held: without one, what waits
-                // is a first contact, and an exhausted heal says nothing about it.
-                if self.lifecycle.has_active_session(&contact_id) {
-                    self.router.take_pending(&contact_id);
-                }
-                vec![Action::HealExhausted { contact_id }]
-            }
-        }
-    }
-
     // ── Accessors ─────────────────────────────────────────────────────────────
 
     pub fn my_user_id(&self) -> &str {
         self.lifecycle.my_user_id()
-    }
-
-    pub fn awaits_acknowledgement(&self, contact_id: &str) -> bool {
-        self.sessions.awaits_acknowledgement(contact_id)
     }
 
     pub fn has_active_session(&self, contact_id: &str) -> bool {
@@ -618,14 +376,13 @@ impl Orchestrator {
     /// deliberately forgot.
     ///
     /// This is not a protocol reset and does not emit END_SESSION. It exists so
-    /// local delete/re-add cannot reuse stale pending/heal/control state and
+    /// local delete/re-add cannot reuse stale pending/control state and
     /// force the next add down the RESPONDER path.
     pub fn forget_contact_state(&mut self, contact_id: &str) {
         self.router.forget_contact(contact_id);
         self.lifecycle.forget_contact_state(contact_id);
         self.sessions.handle(contact_id, SessionEvent::Forget);
         self.prewarm_done.remove(contact_id);
-        self.confirm_holds.remove(contact_id);
     }
 
     pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
@@ -638,7 +395,7 @@ impl Orchestrator {
 
     /// Export the full orchestrator coordination state as a CFE binary blob.
     ///
-    /// Captures ACK dedup cache, healing queue, init locks, archive index, and
+    /// Captures init locks, archive index, and
     /// prekey tracker.  Persist under `SecureStoreSlot::OrchestratorState`.
     pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
         // Serialise only the device ids — timestamps are ephemeral, and the machine re-dates
@@ -837,7 +594,8 @@ impl Orchestrator {
     /// outcome of the PQXDH v2 upgrade sweep while the peer is still on a build without
     /// Kyber-1024 keys (`PQ_REQUIRED`), so the order is the core's: the held session is set
     /// aside, the new one is built, and on any error the held one is put back exactly as it was.
-    /// On success the old ratchet is dropped, as it is after any SESSION_RESET_INIT.
+    /// On success the old one becomes a previous state: what the peer sends on it before our first
+    /// message on the new one reaches them still decrypts.
     pub fn reopen_session_with_bundle(
         &mut self,
         contact_id: &str,
@@ -847,14 +605,18 @@ impl Orchestrator {
     ) -> Result<String, String> {
         let held = self.lifecycle.client.take_session(contact_id);
         let opened = self.init_session_with_bundle(contact_id, public_bundle, kyber, allow_stale);
-        if let (Err(e), Some(session)) = (&opened, held) {
-            tracing::warn!(
-                target: "crypto::orchestrator",
-                contact_id = %contact_id,
-                error = %e,
-                "reopen refused — keeping the session already held"
-            );
-            self.lifecycle.client.put_back_session(contact_id, session);
+        match (&opened, held) {
+            (Err(e), Some(session)) => {
+                tracing::warn!(
+                    target: "crypto::orchestrator",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "reopen refused — keeping the session already held"
+                );
+                self.lifecycle.client.put_back_session(contact_id, session);
+            }
+            (Ok(_), Some(session)) => self.lifecycle.retire(contact_id, session),
+            (_, None) => {}
         }
         if opened.is_err() {
             self.reopen_refused(contact_id);
@@ -881,21 +643,6 @@ impl Orchestrator {
             contact_id: contact_id.to_string(),
             message_ids: dropped,
         })
-    }
-
-    /// Queue a SESSION_RESET_INIT to open a session from, superseding what its sender queued
-    /// before it.
-    ///
-    /// The one carrier that does not arrive through `MessageReceived`: the platform acknowledges a
-    /// SESSION_RESET_INIT before acting on it, so routed through the ACK check it would read as its
-    /// own duplicate. A reset begins a new generation, so what the same device queued before it —
-    /// handshakes and traffic of the session being replaced — is dropped (`PendingDropped`); the
-    /// platform did the same to its own queue until 2026-09-26.
-    pub fn queue_for_open(&mut self, carrier: IncomingMessage) -> Vec<Action> {
-        let device = carrier.contact_id.clone();
-        let actions: Vec<Action> = self.drop_pending(&device).into_iter().collect();
-        self.router.hold_for_open(carrier);
-        actions
     }
 
     /// Whether any of `devices` is opening a session with us right now — a handshake of theirs
@@ -950,7 +697,6 @@ impl Orchestrator {
                 one_time_prekey_id: first.one_time_prekey_id,
                 kem_ciphertext_bytes: first.kem_ciphertext.len() as u32,
                 pq_message_epoch: first.pq_message_epoch,
-                is_session_reset_init: carrier.content_type == CT_SESSION_RESET_INIT,
             };
             if receiving_init_kind(&shape) != ReceivingInitKind::Handshake {
                 continue;
@@ -990,16 +736,13 @@ impl Orchestrator {
                 continue;
             }
 
-            let held_bytes = self
-                .lifecycle
-                .client
-                .has_session(device)
-                .then(|| self.lifecycle.export_session_bytes_for(device).ok())
-                .flatten();
             let held = self.lifecycle.client.take_session(device);
             match self.init_receiving_with_identity(device, &identity, &first) {
                 Ok(plaintext) => {
-                    return self.receiving_opened(device, carrier, plaintext, held_bytes);
+                    if let Some(session) = held {
+                        self.lifecycle.retire(device, session);
+                    }
+                    return self.receiving_opened(device, carrier, plaintext);
                 }
                 Err(e) => {
                     if let Some(session) = held {
@@ -1049,12 +792,8 @@ impl Orchestrator {
         device: &str,
         opener: IncomingMessage,
         plaintext: Vec<u8>,
-        replaced: Option<Vec<u8>>,
     ) -> ReceivingOpen {
         let mut actions = Vec::new();
-        if let Some(bytes) = replaced {
-            actions.push(self.lifecycle.record_archive(device, bytes));
-        }
         self.router.remove_pending(device, &opener.message_id);
 
         // The opener is a message like any other from here on: recorded as processed, and
@@ -1072,7 +811,6 @@ impl Orchestrator {
         ));
 
         self.sessions.handle(device, SessionEvent::OpenFinished);
-        self.lifecycle.healing_queue.settle(device);
         actions.extend(self.after_session_opened(device));
 
         ReceivingOpen {
@@ -1092,7 +830,7 @@ impl Orchestrator {
     /// `pqxdh_v2` is the wire flag; a first message without it, or without a ciphertext, comes
     /// from a build this one does not talk to (`PQXDH_REQUIRED`). A prekey this device no longer
     /// holds — a one-time key already burned, a signed prekey past its 14 days — means the
-    /// session cannot be derived at all (`PQXDH_KEY_UNAVAILABLE`); the caller heals.
+    /// session cannot be derived at all (`PQXDH_KEY_UNAVAILABLE`).
     #[cfg(feature = "post-quantum")]
     fn responder_kem(
         &self,
@@ -1298,30 +1036,6 @@ impl Orchestrator {
 
     pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
         self.lifecycle.client.remove_session(contact_id)
-    }
-
-    /// Store a failed msgNum=0 wire payload in the healing queue for later retry.
-    /// Idempotent — calling with the same `contact_id` again does not overwrite
-    /// the existing record (first failure wins).
-    pub fn enqueue_heal(&mut self, contact_id: &str, payload: Vec<u8>) {
-        use crate::orchestration::healing_queue::HealDirection;
-        self.lifecycle
-            .healing_queue
-            .enqueue(contact_id, payload, HealDirection::Incoming);
-    }
-
-    /// Record one healing attempt for `contact_id` and return whether another
-    /// retry is allowed or the maximum has been reached.
-    pub fn record_heal_attempt(
-        &mut self,
-        contact_id: &str,
-    ) -> crate::orchestration::healing_queue::HealingDecision {
-        self.lifecycle.healing_queue.record_attempt(contact_id)
-    }
-
-    /// Remove the healing record for `contact_id` (called on success or give-up).
-    pub fn clear_heal_record(&mut self, contact_id: &str) {
-        self.lifecycle.healing_queue.remove(contact_id);
     }
 
     /// Export registration bundle as CFE binary.
@@ -1814,9 +1528,7 @@ impl Orchestrator {
         };
 
         self.lifecycle
-            .client
-            .decrypt_message(contact_id, &encrypted_message)
-            .map_err(|e| e.to_string())
+            .decrypt_ratchet_message(contact_id, &encrypted_message)
     }
 
     /// Component-based decrypt. The caller MUST pass the DR message's `suite_id`,
@@ -1860,9 +1572,7 @@ impl Orchestrator {
         };
 
         self.lifecycle
-            .client
-            .decrypt_message(contact_id, &encrypted_message)
-            .map_err(|e| e.to_string())
+            .decrypt_ratchet_message(contact_id, &encrypted_message)
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────
@@ -1893,8 +1603,8 @@ impl Orchestrator {
                 // Legacy caller supplied fields — keep its exact routing behavior.
                 Err(_) if msg_num != 0 || !kem_ct.is_empty() => (msg_num, kem_ct),
                 // Unparseable and nothing to fall back on: decrypt uses this same
-                // parser, so the payload can never decrypt — routing it with
-                // msg_num=0 would spuriously trigger the heal machinery.
+                // parser, so the payload can never decrypt — routing it would
+                // spuriously trigger a teardown.
                 Err(e) => {
                     return vec![Action::NotifyError {
                         code: "MALFORMED_WIRE_PAYLOAD".to_string(),
@@ -1905,7 +1615,7 @@ impl Orchestrator {
         };
 
         // All content types — including CALL_SIGNAL (12) — go through the full
-        // routing pipeline (ACK dedup, session check, heal path, PQ contribution).
+        // routing pipeline (ACK dedup, session check, receiving open, teardown).
         let incoming = IncomingMessage {
             sender_certificate,
             contact_id: from.clone(),
@@ -1929,12 +1639,11 @@ impl Orchestrator {
             // message received since the last orchestrator_state save would hit L2 DB
             // on restart, creating duplicate-processing risk before the DB check fires).
             RoutingDecision::Decrypted { .. }
-                | RoutingDecision::SessionHealNeeded { .. }
                 | RoutingDecision::NeedSessionInit { .. }
                 | RoutingDecision::EndSessionNeeded { .. }
         );
         actions.extend(self.decision_to_actions(decision, &from));
-        // Persist coordination state (healing queue, ACK cache, init_locks) for
+        // Persist coordination state (ACK cache, init_locks) for
         // paths that don't already trigger a session-keyed save on the Swift side.
         if needs_state_save && let Some(save_action) = self.orchestrator_state_action() {
             actions.push(save_action);
@@ -2044,9 +1753,6 @@ impl Orchestrator {
         //
         self.sessions
             .handle(&contact_id, SessionEvent::OpenFinished);
-        // And settles the heal episode for the same reason the phase is released: a session that
-        // exists again is the thing every retry in that episode was trying to produce.
-        self.lifecycle.healing_queue.settle(&contact_id);
 
         let mut actions: Vec<Action> = Vec::new();
 
@@ -2078,7 +1784,7 @@ impl Orchestrator {
     /// Everything a session that now exists settles: the save, the queue behind it, the notice.
     ///
     /// Shared by the platform's `SessionInitCompleted` and `open_receiving`. The machine's phase
-    /// and the heal episode are settled by the caller before the import, as the import can fail.
+    /// is settled by the caller before the import, as the import can fail.
     fn after_session_opened(&mut self, contact_id: &str) -> Vec<Action> {
         let mut actions = Vec::new();
         if let Ok(bytes) = self.lifecycle.export_session_bytes_for(contact_id) {
@@ -2173,22 +1879,19 @@ impl Orchestrator {
     /// `DeferredV1` sessions are left alone — only their first flight, long since sent, was
     /// classical, and a new session would not protect it.
     ///
-    /// Only the side `tie_break_role` makes INITIATOR asks. Both ends see the same classical
-    /// session after they update; if both reopened, the two SRIs would cross and each would
-    /// replace the session the other had just built. The ranking is the one `ReopenRequested`
-    /// already uses, so the responder waits exactly as it waits after a teardown.
+    /// Both ends see the same classical session after they update, and both may ask: the two new
+    /// states cross like any two openings, each side keeps both, and the first message either
+    /// reads settles on one.
     ///
     /// Devices already asked since launch are left out (`pq_upgrade_asked`). Sorted, so the
     /// batches are the same on every run.
     pub fn pq_upgrade_candidates(&self) -> Vec<String> {
         use crate::crypto::kyber_prekey_auth::PqHandshake;
 
-        let me = self.lifecycle.client.local_user_id();
         let mut candidates: Vec<String> = self
             .get_all_session_contact_ids()
             .into_iter()
             .filter(|contact_id| !self.pq_upgrade_asked.contains(contact_id))
-            .filter(|contact_id| matches!(tie_break_role(me, contact_id), Role::Initiator))
             .filter(|contact_id| {
                 self.get_session_health(contact_id)
                     .is_some_and(|health| health.pq_handshake == PqHandshake::None)
@@ -2198,17 +1901,15 @@ impl Orchestrator {
         candidates
     }
 
-    /// One batch of the upgrade: reopen, through the machine, as an announced X3DH.
+    /// One batch of the upgrade: reopen, through the machine.
     ///
     /// `OpenSession` and not a teardown first. The platform answers it by fetching the peer's
     /// bundle and calling `reopen_session_with_bundle`, which keeps the held session when the
     /// peer has no Kyber-1024 keys yet (`PQ_REQUIRED`). So a peer still on an old build
-    /// keeps its working classical session, and only a peer that can take a v2 session gets one,
-    /// by the SESSION_RESET_INIT path every reset already takes. A teardown first would leave the
-    /// pair with no session at all until the peer updated.
+    /// keeps its working classical session, and only a peer that can take a v2 session gets one.
+    /// A teardown first would leave the pair with no session at all until the peer updated.
     ///
-    /// Anything the machine says other than `Open` — an opening already in flight, a teardown
-    /// whose quiet is still running — ends in a new session anyway, and a new session is v2, so
+    /// An opening already in flight ends in a new session anyway, and a new session is v2, so
     /// those devices count as asked too.
     fn pq_upgrade_sweep(&mut self) -> Vec<Action> {
         let candidates = self.pq_upgrade_candidates();
@@ -2216,12 +1917,8 @@ impl Orchestrator {
         let mut actions = Vec::new();
         for contact_id in candidates.into_iter().take(PQ_UPGRADE_BATCH) {
             self.pq_upgrade_asked.insert(contact_id.clone());
-            if let SessionEffect::Open = self.sessions.handle(
-                &contact_id,
-                SessionEvent::WantToReopen {
-                    peer_rebuilds: false,
-                },
-            ) {
+            if let SessionEffect::Open = self.sessions.handle(&contact_id, SessionEvent::WantToOpen)
+            {
                 tracing::info!(
                     target: "crypto::orchestrator",
                     contact_id = %contact_id,
@@ -2244,7 +1941,6 @@ impl Orchestrator {
             "gc_sweep" => {
                 let mut actions = self.lifecycle.gc_old_archives();
                 actions.extend(self.lifecycle.ack_store.prune_expired());
-                self.lifecycle.healing_queue.prune_expired();
                 self.sessions.prune_expired();
                 actions
             }
@@ -2301,61 +1997,6 @@ impl Orchestrator {
                 }
                 actions
             }
-            // The wait has had its moment — the peer's flush, or the peer's whole turn. One timer
-            // for both callers — the platform's re-init and a message queued behind the same
-            // quiet — because after a teardown they want the same thing: an announced X3DH. A
-            // message waiting on it drains out of `pending_queues` when the init completes, as it
-            // does behind any other open.
-            //
-            // It re-asks `WantToOpen` and not `WantToReopen`, which is what bounds the peer's
-            // turn: the ordering was ranked once, when the ratchet died, and this alarm yields to
-            // nobody. Re-ranking here would let a peer who keeps tearing down keep its turn.
-            _ if timer_id.starts_with("reopen:") => {
-                let contact_id = timer_id["reopen:".len()..].to_string();
-                // The peer's rebuild arrived — which is the whole reason the quiet exists.
-                // Clearing the phase is what `OpenFinished` is for: a session that exists again
-                // settles what was owed against the one it replaced.
-                if self.lifecycle.has_active_session(&contact_id) {
-                    self.sessions
-                        .handle(&contact_id, SessionEvent::OpenFinished);
-                    return vec![Action::OpenNotNeeded { contact_id }];
-                }
-                match self.sessions.handle(&contact_id, SessionEvent::WantToOpen) {
-                    // Another teardown landed inside the quiet, so the flush is still arriving.
-                    // Same deadline, re-armed — the machine counts from the last teardown, not
-                    // from this timer.
-                    SessionEffect::DeferOpen { retry_after_ms } => vec![Action::ScheduleTimer {
-                        timer_id: timer_id.clone(),
-                        delay_ms: retry_after_ms,
-                    }],
-                    // Somebody got there first. One announce per ratchet: a second spends another
-                    // of the peer's one-time pre-keys and replaces the session the first is
-                    // announcing, orphaning the SRI already on the wire.
-                    SessionEffect::WaitForOpen => vec![],
-                    _ => vec![Action::OpenSession { contact_id }],
-                }
-            }
-            // The announcement has gone unanswered for a retry interval, or for the whole
-            // window. Which of the two is the machine's to say — this only carries the alarm.
-            _ if timer_id.starts_with("open_confirm:") => {
-                let contact_id = timer_id["open_confirm:".len()..].to_string();
-                match self.sessions.handle(&contact_id, SessionEvent::Timeout) {
-                    SessionEffect::ResendSri { retry_after_ms } => vec![
-                        Action::ResendSri {
-                            contact_id: contact_id.clone(),
-                        },
-                        Action::ScheduleTimer {
-                            timer_id: timer_id.clone(),
-                            delay_ms: retry_after_ms,
-                        },
-                    ],
-                    // No re-arm: the wait is over, and that is the whole point of the bound.
-                    SessionEffect::GiveUpOpening => vec![Action::OpeningGaveUp { contact_id }],
-                    // The peer answered, or the session was torn down, between the alarm being
-                    // armed and firing. Timers outlive their reason.
-                    _ => vec![],
-                }
-            }
             _ => vec![],
         }
     }
@@ -2384,42 +2025,6 @@ impl Orchestrator {
                 // Heartbeat decrypted successfully — session is healthy, no action needed.
                 vec![]
             }
-            RoutingDecision::SessionHealNeeded {
-                contact_id: cid,
-                role,
-                // A heartbeat is a payload, never a handshake, so the gate below applies to it
-                // in full — and the field is destructured rather than ignored so a future
-                // heartbeat carrying something else has to come back through here.
-                is_handshake: false,
-                reason,
-                refused,
-            } => {
-                // Decrypt failed on heartbeat msgNum=0 — proactively trigger heal.
-                if self.sessions.awaits_acknowledgement(&cid) {
-                    self.hold_behind_confirm(&cid, refused);
-                    return vec![
-                        Action::HeldPendingAck { contact_id: cid },
-                        decrypt_failed(reason),
-                    ];
-                }
-                let mut actions = match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
-                    SessionEffect::DeferHeal { retry_after_ms } => vec![Action::HealSuppressed {
-                        contact_id: cid,
-                        retry_after_ms,
-                    }],
-                    _ => {
-                        if role == Role::Responder {
-                            self.router.hold_for_open(refused.message);
-                        }
-                        vec![Action::SessionHealNeeded {
-                            contact_id: cid,
-                            role: role.as_wire().to_string(),
-                        }]
-                    }
-                };
-                actions.push(decrypt_failed(reason));
-                actions
-            }
             other => self.decision_to_actions(other, &contact_id),
         }
     }
@@ -2435,16 +2040,15 @@ impl Orchestrator {
 
     /// Every decision a refused decrypt produced also says *why* it was refused.
     ///
-    /// The decision itself is heal / tear down / hold, and it is the same for every cause; the
+    /// The decision itself is a teardown, and it is the same for every cause; the
     /// cause is what a divergence is diagnosed from. Until 2026-09-24 it was dropped here
-    /// (`reason: _`) and on the heal path never left the router at all, so a device log could
+    /// (`reason: _`) and on the heal path (gone since 2026-09-27) never left the router, so a device log could
     /// show two phones answering every message with END_SESSION and not one word on what the
     /// ratchet had objected to. The platform bridge's `log_event` is not wired on iOS, so an
     /// action is the only channel that reaches the log.
     fn decision_to_actions(&mut self, decision: RoutingDecision, contact_id: &str) -> Vec<Action> {
         let refused = match &decision {
-            RoutingDecision::SessionHealNeeded { reason, .. }
-            | RoutingDecision::EndSessionNeeded { reason, .. } => Some(reason.clone()),
+            RoutingDecision::EndSessionNeeded { reason, .. } => Some(reason.clone()),
             _ => None,
         };
         let mut actions = self.decide_actions(decision, contact_id);
@@ -2499,117 +2103,26 @@ impl Orchestrator {
                 queued_count,
             } => {
                 match self.sessions.handle(&cid, SessionEvent::WantToOpen) {
+                    // Our own init is in flight. The message waits in `pending_queues` (see
+                    // `enqueue_or_reject`) and is routed again when the init completes: it
+                    // decrypts on the state we built, or opens beside it.
                     SessionEffect::WaitForOpen => {
-                        // The message is already in `pending_queues` (see `enqueue_or_reject`)
-                        // and is drained by `handle_session_init_completed`. Say so: the empty
-                        // list this used to return was read by the platform as a drop.
                         vec![Action::MessageQueuedPendingInit {
                             contact_id: cid,
                             queued_count: queued_count as u32,
                         }]
                     }
-                    // Same hold as the platform's re-init gets, for the same reason: the peer
-                    // tore this ratchet down and its rebuild is in the same flush. The message is
-                    // queued either way; what changes is that our X3DH no longer races theirs.
-                    // The timer is ours because nothing re-delivers a queued message to ask again
-                    // — unlike a deferred heal, which the peer's next carrier re-raises.
-                    //
-                    // Same timer as the platform's, and it pays out `OpenSession` rather than the
-                    // `OpenReceiving` this arm grants directly. They are not two answers: after a
-                    // teardown the recovery is an announced X3DH, which is ours to start; opening
-                    // from the peer's carrier is the other half, and it is re-raised by that
-                    // carrier's redelivery, which a timer does not have.
-                    SessionEffect::DeferOpen { retry_after_ms } => vec![
-                        Action::MessageQueuedPendingInit {
-                            contact_id: cid.clone(),
-                            queued_count: queued_count as u32,
-                        },
-                        Action::ScheduleTimer {
-                            timer_id: format!("reopen:{cid}"),
-                            delay_ms: retry_after_ms,
-                        },
-                    ],
                     _ => vec![Action::OpenReceiving { contact_id: cid }],
-                }
-            }
-            RoutingDecision::SessionHealNeeded {
-                contact_id: cid,
-                role,
-                is_handshake,
-                // Reported by `decision_to_actions`, which wraps this for every refusal.
-                reason: _,
-                refused,
-            } => {
-                // Our own announcement to this device is still unanswered, so this failure is
-                // our re-init's own consequence. Healing on it archives the session we built in
-                // answer to it — see `Action::HeldPendingAck`.
-                //
-                // A handshake carrier is exempt, and that exemption is the whole of it: it is
-                // what the wait is waiting for, so holding it would make the gate wait on
-                // itself. The heal is what applies the peer's X3DH, and when it completes the
-                // phase clears by `OpenFinished` — which is the acknowledgement, arriving as an
-                // event rather than as a byte we could not read.
-                //
-                // Asked of **this device**. iOS folded it over the peer's whole device set
-                // (`awaitsAcknowledgementFromAnyDevice`), so an unanswered announcement to one
-                // device held a genuine heal for its sibling; a ratchet is between two devices
-                // and our SRI to one says nothing about the other.
-                if !is_handshake && self.sessions.awaits_acknowledgement(&cid) {
-                    self.hold_behind_confirm(&cid, refused);
-                    return vec![Action::HeldPendingAck { contact_id: cid }];
-                }
-                match self.sessions.handle(&cid, SessionEvent::WantToHeal) {
-                    SessionEffect::DeferHeal { retry_after_ms } => {
-                        // `HealSuppressed` so the platform knows NOT to ACK: the message is
-                        // re-delivered and the decision is taken again with fresher facts, which
-                        // is why a deferred heal carries no debt.
-                        vec![
-                            Action::HealSuppressed {
-                                contact_id: cid.clone(),
-                                retry_after_ms,
-                            },
-                            Action::ScheduleTimer {
-                                timer_id: format!("cooldown_expired:{cid}"),
-                                delay_ms: retry_after_ms,
-                            },
-                        ]
-                    }
-                    _ => {
-                        // The heal rebuilds the session from this message; it waits for that
-                        // with everything else waiting for a session (`open_receiving`). Only
-                        // as RESPONDER: the INITIATOR keeps its own session and the peer's
-                        // handshake is superseded, so queued it would come back on every drain
-                        // and raise the same decision again.
-                        if role == Role::Responder {
-                            self.router.hold_for_open(refused.message);
-                        }
-                        vec![Action::SessionHealNeeded {
-                            contact_id: cid,
-                            role: role.as_wire().to_string(),
-                        }]
-                    }
                 }
             }
             RoutingDecision::EndSessionNeeded {
                 contact_id: cid,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
-                refused,
             } => {
-                // The same hold as the heal above, and there is no exemption to make here: a
-                // real END_SESSION is short-circuited as a control frame before any decrypt is
-                // attempted, so nothing reaching this arm is an acknowledgement. A handshake
-                // that arrives with its heal budget exhausted reaches it, and holding that one
-                // is the improvement — tearing down on it crosses our own unanswered SRI, which
-                // is the defect the gate exists for.
-                if self.sessions.awaits_acknowledgement(&cid) {
-                    self.hold_behind_confirm(&cid, refused);
-                    return vec![Action::HeldPendingAck { contact_id: cid }];
-                }
-                // Evidence, and the decision that produced it says so: `EndSessionNeeded`
-                // arrives from a message that failed to decrypt on a ratchet we still hold a
-                // record of — the peer is demonstrably still using a session we tore down. That
-                // is what buys the fast retry instead of the full window.
+                // Evidence, and the decision that produced it says so: nothing we hold decrypts
+                // it and it carries no handshake — the peer is talking on a state we do not have.
+                // That is what buys the fast retry instead of the full window.
                 match self.sessions.handle(
                     &cid,
                     SessionEvent::WantToTearDown {
@@ -2617,12 +2130,8 @@ impl Orchestrator {
                     },
                 ) {
                     SessionEffect::DeferTearDown { retry_after_ms } => {
-                        // Owed, not dropped. A message that failed to decrypt at msgNum > 0 is
-                        // bound to a ratchet we no longer hold and will never be readable — the
-                        // only thing that recovers it is the peer re-establishing and re-sending,
-                        // which is what END_SESSION asks for. Swallowing it removed the recovery,
-                        // silently: build 585 lost three media messages inside one five-second
-                        // window. The debt is a flag, so every suppression in the window folds
+                        // Owed, not dropped: build 585 lost three media messages to a swallowed
+                        // teardown. The debt is a flag, so every suppression in the window folds
                         // into the single teardown the timer pays.
                         self.condemn_active_session(&cid);
                         vec![
@@ -2678,12 +2187,12 @@ impl Orchestrator {
     // ── Orchestrator state persistence ────────────────────────────────────────
 
     /// Build a `SaveToSecureStore` action that persists the full
-    /// orchestrator coordination state (ACK cache, healing queue, init_locks,
+    /// orchestrator coordination state (ACK cache, init_locks,
     /// archive index, prekey tracker) to the platform's secure store.
     ///
     /// Must be called after any event that mutates coordination state and does
-    /// NOT already trigger a session-keyed save (e.g. SessionHealNeeded,
-    /// NeedSessionInit, EndSessionNeeded).  The `Decrypted` path already causes
+    /// NOT already trigger a session-keyed save (e.g. NeedSessionInit,
+    /// EndSessionNeeded).  The `Decrypted` path already causes
     /// Swift to call `saveOrchestratorStateCFE()` as a side-effect of the
     /// session save, so it does not need this action.
     fn orchestrator_state_action(&self) -> Option<Action> {
@@ -2735,10 +2244,7 @@ mod tests {
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
     use crate::orchestration::clock::MockClock;
-    use crate::orchestration::session_machine::{
-        END_SESSION_COOLDOWN_MS, OPENING_CONFIRM_WINDOW_MS, PEER_TEARDOWN_QUIET_MS,
-        REOPEN_QUIET_MS, RESPONDER_OVERRIDE_MS, SRI_RETRY_MS,
-    };
+    use crate::orchestration::session_machine::END_SESSION_COOLDOWN_MS;
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
@@ -2771,14 +2277,14 @@ mod tests {
             sender_certificate: None,
             message_id: "msg-001".to_string(),
             from: "bob".to_string(),
-            data: packed_wire(0, None),
+            data: packed_wire(0, Some(&[5; 1568])),
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
             is_control: false,
             content_type: 0,
         });
-        // Should ask to fetch bundle (no active session → NeedSessionInit).
+        // A handshake with no session: open from it (no active session → NeedSessionInit).
         let fetches: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, Action::OpenReceiving { .. }))
@@ -2793,7 +2299,7 @@ mod tests {
             sender_certificate: None,
             message_id: "old-backlog".to_string(),
             from: "bob".to_string(),
-            data: packed_wire(0, None),
+            data: packed_wire(0, Some(&[5; 1568])),
             msg_num: 0,
             kem_ct: vec![],
             otpk_id: 0,
@@ -3072,33 +2578,6 @@ mod tests {
         RoutingDecision::EndSessionNeeded {
             contact_id: cid.to_string(),
             reason: "AEAD decryption failed".to_string(),
-            refused: refused("m-held", false),
-        }
-    }
-
-    fn heal_needed(cid: &str, is_handshake: bool) -> RoutingDecision {
-        RoutingDecision::SessionHealNeeded {
-            contact_id: cid.to_string(),
-            role: crate::orchestration::message_router::Role::Responder,
-            is_handshake,
-            reason: "AEAD decryption failed".to_string(),
-            refused: refused("m-held", is_handshake),
-        }
-    }
-
-    fn refused(message_id: &str, opens_session: bool) -> Refused {
-        Refused {
-            message_id: message_id.to_string(),
-            opens_session,
-            message: IncomingMessage {
-                sender_certificate: None,
-                contact_id: "bob".to_string(),
-                wire_payload: vec![],
-                message_id: message_id.to_string(),
-                msg_number: 0,
-                is_control: false,
-                content_type: 0,
-            },
         }
     }
 
@@ -3109,807 +2588,46 @@ mod tests {
         }
     }
 
-    /// A local id that outranks `bob`, so `tie_break_role` makes **us** the natural INITIATOR: a
-    /// reopen is ours to make, and waits only the peer's flush out.
-    const WE_REBUILD: &str = "zoe";
-    /// And one `bob` outranks, so the rebuild is the peer's to make and our reopen waits their
-    /// turn. Which of the two a test uses is what it is testing.
-    const PEER_REBUILDS: &str = "alice";
+    // ── Opening after the peer's teardown ───────────────────────────────────
 
-    // ── Reopening after the peer's teardown (step 2, timer 3) ─────────────────
-
-    /// The platform's re-init asks the machine and is held while the peer's flush arrives. It
-    /// used to be a 1.5 s `Task.sleep` in `SessionCoordinator` with no way for anything else to
-    /// see it — including the core, which would happily open the same ratchet meanwhile.
+    /// A message that can open a session opens at once after the peer's teardown. Until
+    /// 2026-09-27 it waited the peer's flush out, so its open would not cross the peer's rebuild;
+    /// a record that keeps both states converges on the crossing by itself.
     ///
-    /// The timer is the core's: a platform that arms its own on `OpenDeferred` has rebuilt the
-    /// debounce this replaced.
+    /// Mutation: bring back a quiet in `WantToOpen` after `PeerToreDown` — this reddens.
     #[test]
-    fn a_reopen_inside_the_peers_flush_is_deferred_on_the_cores_own_timer() {
-        let mut o = make_orchestrator(WE_REBUILD);
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::OpenDeferred { contact_id, .. } if contact_id == "bob")
-            ),
-            "the platform must be told it is held, not handed an empty list"
-        );
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::ScheduleTimer { timer_id, delay_ms }
-                    if timer_id == "reopen:bob" && *delay_ms <= REOPEN_QUIET_MS + 100
-            )),
-            "nothing else will wake the orchestrator to run it, and the flush is all it waits for"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { .. }))
-        );
-    }
-
-    // ── One heal record (step 4) ─────────────────────────────────────────────
-
-    /// The budget is counted where the queued carrier already is. Until 2026-09-23 this queue's
-    /// `attempts` was permanently zero — `record_attempt` had no caller — while the decision was
-    /// made by a second `HealingQueue` the platform built for itself, keyed by account and fed a
-    /// JSON `ChatMessage`.
-    ///
-    /// Mutation: return `HealAttemptAllowed` unconditionally — this reddens.
-    #[test]
-    fn the_heal_budget_runs_out_where_the_carrier_is_queued() {
-        let mut o = make_orchestrator("alice");
-        o.enqueue_heal("bob", b"x3dh".to_vec());
-        // Two, not three: `max_attempts` is the attempt that is refused. See `HealingQueue`.
-        for expected in 1..=2u32 {
-            let actions = o.handle_event(IncomingEvent::HealAttempted {
-                contact_id: "bob".to_string(),
-            });
-            assert!(
-                actions.iter().any(|a| matches!(
-                    a,
-                    Action::HealAttemptAllowed { contact_id, attempt }
-                        if contact_id == "bob" && *attempt == expected
-                )),
-                "attempt {expected} must be allowed"
-            );
-        }
-        let actions = o.handle_event(IncomingEvent::HealAttempted {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::HealExhausted { contact_id } if contact_id == "bob"))
-        );
-    }
-
-    /// No record means nothing to count against, so the answer is "stop" rather than "go ahead".
-    /// An empty list would be worse than either: the platform read silence as permission before
-    /// this action existed, by way of a Core Data lookup that missed.
-    #[test]
-    fn a_heal_with_nothing_queued_is_not_permission() {
-        let mut o = make_orchestrator("alice");
-        let actions = o.handle_event(IncomingEvent::HealAttempted {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::HealExhausted { .. })),
-            "an unbounded retry is what the budget exists to prevent"
-        );
-        assert!(!actions.is_empty(), "silence is not an answer");
-    }
-
-    /// A session that exists again settles the episode — the same rule that releases the phase.
-    /// Without it a peer that needed three attempts once would start its next episode exhausted,
-    /// for the TTL's whole twenty-four hours.
-    #[test]
-    fn a_session_that_came_back_settles_the_heal_budget() {
-        let mut o = make_orchestrator("alice");
-        o.enqueue_heal("bob", b"x3dh".to_vec());
-        for _ in 0..3 {
-            o.handle_event(IncomingEvent::HealAttempted {
-                contact_id: "bob".to_string(),
-            });
-        }
-        o.handle_event(IncomingEvent::SessionInitCompleted {
-            contact_id: "bob".to_string(),
-            session_data: Vec::new(),
-        });
-        let actions = o.handle_event(IncomingEvent::HealAttempted {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
-            )),
-            "the next episode starts with its own budget"
-        );
-    }
-
-    /// And the peer's teardown settles it too, for the same reason: the ratchet the carrier was
-    /// queued against is gone.
-    #[test]
-    fn the_peers_teardown_settles_the_heal_budget() {
-        let mut o = make_orchestrator("alice");
-        o.enqueue_heal("bob", b"x3dh".to_vec());
-        for _ in 0..3 {
-            o.handle_event(IncomingEvent::HealAttempted {
-                contact_id: "bob".to_string(),
-            });
-        }
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::HealAttempted {
-            contact_id: "bob".to_string(),
-        });
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::HealAttemptAllowed { attempt, .. } if *attempt == 1
-        )));
-    }
-
-    /// But settling is not forgetting. The incoming-trigger cap is what stops a peer from making
-    /// us start heal episodes at will, and a peer who can reset it by tearing down has the
-    /// exhaustion attack back.
-    ///
-    /// Mutation: call `remove` instead of `settle` — this reddens.
-    #[test]
-    fn a_teardown_does_not_hand_back_the_incoming_trigger_budget() {
-        let mut o = make_orchestrator("alice");
-        for _ in 0..12 {
-            o.enqueue_heal("bob", b"x3dh".to_vec());
-        }
-        assert!(
-            o.lifecycle.healing_queue.is_incoming_throttled("bob"),
-            "twelve incoming triggers is past MAX_INCOMING_TRIGGERS"
-        );
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            o.lifecycle.healing_queue.is_incoming_throttled("bob"),
-            "the cap is per record lifetime, not per episode"
-        );
-    }
-
-    // ── Held behind our own announcement (step 3) ────────────────────────────
-
-    /// A message that will not open while our own SESSION_RESET_INIT is unanswered is held, not
-    /// answered. Tearing down there answers our own reset with another reset and takes the
-    /// message with it — 2026-08-04, a user's first message after a re-init.
-    ///
-    /// This was `SessionReducer.confirmGateAction` on iOS, asked at two call sites in
-    /// `MessageRouter` against a gate the core could not see.
-    ///
-    /// Mutation: drop the `awaits_acknowledgement` guard from the `EndSessionNeeded` arm — this
-    /// reddens.
-    #[test]
-    fn a_teardown_is_held_while_our_own_announcement_is_unanswered() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::HeldPendingAck { contact_id } if contact_id == "bob")),
-            "the platform must be told to buffer it — silence here is the message dropped"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. })),
-        );
-    }
-
-    fn held_ids(actions: &[Action]) -> Vec<(&'static str, String)> {
-        actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::ReplayHeld { message_id } => Some(("replay", message_id.clone())),
-                Action::HeldSuperseded { message_id } => Some(("superseded", message_id.clone())),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The core keeps what its gate holds and hands it back when the gate falls. Until
-    /// 2026-09-26 the buffer was the platform's, keyed by account, with its own replay rule; the
-    /// platform now keeps only the envelope.
-    ///
-    /// Mutation: drop `hold_behind_confirm` from the `EndSessionNeeded` arm, or the
-    /// `release_confirm_holds` call in `handle_event` — this reddens.
-    #[test]
-    fn what_the_gate_held_is_handed_back_when_the_peer_acknowledges() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            o.release_confirm_holds().is_empty(),
-            "nothing leaves while the gate is up"
-        );
-
-        let actions = o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        assert_eq!(held_ids(&actions), vec![("replay", "m-held".to_string())]);
-        let again = o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        assert!(held_ids(&again).is_empty(), "handed back once");
-    }
-
-    /// The give-up ends the wait as surely as the acknowledgement does. A gate that expires with
-    /// nothing replayed is the 2026-08-04 defect in its other form.
-    #[test]
-    fn what_the_gate_held_is_handed_back_when_the_window_runs_out() {
-        let clock = Arc::new(MockClock::new(0));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(heal_needed("bob", false), "");
-        clock.advance_ms(crate::orchestration::session_machine::OPENING_CONFIRM_WINDOW_MS + 1);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "open_confirm:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpeningGaveUp { .. })),
-            "{actions:?}"
-        );
-        assert_eq!(held_ids(&actions), vec![("replay", "m-held".to_string())]);
-    }
-
-    /// A held message is not acknowledged, so the server redelivers it while it waits. Each copy
-    /// reaches the gate; one replay comes out.
-    #[test]
-    fn a_redelivered_held_message_is_held_once() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(end_session_needed("bob"), "");
-        o.decision_to_actions(end_session_needed("bob"), "");
-        let actions = o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        assert_eq!(held_ids(&actions).len(), 1);
-    }
-
-    /// Forgetting a contact forgets what was held for it; replaying into a contact the user
-    /// deleted would resurrect it.
-    #[test]
-    fn forgetting_a_contact_drops_its_holds() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(end_session_needed("bob"), "");
-        o.forget_contact_state("bob");
-        let actions = o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        assert!(held_ids(&actions).is_empty());
-    }
-
-    /// Only an opener is judged superseded, and only against a session that exists and is not
-    /// the one it was held against. This was `SessionReducer.heldReplayDisposition` on iOS.
-    ///
-    /// Mutation: drop `hold.opens_session &&` — content would be dropped; return `true` on
-    /// `None` — the handshake that builds the session would be.
-    #[test]
-    fn only_an_opener_whose_ratchet_was_replaced_is_superseded() {
-        let hold = |opens_session: bool, epoch: Option<&str>| ConfirmHold {
-            message_id: "m".to_string(),
-            epoch: epoch.map(str::to_string),
-            opens_session,
-        };
-        assert!(held_opener_superseded(&hold(true, Some("e1")), Some("e2")));
-        assert!(
-            held_opener_superseded(&hold(true, None), Some("e2")),
-            "held with none, one exists now"
-        );
-        assert!(!held_opener_superseded(&hold(true, Some("e1")), Some("e1")));
-        assert!(!held_opener_superseded(&hold(true, Some("e1")), None));
-        assert!(
-            !held_opener_superseded(&hold(false, Some("e1")), Some("e2")),
-            "content always replays"
-        );
-    }
-
-    /// And a heal is held for the sharper version of the same reason: healing as RESPONDER runs
-    /// `archiveSession`, which destroys the session we built two seconds ago in answer to the
-    /// very message that will not open.
-    #[test]
-    fn a_heal_is_held_while_our_own_announcement_is_unanswered() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.decision_to_actions(heal_needed("bob", false), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::HeldPendingAck { contact_id } if contact_id == "bob"))
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SessionHealNeeded { .. }))
-        );
-    }
-
-    /// A handshake carrier is the one thing the wait is waiting for, so holding it would make
-    /// the gate wait on itself. `msg_number == 0` cannot answer this — a DH sending chain
-    /// restarts at 0 on every ratchet turn — which is why the content type rides on the
-    /// decision.
-    ///
-    /// Mutation: ignore `is_handshake` in the heal arm — this reddens, and on device it is the
-    /// 2026-08-21 log: 16 of the peer's 19 `session_ready` sitting in the buffer of the gate
-    /// waiting for them.
-    #[test]
-    fn a_handshake_carrier_is_not_held_behind_the_wait_it_ends() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.decision_to_actions(heal_needed("bob", true), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SessionHealNeeded { .. })),
-            "their X3DH is what resolves the wait; the heal is what applies it"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::HeldPendingAck { .. }))
-        );
-    }
-
-    /// The gate is asked of **one device**. iOS folded it over the peer's device set, so an
-    /// unanswered announcement to one device held a genuine teardown for its sibling — and a
-    /// ratchet is between two devices, so our SRI to one says nothing about the other.
-    ///
-    /// Mutation: fold the question over the peer's devices — this reddens.
-    #[test]
-    fn the_hold_is_asked_of_one_device_not_of_its_sibling() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob-phone".to_string(),
-        });
-        let actions = o.decision_to_actions(end_session_needed("bob-laptop"), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. })),
-            "the sibling's ratchet is not waiting on anything"
-        );
-    }
-
-    /// And the hold ends where the wait does. Both ends work: the peer's acknowledgement here,
-    /// and `OpeningGaveUp` off the `open_confirm:` alarm — which is why that alarm exists.
-    #[test]
-    fn the_hold_ends_when_the_peer_acknowledges() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.decision_to_actions(end_session_needed("bob"), "");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SendEndSession { .. })),
-            "a genuine divergence still tears down, one confirm window later"
-        );
-    }
-
-    // ── Whose turn it is to rebuild (step 2, timer 5) ─────────────────────────
-
-    /// Ranked in the core, over the two device ids, at the one moment both sides see the same
-    /// dead ratchet. The natural RESPONDER's reopen waits the peer's whole turn — not the flush.
-    ///
-    /// Mutation: pass `peer_rebuilds: false` unconditionally — this reddens, and on device it is
-    /// two clients announcing at each other, which is the dueling-initiator deadlock.
-    #[test]
-    fn the_reopen_of_the_side_that_should_not_rebuild_waits_the_peers_turn() {
-        let mut o = make_orchestrator(PEER_REBUILDS);
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::ScheduleTimer { timer_id, delay_ms }
-                    if timer_id == "reopen:bob" && *delay_ms > PEER_TEARDOWN_QUIET_MS
-            )),
-            "the turn must outlast the teardown window, or taking the role finds our own \
-             teardown still gated"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { .. }))
-        );
-    }
-
-    /// And the turn ends. `startResponderFallback` was a 60 s `Task.sleep` keyed by account; what
-    /// pays it now is the core's own alarm, which is the same one the flush quiet uses.
-    #[test]
-    fn the_role_is_taken_when_the_peers_rebuild_never_comes() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(RESPONDER_OVERRIDE_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
-            "a wait with no end is the conversation stopping for good"
-        );
-    }
-
-    /// A peer that keeps tearing down does not keep its turn. The alarm re-asks `WantToOpen`,
-    /// which yields to nobody: the ordering was ranked once, when the ratchet died.
-    ///
-    /// Mutation: make the timer arm ask `WantToReopen` — this reddens.
-    #[test]
-    fn the_peers_turn_is_not_extended_by_tearing_down_again() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(RESPONDER_OVERRIDE_MS / 2);
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(RESPONDER_OVERRIDE_MS / 2 + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
-            "the turn is bounded from the ratchet's death, not from the peer's last word"
-        );
-    }
-
-    /// A message needing a session never waits the peer's turn out, on either side of the
-    /// ranking. It waits the flush, like any other send — `plan_initiation` says the same thing
-    /// in its own words: outbound work outranks prekey economy.
-    ///
-    /// Mutation: rank `NeedSessionInit` too — this reddens, and on device it is a typed message
-    /// sitting for a minute with nothing on screen to say why.
-    #[test]
-    fn a_queued_message_does_not_wait_the_peers_turn_out() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(PEER_REBUILDS, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(need_session_init("bob"), "");
-        clock.advance_ms(REOPEN_QUIET_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob"))
-        );
-    }
-
-    /// Nothing torn down, nothing to wait for — including no turn to yield, because a turn is
-    /// measured from a teardown and there has not been one.
-    #[test]
-    fn a_reopen_of_a_quiet_device_goes_straight_out() {
-        let mut o = make_orchestrator(PEER_REBUILDS);
-        let actions = o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], Action::OpenSession { contact_id } if contact_id == "bob"));
-    }
-
-    /// A backlog flush of N teardowns produces **one** re-init, and not before the flush ends.
-    /// Each used to schedule its own wipe+init+SRI, and every one after the first destroyed the
-    /// session the previous had just created — so the peer AEAD-failed all but the last SRI and
-    /// answered with fresh teardowns. The coalescing map is gone; the phase is what is one.
-    ///
-    /// Mutation: drop the `DeferOpen` arm from `handle_reopen_requested` — this reddens.
-    #[test]
-    fn a_flush_of_teardowns_produces_no_re_init_while_it_is_still_arriving() {
-        let mut o = make_orchestrator("alice");
-        let mut all = Vec::new();
-        for _ in 0..3 {
-            o.handle_event(IncomingEvent::PeerToreDown {
-                contact_id: "bob".to_string(),
-            });
-            all.extend(o.handle_event(IncomingEvent::ReopenRequested {
-                contact_id: "bob".to_string(),
-            }));
-        }
-        assert!(
-            !all.iter().any(|a| matches!(a, Action::OpenSession { .. })),
-            "three teardowns in one flush must not start three announces"
-        );
-        assert_eq!(
-            all.iter()
-                .filter(|a| matches!(a, Action::OpenDeferred { .. }))
-                .count(),
-            3,
-            "each ask is answered — silence is what iOS read as a drop"
-        );
-    }
-
-    /// And when the flush has had its moment, the re-init runs.
-    #[test]
-    fn the_held_re_init_runs_once_the_quiet_passes() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(REOPEN_QUIET_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { contact_id } if contact_id == "bob")),
-            "the core owns the alarm, so the core is what pays it"
-        );
-    }
-
-    /// A message that needs a session waits for the peer's flush too, and for the same reason:
-    /// its X3DH would cross theirs. It is queued either way — `MessageQueuedPendingInit` is the
-    /// word for that, and the empty list this used to be was read by iOS as a drop.
-    #[test]
-    fn a_message_needing_a_session_waits_for_the_peers_flush_too() {
+    fn a_message_needing_a_session_opens_at_once_after_the_peers_teardown() {
         let mut o = make_orchestrator("alice");
         o.handle_event(IncomingEvent::PeerToreDown {
             contact_id: "bob".to_string(),
         });
         let actions = o.decision_to_actions(need_session_init("bob"), "");
         assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::OpenReceiving { contact_id } if contact_id == "bob"))
+        );
+        assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::OpenReceiving { .. })),
-            "the bundle fetch is what starts the crossing init"
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::MessageQueuedPendingInit { .. }))
-        );
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen:bob")
-            ),
-            "a queued message is not re-delivered, so only our own alarm brings it back"
+                .any(|a| matches!(a, Action::ScheduleTimer { .. })),
+            "nothing waits, so nothing is armed"
         );
     }
 
-    /// And it is paid with an announce, not a bundle fetch. The fetch this arm grants directly is
-    /// message-bound on the platform — it re-queues the carrier it came with — and a timer has no
-    /// carrier, so granting one later would be a producer with no reader. After a teardown the
-    /// recovery is an announced X3DH either way, and the queued message drains out of
-    /// `pending_queues` on init completion like anything else held behind an open.
+    /// A refused decrypt says why, beside the teardown it produced.
     #[test]
-    fn the_queued_message_is_recovered_by_an_announce_when_the_quiet_passes() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(need_session_init("bob"), "");
-        clock.advance_ms(REOPEN_QUIET_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], Action::OpenSession { contact_id } if contact_id == "bob"));
-    }
-
-    /// Two callers held by one quiet produce one open. Two announces spend two of the peer's
-    /// one-time pre-keys and the second session orphans the SRI the first just put on the wire —
-    /// which is what the `[String: Task]` map existed to prevent, one flush at a time.
-    #[test]
-    fn two_callers_held_by_one_quiet_produce_one_open() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.decision_to_actions(need_session_init("bob"), "");
-        let held = o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        assert!(
-            held.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "reopen:bob")
-            ),
-            "both callers wait on the one alarm"
-        );
-        clock.advance_ms(REOPEN_QUIET_MS + 200);
-        let first = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        let second = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        assert_eq!(first.len(), 1);
-        assert!(matches!(&first[0], Action::OpenSession { .. }));
-        assert!(
-            second.is_empty(),
-            "the alarm firing twice does not announce twice — the first open holds the phase"
-        );
-    }
-
-    /// The peer's rebuild arrived during the quiet, which is what the quiet was waiting for. The
-    /// line matters on device: it is what to look for when a re-init "should have" happened.
-    #[test]
-    fn a_session_that_came_back_during_the_quiet_cancels_the_re_init() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock(WE_REBUILD, clock.clone());
-        o.handle_event(IncomingEvent::PeerToreDown {
-            contact_id: "bob".to_string(),
-        });
-        o.handle_event(IncomingEvent::ReopenRequested {
-            contact_id: "bob".to_string(),
-        });
-        // Stand in for the peer's init having completed: the machine's record goes, and the
-        // orchestrator's own `has_active_session` is what the timer arm consults.
-        o.sessions.handle("bob", SessionEvent::OpenFinished);
-        clock.advance_ms(REOPEN_QUIET_MS + 200);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "reopen:bob".to_string(),
-        });
-        // No session in this harness, so the machine grants the open — what is pinned here is
-        // that a cleared phase does not leave the quiet running.
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::OpenSession { .. })),
-            "a cleared phase reopens immediately; it is the quiet that must not survive it"
-        );
-    }
-
-    // ── Waiting for the peer's acknowledgement (step 3) ──────────────────────
-
-    /// An announcement arms the confirm alarm. Nothing else ever does, so a missing one is a gate
-    /// that never opens — which is what the single-shot watchdog left behind.
-    ///
-    /// Mutation: return `vec![]` from `handle_sri_announced` — this reddens.
-    #[test]
-    fn an_announcement_arms_the_confirm_alarm() {
+    fn a_refused_decrypt_reports_its_cause() {
         let mut o = make_orchestrator("alice");
-        let actions = o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        assert_eq!(actions.len(), 1);
+        let actions = o.decision_to_actions(end_session_needed("bob"), "");
         assert!(
-            matches!(&actions[0], Action::ScheduleTimer { timer_id, .. } if timer_id == "open_confirm:bob"),
-            "nothing else wakes the orchestrator to re-send an unacknowledged SRI"
+            actions.iter().any(|a| matches!(
+                a,
+                Action::NotifyError { code, message }
+                    if code == DECRYPT_FAILED && message == "AEAD decryption failed"
+            )),
+            "the teardown lost the ratchet's reason: {actions:?}"
         );
-        assert!(o.awaits_acknowledgement("bob"));
-    }
-
-    /// A finished init does not: a responder announces nothing, so there is nothing to wait for,
-    /// and an initiator's wait starts from the carrier rather than from the init behind it.
-    #[test]
-    fn a_finished_init_alone_arms_no_confirm_alarm() {
-        let mut o = make_orchestrator("alice");
-        o.sessions.handle("bob", SessionEvent::WantToOpen);
-        let actions = o.handle_event(IncomingEvent::SessionInitCompleted {
-            contact_id: "bob".to_string(),
-            session_data: vec![],
-        });
-        assert!(
-            !actions.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id.starts_with("open_confirm:"))
-            )
-        );
-        assert!(!o.awaits_acknowledgement("bob"));
-    }
-
-    /// The alarm re-sends and re-arms itself. Re-arming is the whole fix: the watchdog was
-    /// single-shot until 2026-08-04, fired once, went silent, and left the gate raised.
-    #[test]
-    fn the_confirm_alarm_re_sends_and_re_arms() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(SRI_RETRY_MS);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "open_confirm:bob".to_string(),
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ResendSri { contact_id } if contact_id == "bob"))
-        );
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::ScheduleTimer { timer_id, .. } if timer_id == "open_confirm:bob")
-            ),
-            "a retry that does not re-arm is the single-shot watchdog again"
-        );
-    }
-
-    /// And it stops. Past the window the opening is given up, with no re-arm — the platform
-    /// releases what it held and the ordinary decrypt/heal path decides on what arrives next.
-    #[test]
-    fn the_confirm_alarm_gives_up_at_the_window_and_does_not_re_arm() {
-        let clock = Arc::new(MockClock::new(1_000_000));
-        let mut o = make_orchestrator_with_clock("alice", clock.clone());
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        clock.advance_ms(OPENING_CONFIRM_WINDOW_MS + 1);
-        let actions = o.handle_event(IncomingEvent::TimerFired {
-            timer_id: "open_confirm:bob".to_string(),
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], Action::OpeningGaveUp { contact_id } if contact_id == "bob"));
-    }
-
-    /// The peer's acknowledgement ends the wait and cancels the alarm. Leaving it armed means an
-    /// SRI re-sent at a peer that already answered — a fresh X3DH over a working ratchet.
-    #[test]
-    fn the_peers_acknowledgement_ends_the_wait_and_the_alarm() {
-        let mut o = make_orchestrator("alice");
-        o.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        let actions = o.handle_event(IncomingEvent::PeerAcked {
-            contact_id: "bob".to_string(),
-        });
-        assert_eq!(o.sessions.phase("bob"), crate::orchestration::Phase::Absent);
-        assert!(actions.iter().any(
-            |a| matches!(a, Action::CancelTimer { timer_id } if timer_id == "open_confirm:bob")
-        ));
     }
 
     #[test]
@@ -4206,65 +2924,6 @@ mod tests {
             .init_session(device, &x3dh, &identity, 0)
             .is_ok()
     }
-
-    /// A refused decrypt says why, on both paths the refusal takes. The cause was dropped here
-    /// (`reason: _`) and never left the router on the heal path, so a device log showed every
-    /// message answered with END_SESSION and nothing on what the ratchet objected to.
-    ///
-    /// Mutation: drop the `NotifyError` push in `decision_to_actions` — this reddens.
-    /// The platform's question gets the machine's answer, one action, naming the device.
-    /// Mutation that reddens it: map `Redelivery` or `PredatesSession` onto `ApplyResetInit`.
-    #[test]
-    fn an_arriving_reset_init_is_answered_apply_or_superseded() {
-        let mut o = make_orchestrator("alice");
-        let arrive = |o: &mut Orchestrator, key: u8, sent: u64, est: Option<u64>| {
-            o.handle_event(IncomingEvent::ResetInitArrived {
-                contact_id: "bob".into(),
-                init_ephemeral: vec![key; 32],
-                sent_at_s: sent,
-                established_at_s: est,
-            })
-        };
-        assert!(matches!(
-            arrive(&mut o, 1, 100, None).as_slice(),
-            [Action::ApplyResetInit { contact_id }] if contact_id == "bob"
-        ));
-        assert!(matches!(
-            arrive(&mut o, 1, 100, None).as_slice(),
-            [Action::ResetInitSuperseded { contact_id, redelivery: true }] if contact_id == "bob"
-        ));
-        assert!(matches!(
-            arrive(&mut o, 2, 10, Some(1_000)).as_slice(),
-            [Action::ResetInitSuperseded {
-                redelivery: false,
-                ..
-            }]
-        ));
-    }
-
-    #[test]
-    fn a_refused_decrypt_reports_its_cause_on_both_paths() {
-        let mut o = make_orchestrator("alice");
-        for (path, actions) in [
-            (
-                "tear down",
-                o.decision_to_actions(end_session_needed("bob"), ""),
-            ),
-            (
-                "heal",
-                o.decision_to_actions(heal_needed("carol", false), ""),
-            ),
-        ] {
-            assert!(
-                actions.iter().any(|a| matches!(
-                    a,
-                    Action::NotifyError { code, message }
-                        if code == DECRYPT_FAILED && message == "AEAD decryption failed"
-                )),
-                "the {path} path lost the ratchet's reason: {actions:?}"
-            );
-        }
-    }
 }
 
 /// PQXDH v2 as the orchestrator carries it out, end to end: two orchestrators, the wire format in
@@ -4394,75 +3053,6 @@ mod pqxdh_v2_tests {
             (PqHandshake::InitialV2, PqAuthentication::Received)
         );
         assert!(a.is_pq_strengthened && b.is_pq_strengthened);
-    }
-
-    /// The stand defect of 2026-09-25, in the core. The responder opens the session from the
-    /// first message; that message never passes the ACK store, so when it comes round again —
-    /// the platform's init queue replaying it, or a stream replayed below its cursor — it is
-    /// routed like any other. It must be a duplicate. Read as a desync it was healed, the heal
-    /// archived the session the message had just built, and the next message of the first flight
-    /// was lost to an END_SESSION round trip.
-    ///
-    /// Mutation: drop the `MESSAGE_KEY_CONSUMED` arm from the router — this reddens.
-    #[test]
-    fn the_first_message_coming_round_again_is_a_duplicate_not_a_desync() {
-        let (mut alice, mut bob) = (device("alice"), device("bob"));
-        open(&mut alice, &mut bob, true);
-        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
-        let msg1 = alice.encrypt_bytes_for("bob", b"second").unwrap();
-        respond(&mut bob, &alice, "alice", &msg0).unwrap();
-        let session = bob.lifecycle.active_session_id("alice").unwrap();
-
-        // The ratchet names what happened.
-        let err = bob
-            .lifecycle
-            .decrypt_wire_payload("alice", &msg0)
-            .unwrap_err();
-        assert!(
-            err.starts_with(crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED),
-            "{err}"
-        );
-
-        let received = |bob: &mut Orchestrator, id: &str, data: &[u8], msg_num: u32| {
-            bob.handle_event(IncomingEvent::MessageReceived {
-                sender_certificate: None,
-                message_id: id.to_string(),
-                from: "alice".to_string(),
-                data: data.to_vec(),
-                msg_num,
-                kem_ct: vec![],
-                otpk_id: 0,
-                is_control: false,
-                content_type: 0,
-            })
-        };
-        let again = received(&mut bob, "carrier", &msg0, 0);
-        assert!(
-            !again.iter().any(|a| matches!(
-                a,
-                Action::SessionHealNeeded { .. }
-                    | Action::HealSuppressed { .. }
-                    | Action::SendEndSession { .. }
-                    | Action::NotifyError { .. }
-            )),
-            "a copy of the carrier must not heal or tear down: {again:?}"
-        );
-        assert!(
-            again.iter().any(
-                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "carrier")
-            ),
-            "and it is named a duplicate, not answered with silence: {again:?}"
-        );
-        assert_eq!(bob.lifecycle.active_session_id("alice").unwrap(), session);
-
-        let next = received(&mut bob, "second", &msg1, 1);
-        assert!(
-            next.iter().any(|a| matches!(
-                a,
-                Action::MessageDecrypted { plaintext, .. } if plaintext == b"second"
-            )),
-            "the rest of the first flight still opens: {next:?}"
-        );
     }
 
     /// The whole first flight repeats the header, so the responder can open the session from
@@ -4690,7 +3280,7 @@ mod pqxdh_v2_tests {
     /// Mutation: drop the `tie_break_role` filter from `pq_upgrade_candidates` — this reddens
     /// (`zzz`, where this device is RESPONDER, would be reopened from both ends).
     #[test]
-    fn the_upgrade_sweep_reopens_only_classical_sessions_it_initiates() {
+    fn the_upgrade_sweep_reopens_only_classical_sessions() {
         let (mut zed, mut bob) = (device("zed"), device("bob"));
         classical(&mut zed, &mut bob, "amy");
         classical(&mut zed, &mut bob, "bob");
@@ -4698,7 +3288,8 @@ mod pqxdh_v2_tests {
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         zed.init_session_with_bundle("dan", x3dh, kyber, false)
             .unwrap();
-        // "zed" < "zzz": the peer is the INITIATOR here, and it is the one that reopens.
+        // "zed" < "zzz": until 2026-09-27 only the higher id reopened. Both do now — the two new
+        // states cross like any two openings and the record keeps both.
         classical(&mut zed, &mut bob, "zzz");
 
         let launched = zed.handle_event(IncomingEvent::AppLaunched);
@@ -4710,7 +3301,7 @@ mod pqxdh_v2_tests {
         );
 
         let first = sweep(&mut zed);
-        assert_eq!(opened(&first), ["amy", "bob"]);
+        assert_eq!(opened(&first), ["amy", "bob", "zzz"]);
         assert!(!rearmed(&first));
         // The ask is the machine's too: a second open of the same ratchet waits.
         assert!(
@@ -4785,32 +3376,6 @@ mod pqxdh_v2_tests {
         zed.encrypt_bytes_for("bob", b"still here").unwrap();
     }
 
-    /// The same refusal as the platform meets it: the sweep grants the open, the platform raises
-    /// the confirm gate before the init runs, and the init is refused. Nothing was built, so
-    /// nothing may keep holding sends to this peer — on the 2026-09-25 stand the gate stayed up
-    /// for the whole confirm window after every `PQ_REQUIRED`.
-    ///
-    /// Mutation: drop `reopen_refused` from `reopen_session_with_bundle` — this reddens.
-    #[test]
-    fn a_refused_reopen_leaves_no_confirm_gate() {
-        let (mut zed, mut bob) = (device("zed"), device("bob"));
-        classical(&mut zed, &mut bob, "bob");
-        assert_eq!(opened(&sweep(&mut zed)), ["bob"]);
-        zed.handle_event(IncomingEvent::SriAnnounced {
-            contact_id: "bob".to_string(),
-        });
-        assert!(zed.awaits_acknowledgement("bob"));
-
-        let (x3dh, _) = bundle_of(&mut bob, false);
-        zed.reopen_session_with_bundle("bob", x3dh, KyberBundleKeys::default(), false)
-            .unwrap_err();
-        assert!(!zed.awaits_acknowledgement("bob"));
-        assert_eq!(
-            zed.sessions.phase("bob"),
-            crate::orchestration::session_machine::Phase::Absent
-        );
-    }
-
     #[test]
     fn an_accepted_reopen_is_v2_and_the_peer_opens_it() {
         let (mut zed, mut bob) = (device("zed"), device("bob"));
@@ -4850,17 +3415,10 @@ mod pqxdh_v2_tests {
         (o, id)
     }
 
-    /// Alice and Bob with Bob the RESPONDER of any heal between them (lower id — see
-    /// `tie_break_role`). Device ids are random, so a heal test that does not fix this passes or
-    /// fails with the draw.
-    fn responder_pair() -> ((Orchestrator, String), (Orchestrator, String)) {
-        loop {
-            let a = named_device();
-            let b = named_device();
-            if b.1 < a.1 {
-                return (a, b);
-            }
-        }
+    /// Alice and Bob, each named by the device id its identity key derives to. Until 2026-09-27
+    /// this fixed Bob as the lower id, the RESPONDER of any heal; nothing is ranked any more.
+    fn named_pair() -> ((Orchestrator, String), (Orchestrator, String)) {
+        (named_device(), named_device())
     }
 
     fn deliver(bob: &mut Orchestrator, from: &str, id: &str, wire: Vec<u8>, ct: u8) -> Vec<Action> {
@@ -5124,66 +3682,11 @@ mod pqxdh_v2_tests {
         );
     }
 
-    /// A handshake that does not open leaves the session Bob holds exactly as it was; the queue
-    /// goes, and the platform is told which carriers were tried.
-    ///
-    /// Mutation: drop the `put_back_session` on a failed attempt — this reddens.
-    #[test]
-    fn an_attempt_that_opens_nothing_keeps_the_session_it_found() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
-        let server = trusting_server(&mut bob);
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
-        let before = bob.get_session_health(&alice_id).unwrap().session_id;
-
-        // Alice re-initialises; her handshake arrives damaged in the KEM ciphertext, so it fails
-        // on the session Bob holds (a heal carrier) and cannot open a new one either.
-        alice.remove_session_by_contact(&bob_id);
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        let mut reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
-        reinit[crate::wire_payload::HEADER_SIZE + 10] ^= 0x01;
-        let healed = deliver_sealed(
-            &mut bob,
-            &alice_id,
-            certificate(&server, &alice),
-            "m-heal",
-            reinit,
-        );
-        assert!(
-            healed
-                .iter()
-                .any(|a| matches!(a, Action::SessionHealNeeded { .. })),
-            "{healed:?}"
-        );
-        assert_eq!(
-            bob.router.pending_messages(&alice_id).len(),
-            1,
-            "the heal's carrier waits in the queue"
-        );
-
-        let opened = bob.open_receiving(&alice_id);
-        assert!(opened.opened_device.is_none());
-        assert_eq!(opened.tried_message_ids, vec!["m-heal".to_string()]);
-        assert_eq!(
-            bob.get_session_health(&alice_id).unwrap().session_id,
-            before,
-            "the held session is untouched"
-        );
-        assert!(bob.router.pending_messages(&alice_id).is_empty());
-    }
-
     /// The heal: the session held is replaced by the one the carrier opens, and the old one is
     /// archived rather than lost.
     #[test]
-    fn a_heal_opens_from_its_queued_carrier_and_archives_the_old_session() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
+    fn a_new_handshake_over_a_held_session_opens_beside_it() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
         let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
@@ -5200,123 +3703,278 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
-        deliver_sealed(
+        let routed = deliver_sealed(
             &mut bob,
             &alice_id,
             certificate(&server, &alice),
-            "m-heal",
+            "m-reinit",
             reinit,
+        );
+        assert!(
+            routed.iter().any(
+                |a| matches!(a, Action::OpenReceiving { contact_id } if *contact_id == alice_id)
+            ),
+            "no state decrypts it and it carries the header: it opens, it does not tear down"
         );
 
         let opened = bob.open_receiving(&alice_id);
         assert_eq!(opened.opened_device.as_deref(), Some(alice_id.as_str()));
         assert_eq!(
             decrypted(&opened.actions),
-            vec![("m-heal".to_string(), b"again".to_vec())]
+            vec![("m-reinit".to_string(), b"again".to_vec())]
         );
-        assert!(opened.actions.iter().any(
-            |a| matches!(a, Action::SessionTerminated { contact_id, .. } if *contact_id == alice_id)
-        ), "the replaced session is archived");
+        assert!(
+            !opened
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::SessionTerminated { .. })),
+            "the replaced state is kept, not archived"
+        );
         assert_ne!(
             bob.get_session_health(&alice_id).unwrap().session_id,
             before
         );
+        assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 1);
     }
 
-    /// An exhausted heal takes its carriers with it; otherwise each reconnect's drain routes them
-    /// into the same refusal and raises the heal again.
+    // ── Sessions renew by sending (decisions/sessions-renew-by-sending.md) ────
+
+    /// Deliver `wire` sealed and, when the core asks for it, run the receiving open — what the
+    /// platform does with `OpenReceiving`. Everything decrypted on the way, in order.
+    fn receive(
+        to: &mut Orchestrator,
+        from: &Orchestrator,
+        from_id: &str,
+        server: &TestServer,
+        id: &str,
+        wire: Vec<u8>,
+    ) -> Vec<Action> {
+        let mut actions = deliver_sealed(to, from_id, certificate(server, from), id, wire);
+        if actions
+            .iter()
+            .any(|a| matches!(a, Action::OpenReceiving { .. }))
+        {
+            actions.extend(to.open_receiving(from_id).actions);
+        }
+        actions
+    }
+
+    fn tears_down(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendEndSession { .. } | Action::EndSessionSuppressed { .. }
+            )
+        })
+    }
+
+    /// Both sides open at once, each by sending — the crossing the tie-break and the SRI confirm
+    /// window existed for. Each opens the other's state beside its own, and the first message
+    /// either side reads on the other's settles both records on one state. No teardown, no
+    /// message lost.
     ///
-    /// Mutation: drop the `take_pending` from `handle_heal_attempted` — this reddens.
+    /// Mutation: drop the previous-state loop from `decrypt_ratchet_message` — Bob cannot read
+    /// Alice's answer on his own state, and this reddens.
     #[test]
-    fn an_exhausted_heal_drops_its_carriers() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = responder_pair();
+    fn two_sides_opening_at_once_converge_on_one_state() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = TestServer::new();
+        alice.set_trusted_server_keys(vec![server.verifying_key()]);
+        bob.set_trusted_server_keys(vec![server.verifying_key()]);
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let (x3dh, kyber) = bundle_of(&mut alice, true);
+        bob.init_session_with_bundle(&alice_id, x3dh, kyber, false)
+            .unwrap();
+        let a0 = alice.encrypt_bytes_for(&bob_id, b"a0").unwrap();
+        let b0 = bob.encrypt_bytes_for(&alice_id, b"b0").unwrap();
+
+        let at_bob = receive(&mut bob, &alice, &alice_id, &server, "a0", a0);
+        let at_alice = receive(&mut alice, &bob, &bob_id, &server, "b0", b0);
+        assert_eq!(decrypted(&at_bob), vec![("a0".to_string(), b"a0".to_vec())]);
+        assert_eq!(
+            decrypted(&at_alice),
+            vec![("b0".to_string(), b"b0".to_vec())]
+        );
+        assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 1);
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), 1);
+
+        // Alice answers on the state Bob opened; Bob holds it as a previous one.
+        let a1 = alice.encrypt_bytes_for(&bob_id, b"a1").unwrap();
+        let at_bob = receive(&mut bob, &alice, &alice_id, &server, "a1", a1);
+        assert_eq!(decrypted(&at_bob), vec![("a1".to_string(), b"a1".to_vec())]);
+        let b1 = bob.encrypt_bytes_for(&alice_id, b"b1").unwrap();
+        let at_alice = receive(&mut alice, &bob, &bob_id, &server, "b1", b1);
+        assert_eq!(
+            decrypted(&at_alice),
+            vec![("b1".to_string(), b"b1".to_vec())]
+        );
+
+        assert_eq!(
+            alice.get_session_health(&bob_id).unwrap().session_id,
+            bob.get_session_health(&alice_id).unwrap().session_id,
+            "both records settled on one state"
+        );
+        for actions in [&at_bob, &at_alice] {
+            assert!(!tears_down(actions), "{actions:?}");
+        }
+    }
+
+    /// The first message is lost; the second carries the same header and opens the session.
+    /// Until 2026-09-27 only message 0 could open, and a lost one cost the pair a reset.
+    ///
+    /// Mutation: restore `message_number != 0 → MidRatchet` in `receiving_init_kind` — this
+    /// reddens.
+    #[test]
+    fn a_lost_first_message_costs_nothing() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let _lost = alice.encrypt_bytes_for(&bob_id, b"m0").unwrap();
+        let m1 = alice.encrypt_bytes_for(&bob_id, b"m1").unwrap();
+        let m2 = alice.encrypt_bytes_for(&bob_id, b"m2").unwrap();
+
+        let first = receive(&mut bob, &alice, &alice_id, &server, "m1", m1);
+        assert_eq!(decrypted(&first), vec![("m1".to_string(), b"m1".to_vec())]);
+        let next = receive(&mut bob, &alice, &alice_id, &server, "m2", m2);
+        assert_eq!(decrypted(&next), vec![("m2".to_string(), b"m2".to_vec())]);
+        assert!(!tears_down(&first) && !tears_down(&next));
+    }
+
+    /// Alice reopens over the session they hold. What she sent on the old state before the reopen
+    /// still decrypts, and the new state's second message, arriving before its first, opens it;
+    /// the first then decrypts on its skipped key. On the stand (2026-09-27) the second got an
+    /// END_SESSION.
+    ///
+    /// Mutation: archive the held session in `open_receiving` instead of retiring it — the
+    /// message on the old state, delivered after, reddens this.
+    #[test]
+    fn a_new_state_opens_from_any_of_its_messages_and_the_old_one_still_reads() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        receive(&mut bob, &alice, &alice_id, &server, "m0", m0);
+        let reply = bob.encrypt_bytes_for(&alice_id, b"hi").unwrap();
+        alice.decrypt_bytes_for(&bob_id, &reply).unwrap();
+
+        let late_on_old = alice.encrypt_bytes_for(&bob_id, b"late").unwrap();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let n0 = alice.encrypt_bytes_for(&bob_id, b"n0").unwrap();
+        let n1 = alice.encrypt_bytes_for(&bob_id, b"n1").unwrap();
+
+        let opened = receive(&mut bob, &alice, &alice_id, &server, "n1", n1);
+        assert_eq!(decrypted(&opened), vec![("n1".to_string(), b"n1".to_vec())]);
+        let earlier = receive(&mut bob, &alice, &alice_id, &server, "n0", n0);
+        assert_eq!(
+            decrypted(&earlier),
+            vec![("n0".to_string(), b"n0".to_vec())]
+        );
+        let old = receive(&mut bob, &alice, &alice_id, &server, "late", late_on_old);
+        assert_eq!(
+            decrypted(&old),
+            vec![("late".to_string(), b"late".to_vec())]
+        );
+        for actions in [&opened, &earlier, &old] {
+            assert!(!tears_down(actions), "{actions:?}");
+        }
+    }
+
+    /// A handshake that does not open leaves the session Bob holds exactly as it was; the queue
+    /// goes, and the platform is told which carriers were tried.
+    ///
+    /// Mutation: drop the `put_back_session` on a failed attempt — this reddens.
+    #[test]
+    fn an_attempt_that_opens_nothing_keeps_the_session_it_found() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
         let (x3dh, kyber) = bundle_of(&mut bob, false);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
         let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
         respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
-        let (mut other, _) = named_device();
-        other.set_my_user_id(alice_id.clone());
+        let before = bob.get_session_health(&alice_id).unwrap().session_id;
+
+        // Alice reopens; her handshake arrives damaged in the KEM ciphertext, so no state decrypts
+        // it and it cannot open a new one either.
         let (x3dh, kyber) = bundle_of(&mut bob, false);
-        other
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
-        deliver(
+        let mut reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        reinit[crate::wire_payload::HEADER_SIZE + 10] ^= 0x01;
+        deliver_sealed(
             &mut bob,
             &alice_id,
-            "m-heal",
-            other.encrypt_bytes_for(&bob_id, b"x").unwrap(),
-            0,
+            certificate(&server, &alice),
+            "m-reinit",
+            reinit,
         );
         assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
 
-        let mut last = Vec::new();
-        for _ in 0..10 {
-            last = bob.handle_event(IncomingEvent::HealAttempted {
-                contact_id: alice_id.clone(),
-            });
-            if last
-                .iter()
-                .any(|a| matches!(a, Action::HealExhausted { .. }))
-            {
-                break;
-            }
-        }
-        assert!(
-            last.iter()
-                .any(|a| matches!(a, Action::HealExhausted { .. })),
-            "{last:?}"
+        let opened = bob.open_receiving(&alice_id);
+        assert!(opened.opened_device.is_none());
+        assert_eq!(opened.tried_message_ids, vec!["m-reinit".to_string()]);
+        assert_eq!(
+            bob.get_session_health(&alice_id).unwrap().session_id,
+            before,
+            "the held session is untouched"
         );
+        assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 0);
         assert!(bob.router.pending_messages(&alice_id).is_empty());
     }
 
-    /// A SESSION_RESET_INIT starts a new generation: what its sender queued before it goes, and
-    /// the platform is told which messages so it can let the cursor past them.
+    /// The first message coming round again — the platform replaying it, or a stream replayed
+    /// below its cursor — is a duplicate: its key is spent. Read as a failure it would open a new
+    /// state from its own header or tear the session down.
     ///
-    /// Mutation: drop the `drop_pending` from `queue_for_open` — this reddens.
+    /// Mutation: drop the `MESSAGE_KEY_CONSUMED` arm from the router — this reddens.
     #[test]
-    fn a_reset_init_supersedes_what_its_sender_queued() {
-        let (mut alice, alice_id) = named_device();
-        let (mut bob, bob_id) = named_device();
+    fn the_first_message_coming_round_again_is_a_duplicate() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
         let server = trusting_server(&mut bob);
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
-        deliver(
-            &mut bob,
-            &alice_id,
-            "old",
-            alice.encrypt_bytes_for(&bob_id, b"old").unwrap(),
-            0,
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        let m1 = alice.encrypt_bytes_for(&bob_id, b"second").unwrap();
+        receive(&mut bob, &alice, &alice_id, &server, "m0", m0.clone());
+        let session = bob.lifecycle.active_session_id(&alice_id).unwrap();
+
+        let again = receive(&mut bob, &alice, &alice_id, &server, "m0-copy", m0);
+        assert!(
+            again.iter().any(
+                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "m0-copy")
+            ),
+            "{again:?}"
         );
+        assert!(!tears_down(&again));
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, Action::OpenReceiving { .. })),
+            "{again:?}"
+        );
+        assert_eq!(bob.lifecycle.active_session_id(&alice_id).unwrap(), session);
 
-        alice.remove_session_by_contact(&bob_id);
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        let sri = alice.encrypt_bytes_for(&bob_id, b"reset").unwrap();
-        let actions = bob.queue_for_open(IncomingMessage {
-            sender_certificate: Some(certificate(&server, &alice)),
-            contact_id: alice_id.clone(),
-            wire_payload: sri,
-            message_id: "sri".to_string(),
-            msg_number: 0,
-            is_control: false,
-            content_type: 24,
-        });
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::PendingDropped { message_ids, .. } if message_ids == &vec!["old".to_string()]
-        )), "{actions:?}");
-
-        let opened = bob.open_receiving(&alice_id);
-        assert_eq!(opened.opener_message_id.as_deref(), Some("sri"));
+        let next = receive(&mut bob, &alice, &alice_id, &server, "m1", m1);
         assert_eq!(
-            decrypted(&opened.actions),
-            vec![("sri".to_string(), b"reset".to_vec())]
+            decrypted(&next),
+            vec![("m1".to_string(), b"second".to_vec())]
         );
     }
 
@@ -5396,41 +4054,6 @@ mod pqxdh_v2_tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::PendingDropped { .. })),
-            "{actions:?}"
-        );
-        assert_eq!(bob.pending_message_count(&alice_id), 0);
-    }
-
-    /// As INITIATOR the heal keeps its own session and the peer's handshake is superseded; queued,
-    /// it would come back on every drain and raise the same decision.
-    ///
-    /// Mutation: drop the `role == Role::Responder` guard — this reddens.
-    #[test]
-    fn an_initiator_does_not_queue_the_superseded_handshake() {
-        let ((mut bob, bob_id), (mut alice, alice_id)) = responder_pair();
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        alice
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        let msg0 = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
-        respond(&mut bob, &alice, &alice_id, &msg0).unwrap();
-        let (mut other, _) = named_device();
-        other.set_my_user_id(alice_id.clone());
-        let (x3dh, kyber) = bundle_of(&mut bob, false);
-        other
-            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
-            .unwrap();
-        let actions = deliver(
-            &mut bob,
-            &alice_id,
-            "m",
-            other.encrypt_bytes_for(&bob_id, b"x").unwrap(),
-            0,
-        );
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::SessionHealNeeded { role, .. } if role == "Initiator")
-            ),
             "{actions:?}"
         );
         assert_eq!(bob.pending_message_count(&alice_id), 0);

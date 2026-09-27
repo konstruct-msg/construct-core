@@ -1604,15 +1604,23 @@ mod tests {
         orch.pending_message_count(contact_id)
     }
 
-    /// A msgNum=0 carrier from `from`, the shape that opens a receiving session.
+    /// A message carrying the handshake header from `from`, the shape that opens a receiving
+    /// session.
     fn queued_first_message(id: &str, from: &str) -> CfeIncomingEvent {
         CfeIncomingEvent::MessageReceived {
             message_id: id.to_string(),
             from: from.to_string(),
             data: crate::wire_payload::pack(
-                &[7u8; 32], 0, 0, 0, 0, 1, None,
+                &[7u8; 32],
+                0,
+                0,
+                0,
+                0,
+                1,
+                Some(&[5u8; 1568]),
                 &[0u8; 32], // sealed box — never decrypted here
-                0, None,
+                0,
+                None,
             )
             .unwrap(),
             msg_num: 0,
@@ -1628,8 +1636,8 @@ mod tests {
     ///
     /// `forget_contact_state` was implemented, unit-tested at two levels, and absent from the
     /// UDL — so the only deletion a platform could reach was `remove_session`, which drops the
-    /// ratchet and leaves the queue, the init lock, the archive, the heal record, the prekey
-    /// counter and the PQ contribution behind. iOS shipped that for months: "delete this
+    /// ratchet and leaves the queue, the init lock, the archive, the prekey counter and the PQ
+    /// contribution behind. iOS shipped that for months: "delete this
     /// contact" removed the session and the next add was steered by the deleted contact's
     /// leftovers.
     ///
@@ -2525,22 +2533,7 @@ pub fn format_federated_id(device_id: String, server_hostname: String) -> String
     crate::device_id::format_federated_id(&device_id, &server_hostname)
 }
 
-/// Which side opens the session when both try at once.
-///
-/// The platform used to carry its own copy of this rule (`SessionReducer.tieBreakRole`) under a
-/// comment promising it matched the core byte-for-byte. The addressing flip broke that promise
-/// without touching either line: the core began ranking device ids while the platform still
-/// ranked account ids, so the two compared *different pairs* and agreed only by coincidence —
-/// and a disagreement here is both-initiator or both-responder, a permanent deadlock.
-///
-/// Returns the same spelling the `SessionHealNeeded` action carries.
-pub fn tie_break_role(my_id: String, peer_id: String) -> String {
-    crate::orchestration::tie_break_role(&my_id, &peer_id)
-        .as_wire()
-        .to_string()
-}
-
-/// Whether to open a session with a device now, and as which side.
+/// Whether to open a session with a device now.
 ///
 /// Delegates; the reasoning and the run it was written from are in
 /// `orchestration::initiation_plan`.
@@ -2861,7 +2854,6 @@ pub fn plan_receiving_decrypt(
 pub enum ReceivingInitKind {
     Handshake,
     MidRatchet,
-    MidSessionLeftover,
 }
 
 impl From<crate::orchestration::ReceivingInitKind> for ReceivingInitKind {
@@ -2869,9 +2861,6 @@ impl From<crate::orchestration::ReceivingInitKind> for ReceivingInitKind {
         match k {
             crate::orchestration::ReceivingInitKind::Handshake => ReceivingInitKind::Handshake,
             crate::orchestration::ReceivingInitKind::MidRatchet => ReceivingInitKind::MidRatchet,
-            crate::orchestration::ReceivingInitKind::MidSessionLeftover => {
-                ReceivingInitKind::MidSessionLeftover
-            }
         }
     }
 }
@@ -2889,7 +2878,6 @@ pub struct ReceivingInitCarrier {
     pub one_time_prekey_id: u32,
     pub kem_ciphertext_bytes: u32,
     pub pq_message_epoch: u32,
-    pub is_session_reset_init: bool,
 }
 
 impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier {
@@ -2899,7 +2887,6 @@ impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier 
             one_time_prekey_id: c.one_time_prekey_id,
             kem_ciphertext_bytes: c.kem_ciphertext_bytes,
             pq_message_epoch: c.pq_message_epoch,
-            is_session_reset_init: c.is_session_reset_init,
         }
     }
 }
@@ -2955,8 +2942,9 @@ pub enum AckCheckResult {
 // two identity spaces, with nothing holding them in step. Step 4 of
 // `construct-docs/decisions/session-is-one-state-machine.md`.
 //
-// The question is `IncomingEvent::HealAttempted` now, answered by `HealAttemptAllowed` /
-// `HealExhausted` against the queue that already holds the carrier.
+// The orchestrator's own queue followed on 2026-09-27: nothing heals any more — a record keeps its
+// previous states, and a message with the handshake header opens
+// (`construct-docs/decisions/sessions-renew-by-sending.md`).
 
 // ── Orchestration — OrchestratorCore (Phase 5) ───────────────────────────────
 
@@ -3204,13 +3192,6 @@ impl OrchestratorCore {
         orch.has_active_session(&contact_id)
     }
 
-    /// Whether this device's ratchet was announced and is still unacknowledged — the confirm
-    /// gate, asked of one device. The platform folds it over a peer's device set.
-    pub fn awaits_acknowledgement(&self, contact_id: String) -> bool {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.awaits_acknowledgement(&contact_id)
-    }
-
     pub fn init_session(
         &self,
         contact_id: String,
@@ -3309,33 +3290,6 @@ impl OrchestratorCore {
             allow_stale,
         )
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
-    }
-
-    /// Queue a SESSION_RESET_INIT to open a session from. See `Orchestrator::queue_for_open`.
-    pub fn queue_for_open(
-        &self,
-        device_id: String,
-        message_id: String,
-        wire_payload: Vec<u8>,
-        content_type: u8,
-        sender_certificate: Option<SenderCertificate>,
-    ) -> Vec<CfeAction> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let msg_number = crate::wire_payload::unpack(&wire_payload)
-            .map(|d| d.message_number)
-            .unwrap_or(0);
-        orch.queue_for_open(crate::orchestration::message_router::IncomingMessage {
-            sender_certificate,
-            contact_id: device_id,
-            wire_payload,
-            message_id,
-            msg_number,
-            is_control: false,
-            content_type,
-        })
-        .into_iter()
-        .map(CfeAction::from_action)
-        .collect()
     }
 
     /// Whether any of `devices` is opening a session with us right now. See
@@ -3740,30 +3694,6 @@ pub enum CfeIncomingEvent {
     PeerToreDown {
         contact_id: String,
     },
-    /// The platform needs a session with `contact_id` and there is none.
-    ReopenRequested {
-        contact_id: String,
-    },
-    /// The platform is about to attempt one heal of `contact_id` and asks whether the budget
-    /// allows it. Answered with `HealAttemptAllowed` or `HealExhausted`.
-    HealAttempted {
-        contact_id: String,
-    },
-    /// A SESSION_RESET_INIT has gone out to `contact_id` — starts the confirm window.
-    SriAnnounced {
-        contact_id: String,
-    },
-    /// The peer acknowledged the session we opened with `contact_id`.
-    PeerAcked {
-        contact_id: String,
-    },
-    /// A SESSION_RESET_INIT arrived from `contact_id`; the platform asks whether to apply it.
-    ResetInitArrived {
-        contact_id: String,
-        init_ephemeral: Vec<u8>,
-        sent_at_s: u64,
-        established_at_s: Option<u64>,
-    },
 }
 
 /// Why a teardown is being asked for — UDL `enum CfeTearDownCause`.
@@ -3878,21 +3808,6 @@ impl CfeIncomingEvent {
                 cause: cause.into(),
             },
             Self::PeerToreDown { contact_id } => PeerToreDown { contact_id },
-            Self::HealAttempted { contact_id } => HealAttempted { contact_id },
-            Self::ReopenRequested { contact_id } => ReopenRequested { contact_id },
-            Self::SriAnnounced { contact_id } => SriAnnounced { contact_id },
-            Self::PeerAcked { contact_id } => PeerAcked { contact_id },
-            Self::ResetInitArrived {
-                contact_id,
-                init_ephemeral,
-                sent_at_s,
-                established_at_s,
-            } => ResetInitArrived {
-                contact_id,
-                init_ephemeral,
-                sent_at_s,
-                established_at_s,
-            },
         }
     }
 }
@@ -3939,10 +3854,6 @@ pub enum CfeAction {
         contact_id: String,
         message_id: String,
         plaintext: Vec<u8>,
-    },
-    SessionHealNeeded {
-        contact_id: String,
-        role: String,
     },
     SaveToSecureStore {
         slot: CfeSecureStoreSlot,
@@ -4004,42 +3915,10 @@ pub enum CfeAction {
     CheckAckInDb {
         message_id: String,
     },
-    /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
-    HealSuppressed {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-    /// The heal budget allows this attempt — `attempt` is its 1-based index. The answer to
-    /// `HealAttempted`, and the only permission to retry: an empty list is not one.
-    HealAttemptAllowed {
-        contact_id: String,
-        attempt: u32,
-    },
-    /// The heal budget for `contact_id` is spent, or nothing is queued to spend it from. Give up
-    /// on the carrier and tear the ratchet down instead.
-    HealExhausted {
-        contact_id: String,
-    },
-    /// Hold this message: our own SESSION_RESET_INIT to `contact_id` is unacknowledged, so a
-    /// message that will not open is our re-init's own consequence and not evidence about the
-    /// peer. Buffer it and replay it when the wait ends — the platform's buffer, not the
-    /// server's redelivery, because the wait can outlast what the server will re-send. Neither
-    /// heal nor tear down on it.
-    HeldPendingAck {
-        contact_id: String,
-    },
     /// See `Action::PendingDropped`.
     PendingDropped {
         contact_id: String,
         message_ids: Vec<String>,
-    },
-    /// See `Action::ReplayHeld`.
-    ReplayHeld {
-        message_id: String,
-    },
-    /// See `Action::HeldSuperseded`.
-    HeldSuperseded {
-        message_id: String,
     },
     /// END_SESSION suppressed by cooldown — the core owes it and will send it in
     /// `retry_after_ms`. Platform must NOT ACK.
@@ -4052,42 +3931,11 @@ pub enum CfeAction {
     EndSessionNotNeeded {
         contact_id: String,
     },
-    /// Apply the SESSION_RESET_INIT that just arrived from `contact_id` — archive and open the
-    /// receiving side, even over an active session.
-    ApplyResetInit {
-        contact_id: String,
-    },
-    /// Do not apply the SESSION_RESET_INIT that just arrived; acknowledge it only. `redelivery`:
-    /// this exact init was already applied (true), or it pre-dates the session held (false).
-    ResetInitSuperseded {
-        contact_id: String,
-        redelivery: bool,
-    },
     /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
     /// SESSION_RESET_INIT). Not a bare local init — the peer must be told. Build it with
     /// `reopen_session`, which also covers a session still held: the PQXDH v2 upgrade sweep asks
     /// this for classical sessions.
     OpenSession {
-        contact_id: String,
-    },
-    /// Too soon to open: the peer tore this ratchet down and its rebuild is probably in the same
-    /// flush. The core arms the retry itself — do not schedule one here.
-    OpenDeferred {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-    /// The quiet passed and the session is already back. Nothing to open.
-    OpenNotNeeded {
-        contact_id: String,
-    },
-    /// Send the SESSION_RESET_INIT again — unacknowledged for a retry interval, window not yet
-    /// out. The core arms the next alarm itself; do NOT schedule one.
-    ResendSri {
-        contact_id: String,
-    },
-    /// Stop waiting for an acknowledgement: the confirm window ran out. Release whatever was
-    /// held behind the opening — buffered sends and held incoming carriers.
-    OpeningGaveUp {
         contact_id: String,
     },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
@@ -4145,7 +3993,6 @@ impl CfeAction {
                 message_id,
                 plaintext,
             },
-            SessionHealNeeded { contact_id, role } => Self::SessionHealNeeded { contact_id, role },
             SaveToSecureStore { slot, data } => Self::SaveToSecureStore {
                 slot: slot.into(),
                 data: data.into_vec(),
@@ -4198,30 +4045,12 @@ impl CfeAction {
                 proto_bytes,
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
-            HeldPendingAck { contact_id } => Self::HeldPendingAck { contact_id },
             PendingDropped {
                 contact_id,
                 message_ids,
             } => Self::PendingDropped {
                 contact_id,
                 message_ids,
-            },
-            ReplayHeld { message_id } => Self::ReplayHeld { message_id },
-            HeldSuperseded { message_id } => Self::HeldSuperseded { message_id },
-            HealAttemptAllowed {
-                contact_id,
-                attempt,
-            } => Self::HealAttemptAllowed {
-                contact_id,
-                attempt,
-            },
-            HealExhausted { contact_id } => Self::HealExhausted { contact_id },
-            HealSuppressed {
-                contact_id,
-                retry_after_ms,
-            } => Self::HealSuppressed {
-                contact_id,
-                retry_after_ms,
             },
             EndSessionSuppressed {
                 contact_id,
@@ -4231,25 +4060,7 @@ impl CfeAction {
                 retry_after_ms,
             },
             EndSessionNotNeeded { contact_id } => Self::EndSessionNotNeeded { contact_id },
-            ApplyResetInit { contact_id } => Self::ApplyResetInit { contact_id },
-            ResetInitSuperseded {
-                contact_id,
-                redelivery,
-            } => Self::ResetInitSuperseded {
-                contact_id,
-                redelivery,
-            },
             OpenSession { contact_id } => Self::OpenSession { contact_id },
-            OpenDeferred {
-                contact_id,
-                retry_after_ms,
-            } => Self::OpenDeferred {
-                contact_id,
-                retry_after_ms,
-            },
-            OpenNotNeeded { contact_id } => Self::OpenNotNeeded { contact_id },
-            ResendSri { contact_id } => Self::ResendSri { contact_id },
-            OpeningGaveUp { contact_id } => Self::OpeningGaveUp { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
                 queued_count,

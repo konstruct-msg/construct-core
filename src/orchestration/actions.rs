@@ -67,84 +67,12 @@ pub enum Action {
         proto_bytes: Vec<u8>,
     },
 
-    /// Decryption failed on message 0; the session needs healing.
-    /// `role` is either `"Initiator"` (higher userId, wins tie-break) or `"Responder"`.
-    SessionHealNeeded {
-        contact_id: String,
-        role: String,
-    },
-
-    /// A `SessionHealNeeded` decision was suppressed by the per-contact cooldown.
-    /// The platform must NOT acknowledge the message — leave it unread so the server
-    /// re-delivers it after `retry_after_ms` milliseconds when the cooldown clears.
-    HealSuppressed {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-
-    /// The heal budget allows this attempt; `attempt` is its 1-based index.
-    ///
-    /// Not an instruction to heal — the platform asked, and this is the answer. What it must not
-    /// do is treat the absence of an answer as permission, which is why an exhausted budget is
-    /// its own action rather than an empty list.
-    HealAttemptAllowed {
-        contact_id: String,
-        attempt: u32,
-    },
-    /// The heal budget for this device is spent, or there is no record to spend it from.
-    ///
-    /// The platform gives up on the queued carrier and tears the ratchet down instead. Both
-    /// cases answer the same way: with no record there is nothing to bound the retries with, and
-    /// an unbounded heal loop is what the budget exists to prevent.
-    HealExhausted {
-        contact_id: String,
-    },
-
-    /// The decision — heal or tear down — is held because our own SESSION_RESET_INIT to this
-    /// device has not been acknowledged yet.
-    ///
-    /// Inside that window we are the side that replaced the ratchet, so a message that will not
-    /// open is a consequence of our own re-init and not evidence about the peer. Acting on it
-    /// answers our own reset with another reset and takes the message with it: on 2026-08-04 a
-    /// user's first message after a re-init died exactly there, and healing as RESPONDER is
-    /// worse still — `archiveSession` destroys the session created two seconds earlier in answer
-    /// to a message that is unreadable *because* it was created.
-    ///
-    /// Unlike `HealSuppressed` / `EndSessionSuppressed` this does **not** rely on redelivery: the
-    /// platform buffers the message and replays it when the wait ends, whether it ends with the
-    /// peer's acknowledgement or with the window running out. A gate that expires with nothing to
-    /// replay is the 2026-08-04 defect in its other form.
-    HeldPendingAck {
-        contact_id: String,
-    },
-
     /// Messages the core had queued for a session with `contact_id` and has now dropped, because
-    /// what they waited for is gone: the sender tore the session down (END_SESSION), or began a
-    /// new one that supersedes them (`queue_for_open` with its SESSION_RESET_INIT). The platform
+    /// what they waited for is gone: the sender tore the session down (END_SESSION). The platform
     /// releases their envelopes and lets the stream cursor past them.
     PendingDropped {
         contact_id: String,
         message_ids: Vec<String>,
-    },
-
-    /// Route a message the confirm gate held, now that the gate is down.
-    ///
-    /// The core keeps the hold — which message, against which ratchet epoch — and decides when it
-    /// ends; the platform keeps the envelope, as it does for every message it has not finished
-    /// with, and routes it again from the top. Until 2026-09-26 the platform kept the whole
-    /// buffer and its own replay rule (`confirm_replay`) beside a gate the core decided.
-    ReplayHeld {
-        message_id: String,
-    },
-
-    /// A held message that opens a session, whose ratchet was replaced while it waited.
-    ///
-    /// It belongs to a handshake that has already concluded: replayed, it cannot decrypt, the
-    /// heal it provokes archives the session that replaced it (build 579, 2026-08-05, three times
-    /// in an hour). The platform records it as processed and lets the cursor past it. Only an
-    /// opener is ever judged this way — held content always replays, whatever its age.
-    HeldSuperseded {
-        message_id: String,
     },
 
     /// An `EndSessionNeeded` decision was suppressed by the per-contact cooldown, and the
@@ -171,72 +99,13 @@ pub enum Action {
         contact_id: String,
     },
 
-    /// Apply the SESSION_RESET_INIT that just arrived from `contact_id`: archive the ratchet it
-    /// replaces and open the receiving side. The answer to `ResetInitArrived` for a live re-init,
-    /// and it holds even over an active session — the peer has ratcheted onto the new one.
-    ApplyResetInit {
-        contact_id: String,
-    },
-
-    /// Do not apply the SESSION_RESET_INIT that just arrived from `contact_id`; acknowledge it
-    /// only. `redelivery` is true when this exact init was already applied, false when it was
-    /// never applied but pre-dates the session we hold (a backlog replay).
-    ResetInitSuperseded {
-        contact_id: String,
-        redelivery: bool,
-    },
-
-    /// Open a session with `contact_id` now — as INITIATOR, announcing it (X3DH + SESSION_RESET
-    /// _INIT), not a bare local init.
+    /// Open a new session with `contact_id` as INITIATOR, over the one held: fetch the bundle and
+    /// call `reopen_session_with_bundle`, which replaces the held state only once the new one
+    /// exists and keeps it as a previous state. Nothing is sent for it: the handshake header rides
+    /// on the next message to the device, whatever it is.
     ///
-    /// The answer to `ReopenRequested`, and to the timer that follows a deferred one. The
-    /// platform owns the announce because the carrier is its transport; what it no longer owns is
-    /// *when*.
-    ///
-    /// Also raised over a session that is still held, by the PQXDH v2 upgrade sweep
-    /// (`Orchestrator::pq_upgrade_candidates`). Build it with `reopen_session_with_bundle`, which
-    /// replaces a held session only once the new one exists — never remove it first.
+    /// Raised by the PQXDH v2 upgrade sweep (`Orchestrator::pq_upgrade_candidates`).
     OpenSession {
-        contact_id: String,
-    },
-
-    /// Not yet: the peer tore this ratchet down and its rebuild is probably in the same flush.
-    /// Come back in `retry_after_ms` — the core arms that timer itself and re-asks.
-    ///
-    /// Informational, like `EndSessionSuppressed`: the platform logs it and does nothing. A
-    /// platform that schedules its own retry on it is rebuilding the debounce this replaced.
-    OpenDeferred {
-        contact_id: String,
-        retry_after_ms: u64,
-    },
-
-    /// The quiet passed and the session is already back — the peer's rebuild arrived, which is
-    /// what the quiet was waiting for. Nothing to open.
-    ///
-    /// Distinct from `OpenDeferred`, which comes back. This one is the end of the sequence, and
-    /// it is the line to look for when a re-init "should have" happened and did not.
-    OpenNotNeeded {
-        contact_id: String,
-    },
-
-    /// Send the SESSION_RESET_INIT to `contact_id` again: the last one has gone unacknowledged
-    /// for a retry interval and the confirm window has not run out.
-    ///
-    /// The core arms the next alarm itself, so a platform that schedules its own retry here has
-    /// rebuilt `tieBreakWatchdogs` outside the machine. There is no acknowledgement for an SRI
-    /// other than the peer's, so a lost carrier and a silent peer look the same from here — which
-    /// is why this is bounded rather than endless.
-    ResendSri {
-        contact_id: String,
-    },
-
-    /// Stop waiting for `contact_id` to acknowledge: the confirm window has run out.
-    ///
-    /// Release whatever was held behind the opening — buffered sends, held incoming carriers —
-    /// and let the ordinary decrypt/heal path decide on what arrives next. Not an error, a bound:
-    /// before 2026-08-04 the watchdog was single-shot, so a lost SRI left the gate raised and the
-    /// conversation stopped sending until the app restarted.
-    OpeningGaveUp {
         contact_id: String,
     },
 
@@ -457,7 +326,7 @@ pub enum IncomingEvent {
     /// it may.
     ///
     /// Every other teardown in this file is the core's own conclusion from a message it routed.
-    /// This one is the platform's: an init that failed terminally, a heal that gave up, a DR
+    /// This one is the platform's: an init that failed terminally, a DR
     /// divergence noticed outside the routing path. Those are facts only the platform has, and
     /// before this event existed it answered them with a second cooldown of its own — a 30 s
     /// window in `SessionCoordinator` beside the core's 5 s, neither aware of the other. See
@@ -480,64 +349,9 @@ pub enum IncomingEvent {
     PeerToreDown {
         contact_id: String,
     },
-    /// The platform is about to make one attempt at healing the ratchet with `contact_id`, and
-    /// asks whether the budget allows it.
-    ///
-    /// A request, and the only one about healing the platform still makes. The count it used to
-    /// keep — a second `HealingQueue` of its own, keyed by account and fed a JSON `ChatMessage`,
-    /// plus a Core Data column nothing read — is the record this queue already holds beside the
-    /// carrier. Answered with `HealAttemptAllowed` or `HealExhausted`.
-    HealAttempted {
-        contact_id: String,
-    },
-    /// Something the platform owns needs a session with `contact_id` and there is none.
-    ///
-    /// Today that is the INITIATOR re-init raised by an inbound teardown; the core's own
-    /// "a message needs a session" path asks the same machine without going through here.
-    /// Answered with `OpenSession`, or `OpenDeferred` + `ScheduleTimer` while the peer's flush
-    /// is still arriving. It replaced `endSessionReinitTasks` — a 1.5 s debounce and a
-    /// `[String: Task]` map that coalesced N teardowns in one flush into one re-init; the phase
-    /// is one per device, so the map has nothing left to do. The third of step 2's five timers.
-    ReopenRequested {
-        contact_id: String,
-    },
-    /// A SESSION_RESET_INIT has gone out to `contact_id`.
-    ///
-    /// A report, not a request: it is the one fact about an opening only the sender has, because
-    /// an SRI carries no acknowledgement other than the peer's own next carrier. It starts the
-    /// confirm window and arms the retry, and it replaced
-    /// `SessionConfirmationTracker.markPending` plus the `tieBreakWatchdogs` task beside it —
-    /// the fourth of step 2's five timers.
-    SriAnnounced {
-        contact_id: String,
-    },
-    /// The peer acknowledged the session we opened with `contact_id` — `session_ready`, a ping,
-    /// or its own init carrier arriving on the ratchet we announced.
-    ///
-    /// Whatever carried it, it proves the peer holds that ratchet, which is the only thing the
-    /// confirm window waits for. It replaced `SessionConfirmationTracker.markConfirmed`, a gate
-    /// the platform raised and dropped beside a phase the core kept, neither aware of the other.
-    PeerAcked {
-        contact_id: String,
-    },
-    /// A SESSION_RESET_INIT arrived from `contact_id` and the platform asks whether to apply it.
-    /// Answered with `ApplyResetInit` or `ResetInitSuperseded` — the ledger of inits already
-    /// applied lives with the phase it belongs to, not in a platform map beside it.
-    ///
-    /// `init_ephemeral` is the X3DH ephemeral public key from the envelope, the init's identity.
-    /// `sent_at_s` is the envelope timestamp and `established_at_s` the platform's record of when
-    /// the session it holds with this device was established, both Unix seconds. The second is
-    /// supplied, not kept here, because the core has no establishment record yet; it moves in
-    /// with the END_SESSION staleness check that reads the same record.
-    ResetInitArrived {
-        contact_id: String,
-        init_ephemeral: Vec<u8>,
-        sent_at_s: u64,
-        established_at_s: Option<u64>,
-    },
     /// The platform received a heartbeat message from `contact_id`.
-    /// The orchestrator should attempt to decrypt it — if decryption fails,
-    /// it triggers heal proactively (before the user sends any message).
+    /// The orchestrator should attempt to decrypt it — if nothing held decrypts it,
+    /// the answer is the one any message gets (a receiving open or a teardown).
     HeartbeatReceived {
         contact_id: String,
         message_id: String,

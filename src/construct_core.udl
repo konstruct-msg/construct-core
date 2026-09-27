@@ -28,15 +28,7 @@ namespace construct_core {
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
-    /// Which side opens the session when both try at once: "Initiator" or "Responder".
-    ///
-    /// Higher id wins, by plain byte comparison — no normalisation, no parsing. Both peers
-    /// compute it over the same pair, so a disagreement is a permanent deadlock rather than a
-    /// retryable error. Pass the ids the session is addressed by; anything else ranks a
-    /// different pair.
-    string tie_break_role(string my_id, string peer_id);
-
-    /// Whether to open a session with a device now, and as which side.
+    /// Whether to open a session with a device now.
     ///
     /// Called at the moment a client wants a session and has none it can use. Answering this
     /// locally is what produced 2026-09-04: both sides opened an INITIATOR session thirty-three
@@ -44,10 +36,9 @@ namespace construct_core {
     /// seconds until one fell back to responder.
     InitiationDecision plan_initiation(InitiationContext context);
 
-    /// Classify a queued message: can it open a receiving session?
-    /// One rule, one implementation — every client asks rather than reimplements. A
-    /// `message_number == 0` with an advanced PQ epoch is shaped like an opener and is not one,
-    /// which is why this is a named function and not an inline check.
+    /// Classify a message: can it open a receiving session? One rule, one implementation —
+    /// every client asks rather than reimplements. A handshake header (the KEM ciphertext) opens
+    /// at any message number.
     ReceivingInitKind receiving_init_kind(ReceivingInitCarrier carrier);
 
     /// Every device that must receive its own ciphertext of an outgoing message.
@@ -663,14 +654,12 @@ dictionary DeliveryTarget {
     DeliveryAudience audience;
 };
 
-/// What a queued message is, for the purpose of opening a receiving session.
+/// What a message is, for the purpose of opening a receiving session.
 enum ReceivingInitKind {
-    /// Carries an X3DH init: this message can open a session.
+    /// Carries the initiator's handshake header: this message can open a session.
     "Handshake",
-    /// Already inside a ratchet. Initialising from it fails and destroys the queue behind it.
+    /// Carries none: it decrypts on a state already held or not at all.
     "MidRatchet",
-    /// `message_number == 0` but a PQ epoch has advanced — a re-keyed continuation, not an opener.
-    "MidSessionLeftover",
 };
 
 /// The wire-visible shape of a queued message, for `receiving_init_kind`.
@@ -680,7 +669,6 @@ dictionary ReceivingInitCarrier {
     u32 one_time_prekey_id;
     u32 kem_ciphertext_bytes;
     u32 pq_message_epoch;
-    boolean is_session_reset_init;
 };
 
 /// What to do about one device when tearing down a session with a peer.
@@ -700,16 +688,14 @@ dictionary TeardownDecision {
     TeardownAction action;
 };
 
-/// Whether to open a session with a device right now, and as which side.
-/// See orchestration::initiation_plan. `tie_break_role` settles a collision that has happened;
-/// this settles whether to walk into one, and both peers must answer it compatibly.
+/// Whether to open a session with a device right now. See orchestration::initiation_plan.
 enum InitiationDecision {
     /// Open a fresh session as INITIATOR now.
     "Initiate",
-    /// One of ours is already in flight — join it. A second init derives a new root key, spends
-    /// another one-time prekey, and orphans the first SESSION_RESET_INIT.
+    /// One of ours is already in flight — join it. A second init spends another one-time prekey
+    /// for a state that will not be used.
     "JoinInFlight",
-    /// The peer's init is arriving and outranks ours. Take the responder side.
+    /// The peer's handshake is in hand: open from it rather than build a second state.
     "YieldToPeer",
     /// Nothing to send and no init in the air. Opening spends a prekey on a session that carries
     /// nothing and doubles the chance of colliding with the peer's next one.
@@ -719,11 +705,10 @@ enum InitiationDecision {
 /// What the caller knows at the moment it wants a session. Every field is something only the
 /// caller can see — the network, the outbox, the UI; the decision over them is made in the core.
 dictionary InitiationContext {
-    /// Ours and theirs in the space the session is addressed by. Anything else ranks a
-    /// different pair — see tie_break_role.
+    /// Ours and theirs in the space the session is addressed by.
     string my_device_id;
     string peer_device_id;
-    /// We sent a SESSION_RESET_INIT to this device; it is neither acknowledged nor expired.
+    /// We are opening a session with this device right now (bundle fetch and init).
     boolean our_init_in_flight;
     /// We hold the peer's init — received, not yet completed.
     boolean peer_init_in_flight;
@@ -760,11 +745,10 @@ interface RustAckStore {
     u64 cache_len();
 };
 
-// `HealingAttemptResult` and `interface RustHealingQueue` stood here until 2026-09-23. The
-// object let the platform construct a second healing queue of its own, in the account space,
-// beside the one the orchestrator keeps in the device space — and it was the platform's that
-// decided. The question is `HealAttempted` now. Step 4 of
-// decisions/session-is-one-state-machine.md.
+// `HealingAttemptResult` and `interface RustHealingQueue` stood here until 2026-09-23, and the
+// orchestrator's own healing queue until 2026-09-27: a session record keeps its previous states
+// and any message with the handshake header opens, so there is nothing to heal
+// (decisions/sessions-renew-by-sending.md).
 
 // ── OrchestratorCore ──────────────────────────────────────────────────────────
 
@@ -797,26 +781,6 @@ interface CfeIncomingEvent {
     /// report, not a request: it opens the window that keeps our own teardown quiet, and returns
     /// no actions.
     PeerToreDown(string contact_id);
-    /// The platform needs a session with `contact_id` and there is none — today, the INITIATOR
-    /// re-init an inbound teardown raises. Answered with `OpenSession`, or `OpenDeferred` +
-    /// `ScheduleTimer` while the peer's own rebuild may still be in the same flush.
-    ReopenRequested(string contact_id);
-    /// The platform is about to attempt one heal of `contact_id` and asks whether the budget
-    /// allows it. Answered with `HealAttemptAllowed` or `HealExhausted` — never an empty list,
-    /// because silence read as permission is an unbounded heal loop.
-    HealAttempted(string contact_id);
-    /// A SESSION_RESET_INIT has gone out to `contact_id`. A report, not a request: it starts the
-    /// confirm window and arms the retry the core owns.
-    SriAnnounced(string contact_id);
-    /// The peer acknowledged the session we opened with `contact_id` — `session_ready`, a ping,
-    /// or its own init carrier on the ratchet we announced. Ends the confirm window.
-    PeerAcked(string contact_id);
-    /// A SESSION_RESET_INIT arrived from `contact_id` and the platform asks whether to apply it.
-    /// Answered with `ApplyResetInit` or `ResetInitSuperseded`. `init_ephemeral` is the X3DH
-    /// ephemeral public key from the envelope — the init's identity; `sent_at_s` the envelope
-    /// timestamp; `established_at_s` the platform's record of when the session it holds with this
-    /// device was established (Unix seconds, null when there is none).
-    ResetInitArrived(string contact_id, bytes init_ephemeral, u64 sent_at_s, u64? established_at_s);
 };
 
 /// Why a teardown is being asked for.
@@ -856,46 +820,17 @@ interface CfeAction {
     InitSession(string contact_id, string bundle_json);
     ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, bytes plaintext);
-    SessionHealNeeded(string contact_id, string role);
-    /// Heal suppressed by cooldown — platform must NOT ACK; server will re-deliver.
-    HealSuppressed(string contact_id, u64 retry_after_ms);
-    /// Our own SESSION_RESET_INIT to this device is unacknowledged, so neither heal nor tear
-    /// down on the message that provoked this: buffer it and replay it when the wait ends.
-    HeldPendingAck(string contact_id);
     PendingDropped(string contact_id, sequence<string> message_ids);
-    ReplayHeld(string message_id);
-    HeldSuperseded(string message_id);
-    /// The heal budget allows this attempt; `attempt` is its 1-based index.
-    HealAttemptAllowed(string contact_id, u32 attempt);
-    /// The heal budget for this device is spent, or nothing is queued to spend it from — give up
-    /// on the carrier and tear the ratchet down instead.
-    HealExhausted(string contact_id);
     /// END_SESSION suppressed by cooldown — the core owes it and sends it in retry_after_ms.
     /// Platform must NOT ACK.
     EndSessionSuppressed(string contact_id, u64 retry_after_ms);
     /// A teardown was asked for and will not be sent, now or later — the peer tore this ratchet
     /// down itself. Nothing is owed; do NOT schedule a retry.
     EndSessionNotNeeded(string contact_id);
-    /// Apply the SESSION_RESET_INIT that just arrived — archive and open the receiving side, even
-    /// over an active session: the peer has ratcheted onto it.
-    ApplyResetInit(string contact_id);
-    /// Acknowledge the SESSION_RESET_INIT that just arrived, and do not apply it. `redelivery`:
-    /// this exact init was already applied (true), or it pre-dates the session held (false).
-    ResetInitSuperseded(string contact_id, boolean redelivery);
-    /// Open a session with `contact_id` now, as INITIATOR, and announce it (X3DH +
-    /// SESSION_RESET_INIT) — not a bare local init. Build it with `reopen_session`, which also
-    /// covers a session still held: the PQXDH v2 upgrade sweep asks this for classical sessions.
+    /// Open a new session with `contact_id` as INITIATOR over the one held: build it with
+    /// `reopen_session`, which keeps the held state as a previous one. Nothing is sent for it —
+    /// the handshake header rides on the next message. Raised by the PQXDH v2 upgrade sweep.
     OpenSession(string contact_id);
-    /// Too soon to open: the peer tore this ratchet down and its rebuild may be in the same
-    /// flush. The core arms the retry itself; do NOT schedule one.
-    OpenDeferred(string contact_id, u64 retry_after_ms);
-    /// The quiet passed and the session is already back — nothing to open.
-    OpenNotNeeded(string contact_id);
-    /// Re-send the SESSION_RESET_INIT — unacknowledged for a retry interval, window not out.
-    /// The core arms the next alarm; do NOT schedule one.
-    ResendSri(string contact_id);
-    /// The confirm window ran out. Release what was held behind the opening, both directions.
-    OpeningGaveUp(string contact_id);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
     /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
@@ -1011,11 +946,6 @@ interface OrchestratorCore {
 
     boolean has_session(string contact_id);
 
-    /// Whether the ratchet with this **device** was announced (SESSION_RESET_INIT sent) and the
-    /// peer has not acknowledged it yet. The confirm gate; fold it over a peer's device set for
-    /// the account-shaped question, since one message becomes a copy per device.
-    boolean awaits_acknowledgement(string contact_id);
-
     SessionHealthReport? get_session_health(string contact_id);
 
     [Throws=CryptoError]
@@ -1030,9 +960,9 @@ interface OrchestratorCore {
     string init_session_allowing_stale(string contact_id, BinaryKeyBundle recipient_bundle);
 
     // The answer to CfeAction.OpenSession, with or without a session held: builds the new
-    // session first and replaces the held one only if that succeeded. A refusal (PQ_REQUIRED
-    // while the peer has no Kyber-1024 keys yet) leaves the held session exactly as it was.
-    // Do not remove the session yourself before calling it.
+    // session first and replaces the held one only if that succeeded, keeping it as a previous
+    // state. A refusal (PQ_REQUIRED while the peer has no Kyber-1024 keys yet) leaves the held
+    // session exactly as it was. Do not remove the session yourself before calling it.
     [Throws=CryptoError]
     string reopen_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
@@ -1050,11 +980,6 @@ interface OrchestratorCore {
     // the key its own sender certificate names, once the core has checked that certificate; one
     // attempt per carrier, no bundle. See decisions/first-message-opens-without-the-server.
     ReceivingOpenResult open_receiving(string device);
-
-    // Queue a SESSION_RESET_INIT — already acknowledged by the platform, so it cannot pass the
-    // ACK check — to open a session from; drops what the same device queued before it
-    // (PendingDropped in the answer).
-    sequence<CfeAction> queue_for_open(string device_id, string message_id, sequence<u8> wire_payload, u8 content_type, SenderCertificate? sender_certificate);
 
     // Whether any of `devices` has a session-opening message queued within the last 20 s — the
     // peer opening a session with us right now. Pass every device of the account known so far,
@@ -1077,7 +1002,7 @@ interface OrchestratorCore {
     boolean remove_session(string contact_id);
 
     /// Drop every piece of local orchestration state this core holds about `contact_id`:
-    /// the ratchet, the archive and its timestamp, the prekey counter, the heal record, the PQ
+    /// the ratchet and its previous states, the archive and its timestamp, the prekey counter, the PQ
     /// contribution, the init lock, the cooldown, the pending END_SESSION, the prewarm mark and
     /// the active-chat mark.
     ///
@@ -1149,8 +1074,8 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     RotatedSpkBundle rotate_signed_prekey();
 
-    /// Export the full orchestrator coordination state (ACK cache, healing queue,
-    /// init locks, archive index, prekey tracker) as a CFE binary blob.
+    /// Export the full orchestrator coordination state (init locks, archive index,
+    /// prekey tracker) as a CFE binary blob.
     /// Persist under CfeSecureStoreSlot::OrchestratorState.
     [Throws=CryptoError]
     sequence<u8> export_orchestrator_state();

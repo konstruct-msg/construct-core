@@ -15,88 +15,27 @@
 ///   │
 ///   ├─ is_duplicate? → Duplicate
 ///   │
-///   ├─ is END_SESSION? → EndSessionNeeded
+///   ├─ is END_SESSION? → EndSessionReceived
 ///   │
-///   ├─ no active session?
-///   │     └─ enqueue → NeedSessionInit
+///   ├─ no session, carries the handshake header?
+///   │     └─ enqueue → NeedSessionInit (open from it)
 ///   │
-///   └─ has session → decrypt
-///         ├─ ok → Decrypted (+ drain pending queue)
+///   └─ decrypt on the current state, then on each previous one
+///         ├─ ok → Decrypted
+///         ├─ key already used → Duplicate
 ///         └─ fail
-///               ├─ msg_num == 0 → SessionHealNeeded (enqueue healing)
-///               └─ msg_num >  0 → EndSessionNeeded
+///               ├─ carries the header → NeedSessionInit (a new state opens from it)
+///               └─ carries none      → EndSessionNeeded
 /// ```
 use std::collections::{HashMap, VecDeque};
 
 use crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED;
 use crate::orchestration::actions::Action;
-use crate::orchestration::healing_queue::HealDirection;
 use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_PENDING_PER_USER: usize = 100;
-
-/// Magic content that signals an END_SESSION control message.
-#[allow(dead_code)]
-const END_SESSION_MARKER: &str = "__END_SESSION__";
-
-/// Content types that carry a handshake rather than a payload.
-///
-/// Readable without the ratchet — both are `sealed_inner_content_type` in
-/// `construct-protos/conformance/knst_content_types.json`, so the type survives the unseal that
-/// precedes the decrypt this module is reacting to the failure of.
-///
-/// They matter here for one reason: a handshake is what *ends* the wait for an acknowledgement,
-/// so it is the one thing that must not be held behind that wait. `SESSION_RESET` is listed for
-/// completeness — a control frame is short-circuited above before any decrypt is attempted — and
-/// listing it costs nothing next to the alternative of a reader wondering which of the two is
-/// meant.
-const CT_SESSION_RESET: u8 = 21;
-pub(crate) const CT_SESSION_RESET_INIT: u8 = 24;
-
-// ── Public types ──────────────────────────────────────────────────────────────
-
-/// Role in a tie-break scenario (HIGHER id = INITIATOR — see `tie_break_role`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Role {
-    Initiator,
-    Responder,
-}
-
-impl Role {
-    /// The name the platform sees on `Action::SessionHealNeeded` and gets back from
-    /// `tie_break_role`. One spelling, so the answer to "what role am I" and the role announced
-    /// in an action cannot disagree — they were two `match` blocks in `orchestrator.rs` until
-    /// 2026-08-26.
-    pub fn as_wire(&self) -> &'static str {
-        match self {
-            Role::Initiator => "Initiator",
-            Role::Responder => "Responder",
-        }
-    }
-}
-
-/// Which side opens the session when both try at once.
-///
-/// **Higher id wins as INITIATOR**, by plain byte comparison of the two ids — no normalisation,
-/// no parsing. Both peers compute it independently over the same pair, so any disagreement means
-/// both-initiator or both-responder, which is a permanent deadlock rather than a retryable error.
-///
-/// That is why this is exported rather than described. iOS carried its own copy in
-/// `SessionReducer.tieBreakRole` under a comment promising it matched this function
-/// byte-for-byte — and the addressing flip broke the promise without touching either line: the
-/// core began comparing device ids while the platform still compared account ids, so the two
-/// ranked *different pairs* and agreed only by coincidence.
-///
-/// The ids must be the ones the session is addressed by. Anything else ranks a different pair.
-pub fn tie_break_role(my_id: &str, peer_id: &str) -> Role {
-    if my_id > peer_id {
-        Role::Initiator
-    } else {
-        Role::Responder
-    }
-}
 
 /// Outcome of routing one message.
 #[derive(Debug, Clone)]
@@ -114,30 +53,8 @@ pub enum RoutingDecision {
         contact_id: String,
         queued_count: usize,
     },
-    /// Decryption failed on message 0 — session healing required.
-    SessionHealNeeded {
-        contact_id: String,
-        role: Role,
-        /// The carrier that failed to open was itself a handshake.
-        ///
-        /// `msg_number == 0` does not say this: a DH sending chain restarts at 0 on every
-        /// ratchet turn, so a peer's first message under a fresh chain reaches this decision
-        /// looking exactly like an init. The content type is the only thing that tells them
-        /// apart, and it is the fact the confirm gate needs — see `Action::HeldPendingAck`.
-        is_handshake: bool,
-        /// Why the decrypt refused, as the ratchet said it. Carried so the platform log can say
-        /// it — see `Orchestrator::decision_to_actions`.
-        reason: String,
-        /// The message refused — what the confirm gate holds when it holds this decision.
-        refused: Refused,
-    },
-    /// Session is irrecoverably broken — send END_SESSION.
-    EndSessionNeeded {
-        contact_id: String,
-        reason: String,
-        /// The message refused — what the confirm gate holds when it holds this decision.
-        refused: Refused,
-    },
+    /// Nothing held decrypts it and it carries no handshake header — send END_SESSION.
+    EndSessionNeeded { contact_id: String, reason: String },
     /// Message already processed — discard.
     Duplicate { message_id: String },
     /// ACK status unknown — buffered pending a DB check (platform feeds back `AckDbResult`).
@@ -151,35 +68,6 @@ pub enum RoutingDecision {
     },
     /// Unrecoverable routing error.
     Error { message: String },
-}
-
-/// The message a refusal is about, as the confirm gate needs to hold it.
-///
-/// Carried on the decision rather than looked up afterwards because the gate is decided far from
-/// the message: `decide_actions` sees a verdict, and a verdict that does not name its message
-/// cannot be held by anyone but the platform — which is how the hold buffer came to live in the
-/// client, keyed by account, beside a gate the core keeps per device.
-#[derive(Debug, Clone)]
-pub struct Refused {
-    pub message_id: String,
-    /// The header says this message could open a session (`receiving_init_kind` is
-    /// `Handshake`). Not `is_handshake`, which reads the content type: that one decides whether
-    /// the gate applies at all, this one whether a held message outlives a session that replaced
-    /// the one it was held against.
-    pub opens_session: bool,
-    /// The message itself. A heal that is granted rebuilds the session *from* it, so it waits in
-    /// the pending queue with everything else that waits for a session (`hold_for_open`).
-    pub message: IncomingMessage,
-}
-
-impl Refused {
-    fn of(msg: &IncomingMessage) -> Self {
-        Self {
-            message_id: msg.message_id.clone(),
-            opens_session: opens_session(msg),
-            message: msg.clone(),
-        }
-    }
 }
 
 /// Whether `msg`'s header is a session opener — the classifier `open_receiving` uses, over
@@ -196,7 +84,6 @@ pub(crate) fn opens_session(msg: &IncomingMessage) -> bool {
         one_time_prekey_id: header.one_time_prekey_id,
         kem_ciphertext_bytes: header.kem_ciphertext.as_ref().map_or(0, |k| k.len() as u32),
         pq_message_epoch: header.pq_message_epoch,
-        is_session_reset_init: msg.content_type == CT_SESSION_RESET_INIT,
     }) == ReceivingInitKind::Handshake
 }
 
@@ -337,7 +224,7 @@ impl MessageRouter {
     ///
     /// Returns one `RoutingDecision` per queued message.
     /// Returns one `RoutingDecision` per queued message, stopping early on
-    /// the first error decision (EndSessionNeeded / SessionHealNeeded) to
+    /// the first error decision (EndSessionNeeded) to
     /// avoid cascading 50+ failures from a single broken session.
     pub fn drain_pending(
         &mut self,
@@ -354,11 +241,7 @@ impl MessageRouter {
         let mut remaining_start = queued.len(); // index after which messages should be re-queued
         for (i, msg) in queued.iter().enumerate() {
             let decision = self.route_message(lifecycle, msg);
-            let is_error = matches!(
-                &decision,
-                RoutingDecision::EndSessionNeeded { .. }
-                    | RoutingDecision::SessionHealNeeded { .. }
-            );
+            let is_error = matches!(&decision, RoutingDecision::EndSessionNeeded { .. });
             results.push(decision);
             if is_error {
                 remaining_start = i + 1;
@@ -382,27 +265,6 @@ impl MessageRouter {
     /// Number of queued messages for `contact_id`.
     pub fn pending_count(&self, contact_id: &str) -> usize {
         self.pending_queues.get(contact_id).map_or(0, |q| q.len())
-    }
-
-    /// Queue `msg` to wait for its session to be rebuilt — a heal's carrier. Idempotent by id.
-    ///
-    /// A heal opens a new receiving session from the handshake that failed on the old one, so the
-    /// handshake waits where every message waiting for a session waits. One list of carriers for
-    /// `Orchestrator::open_receiving`, whichever way it was reached; the heal record keeps only
-    /// the budget.
-    pub fn hold_for_open(&mut self, msg: IncomingMessage) {
-        let queue = self
-            .pending_queues
-            .entry(msg.contact_id.clone())
-            .or_default();
-        if queue.iter().any(|q| q.message_id == msg.message_id) {
-            return;
-        }
-        if queue.len() < self.max_pending_per_user {
-            self.arrived_at
-                .insert(msg.message_id.clone(), self.clock.now_ms());
-            queue.push_back(msg);
-        }
     }
 
     /// The messages waiting for a session with `contact_id`, oldest first.
@@ -501,18 +363,23 @@ impl MessageRouter {
             };
         }
 
-        // ── 3. Session availability check ─────────────────────────────────────
-        if !lifecycle.has_active_session(&msg.contact_id) {
-            if lifecycle.has_archive(&msg.contact_id) {
-                if lifecycle.restore_latest_archive(&msg.contact_id).is_err() {
-                    return self.enqueue_or_reject(lifecycle, msg);
-                }
-            } else {
-                return self.enqueue_or_reject(lifecycle, msg);
-            }
+        // ── 3. A handshake with nothing to open it on ────────────────────────
+        let opener = opens_session(msg);
+        if opener && !lifecycle.has_active_session(&msg.contact_id) {
+            return self.enqueue_or_reject(lifecycle, msg);
+        }
+        if !lifecycle.has_active_session(&msg.contact_id)
+            && lifecycle.has_archive(&msg.contact_id)
+            && lifecycle.restore_latest_archive(&msg.contact_id).is_err()
+        {
+            tracing::warn!(
+                target: "crypto::router",
+                contact_id = %msg.contact_id,
+                "archived session did not restore"
+            );
         }
 
-        // ── 4. Decrypt ────────────────────────────────────────────────────────
+        // ── 4. Decrypt on any state held ──────────────────────────────────────
         match lifecycle.decrypt_wire_payload(&msg.contact_id, &msg.wire_payload) {
             Ok(result) => {
                 let mut actions = lifecycle.ack_store.mark_processed(&msg.message_id);
@@ -526,12 +393,9 @@ impl MessageRouter {
                 }
             }
             Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => {
-                // Already decrypted — by this path, or as the carrier a responder init opened the
-                // session from, which never passes the ACK store. A duplicate, not a desync: the
-                // session is intact, and healing it would archive the ratchet this very message
-                // built. Recorded in the in-memory ACK cache so the next copy stops at step 1; not
-                // persisted, since `Duplicate` carries no actions — after a restart a copy lands
-                // here again and is judged the same way, which is the part that matters.
+                // Already decrypted — by this path, or as the carrier a receiving open opened the
+                // session from, which never passes the ACK store. A duplicate, not a desync.
+                // Recorded in the in-memory ACK cache so the next copy stops at step 1.
                 tracing::info!(
                     target: "crypto::router",
                     contact_id = %msg.contact_id,
@@ -544,48 +408,14 @@ impl MessageRouter {
                     message_id: msg.message_id.clone(),
                 }
             }
-            Err(e) => {
-                if msg.msg_number == 0 {
-                    let role = tie_break_role(lifecycle.my_user_id(), &msg.contact_id);
-                    // Reject if attacker has exhausted the incoming-trigger budget
-                    // for this contact. This preserves the 3-retry heal budget for
-                    // a legitimate peer that sends a real session-init later.
-                    if lifecycle
-                        .healing_queue
-                        .is_incoming_throttled(&msg.contact_id)
-                    {
-                        return RoutingDecision::EndSessionNeeded {
-                            contact_id: msg.contact_id.clone(),
-                            reason: format!(
-                                "incoming heal throttled for {} — possible heal exhaustion attack; decrypt: {e}",
-                                &msg.contact_id
-                            ),
-                            refused: Refused::of(msg),
-                        };
-                    }
-                    lifecycle.healing_queue.enqueue(
-                        &msg.contact_id,
-                        msg.wire_payload.clone(),
-                        HealDirection::Incoming,
-                    );
-                    RoutingDecision::SessionHealNeeded {
-                        contact_id: msg.contact_id.clone(),
-                        role,
-                        is_handshake: matches!(
-                            msg.content_type,
-                            CT_SESSION_RESET | CT_SESSION_RESET_INIT
-                        ),
-                        reason: e,
-                        refused: Refused::of(msg),
-                    }
-                } else {
-                    RoutingDecision::EndSessionNeeded {
-                        contact_id: msg.contact_id.clone(),
-                        reason: e,
-                        refused: Refused::of(msg),
-                    }
-                }
-            }
+            // No state we hold is the one it was written on, and it says how to build that one:
+            // the peer opened a new session. It waits for the open like any first message, and
+            // the state it opens becomes current, the old one previous.
+            Err(_) if opener => self.enqueue_or_reject(lifecycle, msg),
+            Err(e) => RoutingDecision::EndSessionNeeded {
+                contact_id: msg.contact_id.clone(),
+                reason: e,
+            },
         }
     }
 
@@ -648,11 +478,26 @@ mod tests {
         SessionLifecycleManager::new(client, user_id.to_string())
     }
 
+    /// A message whose header carries the initiator's handshake (a KEM ciphertext) — one that can
+    /// open a session. The body is noise: routing decides on the header alone.
     fn msg(contact_id: &str, msg_id: &str, msg_num: u32) -> IncomingMessage {
+        let wire_payload = crate::wire_payload::pack(
+            &[3; 32],
+            msg_num,
+            0,
+            0,
+            0,
+            1,
+            Some(&[7; 1568]),
+            &[9; 40],
+            0,
+            None,
+        )
+        .unwrap();
         IncomingMessage {
             sender_certificate: None,
             contact_id: contact_id.to_string(),
-            wire_payload: vec![],
+            wire_payload,
             message_id: msg_id.to_string(),
             msg_number: msg_num,
             is_control: false,
@@ -827,59 +672,6 @@ mod tests {
         ));
     }
 
-    // ── The exported rule ────────────────────────────────────────────────────
-    //
-    // Both peers compute this independently, so a disagreement is a permanent deadlock rather
-    // than a retryable error. Each test names the mutation that must redden it.
-
-    /// Mutation: flip the comparison to `<` — this reddens.
-    #[test]
-    fn test_the_higher_id_is_the_initiator() {
-        assert_eq!(tie_break_role("b", "a"), Role::Initiator);
-        assert_eq!(tie_break_role("a", "b"), Role::Responder);
-    }
-
-    /// Equal ids are not an initiator. A self-addressed or echoed message must not make both
-    /// halves of one device think they opened the session.
-    ///
-    /// Mutation: use `>=` — this reddens.
-    #[test]
-    fn test_an_id_does_not_win_against_itself() {
-        assert_eq!(tie_break_role("a", "a"), Role::Responder);
-    }
-
-    /// Plain byte comparison, no normalisation. Lowercasing either side here would rank a
-    /// different pair than a caller that did not, which is the divergence this rule cannot
-    /// survive — and it is why the platform must call this rather than describe it.
-    ///
-    /// Mutation: compare `my_id.to_lowercase()` — this reddens.
-    #[test]
-    fn test_the_comparison_does_not_normalise() {
-        // 'B' (0x42) < 'a' (0x61): case-sensitively "a" wins, case-insensitively "b" would.
-        assert_eq!(tie_break_role("a", "B"), Role::Initiator);
-        assert_eq!(tie_break_role("B", "a"), Role::Responder);
-    }
-
-    /// Device ids are 32 lowercase hex characters; the rule must order them the same way the
-    /// platform's own comparison of the same strings does.
-    #[test]
-    fn test_device_ids_order_by_their_bytes() {
-        let lower = "0620d675aad44cf88fa0a389040c487c";
-        let higher = "b814c8ab96bc4496b80795fa256eed9f";
-        assert_eq!(tie_break_role(higher, lower), Role::Initiator);
-        assert_eq!(tie_break_role(lower, higher), Role::Responder);
-    }
-
-    /// The name the platform sees is one spelling: the answer to "what role am I" and the role
-    /// announced on `SessionHealNeeded` were two separate `match` blocks until 2026-08-26.
-    ///
-    /// Mutation: return "initiator" (lowercase) from one of them — this reddens.
-    #[test]
-    fn test_the_wire_name_is_one_spelling() {
-        assert_eq!(Role::Initiator.as_wire(), "Initiator");
-        assert_eq!(Role::Responder.as_wire(), "Responder");
-    }
-
     #[test]
     fn test_drain_pending_no_session_returns_decisions() {
         let mut router = MessageRouter::new();
@@ -897,26 +689,37 @@ mod tests {
         assert_eq!(router.pending_count("bob"), 1);
     }
 
+    /// Nothing held and no header to open from: the message was written on a state we do not
+    /// have, and only the peer can start a new one. Until 2026-09-27 this was queued to wait for
+    /// an open that nothing in the queue could perform, and then dropped.
+    ///
+    /// Mutation: enqueue on "no session" regardless of the header — this reddens.
     #[test]
-    fn test_healing_queued_on_msg0_decrypt_fail() {
+    fn a_message_without_a_header_and_no_state_asks_for_a_teardown() {
         let mut router = MessageRouter::new();
         let mut lifecycle = make_lifecycle("alice");
-
-        // Inject a fake active session marker so the router tries to decrypt.
-        // Since we can't inject a real session without a full X3DH handshake,
-        // we test the msg_num>0 path instead (END_SESSION).
-        // The msg_num==0 path is covered in integration tests.
         let m = IncomingMessage {
             sender_certificate: None,
             contact_id: "bob".to_string(),
             wire_payload: vec![],
             message_id: "bad-msg".to_string(),
-            msg_number: 5, // >0 → EndSessionNeeded on fail
+            msg_number: 5,
             is_control: false,
             content_type: 0,
         };
-        // Without a session → NeedSessionInit (queue)
         let decision = router.route_message(&mut lifecycle, &m);
+        assert!(matches!(decision, RoutingDecision::EndSessionNeeded { .. }));
+        assert_eq!(router.pending_count("bob"), 0);
+    }
+
+    /// A header on message 5 opens, like one on message 0 — the first flight repeats it, and a
+    /// lost first message must not cost the session.
+    #[test]
+    fn a_header_past_message_zero_waits_for_the_open() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        let decision = router.route_message(&mut lifecycle, &msg("bob", "m5", 5));
         assert!(matches!(decision, RoutingDecision::NeedSessionInit { .. }));
+        assert_eq!(router.pending_count("bob"), 1);
     }
 }

@@ -653,6 +653,9 @@ impl SerializableSession {
                     pending_since: pq.pending_since,
                     turns_since_mix: pq.turns_since_mix,
                 }),
+            // The ratchet knows only itself; the record's previous states are the lifecycle
+            // manager's, which attaches them (`SessionLifecycleManager::export_session_bytes_for`).
+            previous: Vec::new(),
         })
     }
 
