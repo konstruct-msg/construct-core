@@ -2199,17 +2199,25 @@ impl Orchestrator {
             } => {
                 // Nothing held reads it and it carries no handshake: the writer is on a state we
                 // do not have. Tell it, by the key it wrote with, and let the message go — the
-                // writer resends it on the state it opens next. Recorded as processed, so a
-                // redelivery is a duplicate and sends no second error: one per unread message.
-                let mut actions = self.lifecycle.ack_store.mark_processed(&message_id);
-                actions.extend(self.decryption_error_for(
+                // writer resends it on the state it opens next. Recorded as processed once the
+                // error exists, so a redelivery is a duplicate and sends no second one: one per
+                // unread message. With no error to send (an unsealed message names no writer to
+                // seal to) nothing is recorded: the platform may still try the sessions of the
+                // sender's other devices, and a recorded message would read as a duplicate there.
+                match self.decryption_error_for(
                     &cid,
                     &message_id,
                     ratchet_key,
                     writer_identity,
                     DecryptionErrorHint::None,
-                ));
-                actions
+                ) {
+                    Some(error) => {
+                        let mut actions = self.lifecycle.ack_store.mark_processed(&message_id);
+                        actions.push(error);
+                        actions
+                    }
+                    None => Vec::new(),
+                }
             }
             RoutingDecision::Duplicate { message_id } => {
                 vec![Action::DuplicateDropped { message_id }]
@@ -2482,6 +2490,29 @@ mod tests {
             writer_identity: None,
             reason: "AEAD decryption failed".to_string(),
         }
+    }
+
+    /// An unread message with no certificate names no writer to seal an error to, so none is
+    /// sent — and the message is not recorded, because the platform may still try it against the
+    /// sessions of the sender's other devices, where a recorded message would read as a duplicate.
+    ///
+    /// Mutation: record it whether or not an error was built — this reddens.
+    #[test]
+    fn an_unread_message_with_no_error_to_send_is_not_recorded() {
+        let mut o = make_orchestrator("alice");
+        let actions = o.decision_to_actions(decryption_error_needed("bob"), "");
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::SendDecryptionError { .. } | Action::PersistAck { .. }
+            )),
+            "{actions:?}"
+        );
+        assert!(matches!(
+            o.ack_is_processed("unread"),
+            crate::orchestration::AckCheckResult::NotProcessed
+                | crate::orchestration::AckCheckResult::NeedDbCheck
+        ));
     }
 
     /// A refused decrypt says why, beside the decryption error it produced.
