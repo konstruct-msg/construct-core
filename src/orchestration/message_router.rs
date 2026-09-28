@@ -52,15 +52,16 @@ pub enum RoutingDecision {
         queued_count: usize,
     },
     /// Nothing held decrypts it and it carries no handshake header: tell the device that wrote it
-    /// (`decryption_error`). `ratchet_key` is the key in the message's header and
-    /// `writer_identity` the key its sender certificate names — what the error is addressed by
-    /// and sealed to. Either is `None` when the message does not carry it, and then no error can
-    /// be built.
+    /// (`decryption_error`). `ratchet_key` is the key in the message's header — what the error is
+    /// addressed by. `writer_certificate` is the certificate the message carried, **unchecked**:
+    /// the router holds no server key, so whether it may be answered, and with which key, is the
+    /// orchestrator's question (`Orchestrator::vouched_writer`). Either is `None` when the message
+    /// does not carry it, and then no error can be built.
     DecryptionErrorNeeded {
         contact_id: String,
         message_id: String,
         ratchet_key: Option<Vec<u8>>,
-        writer_identity: Option<Vec<u8>>,
+        writer_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
         reason: String,
     },
     /// Message already processed — discard.
@@ -389,10 +390,7 @@ impl MessageRouter {
                 ratchet_key: crate::wire_payload::unpack(&msg.wire_payload)
                     .ok()
                     .map(|header| header.dh_public_key),
-                writer_identity: msg
-                    .sender_certificate
-                    .as_ref()
-                    .map(|c| c.identity_key.clone()),
+                writer_certificate: msg.sender_certificate.clone(),
                 reason: e,
             },
         }
@@ -698,12 +696,15 @@ mod tests {
             RoutingDecision::DecryptionErrorNeeded {
                 message_id,
                 ratchet_key,
-                writer_identity,
+                writer_certificate,
                 ..
             } => {
                 assert_eq!(message_id, "unread");
                 assert_eq!(ratchet_key, Some(vec![4; 32]));
-                assert_eq!(writer_identity, Some(vec![6; 32]));
+                assert_eq!(
+                    writer_certificate.map(|c| c.identity_key),
+                    Some(vec![6; 32])
+                );
             }
             other => panic!("expected a decryption error, got {other:?}"),
         }

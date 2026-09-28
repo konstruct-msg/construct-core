@@ -406,6 +406,27 @@ impl Orchestrator {
     /// state by, and a sender certificate to seal it to. An unsealed message has no certificate
     /// — only DEBUG builds send one — and the writer then learns nothing; there is no address to
     /// tell it at that the relay could not also read.
+    /// The key to seal a decryption error to, if `certificate` names a writer we may answer: it
+    /// passes `identity_for_opening` against the server keys held now, and its key derives to
+    /// `device`, the device the message was filed under.
+    ///
+    /// Both paths that answer an unread message ask this — a failed receiving open and a message
+    /// no held state reads. Until 2026-09-28 only the first did; the second sealed the error to
+    /// whatever key the certificate named, signed or not (construct-protocol `DE-1`). Anyone who
+    /// knows our public identity key can seal an envelope to us, so an unchecked certificate made
+    /// us answer a stranger's claim, to a device the stranger chose.
+    fn vouched_writer(
+        &self,
+        certificate: Option<&crate::crypto::sealed_sender::SenderCertificate>,
+        device: &str,
+    ) -> Option<Vec<u8>> {
+        let now = self.clock.now_secs() as i64;
+        certificate
+            .and_then(|c| c.identity_for_opening(&self.trusted_server_keys, now).ok())
+            .map(|key| key.to_vec())
+            .filter(|key| crate::device_id::derive_device_id(key) == device)
+    }
+
     fn decryption_error_for(
         &self,
         contact_id: &str,
@@ -873,14 +894,7 @@ impl Orchestrator {
             } else {
                 DecryptionErrorHint::None
             };
-            // Only to a writer the server vouches for: a certificate that fails its check names
-            // nobody we should answer.
-            let writer_identity = message
-                .sender_certificate
-                .as_ref()
-                .and_then(|c| c.identity_for_opening(&self.trusted_server_keys, now).ok())
-                .map(|key| key.to_vec())
-                .filter(|key| crate::device_id::derive_device_id(key) == device);
+            let writer_identity = self.vouched_writer(message.sender_certificate.as_ref(), device);
             let ratchet_key = crate::wire_payload::unpack(&message.wire_payload)
                 .ok()
                 .map(|header| header.dh_public_key);
@@ -2195,7 +2209,7 @@ impl Orchestrator {
                 contact_id: cid,
                 message_id,
                 ratchet_key,
-                writer_identity,
+                writer_certificate,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
             } => {
@@ -2206,6 +2220,7 @@ impl Orchestrator {
                 // unread message. With no error to send (an unsealed message names no writer to
                 // seal to) nothing is recorded: the platform may still try the sessions of the
                 // sender's other devices, and a recorded message would read as a duplicate there.
+                let writer_identity = self.vouched_writer(writer_certificate.as_ref(), &cid);
                 match self.decryption_error_for(
                     &cid,
                     &message_id,
@@ -2489,7 +2504,7 @@ mod tests {
             contact_id: cid.to_string(),
             message_id: "unread".to_string(),
             ratchet_key: None,
-            writer_identity: None,
+            writer_certificate: None,
             reason: "AEAD decryption failed".to_string(),
         }
     }
@@ -3543,6 +3558,51 @@ mod pqxdh_v2_tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no decryption error about {about}: {actions:?}"))
+    }
+
+    /// A message no held state reads is answered only to a writer the server vouches for — the
+    /// check the failed-open path already made. Until 2026-09-28 this path sealed the error to
+    /// whatever key the certificate named (construct-protocol `DE-1`): an envelope with a
+    /// certificate no trusted server signed, or one naming another device's key, still drew an
+    /// error, to a device the sender chose.
+    ///
+    /// Unanswered is also unrecorded, so the same message with an honest certificate is still
+    /// answered — a refusal here is not a way to suppress the real writer's error.
+    ///
+    /// Mutation: seal to `writer_certificate.identity_key` without `vouched_writer` — this reddens.
+    #[test]
+    fn an_unread_message_is_answered_only_to_a_writer_the_server_vouches_for() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.forget_contact_state(&alice_id);
+
+        // Signed by a server Bob does not trust.
+        let stranger = TestServer::new();
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let unsigned = deliver_sealed(
+            &mut bob,
+            &alice_id,
+            certificate(&stranger, &alice),
+            "lost",
+            lost.clone(),
+        );
+        assert!(!reports_unreadable(&unsigned), "{unsigned:?}");
+
+        // Signed by the trusted server, but for someone else's key, filed under Alice's device.
+        let ((mallory, _), _) = named_pair();
+        let misfiled = deliver_sealed(
+            &mut bob,
+            &alice_id,
+            certificate(&server, &mallory),
+            "lost",
+            lost.clone(),
+        );
+        assert!(!reports_unreadable(&misfiled), "{misfiled:?}");
+
+        // Neither was recorded: Alice's own certificate still gets her the error.
+        let honest = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        error_payload(&honest, "lost");
     }
 
     /// Bob lost the state; Alice's next message cannot be read. Bob tells her, by the key she
