@@ -747,7 +747,12 @@ interface CfeIncomingEvent {
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
     AckReceived(string message_id);
-    KeyBundleFetched(string user_id, string bundle_json);
+    /// The answer to `CfeAction::OpenSession`: the bundle of that one device. The core reopens
+    /// from it and answers with the save, the messages that waited, or `OPEN_SESSION_REFUSED`.
+    SessionBundleFetched(string contact_id, BinaryKeyBundle bundle);
+    /// The answer to `CfeAction::OpenSession` when no bundle could be fetched. The held session
+    /// stays; the core stops waiting for the open now instead of at its time-out.
+    SessionBundleUnavailable(string contact_id);
     NetworkReconnected();
     AppLaunched();
     TimerFired(string timer_id);
@@ -780,12 +785,13 @@ interface CfeSecureStoreSlot {
 interface CfeAction {
     DecryptMessage(string contact_id, bytes ciphertext);
     EncryptMessage(string contact_id, bytes plaintext);
-    InitSession(string contact_id, string bundle_json);
     ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, bytes plaintext);
-    /// Open a new session with `contact_id` as INITIATOR over the one held: build it with
-    /// `reopen_session`, which keeps the held state as a previous one. Nothing is sent for it —
-    /// the handshake header rides on the next message. Raised by the PQXDH v2 upgrade sweep.
+    /// Open a new session with `contact_id` — a device — as INITIATOR over the one held: fetch
+    /// that device's bundle and answer with `SessionBundleFetched` (or `SessionBundleUnavailable`).
+    /// Do not call `reopen_session` for it: the event's answer carries the save and the drained
+    /// queue that the call cannot. Nothing is sent — the handshake header rides on the next
+    /// message. Raised by the PQXDH v2 upgrade sweep.
     OpenSession(string contact_id);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
@@ -912,9 +918,10 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     string init_session_allowing_stale(string contact_id, BinaryKeyBundle recipient_bundle);
 
-    // The answer to CfeAction.OpenSession, with or without a session held: builds the new
-    // session first and replaces the held one only if that succeeded, keeping it as a previous
-    // state. A refusal (PQ_REQUIRED while the peer has no Kyber-1024 keys yet) leaves the held
+    // An open the platform decides on, over a session held (a manual reset, a diagnostic
+    // re-init): builds the new session first and replaces the held one only if that succeeded,
+    // keeping it as a previous state. NOT the answer to CfeAction.OpenSession — that is the
+    // SessionBundleFetched event, whose answer carries the save and the drained queue. A refusal (PQ_REQUIRED while the peer has no Kyber-1024 keys yet) leaves the held
     // session exactly as it was. Do not remove the session yourself before calling it.
     [Throws=CryptoError]
     string reopen_session(string contact_id, BinaryKeyBundle recipient_bundle);

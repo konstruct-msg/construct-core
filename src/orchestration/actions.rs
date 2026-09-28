@@ -37,10 +37,6 @@ pub enum Action {
         contact_id: String,
         plaintext: Vec<u8>,
     },
-    InitSession {
-        contact_id: String,
-        bundle_json: String,
-    },
     ArchiveSession {
         contact_id: String,
     },
@@ -64,10 +60,11 @@ pub enum Action {
         proto_bytes: Vec<u8>,
     },
 
-    /// Open a new session with `contact_id` as INITIATOR, over the one held: fetch the bundle and
-    /// call `reopen_session_with_bundle`, which replaces the held state only once the new one
-    /// exists and keeps it as a previous state. Nothing is sent for it: the handshake header rides
-    /// on the next message to the device, whatever it is.
+    /// Open a new session with `contact_id` — a device — as INITIATOR, over the one held: fetch
+    /// that device's bundle and answer with `IncomingEvent::SessionBundleFetched` (or
+    /// `SessionBundleUnavailable`). The core reopens inside the event, keeps the held state as a
+    /// previous one, and answers with the save, the drained queue and the end of `Opening`.
+    /// Nothing is sent for it: the handshake header rides on the next message to the device.
     ///
     /// Raised by the PQXDH v2 upgrade sweep (`Orchestrator::pq_upgrade_candidates`).
     OpenSession {
@@ -272,11 +269,23 @@ pub enum IncomingEvent {
     AckReceived {
         message_id: String,
     },
-    /// A key bundle the platform fetched to open a session as INITIATOR. Sent only by
-    /// construct-tui, whose JSON path (`InitSession`) predates `OpenSession`; see TODO 70.
-    KeyBundleFetched {
-        user_id: String,
-        bundle_json: String,
+    /// The answer to `Action::OpenSession`: the bundle of that one device. The core reopens from
+    /// it and answers with everything that follows — the save of the record, the messages queued
+    /// behind the open, the end of `Opening`. `Err` is a bundle the FFI boundary already refused
+    /// (stale, malformed), handled as any refused reopen.
+    ///
+    /// Until 2026-09-28 the platform called `reopen_session` itself, which returns only an id: the
+    /// save, the queue and the end of the phase had nobody to do them. iOS saved, Android did not,
+    /// neither drained, and `Opening` lasted its full TTL. This event replaced the JSON
+    /// `KeyBundleFetched` → `InitSession` pair, which no platform answered.
+    SessionBundleFetched {
+        contact_id: String,
+        bundle: Result<crate::orchestration::orchestrator::SessionBundle, String>,
+    },
+    /// The answer to `Action::OpenSession` when no bundle could be fetched (network, no such
+    /// device on the server). Ends `Opening` now rather than at its TTL; the held session stays.
+    SessionBundleUnavailable {
+        contact_id: String,
     },
     NetworkReconnected,
     AppLaunched,

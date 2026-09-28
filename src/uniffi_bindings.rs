@@ -2939,6 +2939,36 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
     })
 }
 
+/// A bundle as the reopen takes it: fresh, and split into the X3DH half and the Kyber half.
+/// Shared by `reopen_session` and `CfeIncomingEvent::SessionBundleFetched`, so both refuse the
+/// same bundles.
+fn parse_bundle_for_reopen(
+    b: &BinaryKeyBundle,
+) -> Result<crate::orchestration::orchestrator::SessionBundle, CryptoError> {
+    check_bundle_freshness(b)?;
+    Ok(crate::orchestration::orchestrator::SessionBundle {
+        x3dh: binary_bundle_to_x3dh(b)?,
+        kyber: kyber_keys_of(b),
+    })
+}
+
+fn kyber_keys_of(b: &BinaryKeyBundle) -> crate::orchestration::orchestrator::KyberBundleKeys {
+    crate::orchestration::orchestrator::KyberBundleKeys {
+        pre_key_id: b.kyber_pre_key_id,
+        pre_key_public: b.kyber_pre_key_public.clone(),
+        pre_key_created_at: b.kyber_pre_key_created_at,
+        pre_key_signature: b.kyber_pre_key_signature.clone(),
+        pre_key_hybrid_signature: b.kyber_pre_key_hybrid_signature.clone(),
+        one_time_prekey_id: b.kyber_one_time_prekey_id,
+        one_time_prekey_public: b.kyber_one_time_prekey_public.clone(),
+        one_time_prekey_created_at: b.kyber_one_time_prekey_created_at,
+        one_time_prekey_signature: b.kyber_one_time_prekey_signature.clone(),
+        one_time_prekey_hybrid_signature: b.kyber_one_time_prekey_hybrid_signature.clone(),
+        hybrid_identity_key: b.hybrid_identity_key.clone(),
+        hybrid_identity_signature: b.hybrid_identity_signature.clone(),
+    }
+}
+
 /// Check SPK freshness from raw bundle JSON bytes.
 ///
 /// Returns `Err(CryptoError::PeerSpkStale { age_secs })` if the SPK or Kyber SPK is stale
@@ -3222,21 +3252,7 @@ impl OrchestratorCore {
             &mut orch,
             &contact_id,
             public_bundle,
-            crate::orchestration::orchestrator::KyberBundleKeys {
-                pre_key_id: recipient_bundle.kyber_pre_key_id,
-                pre_key_public: recipient_bundle.kyber_pre_key_public,
-                pre_key_created_at: recipient_bundle.kyber_pre_key_created_at,
-                pre_key_signature: recipient_bundle.kyber_pre_key_signature,
-                pre_key_hybrid_signature: recipient_bundle.kyber_pre_key_hybrid_signature,
-                one_time_prekey_id: recipient_bundle.kyber_one_time_prekey_id,
-                one_time_prekey_public: recipient_bundle.kyber_one_time_prekey_public,
-                one_time_prekey_created_at: recipient_bundle.kyber_one_time_prekey_created_at,
-                one_time_prekey_signature: recipient_bundle.kyber_one_time_prekey_signature,
-                one_time_prekey_hybrid_signature: recipient_bundle
-                    .kyber_one_time_prekey_hybrid_signature,
-                hybrid_identity_key: recipient_bundle.hybrid_identity_key,
-                hybrid_identity_signature: recipient_bundle.hybrid_identity_signature,
-            },
+            kyber_keys_of(&recipient_bundle),
             allow_stale,
         )
         .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
@@ -3623,9 +3639,14 @@ pub enum CfeIncomingEvent {
     AckReceived {
         message_id: String,
     },
-    KeyBundleFetched {
-        user_id: String,
-        bundle_json: String,
+    /// The answer to `CfeAction::OpenSession`: the bundle of that one device.
+    SessionBundleFetched {
+        contact_id: String,
+        bundle: BinaryKeyBundle,
+    },
+    /// The answer to `CfeAction::OpenSession` when no bundle could be fetched.
+    SessionBundleUnavailable {
+        contact_id: String,
     },
     NetworkReconnected,
     AppLaunched,
@@ -3701,13 +3722,14 @@ impl CfeIncomingEvent {
                 session_data,
             },
             Self::AckReceived { message_id } => AckReceived { message_id },
-            Self::KeyBundleFetched {
-                user_id,
-                bundle_json,
-            } => KeyBundleFetched {
-                user_id,
-                bundle_json,
+            Self::SessionBundleFetched { contact_id, bundle } => SessionBundleFetched {
+                contact_id,
+                // Refused here or in the core, a bundle ends the same way: the handler's refusal.
+                bundle: parse_bundle_for_reopen(&bundle).map_err(|e| e.to_string()),
             },
+            Self::SessionBundleUnavailable { contact_id } => {
+                SessionBundleUnavailable { contact_id }
+            }
             Self::NetworkReconnected => NetworkReconnected,
             Self::AppLaunched => AppLaunched,
             Self::TimerFired { timer_id } => TimerFired { timer_id },
@@ -3768,10 +3790,6 @@ pub enum CfeAction {
     EncryptMessage {
         contact_id: String,
         plaintext: Vec<u8>,
-    },
-    InitSession {
-        contact_id: String,
-        bundle_json: String,
     },
     ArchiveSession {
         contact_id: String,
@@ -3887,13 +3905,6 @@ impl CfeAction {
             } => Self::EncryptMessage {
                 contact_id,
                 plaintext,
-            },
-            InitSession {
-                contact_id,
-                bundle_json,
-            } => Self::InitSession {
-                contact_id,
-                bundle_json,
             },
             ArchiveSession { contact_id } => Self::ArchiveSession { contact_id },
             MessageDecrypted {

@@ -39,7 +39,7 @@ const PREWARM_COOLDOWN_MS: u64 = 30_000;
 /// server served it. PQXDH v2 decides from it whether a session may be opened at all
 /// (`pq_prekey_plan`): every Kyber prekey is signed, Ed25519 and hybrid, over
 /// `"KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || public`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct KyberBundleKeys {
     /// Kyber signed prekey (ML-KEM-1024), its id (from 1), signed creation time, signatures.
     pub pre_key_id: Option<u32>,
@@ -57,6 +57,13 @@ pub struct KyberBundleKeys {
     /// device's identity key (field 21).
     pub hybrid_identity_key: Option<Vec<u8>>,
     pub hybrid_identity_signature: Option<Vec<u8>>,
+}
+
+/// A peer device's bundle, parsed: what `IncomingEvent::SessionBundleFetched` carries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundle {
+    pub x3dh: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+    pub kyber: KyberBundleKeys,
 }
 
 /// Binary first message for RESPONDER path — replaces JSON-encoded `&[u8]`.
@@ -294,10 +301,13 @@ impl Orchestrator {
                 session_data,
             } => self.handle_session_init_completed(contact_id, session_data),
             IncomingEvent::AckReceived { message_id } => self.handle_ack_received(message_id),
-            IncomingEvent::KeyBundleFetched {
-                user_id,
-                bundle_json,
-            } => self.handle_key_bundle_fetched(user_id, bundle_json),
+            IncomingEvent::SessionBundleFetched { contact_id, bundle } => {
+                self.handle_session_bundle_fetched(contact_id, bundle)
+            }
+            IncomingEvent::SessionBundleUnavailable { contact_id } => {
+                self.reopen_refused(&contact_id);
+                Vec::new()
+            }
             IncomingEvent::NetworkReconnected => self.handle_network_reconnected(),
             IncomingEvent::AppLaunched => self.handle_app_launched(),
             IncomingEvent::TimerFired { timer_id } => self.handle_timer_fired(timer_id),
@@ -1934,8 +1944,9 @@ impl Orchestrator {
 
     /// Everything a session that now exists settles: the save, the queue behind it, the notice.
     ///
-    /// Shared by the platform's `SessionInitCompleted` and `open_receiving`. The machine's phase
-    /// is settled by the caller before the import, as the import can fail.
+    /// Shared by the platform's `SessionInitCompleted`, `open_receiving` and the answer to
+    /// `OpenSession` (`SessionBundleFetched`). The machine's phase is settled by the caller before
+    /// the import, as the import can fail.
     fn after_session_opened(&mut self, contact_id: &str) -> Vec<Action> {
         let mut actions = Vec::new();
         if let Ok(bytes) = self.lifecycle.export_session_bytes_for(contact_id) {
@@ -1970,14 +1981,34 @@ impl Orchestrator {
         self.decision_to_actions(decision, "")
     }
 
-    fn handle_key_bundle_fetched(&mut self, user_id: String, _bundle_json: String) -> Vec<Action> {
-        // Session init is done by the platform using ClassicCryptoCore.init_session.
-        // The result comes back via SessionInitCompleted.
-        // Here we just clear the init lock if we were waiting.
-        vec![Action::InitSession {
-            contact_id: user_id,
-            bundle_json: _bundle_json,
-        }]
+    /// The platform's answer to `OpenSession`: reopen from the bundle, and settle everything the
+    /// open settles — `after_session_opened` saves the record and drains what waited behind the
+    /// open, exactly as for a receiving open. A refusal keeps the held session (the reopen puts it
+    /// back) and ends `Opening`; the reason goes out as `OPEN_SESSION_REFUSED`, its message
+    /// starting with the core's prefix (`PQ_REQUIRED: …` for a peer without Kyber-1024 keys).
+    fn handle_session_bundle_fetched(
+        &mut self,
+        contact_id: String,
+        bundle: Result<SessionBundle, String>,
+    ) -> Vec<Action> {
+        let opened = bundle
+            .and_then(|b| self.reopen_session_with_bundle(&contact_id, b.x3dh, b.kyber, false));
+        match opened {
+            Ok(_) => {
+                self.sessions
+                    .handle(&contact_id, SessionEvent::OpenFinished);
+                self.after_session_opened(&contact_id)
+            }
+            Err(reason) => {
+                // `reopen_session_with_bundle` ends the phase on its own refusals; a bundle the
+                // FFI refused never reached it. Idempotent either way.
+                self.reopen_refused(&contact_id);
+                vec![Action::NotifyError {
+                    code: "OPEN_SESSION_REFUSED".to_string(),
+                    message: format!("contact={contact_id}: {reason}"),
+                }]
+            }
+        }
     }
 
     fn handle_network_reconnected(&mut self) -> Vec<Action> {
@@ -3087,6 +3118,171 @@ mod pqxdh_v2_tests {
         assert_eq!(
             bob.get_session_health("zed").unwrap().pq_handshake,
             PqHandshake::InitialV2
+        );
+    }
+
+    // ── The answer to OpenSession is an event ─────────────────────────────────
+
+    fn answer_open(
+        o: &mut Orchestrator,
+        contact_id: &str,
+        bundle: Result<SessionBundle, String>,
+    ) -> Vec<Action> {
+        o.handle_event(IncomingEvent::SessionBundleFetched {
+            contact_id: contact_id.to_string(),
+            bundle,
+        })
+    }
+
+    fn still_opening(o: &mut Orchestrator, contact_id: &str) -> bool {
+        matches!(
+            o.sessions.phase(contact_id),
+            crate::orchestration::session_machine::Phase::Opening { .. }
+        )
+    }
+
+    fn saves_the_record(actions: &[Action], contact_id: &str) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::SaveToSecureStore { slot: SecureStoreSlot::Session { contact_id: c }, .. }
+                if c == contact_id)
+        })
+    }
+
+    /// The upgrade asks, the platform answers with the bundle, and the core settles all of it:
+    /// the record is saved, the open is over, the session is v2. Until 2026-09-28 the platform
+    /// called `reopen_session`, which returns an id and nothing else — Android never saved the
+    /// record, neither platform drained what waited, and `Opening` held for its full 30 s.
+    ///
+    /// Mutations that redden it: drop `OpenFinished` from `handle_session_bundle_fetched`; answer
+    /// the success with no actions.
+    #[test]
+    fn an_answered_open_session_saves_the_record_and_ends_the_opening() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        assert_eq!(opened(&sweep(&mut zed)), ["bob"]);
+        assert!(still_opening(&mut zed, "bob"));
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let answer = answer_open(&mut zed, "bob", Ok(SessionBundle { x3dh, kyber }));
+
+        assert!(saves_the_record(&answer, "bob"), "{answer:?}");
+        assert!(answer.iter().any(
+            |a| matches!(a, Action::NotifySessionCreated { contact_id } if contact_id == "bob")
+        ));
+        assert!(!still_opening(&mut zed, "bob"));
+        assert_eq!(
+            zed.get_session_health("bob").unwrap().pq_handshake,
+            PqHandshake::InitialV2
+        );
+        assert_eq!(zed.lifecycle.previous_state_count("bob"), 1);
+    }
+
+    /// A peer still on an old build: its bundle has no Kyber-1024 key. The held session stays,
+    /// the open is over now rather than at its time-out, and the reason carries the core's prefix
+    /// so a platform can say "the peer has not updated" rather than "broken".
+    #[test]
+    fn a_refused_open_session_keeps_the_session_and_ends_the_opening() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        let before = zed.lifecycle.active_session_id("bob").unwrap();
+        sweep(&mut zed);
+
+        let (x3dh, _) = bundle_of(&mut bob, false);
+        let answer = answer_open(
+            &mut zed,
+            "bob",
+            Ok(SessionBundle {
+                x3dh,
+                kyber: KyberBundleKeys::default(),
+            }),
+        );
+
+        assert!(
+            answer
+                .iter()
+                .any(|a| matches!(a, Action::NotifyError { code, message }
+            if code == "OPEN_SESSION_REFUSED" && message.contains("PQ_REQUIRED"))),
+            "{answer:?}"
+        );
+        assert!(!saves_the_record(&answer, "bob"));
+        assert!(!still_opening(&mut zed, "bob"));
+        assert_eq!(zed.lifecycle.active_session_id("bob").unwrap(), before);
+    }
+
+    /// A bundle refused at the FFI boundary (stale, malformed) and a bundle that could not be
+    /// fetched at all end the open the same way: at once, with the held session untouched.
+    ///
+    /// Mutation: make `SessionBundleUnavailable` a no-op — the phase outlives the answer, and
+    /// this reddens.
+    #[test]
+    fn an_open_session_without_a_usable_bundle_ends_at_once() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        let before = zed.lifecycle.active_session_id("bob").unwrap();
+
+        sweep(&mut zed);
+        let refused = answer_open(&mut zed, "bob", Err("PeerSpkStale".to_string()));
+        assert!(refused.iter().any(
+            |a| matches!(a, Action::NotifyError { code, .. } if code == "OPEN_SESSION_REFUSED")
+        ));
+        assert!(!still_opening(&mut zed, "bob"));
+
+        assert_eq!(
+            zed.sessions.handle("bob", SessionEvent::WantToOpen),
+            SessionEffect::Open
+        );
+        let unavailable = zed.handle_event(IncomingEvent::SessionBundleUnavailable {
+            contact_id: "bob".to_string(),
+        });
+        assert!(unavailable.is_empty(), "{unavailable:?}");
+        assert!(!still_opening(&mut zed, "bob"));
+        assert_eq!(zed.lifecycle.active_session_id("bob").unwrap(), before);
+    }
+
+    /// The peer's own new state crosses our upgrade: its message carries a header nothing held
+    /// reads, and it waits behind our `Opening`. The answer to `OpenSession` drains it — it asks
+    /// for the receiving open, and the message is read. Until 2026-09-28 nothing drained this
+    /// queue after a reopen: the message sat until a reconnect or a restart.
+    ///
+    /// Mutation: drop the drain from `after_session_opened` — this reddens.
+    #[test]
+    fn what_waited_behind_the_open_is_read_once_it_is_answered() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut alice);
+        bob.set_trusted_server_keys(vec![server.verifying_key()]);
+        converged(&mut bob, &bob_id, &mut alice, &alice_id, &server);
+
+        // What the upgrade sweep does for a device: the machine's ask, then `OpenSession`.
+        assert_eq!(
+            alice.sessions.handle(&bob_id, SessionEvent::WantToOpen),
+            SessionEffect::Open
+        );
+
+        let (x3dh, kyber) = bundle_of(&mut alice, true);
+        bob.reopen_session_with_bundle(&alice_id, x3dh, kyber, false)
+            .unwrap();
+        let crossing = bob.encrypt_bytes_for(&alice_id, b"crossing").unwrap();
+        let waited = receive(&mut alice, &bob, &bob_id, &server, "crossing", crossing);
+        assert!(
+            waited
+                .iter()
+                .any(|a| matches!(a, Action::MessageQueuedPendingInit { .. })),
+            "{waited:?}"
+        );
+        assert!(decrypted(&waited).is_empty());
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let mut answer = answer_open(&mut alice, &bob_id, Ok(SessionBundle { x3dh, kyber }));
+        assert!(
+            answer.iter().any(
+                |a| matches!(a, Action::OpenReceiving { contact_id } if *contact_id == bob_id)
+            ),
+            "{answer:?}"
+        );
+        answer.extend(alice.open_receiving(&bob_id).actions);
+        assert_eq!(
+            decrypted(&answer),
+            vec![("crossing".to_string(), b"crossing".to_vec())]
         );
     }
 
