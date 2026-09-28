@@ -355,6 +355,17 @@ where
         self.messaging_session.decrypt(message)
     }
 
+    /// `decrypt` with the answer to our KEM identity key — see
+    /// `SecureMessaging::decrypt_with_identity_secret`.
+    pub fn decrypt_with_identity_secret(
+        &mut self,
+        message: &M::EncryptedMessage,
+        identity_secret: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        self.messaging_session
+            .decrypt_with_identity_secret(message, identity_secret)
+    }
+
     /// Получить session ID
     pub fn session_id(&self) -> &str {
         self.messaging_session.session_id()

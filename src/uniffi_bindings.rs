@@ -1,7 +1,6 @@
 use crate::crypto::SuiteID;
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::group::{MemberAddition, MlsError};
@@ -139,27 +138,6 @@ pub struct RotatedSpkBundle {
     pub signature: Vec<u8>,  // raw Ed25519 signature bytes (64 bytes)
 }
 
-// Encrypted message components for wire format (matches server ChatMessage)
-// Note: We use UDL definition for UniFFI
-#[derive(Debug, Clone)]
-pub struct EncryptedMessageComponents {
-    pub ephemeral_public_key: Vec<u8>, // 32 bytes
-    pub message_number: u32,
-    pub content: Vec<u8>,        // raw bytes: nonce || ciphertext_with_tag
-    pub one_time_prekey_id: u32, // OTPK key_id used in X3DH (0 = no OTPK / fallback mode)
-    pub storage_key: Vec<u8>,    // 32-byte random key — caller must store in MessageKeyStore
-    /// Negotiated DR message suite (e.g. `SuiteID::PQ_RATCHET`=3). Transmitted so the receiver
-    /// rebuilds the exact AEAD associated data — see task #12. 1/CLASSIC for non-PQ_RATCHET.
-    pub suite_id: u16,
-    /// Suite-3 PQ epoch tag the initiator authenticated into the AD (0 for other suites).
-    pub pq_message_epoch: u32,
-    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
-    pub pq_ratchet_field: Vec<u8>,
-    /// PQXDH v2 handshake header on the initiator's first flight (empty / 0 otherwise).
-    pub kem_ciphertext: Vec<u8>,
-    pub kyber_prekey_id: u32,
-}
-
 // Result of decrypting a message: plaintext + per-message storage key.
 // The caller (Swift) must store `storage_key` in MessageKeyStore keyed by message_id.
 // Deleting the key from MessageKeyStore permanently prevents decryption of the local copy.
@@ -167,29 +145,6 @@ pub struct EncryptedMessageComponents {
 pub struct DecryptedMessageResult {
     pub plaintext: Vec<u8>,
     pub storage_key: Vec<u8>, // 32-byte random key — caller must store in MessageKeyStore
-}
-
-// Input message for decrypt_offline_batch — one slot per message.
-#[derive(Debug, Clone)]
-pub struct OfflineBatchMessage {
-    pub id: String,                    // server message ID (for dedup correlation)
-    pub contact_id: String,            // DR session key (userId or userId:deviceId)
-    pub ephemeral_public_key: Vec<u8>, // 32 bytes
-    pub message_number: u32,
-    pub content: Vec<u8>, // raw sealed box from wire: nonce[12] || ciphertext || tag (unpadding happens in Rust after decrypt)
-    pub suite_id: u16,    // negotiated DR suite (task #12); 1/CLASSIC for non-PQ_RATCHET
-    pub pq_message_epoch: u32, // suite-3 PQ epoch tag (0 otherwise)
-    pub pq_ratchet_field: Vec<u8>, // suite-3 sparse PQ-ratchet field, serialized (empty = none)
-}
-
-// Per-message result from decrypt_offline_batch.
-// Exactly one of `plaintext` / `error` is populated.
-#[derive(Debug, Clone)]
-pub struct OfflineBatchResult {
-    pub id: String,                 // mirrors OfflineBatchMessage.id
-    pub plaintext: Option<Vec<u8>>, // Some(_) on success
-    pub error: Option<String>,      // Some(_) on failure; session is NOT archived
-    pub storage_key: Vec<u8>,       // 32-byte key (empty when error is Some)
 }
 
 // Session initialization result with decrypted first message
@@ -262,8 +217,12 @@ pub struct WirePayload {
     pub pq_message_epoch: u32,
     /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
     pub pq_ratchet_field: Vec<u8>,
-    /// Unpack: the wire carried `PQXDH_V2_FLAG`. Pack: ignored — derived from `kem_ciphertext`.
+    /// The wire carried `PQXDH_V2_FLAG`.
     pub pqxdh_v2: bool,
+    /// The initiator's ML-KEM-1024 identity key, on a first flight.
+    pub kem_identity: Option<Vec<u8>>,
+    /// The responder's answer to it, until the initiator proves itself.
+    pub identity_proof_ciphertext: Option<Vec<u8>>,
 }
 
 /// Serialize the optional suite-3 sparse PQ-ratchet field for the FFI/wire boundary.
@@ -277,6 +236,7 @@ fn pq_field_to_bytes(
     }
 }
 
+#[cfg(test)]
 /// Inverse of [`pq_field_to_bytes`]. An empty (or unparseable) slice yields `None`.
 fn pq_field_from_bytes(
     bytes: &[u8],
@@ -604,141 +564,6 @@ impl ClassicCryptoCore {
             })?;
 
         Ok(contact_id)
-    }
-
-    /// Encrypt a message for a session - returns wire format components
-    pub fn encrypt_message(
-        &self,
-        session_id: String,
-        plaintext: String,
-    ) -> Result<EncryptedMessageComponents, CryptoError> {
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Note: session_id from Swift is actually contact_id in our new API
-        let contact_id = &session_id;
-
-        let encrypted_message = client
-            .encrypt_message(contact_id, plaintext.as_bytes())
-            .map_err(|e| {
-                tracing::error!(
-                    target: "crypto::uniffi",
-                    contact_id = %contact_id,
-                    error = %e,
-                    plaintext_len = plaintext.len(),
-                    "encrypt_message failed"
-                );
-                CryptoError::EncryptionFailed {
-                    message: e.to_string(),
-                }
-            })?;
-
-        tracing::debug!(
-            target: "crypto::uniffi",
-            contact_id = %contact_id,
-            dh_public_key_len = encrypted_message.dh_public_key.len(),
-            message_number = encrypted_message.message_number,
-            nonce_len = encrypted_message.nonce.len(),
-            ciphertext_len = encrypted_message.ciphertext.len(),
-            "Message encrypted"
-        );
-
-        // Create sealed box: nonce || ciphertext_with_tag
-        let mut sealed_box = Vec::new();
-        sealed_box.extend_from_slice(&encrypted_message.nonce);
-        sealed_box.extend_from_slice(&encrypted_message.ciphertext);
-
-        // Pop OTPK id for first message (message_number == 0), else 0
-        let one_time_prekey_id = if encrypted_message.message_number == 0 {
-            client.take_pending_otpk_id(contact_id)
-        } else {
-            0
-        };
-
-        Ok(EncryptedMessageComponents {
-            ephemeral_public_key: encrypted_message.dh_public_key.to_vec(),
-            message_number: encrypted_message.message_number,
-            content: sealed_box,
-            one_time_prekey_id,
-            storage_key: gen_storage_key(),
-            suite_id: encrypted_message.suite_id,
-            pq_message_epoch: encrypted_message.pq_message_epoch,
-            pq_ratchet_field: pq_field_to_bytes(&encrypted_message.pq_ratchet_field),
-            // Classic bootstrap core: no PQXDH v2 handshake to carry.
-            kem_ciphertext: Vec::new(),
-            kyber_prekey_id: 0,
-        })
-    }
-
-    /// Decrypt a message from a session - accepts wire format components.
-    ///
-    /// The caller MUST pass the DR message's `suite_id`, `pq_message_epoch` and
-    /// `pq_ratchet_field` from the wire so `SuiteID::PQ_RATCHET` traffic reconstructs the exact
-    /// AEAD associated data (task #12). `(classic, 0, empty)` reproduces the old behaviour.
-    pub fn decrypt_message(
-        &self,
-        session_id: String,
-        ephemeral_public_key: Vec<u8>,
-        message_number: u32,
-        content: Vec<u8>,
-        suite_id: u16,
-        pq_message_epoch: u32,
-        pq_ratchet_field: Vec<u8>,
-    ) -> Result<DecryptedMessageResult, CryptoError> {
-        let sealed_box = content;
-
-        // Extract nonce (first 12 bytes) and ciphertext (rest)
-        if sealed_box.len() < 12 {
-            return Err(CryptoError::InvalidCiphertext);
-        }
-        let nonce = sealed_box[..12].to_vec();
-        let ciphertext = sealed_box[12..].to_vec();
-
-        // Convert ephemeral_public_key to [u8; 32]
-        let dh_public_key: [u8; 32] = ephemeral_public_key
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyData)?;
-
-        // Reconstruct EncryptedRatchetMessage
-        let encrypted_message = EncryptedRatchetMessage {
-            dh_public_key,
-            message_number,
-            ciphertext,
-            nonce,
-            previous_chain_length: 0, // Not used by decryption
-            suite_id,
-            pq_message_epoch,
-            pq_ratchet_field: pq_field_from_bytes(&pq_ratchet_field),
-        };
-
-        // Note: session_id from Swift is actually contact_id in our new API
-        let contact_id = &session_id;
-
-        let mut client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let plaintext = client
-            .decrypt_message(contact_id, &encrypted_message)
-            .map_err(|e| {
-                tracing::error!(
-                    target: "crypto::uniffi",
-                    contact_id = %contact_id,
-                    message_number = message_number,
-                    error = %e,
-                    "decrypt_message failed"
-                );
-                CryptoError::DecryptionFailed {
-                    message: e.to_string(),
-                }
-            })?;
-
-        Ok(DecryptedMessageResult {
-            plaintext,
-            storage_key: gen_storage_key(),
-        })
     }
 
     /// Deletes a session for a contact, allowing a new one to be created.
@@ -1547,10 +1372,10 @@ mod tests {
                 .identity_public,
         );
         let keys = classic.export_private_keys().unwrap();
-        (
-            create_orchestrator_core_from_keys(keys, id.clone()).unwrap(),
-            id,
-        )
+        let core = create_orchestrator_core_from_keys(keys, id.clone()).unwrap();
+        // Every device that publishes a bundle holds one; the KEM identity key derives from it.
+        core.ensure_hybrid_signature_key().unwrap();
+        (core, id)
     }
 
     /// `sender`'s sender certificate as `server` issues it now, and `recipient` trusting `server`.
@@ -1569,24 +1394,6 @@ mod tests {
             .unwrap()
             .identity_public;
         server.certify(&identity, now)
-    }
-
-    /// The wire payload of an encrypted message, packed the way the platforms pack it.
-    fn wire_of(encrypted: EncryptedMessageComponents) -> Vec<u8> {
-        wire_payload_pack(WirePayload {
-            dh_public_key: encrypted.ephemeral_public_key,
-            message_number: encrypted.message_number,
-            one_time_prekey_id: encrypted.one_time_prekey_id,
-            kyber_otpk_id: encrypted.kyber_prekey_id,
-            previous_chain_length: 0,
-            suite_id: encrypted.suite_id,
-            kem_ciphertext: Some(encrypted.kem_ciphertext).filter(|k| !k.is_empty()),
-            sealed_box: encrypted.content,
-            pq_message_epoch: encrypted.pq_message_epoch,
-            pq_ratchet_field: encrypted.pq_ratchet_field,
-            pqxdh_v2: false,
-        })
-        .unwrap()
     }
 
     fn make_orchestrator(user_id: &str) -> std::sync::Arc<OrchestratorCore> {
@@ -1618,6 +1425,8 @@ mod tests {
                 0,
                 1,
                 Some(&[5u8; 1568]),
+                None,
+                None,
                 &[0u8; 32], // sealed box — never decrypted here
                 0,
                 None,
@@ -1765,6 +1574,8 @@ mod tests {
     #[test]
     fn test_init_session_allowing_stale_accepts_stale_spk() {
         let alice = make_orchestrator("alice_user");
+        // The initiator's KEM identity key derives from its hybrid key.
+        alice.ensure_hybrid_signature_key().unwrap();
         let bob = make_orchestrator("bob_user");
 
         let mut bob_bundle = pq_bundle(&bob);
@@ -1816,13 +1627,10 @@ mod tests {
             .expect("degraded init should succeed");
 
         let plaintext = b"reachable while offline".to_vec();
-        let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
+        let wire = alice.encrypt_to_wire(session, plaintext.clone()).unwrap();
 
         let bob_result = bob
-            .init_receiving_session_from_wire_payload(
-                certified(&server, &alice, &bob),
-                wire_of(encrypted),
-            )
+            .init_receiving_session_from_wire_payload(certified(&server, &alice, &bob), wire)
             .expect("Bob should establish receiving session from a degraded-init first message");
 
         assert_eq!(
@@ -1842,6 +1650,8 @@ mod tests {
     #[test]
     fn test_reopen_session_replaces_only_once_the_new_one_exists() {
         let alice = make_orchestrator("alice_user_id");
+        // The initiator's KEM identity key derives from its hybrid key.
+        alice.ensure_hybrid_signature_key().unwrap();
         let bob = make_orchestrator("bob_user_id");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1855,10 +1665,9 @@ mod tests {
         bundle.kyber_spk_rotation_epoch = 5;
         let bob_id = || "bob_user_id".to_string();
         let kyber_prekey_in_use = || {
-            alice
-                .encrypt_message(bob_id(), b"x".to_vec())
+            wire_payload_unpack(alice.encrypt_to_wire(bob_id(), b"x".to_vec()).unwrap())
                 .unwrap()
-                .kyber_prekey_id
+                .kyber_otpk_id
         };
 
         // Nothing held: an ordinary open.
@@ -1934,18 +1743,21 @@ mod tests {
             "suite 3 is mandatory"
         );
 
-        let encrypted = alice
-            .encrypt_message(bob_id.clone(), b"hello".to_vec())
+        let wire = alice
+            .encrypt_to_wire(bob_id.clone(), b"hello".to_vec())
             .unwrap();
-        assert_eq!(encrypted.kyber_prekey_id, kyber_otpk.key_id);
-        assert_eq!(encrypted.kem_ciphertext.len(), 1568);
-        assert_eq!(encrypted.one_time_prekey_id, bob_otpk.key_id);
+        let header = wire_payload_unpack(wire.clone()).unwrap();
+        assert_eq!(header.kyber_otpk_id, kyber_otpk.key_id);
+        assert_eq!(header.kem_ciphertext.map(|c| c.len()), Some(1568));
+        assert_eq!(header.one_time_prekey_id, bob_otpk.key_id);
+        assert_eq!(
+            header.kem_identity.map(|k| k.len()),
+            Some(1568),
+            "the first flight names the initiator's KEM identity key"
+        );
 
         let result = bob
-            .init_receiving_session_from_wire_payload(
-                certified(&server, &alice, &bob),
-                wire_of(encrypted),
-            )
+            .init_receiving_session_from_wire_payload(certified(&server, &alice, &bob), wire)
             .unwrap();
         assert_eq!(
             result.session_id, alice_id,
@@ -1987,7 +1799,7 @@ mod tests {
         let (bob, bob_id) = named_core();
         let server = crate::crypto::sealed_sender::test_support::TestServer::new();
         alice.init_session(bob_id.clone(), pq_bundle(&bob)).unwrap();
-        let encrypted = alice.encrypt_message(bob_id, b"hi".to_vec()).unwrap();
+        let wire = alice.encrypt_to_wire(bob_id, b"hi".to_vec()).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2000,7 +1812,7 @@ mod tests {
             now,
         );
         let err = bob
-            .init_receiving_session_from_wire_payload(cert, wire_of(encrypted))
+            .init_receiving_session_from_wire_payload(cert, wire)
             .unwrap_err();
         assert!(
             matches!(&err, CryptoError::SessionInitializationFailed { message }
@@ -2010,8 +1822,8 @@ mod tests {
     }
 
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
-    /// FIRST message through the uniffi wire types the apps use — `EncryptedMessageComponents`
-    /// packed with `wire_payload_pack`, opened from the payload. The responder rebuilds the exact
+    /// FIRST message through the uniffi wire API the apps use — `encrypt_to_wire`, opened from the
+    /// payload. The responder rebuilds the exact
     /// AEAD associated data from the suite and the suite-3 tags on the wire; before task #12 it
     /// defaulted the suite to the bundle's crypto suite and failed with
     /// `"All 1 prekey(s) failed. AEAD decryption failed"`. The pure-core
@@ -2038,22 +1850,18 @@ mod tests {
         );
 
         let plaintext = b"pq ratchet over the wire".to_vec();
-        let encrypted = alice.encrypt_message(session, plaintext.clone()).unwrap();
+        let wire = alice.encrypt_to_wire(session, plaintext.clone()).unwrap();
 
         let bob_result = bob
-            .init_receiving_session_from_wire_payload(
-                certified(&server, &alice, &bob),
-                wire_of(encrypted),
-            )
+            .init_receiving_session_from_wire_payload(certified(&server, &alice, &bob), wire)
             .expect("Bob must establish a receiving session from a suite-3 first message");
 
         assert_eq!(bob_result.decrypted_message, plaintext);
     }
 
-    /// Variant-2 guard: the suite-3 fields must survive the SAME `wire_payload_pack`
-    /// → `wire_payload_unpack` path iOS/Android now call, instead of each SDK
-    /// re-implementing the byte layout (the original wire-drop). If the canonical
-    /// packer ever loses suite_id / pq_message_epoch / pq_ratchet_field, this fails.
+    /// Variant-2 guard: every field must survive the core's packer → `wire_payload_unpack`, the
+    /// one reader the platforms call, instead of each SDK re-implementing the byte layout (the
+    /// original wire-drop). If the reader ever loses a field, this fails.
     #[cfg(feature = "post-quantum")]
     #[test]
     fn test_wire_payload_pack_roundtrip_suite3() {
@@ -2074,11 +1882,33 @@ mod tests {
             sealed_box: vec![0x33; 60],
             pq_message_epoch: 9,
             pq_ratchet_field: pq_field_to_bytes(&Some(field.clone())),
-            pqxdh_v2: false, // ignored on pack: derived from the ciphertext
+            pqxdh_v2: true,
+            kem_identity: Some(vec![0x44; 1568]),
+            identity_proof_ciphertext: Some(vec![0x55; 1568]),
         };
 
-        let bytes = wire_payload_pack(original.clone()).expect("pack must succeed");
+        let bytes = crate::wire_payload::pack(
+            &original.dh_public_key,
+            original.message_number,
+            original.one_time_prekey_id,
+            original.kyber_otpk_id,
+            original.previous_chain_length,
+            original.suite_id,
+            original.kem_ciphertext.as_deref(),
+            original.kem_identity.as_deref(),
+            original.identity_proof_ciphertext.as_deref(),
+            &original.sealed_box,
+            original.pq_message_epoch,
+            Some(field.clone()),
+        )
+        .expect("pack must succeed");
         let decoded = wire_payload_unpack(bytes).expect("unpack must succeed");
+        assert_eq!(decoded.kem_identity, original.kem_identity);
+        assert_eq!(
+            decoded.identity_proof_ciphertext,
+            original.identity_proof_ciphertext
+        );
+        assert!(decoded.pqxdh_v2);
 
         assert_eq!(decoded.suite_id, 3, "suite_id must survive the wire");
         assert_eq!(
@@ -2103,10 +1933,10 @@ mod tests {
     /// Test that encryption fails with proper error when session doesn't exist
     #[test]
     fn test_encrypt_without_session_fails() {
-        let alice = create_crypto_core().unwrap();
+        let alice = make_orchestrator("alice_user_id");
 
         let result =
-            alice.encrypt_message("nonexistent_user".to_string(), "test message".to_string());
+            alice.encrypt_to_wire("nonexistent_user".to_string(), b"test message".to_vec());
 
         assert!(
             result.is_err(),
@@ -2192,115 +2022,6 @@ mod tests {
         eprintln!("[DIRECT TEST] ✅ Direct Client API test PASSED!");
     }
 
-    /// Test that mimics UniFFI flow but uses EncryptedMessageComponents
-    #[test]
-    fn test_uniffi_flow_with_components() {
-        use crate::crypto::client_api::Client;
-        use crate::crypto::handshake::x3dh::X3DHProtocol;
-        use crate::crypto::messaging::double_ratchet::{
-            DoubleRatchetSession, EncryptedRatchetMessage,
-        };
-        use crate::crypto::suites::classic::ClassicSuiteProvider;
-
-        type TestClient = Client<
-            ClassicSuiteProvider,
-            X3DHProtocol<ClassicSuiteProvider>,
-            DoubleRatchetSession<ClassicSuiteProvider>,
-        >;
-
-        // Create Alice and Bob
-        let mut alice = TestClient::new().unwrap();
-        let mut bob = TestClient::new().unwrap();
-        alice.set_local_user_id("alice".to_string());
-        bob.set_local_user_id("bob".to_string());
-
-        eprintln!("\n[UNIFFI FLOW TEST] Creating clients...");
-
-        // Get bundles
-        let alice_bundle = alice.key_manager().export_registration_bundle().unwrap();
-        let bob_bundle = bob.key_manager().export_registration_bundle().unwrap();
-
-        let alice_identity_pub =
-            ClassicSuiteProvider::kem_public_key_from_bytes(alice_bundle.identity_public.clone());
-        let bob_identity_pub =
-            ClassicSuiteProvider::kem_public_key_from_bytes(bob_bundle.identity_public.clone());
-
-        // Alice creates session with Bob
-        alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
-            .unwrap();
-
-        // Alice encrypts message
-        let plaintext1 = b"Hello Bob!";
-        let encrypted1 = alice.encrypt_message("bob", plaintext1).unwrap();
-
-        eprintln!("[UNIFFI FLOW TEST] Alice encrypted:");
-        eprintln!("  dh_public_key: {}", hex::encode(encrypted1.dh_public_key));
-        eprintln!("  nonce len: {}", encrypted1.nonce.len());
-        eprintln!("  ciphertext len: {}", encrypted1.ciphertext.len());
-        eprintln!("  suite_id: {}", encrypted1.suite_id);
-
-        // Mimic UniFFI: create sealed box
-        let mut sealed_box = Vec::new();
-        sealed_box.extend_from_slice(&encrypted1.nonce);
-        sealed_box.extend_from_slice(&encrypted1.ciphertext);
-
-        eprintln!("[UNIFFI FLOW TEST] Sealed box length: {}", sealed_box.len());
-
-        // Mimic UniFFI: extract nonce and ciphertext
-        let nonce_parsed = sealed_box[..12].to_vec();
-        let ciphertext_parsed = sealed_box[12..].to_vec();
-
-        eprintln!("[UNIFFI FLOW TEST] After parsing:");
-        eprintln!("  nonce len: {}", nonce_parsed.len());
-        eprintln!("  ciphertext len: {}", ciphertext_parsed.len());
-
-        // Mimic UniFFI: reconstruct EncryptedRatchetMessage
-        let reconstructed_message = EncryptedRatchetMessage {
-            dh_public_key: encrypted1.dh_public_key,
-            message_number: encrypted1.message_number,
-            ciphertext: ciphertext_parsed,
-            nonce: nonce_parsed,
-            previous_chain_length: 0,
-            // The message's negotiated suite, as the wire carries it — not the bundle's (task #12).
-            suite_id: encrypted1.suite_id,
-            pq_message_epoch: encrypted1.pq_message_epoch,
-            pq_ratchet_field: encrypted1.pq_ratchet_field.clone(),
-        };
-
-        eprintln!("[UNIFFI FLOW TEST] Reconstructed message:");
-        eprintln!(
-            "  dh_public_key: {}",
-            hex::encode(reconstructed_message.dh_public_key)
-        );
-        eprintln!("  suite_id: {}", reconstructed_message.suite_id);
-
-        // Bob creates receiving session with RECONSTRUCTED message
-        let alice_ephemeral_pub = ClassicSuiteProvider::kem_public_key_from_bytes(
-            reconstructed_message.dh_public_key.to_vec(),
-        );
-
-        let result = bob.init_receiving_session_with_ephemeral(
-            "alice",
-            &alice_identity_pub,
-            &alice_ephemeral_pub,
-            &reconstructed_message,
-            0,
-            None,
-        );
-
-        match &result {
-            Ok(_) => eprintln!("[UNIFFI FLOW TEST] ✅ PASSED!"),
-            Err(e) => eprintln!("[UNIFFI FLOW TEST] ❌ FAILED: {}", e),
-        }
-
-        let (_session_id, decrypted1) = result.unwrap();
-        assert_eq!(decrypted1, plaintext1);
-    }
-
-    /// The free key-record functions answer exactly what a core built from the same record
-    /// answers — both kinds of core. They are a replacement for the bootstrap core, not a
-    /// second implementation of it.
     #[test]
     fn free_key_functions_match_both_cores() {
         let keys = generate_private_keys().unwrap();
@@ -2479,33 +2200,9 @@ pub fn intake_tag(
         .map_err(|_| CryptoError::InvalidKeyData)
 }
 
-/// Pack encrypted message components into the canonical `encrypted_payload` blob.
-///
-/// This is the ONLY sanctioned way for a platform SDK to produce the wire bytes:
-/// it forwards straight to [`wire_payload::pack`], so `suite_id`,
-/// `pq_message_epoch` and `pq_ratchet_field` are always framed correctly (the
-/// suite-3 wire-drop that broke messaging came from iOS re-implementing this).
-pub fn wire_payload_pack(payload: WirePayload) -> Result<Vec<u8>, CryptoError> {
-    let field = pq_field_from_bytes(&payload.pq_ratchet_field);
-    crate::wire_payload::pack(
-        &payload.dh_public_key,
-        payload.message_number,
-        payload.one_time_prekey_id,
-        payload.kyber_otpk_id,
-        payload.previous_chain_length,
-        payload.suite_id,
-        payload.kem_ciphertext.as_deref(),
-        &payload.sealed_box,
-        payload.pq_message_epoch,
-        field,
-    )
-    .map_err(|e| CryptoError::SerializationFailed {
-        message: format!("wire_payload_pack: {e}"),
-    })
-}
-
 /// Unpack a received `encrypted_payload` blob into its components.
-/// Inverse of [`wire_payload_pack`]; forwards to [`wire_payload::unpack`].
+/// Forwards to [`wire_payload::unpack`]. For reading routing fields only: decrypting takes the
+/// whole payload (`OrchestratorCore::decrypt_wire_payload`).
 pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
     let decoded =
         crate::wire_payload::unpack(&data).map_err(|e| CryptoError::SerializationFailed {
@@ -2523,6 +2220,8 @@ pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
         pq_message_epoch: decoded.pq_message_epoch,
         pq_ratchet_field: pq_field_to_bytes(&decoded.pq_ratchet_field),
         pqxdh_v2: decoded.pqxdh_v2,
+        kem_identity: decoded.kem_identity,
+        identity_proof_ciphertext: decoded.identity_proof_ciphertext,
     })
 }
 
@@ -3317,103 +3016,35 @@ impl OrchestratorCore {
         })
     }
 
-    pub fn encrypt_message(
+    /// Encrypt for `contact_id` and return the wire payload, handshake header and every other
+    /// field included. The platform sends the bytes as they are: a copy rebuilt from components
+    /// is how fields went missing on the way (the suite-3 tags; the PN field; the answer to a
+    /// KEM identity key — decisions/responder-authenticates-initiator-by-kem.md).
+    pub fn encrypt_to_wire(
         &self,
         contact_id: String,
         plaintext: Vec<u8>,
-    ) -> Result<EncryptedMessageComponents, CryptoError> {
+    ) -> Result<Vec<u8>, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let out = orch
-            .encrypt_message_for(&contact_id, &plaintext)
-            .map_err(|e| CryptoError::EncryptionFailed { message: e })?;
-        let header = out
-            .header
-            .unwrap_or(crate::crypto::messaging::double_ratchet::PrekeyHeader {
-                one_time_prekey_id: 0,
-                kyber_prekey_id: 0,
-                kem_ciphertext: Vec::new(),
-            });
-        Ok(EncryptedMessageComponents {
-            ephemeral_public_key: out.message.dh_public_key.to_vec(),
-            message_number: out.message.message_number,
-            content: out.sealed_box,
-            one_time_prekey_id: header.one_time_prekey_id,
-            storage_key: gen_storage_key(),
-            suite_id: out.message.suite_id,
-            pq_message_epoch: out.message.pq_message_epoch,
-            pq_ratchet_field: pq_field_to_bytes(&out.message.pq_ratchet_field),
-            kem_ciphertext: header.kem_ciphertext,
-            kyber_prekey_id: header.kyber_prekey_id,
-        })
+        orch.encrypt_bytes_for(&contact_id, &plaintext)
+            .map_err(|e| CryptoError::EncryptionFailed { message: e })
     }
 
-    pub fn decrypt_message(
+    /// Decrypt a wire payload from `contact_id` on the states held with it. The counterpart of
+    /// `encrypt_to_wire`; the core reads every field from the bytes.
+    pub fn decrypt_wire_payload(
         &self,
         contact_id: String,
-        ephemeral_public_key: Vec<u8>,
-        message_number: u32,
-        content: Vec<u8>,
-        suite_id: u16,
-        pq_message_epoch: u32,
-        pq_ratchet_field: Vec<u8>,
+        wire_payload: Vec<u8>,
     ) -> Result<DecryptedMessageResult, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let plaintext = orch
-            .decrypt_message_for(
-                &contact_id,
-                ephemeral_public_key,
-                message_number,
-                &content,
-                suite_id,
-                pq_message_epoch,
-                pq_field_from_bytes(&pq_ratchet_field),
-            )
+            .decrypt_bytes_for(&contact_id, &wire_payload)
             .map_err(|e| CryptoError::DecryptionFailed { message: e })?;
         Ok(DecryptedMessageResult {
             plaintext,
             storage_key: gen_storage_key(),
         })
-    }
-
-    /// Batch offline decrypt — one mutex acquisition for the entire batch.
-    ///
-    /// Designed for `BackgroundFetchManager`: decrypts N messages in a single lock
-    /// acquisition, returning a per-message result without aborting on individual
-    /// failures.  Nothing is retired or reported on a decrypt failure here — the
-    /// foreground stream owns recovery (the decryption error to the writer).
-    pub fn decrypt_offline_batch(
-        &self,
-        messages: Vec<OfflineBatchMessage>,
-    ) -> Vec<OfflineBatchResult> {
-        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        messages
-            .into_iter()
-            .map(|msg| {
-                let pq_field = pq_field_from_bytes(&msg.pq_ratchet_field);
-                match orch.decrypt_message_for(
-                    &msg.contact_id,
-                    msg.ephemeral_public_key,
-                    msg.message_number,
-                    &msg.content,
-                    msg.suite_id,
-                    msg.pq_message_epoch,
-                    pq_field,
-                ) {
-                    Ok(plaintext) => OfflineBatchResult {
-                        id: msg.id,
-                        plaintext: Some(plaintext),
-                        error: None,
-                        storage_key: gen_storage_key(),
-                    },
-                    Err(e) => OfflineBatchResult {
-                        id: msg.id,
-                        plaintext: None,
-                        error: Some(e),
-                        storage_key: Vec::new(),
-                    },
-                }
-            })
-            .collect()
     }
 
     pub fn remove_session(&self, contact_id: String) -> bool {

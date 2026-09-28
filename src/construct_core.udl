@@ -16,12 +16,11 @@ namespace construct_core {
     // `supports_pq_ratchet()` was here: suite 3 is mandatory in every platform build, and the
     // unsigned bundle flag it fed was the downgrade (PQXDH v2 cutover).
 
-    // Wire payload framing — the SINGLE source of truth for the encrypted_payload
-    // byte layout (see wire_payload.rs). Platform SDKs (iOS/Android) MUST call
-    // these instead of re-implementing the format, so suite_id / pq_message_epoch /
-    // pq_ratchet_field can never be silently dropped on the wire again.
-    [Throws=CryptoError]
-    sequence<u8> wire_payload_pack(WirePayload payload);
+    // Wire payload framing is the core's (wire_payload.rs). A platform reads routing fields with
+    // this and nothing else; it never packs a payload, and never decrypts one from components —
+    // `OrchestratorCore.encrypt_to_wire` / `decrypt_wire_payload` take and give whole payloads.
+    // `wire_payload_pack` was here: rebuilding a payload from components is how suite-3 tags and
+    // the PN field went missing, and it had no caller left.
     [Throws=CryptoError]
     WirePayload wire_payload_unpack(sequence<u8> data);
 
@@ -80,7 +79,9 @@ dictionary WirePayload {
     sequence<u8> sealed_box;           // nonce || ciphertext || auth_tag
     u32 pq_message_epoch;              // suite-3 PQ epoch tag (0 otherwise)
     sequence<u8> pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
-    boolean pqxdh_v2 = false;          // unpack: the wire carried the PQXDH v2 flag. pack: ignored (set from kem_ciphertext)
+    boolean pqxdh_v2 = false;          // the wire carried the PQXDH v2 flag
+    sequence<u8>? kem_identity = null;               // the initiator's ML-KEM-1024 identity key (first flight)
+    sequence<u8>? identity_proof_ciphertext = null;  // the responder's answer to it, until the initiator proves itself
 };
 
 // ============================================================================
@@ -119,21 +120,6 @@ dictionary RotatedSpkBundle {
     u32 key_id;
     sequence<u8> public_key;  // raw X25519 public key bytes (32 bytes)
     sequence<u8> signature;   // raw Ed25519 signature bytes (64 bytes)
-};
-
-dictionary EncryptedMessageComponents {
-    sequence<u8> ephemeral_public_key;
-    u32 message_number;
-    sequence<u8> content;
-    u32 one_time_prekey_id;
-    sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
-    u16 suite_id;              // negotiated DR suite (e.g. 3 = PQ_RATCHET); transmit so the receiver rebuilds the exact AEAD AD (task #12)
-    u32 pq_message_epoch;      // suite-3 PQ epoch tag (0 otherwise)
-    sequence<u8> pq_ratchet_field;  // suite-3 sparse PQ-ratchet field, serialized (empty = none)
-    // The PQXDH v2 handshake header — on every message of the initiator's first flight, until the
-    // peer answers; empty / 0 otherwise. Pack it as WirePayload.kem_ciphertext / kyber_otpk_id.
-    sequence<u8> kem_ciphertext;
-    u32 kyber_prekey_id;
 };
 
 // A sender certificate as the platform unsealed it: the fields the server signed and its
@@ -227,7 +213,8 @@ enum PqAuthentication {
     "Classic",          // no Kyber contribution
     "Authenticated",    // we encapsulated to a Kyber key whose signature verified
     "Unauthenticated",  // we encapsulated to an unsigned Kyber key: passive-recorder protection only
-    "Received",         // we are the responder; the peer encapsulated to our own key
+    "Received",         // we are the responder; the initiator has not yet proved its KEM identity key
+    "ReceivedProven",   // we are the responder; the initiator proved the KEM identity key pinned for its device
 };
 
 /// Returned by get_session_health(). Does not mutate session state.
@@ -245,27 +232,6 @@ dictionary SessionHealthReport {
 dictionary DecryptedMessageResult {
     sequence<u8> plaintext;
     sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
-};
-
-/// Input slot for decrypt_offline_batch.
-dictionary OfflineBatchMessage {
-    string id;                          // server message ID (for dedup correlation)
-    string contact_id;                  // DR session key (userId or userId:deviceId)
-    sequence<u8> ephemeral_public_key;  // 32 bytes
-    u32 message_number;
-    sequence<u8> content;               // raw ciphertext (already unpadded by Swift caller)
-    u16 suite_id;                       // negotiated DR suite (task #12); 1/CLASSIC for non-PQ_RATCHET
-    u32 pq_message_epoch;               // suite-3 PQ epoch tag (0 otherwise)
-    sequence<u8> pq_ratchet_field;      // suite-3 sparse PQ-ratchet field, serialized (empty = none)
-};
-
-/// Per-message result from decrypt_offline_batch.
-/// Exactly one of plaintext / error is populated.
-dictionary OfflineBatchResult {
-    string id;                      // mirrors OfflineBatchMessage.id
-    sequence<u8>? plaintext;        // Some(_) on success
-    string? error;                  // Some(_) on failure; session is NOT archived
-    sequence<u8> storage_key;       // 32-byte key (empty when error is Some)
 };
 
 dictionary PrivateKeysJson {
@@ -350,11 +316,7 @@ interface ClassicCryptoCore {
     [Throws=CryptoError]
     string init_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
-    [Throws=CryptoError]
-    EncryptedMessageComponents encrypt_message(string session_id, string plaintext);
-
-    [Throws=CryptoError]
-    DecryptedMessageResult decrypt_message(string session_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content, u16 suite_id, u32 pq_message_epoch, sequence<u8> pq_ratchet_field);
+    // `encrypt_message` / `decrypt_message` (components) were here; see OrchestratorCore.
 
     boolean remove_session(string contact_id);
 
@@ -949,15 +911,14 @@ interface OrchestratorCore {
     // How many messages wait for a session with `contact_id`.
     u32 pending_message_count(string contact_id);
 
+    /// Encrypt for a device and return the whole wire payload. Sent as it is: a payload rebuilt
+    /// from components dropped fields (decisions/responder-authenticates-initiator-by-kem.md).
     [Throws=CryptoError]
-    EncryptedMessageComponents encrypt_message(string contact_id, bytes plaintext);
+    bytes encrypt_to_wire(string contact_id, bytes plaintext);
 
+    /// Decrypt a whole wire payload on the states held with a device.
     [Throws=CryptoError]
-    DecryptedMessageResult decrypt_message(string contact_id, sequence<u8> ephemeral_public_key, u32 message_number, sequence<u8> content, u16 suite_id, u32 pq_message_epoch, sequence<u8> pq_ratchet_field);
-
-    /// Batch offline decrypt — single mutex acquisition for the whole batch.
-    /// Session is never archived on per-message failure.
-    sequence<OfflineBatchResult> decrypt_offline_batch(sequence<OfflineBatchMessage> messages);
+    DecryptedMessageResult decrypt_wire_payload(string contact_id, bytes wire_payload);
 
     boolean remove_session(string contact_id);
 

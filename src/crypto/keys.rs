@@ -17,6 +17,10 @@ use zeroize::{Zeroize, Zeroizing};
 /// life still has its full window.
 pub const SPK_RETENTION_AFTER_ROTATION_SECS: u64 = 14 * 24 * 3600;
 
+/// HKDF info of the KEM identity seed (`KeyManager::kem_identity_seed`).
+#[cfg(feature = "post-quantum")]
+const KEM_IDENTITY_SEED_INFO: &[u8] = b"Construct-KEM-identity-v1";
+
 /// Build prologue for X3DH signature (как в Noise Protocol)
 /// Prologue включает протокол и suite ID для предотвращения key substitution attacks
 pub fn build_prologue(suite_id: SuiteID) -> Vec<u8> {
@@ -568,6 +572,61 @@ impl<P: CryptoProvider> KeyManager<P> {
     /// Export the hybrid sig private (if any) for CFE persistence.
     pub fn hybrid_signature_private_bytes(&self) -> Option<crate::crypto::SecretBytes> {
         self.hybrid_sig_priv.clone()
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// The seed of this device's ML-KEM-1024 identity key: the key its first flight names and a
+    /// responder answers to, which is how the responder learns — post-quantum — that the initiator
+    /// is who the first flight claims (decisions/responder-authenticates-initiator-by-kem.md).
+    ///
+    /// Derived from the ML-DSA-65 seed of the hybrid key, not stored. A stored key generated in
+    /// memory and lost before it was persisted would change on the next launch, and every peer
+    /// that pinned the old one would refuse this device; the hybrid key is already persisted and
+    /// carried by restore. The X25519 identity would not do as the source: a quantum adversary
+    /// recovers it from its public half, and this key with it.
+    fn kem_identity_seed(&self) -> Result<crate::crypto::SecretBytes> {
+        use crate::crypto::suites::hybrid::{ED25519_SECRET_KEY_SIZE, ML_DSA_65_SECRET_KEY_SIZE};
+        let hybrid = self.hybrid_sig_priv.as_ref().ok_or_else(|| {
+            ConstructError::Crypto(crate::error::CryptoError::Other(
+                "KEM identity: no hybrid signature key to derive it from".to_string(),
+            ))
+        })?;
+        let mldsa_seed = hybrid
+            .expose()
+            .get(ED25519_SECRET_KEY_SIZE..ED25519_SECRET_KEY_SIZE + ML_DSA_65_SECRET_KEY_SIZE)
+            .ok_or_else(|| {
+                ConstructError::Crypto(crate::error::CryptoError::Other(
+                    "KEM identity: hybrid signature key too short".to_string(),
+                ))
+            })?;
+        let seed = P::hkdf_derive_key(
+            &[],
+            mldsa_seed,
+            KEM_IDENTITY_SEED_INFO,
+            crate::crypto::pq_x3dh::MLKEM_SEED_SIZE,
+        )
+        .map_err(ConstructError::Crypto)?;
+        Ok(crate::crypto::SecretBytes::from(seed))
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// This device's ML-KEM-1024 identity public key (1568 bytes); see `kem_identity_seed`.
+    pub fn kem_identity_public(&self) -> Result<Vec<u8>> {
+        let seed = self.kem_identity_seed()?;
+        crate::crypto::pq_x3dh::mlkem1024_public_from_seed(seed.expose())
+            .map_err(|e| ConstructError::Crypto(crate::error::CryptoError::Other(e)))
+    }
+
+    #[cfg(feature = "post-quantum")]
+    /// Decapsulate a responder's answer to this device's KEM identity key. A ciphertext for
+    /// another key does not fail here (ML-KEM implicit rejection); it fails as the AEAD after it.
+    pub fn kem_identity_decapsulate(
+        &self,
+        ciphertext: &[u8],
+    ) -> Result<crate::crypto::SecretBytes> {
+        let seed = self.kem_identity_seed()?;
+        crate::crypto::pq_x3dh::mlkem1024_decapsulate(seed.expose(), ciphertext)
+            .map_err(|e| ConstructError::Crypto(crate::error::CryptoError::Other(e)))
     }
 
     // ── Kyber prekeys (ML-KEM-1024, PQXDH v2) ─────────────────────────────────

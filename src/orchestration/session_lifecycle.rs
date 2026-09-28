@@ -11,8 +11,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::crypto::client_api::ClassicClient;
 use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
@@ -66,76 +64,12 @@ pub enum RatchetKeyOwner {
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
-/// Returned by `encrypt`.
-#[derive(Debug, Clone)]
-pub struct EncryptResult {
-    /// JSON-encoded `EncryptedRatchetMessage` ready for wire transmission.
-    pub ciphertext_json: String,
-    /// Actions the platform must execute (e.g. save updated session state).
-    pub actions: Vec<Action>,
-}
-
-/// Returned by `decrypt`.
+/// Returned by `decrypt_wire_payload`.
 #[derive(Debug, Clone)]
 pub struct DecryptResult {
     pub plaintext: Vec<u8>,
     /// Actions the platform must execute after successful decryption.
     pub actions: Vec<Action>,
-}
-
-// ── Serializable wire message ─────────────────────────────────────────────────
-
-/// JSON-serializable form of `EncryptedRatchetMessage`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WireMessage {
-    pub dh_public_key: Vec<u8>,
-    pub message_number: u32,
-    pub ciphertext: Vec<u8>,
-    pub nonce: Vec<u8>,
-    pub previous_chain_length: u32,
-    pub suite_id: u16,
-    /// Suite-3 only: PQ epoch mixed into this message's key (0 otherwise).
-    /// `serde(default)` keeps old JSON blobs parseable.
-    #[serde(default)]
-    pub pq_message_epoch: u32,
-    /// Suite-3 only: sparse PQ ratchet EK/CT field.
-    #[serde(default)]
-    pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
-}
-
-impl From<EncryptedRatchetMessage> for WireMessage {
-    fn from(m: EncryptedRatchetMessage) -> Self {
-        Self {
-            dh_public_key: m.dh_public_key.to_vec(),
-            message_number: m.message_number,
-            ciphertext: m.ciphertext,
-            nonce: m.nonce,
-            previous_chain_length: m.previous_chain_length,
-            suite_id: m.suite_id,
-            pq_message_epoch: m.pq_message_epoch,
-            pq_ratchet_field: m.pq_ratchet_field,
-        }
-    }
-}
-
-impl TryFrom<WireMessage> for EncryptedRatchetMessage {
-    type Error = String;
-    fn try_from(w: WireMessage) -> Result<Self, String> {
-        let dh: [u8; 32] = w
-            .dh_public_key
-            .try_into()
-            .map_err(|_| "dh_public_key must be 32 bytes".to_string())?;
-        Ok(EncryptedRatchetMessage {
-            dh_public_key: dh,
-            message_number: w.message_number,
-            ciphertext: w.ciphertext,
-            nonce: w.nonce,
-            previous_chain_length: w.previous_chain_length,
-            suite_id: w.suite_id,
-            pq_message_epoch: w.pq_message_epoch,
-            pq_ratchet_field: w.pq_ratchet_field,
-        })
-    }
 }
 
 // ── SessionLifecycleManager ───────────────────────────────────────────────────
@@ -152,6 +86,11 @@ pub struct SessionLifecycleManager {
     /// was opened. The bundle binds that key to the device only by an Ed25519 cross-signature, so
     /// the pin is what a quantum adversary cannot get past — see `pq_prekey_plan`.
     hybrid_identity_pins: std::collections::BTreeMap<String, [u8; 32]>,
+    /// Device → SHA-256 of the KEM identity key its first message named the first time it opened
+    /// a session to us (decisions/responder-authenticates-initiator-by-kem.md). The responder's
+    /// counterpart of `hybrid_identity_pins`: what a quantum adversary holding the device's X25519
+    /// key and a forged server certificate still cannot present.
+    kem_identity_pins: std::collections::BTreeMap<String, [u8; 32]>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
 }
@@ -180,6 +119,7 @@ impl SessionLifecycleManager {
             previous: HashMap::new(),
             prekey_tracker: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
+            kem_identity_pins: std::collections::BTreeMap::new(),
             my_user_id,
             clock,
         }
@@ -214,6 +154,7 @@ impl SessionLifecycleManager {
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
         self.hybrid_identity_pins.remove(contact_id);
+        self.kem_identity_pins.remove(contact_id);
     }
 
     /// Now, by the injected clock (unix seconds).
@@ -233,6 +174,18 @@ impl SessionLifecycleManager {
             .or_insert(fingerprint);
     }
 
+    /// The KEM identity key pinned for `device_id`, if it ever opened a session to us.
+    pub fn pinned_kem_identity(&self, device_id: &str) -> Option<&[u8; 32]> {
+        self.kem_identity_pins.get(device_id)
+    }
+
+    /// Pin on first sight; an existing pin is never replaced here (a change is refused upstream).
+    pub fn pin_kem_identity(&mut self, device_id: &str, fingerprint: [u8; 32]) {
+        self.kem_identity_pins
+            .entry(device_id.to_string())
+            .or_insert(fingerprint);
+    }
+
     /// Update the local user-id on both the lifecycle manager and the
     /// underlying `ClassicClient`.  Both fields must stay in sync so that
     /// newly created sessions bake in the correct sender/receiver ID.
@@ -241,70 +194,11 @@ impl SessionLifecycleManager {
         self.client.set_local_user_id(user_id);
     }
 
-    // ── Encrypt ───────────────────────────────────────────────────────────────
-
-    /// Encrypt `plaintext` for `contact_id`.
-    ///
-    /// Returns `EncryptResult` with ciphertext JSON and follow-up `Action`s
-    /// (always includes `SaveToSecureStore` to persist the updated session).
-    pub fn encrypt(&mut self, contact_id: &str, plaintext: &[u8]) -> Result<EncryptResult, String> {
-        // Ensure session is loaded.
-        if !self.client.has_session(contact_id) {
-            return Err(format!("No active session for {}", contact_id));
-        }
-
-        let encrypted = self.client.encrypt_message(contact_id, plaintext)?;
-        let wire: WireMessage = encrypted.into();
-        let ciphertext_json =
-            serde_json::to_string(&wire).map_err(|e| format!("serialize: {}", e))?;
-
-        // Always save updated session state after encrypt.
-        let session_bytes = self.export_session_bytes_for(contact_id)?;
-        let actions = vec![Action::SaveToSecureStore {
-            slot: SecureStoreSlot::Session {
-                contact_id: contact_id.to_string(),
-            },
-            data: session_bytes.into(),
-        }];
-
-        Ok(EncryptResult {
-            ciphertext_json,
-            actions,
-        })
-    }
-
     // ── Decrypt ───────────────────────────────────────────────────────────────
 
-    /// Decrypt a wire-format message for `contact_id`.
-    ///
-    /// `wire_json` is a JSON-encoded `WireMessage`.
-    ///
-    /// On success, returns `DecryptResult` with plaintext and follow-up actions
-    /// (save updated session). On failure, returns `Err` so the caller (Phase 4
-    /// `MessageRouter`) can decide between opening a new state and a decryption error.
-    pub fn decrypt(&mut self, contact_id: &str, wire_json: &str) -> Result<DecryptResult, String> {
-        let wire: WireMessage =
-            serde_json::from_str(wire_json).map_err(|e| format!("parse wire: {}", e))?;
-        let msg = EncryptedRatchetMessage::try_from(wire)?;
-
-        let plaintext = self.decrypt_ratchet_message(contact_id, &msg)?;
-
-        // Persist updated session state.
-        let session_bytes = self.export_session_bytes_for(contact_id)?;
-        let actions = vec![Action::SaveToSecureStore {
-            slot: SecureStoreSlot::Session {
-                contact_id: contact_id.to_string(),
-            },
-            data: session_bytes.into(),
-        }];
-
-        Ok(DecryptResult { plaintext, actions })
-    }
-
-    /// Decrypt using a binary WirePayload blob (no JSON round-trip).
-    ///
-    /// Functionally equivalent to `decrypt` but bypasses JSON serialization.
-    /// The payload is the raw wire format produced by `wire_payload::pack`.
+    /// Decrypt a wire payload (`wire_payload::pack`) and return the save the platform executes.
+    /// The JSON path beside it (`encrypt` / `decrypt` over a `WireMessage`) was removed on
+    /// 2026-09-28: a third carrier of the message, with no caller outside its own tests.
     pub fn decrypt_wire_payload(
         &mut self,
         contact_id: &str,
@@ -334,6 +228,7 @@ impl SessionLifecycleManager {
             suite_id: decoded.suite_id,
             pq_message_epoch: decoded.pq_message_epoch,
             pq_ratchet_field: decoded.pq_ratchet_field,
+            identity_proof_ciphertext: decoded.identity_proof_ciphertext,
         };
 
         let plaintext = self.decrypt_ratchet_message(contact_id, &msg)?;
@@ -370,9 +265,19 @@ impl SessionLifecycleManager {
     ) -> Result<Vec<u8>, String> {
         use crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED;
 
+        // The answer to our KEM identity key, when the message carries one: a responder's reply
+        // until we have proved ourselves. The state it applies to — current or previous — decides
+        // whether it is used (`IdentityProof::AwaitingAnswer`); decapsulating is cheap and never
+        // fails on a foreign ciphertext, so it is done once, up front.
+        let identity_secret = self.identity_answer_secret(msg)?;
+        let identity_secret = identity_secret.as_ref().map(|s| s.expose());
+
         let mut current_error = None;
         if self.client.has_session(contact_id) {
-            match self.client.decrypt_message(contact_id, msg) {
+            match self
+                .client
+                .decrypt_message_with_identity_secret(contact_id, msg, identity_secret)
+            {
                 Ok(plaintext) => return Ok(plaintext),
                 Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => return Err(e),
                 Err(e) => current_error = Some(e),
@@ -384,7 +289,10 @@ impl SessionLifecycleManager {
         let mut decrypted = None;
         if let Some(states) = states {
             for (index, state) in states.iter_mut().enumerate() {
-                match state.session.decrypt(msg) {
+                match state
+                    .session
+                    .decrypt_with_identity_secret(msg, identity_secret)
+                {
                     Ok(plaintext) => {
                         decrypted = Some((index, plaintext));
                         break;
@@ -417,6 +325,30 @@ impl SessionLifecycleManager {
         );
         self.install_current(contact_id, promoted.session);
         Ok(plaintext)
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn identity_answer_secret(
+        &self,
+        msg: &EncryptedRatchetMessage,
+    ) -> Result<Option<crate::crypto::SecretBytes>, String> {
+        msg.identity_proof_ciphertext
+            .as_deref()
+            .map(|ct| {
+                self.client
+                    .key_manager()
+                    .kem_identity_decapsulate(ct)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+
+    #[cfg(not(feature = "post-quantum"))]
+    fn identity_answer_secret(
+        &self,
+        _msg: &EncryptedRatchetMessage,
+    ) -> Result<Option<crate::crypto::SecretBytes>, String> {
+        Ok(None)
     }
 
     /// Make `session` the current state with `contact_id`; the state it replaces, if any, becomes
@@ -572,6 +504,14 @@ impl SessionLifecycleManager {
                     fingerprint: serde_bytes::ByteBuf::from(fp.to_vec()),
                 })
                 .collect(),
+            kem_identity_pins: self
+                .kem_identity_pins
+                .iter()
+                .map(|(device, fp)| crate::cfe::CfeHybridPinV1 {
+                    device_id: device.clone(),
+                    fingerprint: serde_bytes::ByteBuf::from(fp.to_vec()),
+                })
+                .collect(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -606,15 +546,17 @@ impl SessionLifecycleManager {
         self.prekey_tracker = state.prekey_tracker.into_iter().collect();
         // A pin that is not 32 bytes cannot be compared with anything; dropping it re-pins on the
         // next session, which is where a device with no pin starts anyway.
-        self.hybrid_identity_pins = state
-            .hybrid_identity_pins
-            .into_iter()
-            .filter_map(|p| {
-                <[u8; 32]>::try_from(p.fingerprint.as_slice())
-                    .ok()
-                    .map(|fp| (p.device_id, fp))
-            })
-            .collect();
+        let pins = |pins: Vec<crate::cfe::CfeHybridPinV1>| {
+            pins.into_iter()
+                .filter_map(|p| {
+                    <[u8; 32]>::try_from(p.fingerprint.as_slice())
+                        .ok()
+                        .map(|fp| (p.device_id, fp))
+                })
+                .collect()
+        };
+        self.hybrid_identity_pins = pins(state.hybrid_identity_pins);
+        self.kem_identity_pins = pins(state.kem_identity_pins);
 
         // Return init_locks for the caller to restore.
         Ok(state.init_locks.into_iter().collect())
@@ -775,23 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_without_session_returns_error() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        let result = mgr.encrypt("bob", b"hello");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No active session"));
-    }
-
-    #[test]
-    fn test_decrypt_without_session_returns_error() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        let result = mgr.decrypt("bob", r#"{"msg":"fake"}"#);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_prekey_tracking() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
@@ -812,27 +737,6 @@ mod tests {
 
         assert!(!mgr.is_reinstall("bob", 99));
         assert!(mgr.pinned_hybrid_identity("bob").is_none());
-    }
-
-    #[test]
-    fn test_wire_message_roundtrip() {
-        let original = EncryptedRatchetMessage {
-            dh_public_key: [42u8; 32],
-            message_number: 7,
-            ciphertext: vec![1, 2, 3],
-            nonce: vec![4, 5, 6],
-            previous_chain_length: 0,
-            suite_id: 1,
-            pq_message_epoch: 0,
-            pq_ratchet_field: None,
-        };
-        let wire: WireMessage = original.clone().into();
-        let json = serde_json::to_string(&wire).unwrap();
-        let wire2: WireMessage = serde_json::from_str(&json).unwrap();
-        let restored = EncryptedRatchetMessage::try_from(wire2).unwrap();
-        assert_eq!(restored.dh_public_key, original.dh_public_key);
-        assert_eq!(restored.message_number, original.message_number);
-        assert_eq!(restored.ciphertext, original.ciphertext);
     }
 
     /// Establish a real X3DH session between two lifecycle managers.
@@ -1426,6 +1330,7 @@ mod tests {
             init_locks: vec![],
             prekey_tracker: vec![],
             hybrid_identity_pins: vec![],
+            kem_identity_pins: vec![],
         };
         let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
 

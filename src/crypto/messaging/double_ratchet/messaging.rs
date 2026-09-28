@@ -105,6 +105,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             last_ratchet_at: unix_now(),
             pq_authentication: PqAuthentication::Classic,
             pq_applied: Some(false),
+            identity_proof: IdentityProof::None,
         })
     }
 
@@ -217,6 +218,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             last_ratchet_at: unix_now(),
             pq_authentication: PqAuthentication::Classic,
             pq_applied: Some(false),
+            identity_proof: IdentityProof::None,
         };
 
         // КРИТИЧЕСКИ ВАЖНО: Расшифровываем первое сообщение!
@@ -382,6 +384,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             suite_id: self.suite_id.as_u16(),
             pq_message_epoch,
             pq_ratchet_field: self.take_outgoing_pq_field(),
+            identity_proof_ciphertext: match &self.identity_proof {
+                IdentityProof::Answered { ciphertext } => Some(ciphertext.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -399,7 +405,15 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     /// - Лимит на количество skipped keys (MAX_SKIPPED_MESSAGES)
     /// - Automatic cleanup старых ключей по timestamp
     fn decrypt(&mut self, encrypted: &Self::EncryptedMessage) -> Result<Vec<u8>, String> {
-        let result = self.decrypt_message(encrypted);
+        self.decrypt_with_identity_secret(encrypted, None)
+    }
+
+    fn decrypt_with_identity_secret(
+        &mut self,
+        encrypted: &Self::EncryptedMessage,
+        identity_secret: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let result = self.decrypt_message(encrypted, identity_secret);
         // The peer answered: the responder has the session, the handshake header is done.
         // (A first-flight message never decrypts at the initiator — it is the initiator's own.)
         if result.is_ok() {
@@ -462,8 +476,13 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.dh_ratchet_public.as_ref()
     }
 
-    /// The ratchet's decrypt; `SecureMessaging::decrypt` wraps it.
-    fn decrypt_message(&mut self, encrypted: &EncryptedRatchetMessage) -> Result<Vec<u8>, String> {
+    /// The ratchet's decrypt; `SecureMessaging::decrypt` wraps it. `identity_secret`: see
+    /// `perform_dh_ratchet`.
+    fn decrypt_message(
+        &mut self,
+        encrypted: &EncryptedRatchetMessage,
+        identity_secret: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
         use tracing::{debug, trace};
 
         // Periodically evict stale skipped-message keys to bound memory usage.
@@ -535,6 +554,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             pending_pq_exchange: self.pending_pq_exchange.clone(),
             pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
+            identity_proof: self.identity_proof.clone(),
+            pq_authentication: self.pq_authentication,
         });
 
         if needs_ratchet {
@@ -576,7 +597,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 }
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
-            self.perform_dh_ratchet(&remote_dh_public)
+            self.perform_dh_ratchet(&remote_dh_public, identity_secret)
                 .inspect_err(|_e| {
                     self.restore_snapshot(snapshot.clone());
                 })?;
@@ -603,6 +624,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 "decrypting a skipped (out-of-order) message must not advance the receiving chain"
             );
             self.commit_pq_post_decrypt(encrypted);
+            if needs_ratchet {
+                self.complete_identity_proof();
+            }
             return Ok(plaintext);
         }
 
@@ -636,6 +660,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         self.restore_snapshot(snapshot);
                     })?;
                 self.commit_pq_post_decrypt(encrypted);
+                if needs_ratchet {
+                    self.complete_identity_proof();
+                }
                 return Ok(plaintext);
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)

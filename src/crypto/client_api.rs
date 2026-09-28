@@ -821,6 +821,22 @@ where
         session.decrypt(message)
     }
 
+    /// `decrypt_message` with the answer to our KEM identity key, when the message carried one.
+    pub fn decrypt_message_with_identity_secret(
+        &mut self,
+        contact_id: &str,
+        message: &M::EncryptedMessage,
+        identity_secret: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        self.ensure_local_user_id_set()?;
+        let session = self
+            .sessions
+            .get_mut(contact_id)
+            .ok_or_else(|| format!("No session with contact: {}", contact_id))?;
+
+        session.decrypt_with_identity_secret(message, identity_secret)
+    }
+
     /// Проверить наличие сессии с контактом
     pub fn has_session(&self, contact_id: &str) -> bool {
         self.sessions.contains_key(contact_id)

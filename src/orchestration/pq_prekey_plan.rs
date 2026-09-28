@@ -99,6 +99,12 @@ pub fn hybrid_identity_fingerprint(hybrid_identity_key: &[u8]) -> [u8; 32] {
     Sha256::digest(hybrid_identity_key).into()
 }
 
+/// SHA-256 of an initiator's KEM identity key — what a responder pins for its device.
+pub fn kem_identity_fingerprint(kem_identity_key: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(kem_identity_key).into()
+}
+
 pub fn plan_pqxdh(
     offer: &PqxdhOffer<'_>,
     ctx: &PqxdhContext<'_>,

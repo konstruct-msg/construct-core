@@ -264,6 +264,30 @@ pub struct PrekeyHeader {
     pub kyber_prekey_id: u32,
     /// ML-KEM-1024 ciphertext (1568 bytes); empty when `kyber_prekey_id == 0`.
     pub kem_ciphertext: Vec<u8>,
+    /// The initiator's ML-KEM-1024 identity key (1568 bytes), which the responder pins and answers
+    /// to (`IdentityProof`); empty when `kyber_prekey_id == 0`.
+    pub kem_identity: Vec<u8>,
+}
+
+/// Where a session stands on the initiator's post-quantum proof of identity
+/// (decisions/responder-authenticates-initiator-by-kem.md).
+///
+/// The responder encapsulates to the initiator's KEM identity key and mixes the secret into its
+/// first sending chain and the root; the initiator mixes the same secret on its first receiving
+/// ratchet step. Only the holder of the key can do that, so a message on any chain after it proves
+/// the initiator — the responder then stops attaching the ciphertext and labels the session
+/// `PqAuthentication::ReceivedProven`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IdentityProof {
+    /// Nothing pending: a session recorded before this existed, a proof completed, or a build
+    /// without `post-quantum`.
+    #[default]
+    None,
+    /// INITIATOR: the first receiving ratchet step must mix the secret the responder's
+    /// ciphertext carries.
+    AwaitingAnswer,
+    /// RESPONDER: the ciphertext every outgoing message carries until the initiator proves itself.
+    Answered { ciphertext: Vec<u8> },
 }
 
 /// Double Ratchet Session
@@ -362,6 +386,8 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// A KEM secret has been mixed into the root key. `None` for a session recorded before this
     /// was tracked — which claims nothing.
     pq_applied: Option<bool>,
+    /// The initiator's proof of its KEM identity key — see `IdentityProof`.
+    identity_proof: IdentityProof,
 }
 
 /// Snapshot of mutable session fields captured before a DH ratchet in `decrypt()`.
@@ -384,6 +410,8 @@ struct DecryptSnapshot<P: CryptoProvider> {
     pending_pq_exchange: Option<PendingPqExchange>,
     pending_pq_ciphertext: Option<PendingPqCiphertext>,
     pq_pending_since: u64,
+    identity_proof: IdentityProof,
+    pq_authentication: PqAuthentication,
 }
 
 impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
@@ -406,6 +434,8 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             pending_pq_exchange: self.pending_pq_exchange.clone(),
             pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
+            identity_proof: self.identity_proof.clone(),
+            pq_authentication: self.pq_authentication,
         }
     }
 }
@@ -431,6 +461,12 @@ pub struct EncryptedRatchetMessage {
     /// PQ ratchet field for SuiteID::PQ_RATCHET=3 (sparse continuous). None for other suites.
     /// Present only on messages carrying a PQ exchange (EK or CT). Resent until acked.
     pub pq_ratchet_field: Option<PqRatchetWireField>,
+    /// RESPONDER: the answer to the initiator's KEM identity key (ML-KEM-1024 ciphertext), carried
+    /// until the initiator proves itself (`IdentityProof::Answered`). The initiator needs it for
+    /// its first receiving ratchet step, so it must reach the core with the message — a path that
+    /// rebuilds a message from components drops it.
+    #[serde(default)]
+    pub identity_proof_ciphertext: Option<Vec<u8>>,
 }
 
 impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {

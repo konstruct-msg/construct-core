@@ -47,6 +47,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                     one_time_prekey_id: h.one_time_prekey_id,
                     kyber_prekey_id: h.kyber_prekey_id,
                     kem_ciphertext: h.kem_ciphertext.clone(),
+                    kem_identity: h.kem_identity.clone(),
                 }),
             pq_handshake: Some(self.pq_handshake.as_u8()),
             session_id: self.session_id.clone(),
@@ -55,6 +56,11 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             last_ratchet_at: self.last_ratchet_at,
             pq_authentication: self.pq_authentication.as_u8(),
             pq_applied: self.pq_applied,
+            identity_proof_awaiting: self.identity_proof == IdentityProof::AwaitingAnswer,
+            identity_proof_ciphertext: match &self.identity_proof {
+                IdentityProof::Answered { ciphertext } => Some(ciphertext.clone()),
+                _ => None,
+            },
             pq_ratchet: if self.suite_id.is_pq_ratchet() {
                 Some(SerializablePqRatchetState {
                     is_initiator: self.is_pq_initiator,
@@ -139,6 +145,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 one_time_prekey_id: h.one_time_prekey_id,
                 kyber_prekey_id: h.kyber_prekey_id,
                 kem_ciphertext: h.kem_ciphertext.clone(),
+                kem_identity: h.kem_identity.clone(),
             }),
             pq_handshake: data
                 .pq_handshake
@@ -160,6 +167,18 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             last_ratchet_at: data.last_ratchet_at,
             pq_authentication: PqAuthentication::from_u8(data.pq_authentication),
             pq_applied: data.pq_applied,
+            // Both set is not a state the ratchet produces; the answer wins, since dropping it
+            // would leave the initiator unable to read the reply.
+            identity_proof: match (
+                &data.identity_proof_ciphertext,
+                data.identity_proof_awaiting,
+            ) {
+                (Some(ciphertext), _) => IdentityProof::Answered {
+                    ciphertext: ciphertext.clone(),
+                },
+                (None, true) => IdentityProof::AwaitingAnswer,
+                (None, false) => IdentityProof::None,
+            },
         };
 
         session.restore_pq_ratchet_state(&data);
@@ -332,6 +351,8 @@ pub(crate) struct SerializablePrekeyHeader {
     one_time_prekey_id: u32,
     kyber_prekey_id: u32,
     kem_ciphertext: Vec<u8>,
+    #[serde(default)]
+    kem_identity: Vec<u8>,
 }
 
 /// Serializable session format for storage
@@ -416,6 +437,12 @@ pub struct SerializableSession {
     pq_authentication: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pq_applied: Option<bool>,
+    /// `IdentityProof::AwaitingAnswer` (initiator).
+    #[serde(default)]
+    identity_proof_awaiting: bool,
+    /// `IdentityProof::Answered` (responder): the ciphertext carried until the initiator proves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_proof_ciphertext: Option<Vec<u8>>,
     /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
     /// message-key mixing design. Present only for suite-3 sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
@@ -616,11 +643,14 @@ impl SerializableSession {
                     one_time_prekey_id: h.one_time_prekey_id,
                     kyber_prekey_id: h.kyber_prekey_id,
                     kem_ciphertext: ByteBuf::from(h.kem_ciphertext.clone()),
+                    kem_identity: ByteBuf::from(h.kem_identity.clone()),
                 }),
             pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
             pq_authentication: self.pq_authentication,
             pq_applied: self.pq_applied,
+            identity_proof_awaiting: self.identity_proof_awaiting,
+            identity_proof_ciphertext: self.identity_proof_ciphertext.clone().map(ByteBuf::from),
             pqr: self
                 .pq_ratchet
                 .as_ref()
@@ -692,6 +722,7 @@ impl SerializableSession {
                 one_time_prekey_id: h.one_time_prekey_id,
                 kyber_prekey_id: h.kyber_prekey_id,
                 kem_ciphertext: h.kem_ciphertext.into_vec(),
+                kem_identity: h.kem_identity.into_vec(),
             }),
             pq_handshake: data.pq_handshake,
             session_id: session_id_hex,
@@ -700,6 +731,8 @@ impl SerializableSession {
             last_ratchet_at: data.last_ratchet_at,
             pq_authentication: data.pq_authentication,
             pq_applied: data.pq_applied,
+            identity_proof_awaiting: data.identity_proof_awaiting,
+            identity_proof_ciphertext: data.identity_proof_ciphertext.map(|b| b.into_vec()),
             // Secrets leave `SecretBytes` here: `SerializableSession` still holds plain `Vec`s.
             pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {
                 is_initiator: pq.is_initiator,

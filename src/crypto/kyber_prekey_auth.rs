@@ -120,8 +120,13 @@ pub enum PqAuthentication {
     /// recorder; not against whoever served the bundle.
     Unauthenticated,
     /// We are the responder: the peer encapsulated to our own key. Whether *they* verified it is
-    /// decided on their side.
+    /// decided on their side. The initiator has not yet proved it holds the KEM identity key its
+    /// first flight named (`IdentityProof`): who it is rests on X25519 and the server's signature.
     Received,
+    /// We are the responder, and the initiator proved it holds the KEM identity key its first
+    /// flight named, which is pinned for its device: its identity no longer rests on classical
+    /// cryptography alone.
+    ReceivedProven,
 }
 
 impl PqAuthentication {
@@ -132,6 +137,7 @@ impl PqAuthentication {
             Self::Authenticated => 2,
             Self::Unauthenticated => 3,
             Self::Received => 4,
+            Self::ReceivedProven => 5,
         }
     }
 
@@ -142,6 +148,7 @@ impl PqAuthentication {
             2 => Self::Authenticated,
             3 => Self::Unauthenticated,
             4 => Self::Received,
+            5 => Self::ReceivedProven,
             _ => Self::Unknown,
         }
     }

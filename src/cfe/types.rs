@@ -253,6 +253,9 @@ pub struct CfePrekeyHeaderV1 {
     pub kyber_prekey_id: u32,
     #[serde(rename = "ct")]
     pub kem_ciphertext: ByteBuf,
+    /// The initiator's ML-KEM-1024 identity key the first flight carries.
+    #[serde(rename = "ikk", default)]
+    pub kem_identity: ByteBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +333,16 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "pqap")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_applied: Option<bool>,
+
+    /// INITIATOR: the first receiving ratchet step mixes the answer to our KEM identity key
+    /// (`IdentityProof::AwaitingAnswer`).
+    #[serde(rename = "ipw", default, skip_serializing_if = "std::ops::Not::not")]
+    pub identity_proof_awaiting: bool,
+
+    /// RESPONDER: the answer to the initiator's KEM identity key, carried until it proves itself
+    /// (`IdentityProof::Answered`).
+    #[serde(rename = "ipc", default, skip_serializing_if = "Option::is_none")]
+    pub identity_proof_ciphertext: Option<ByteBuf>,
 
     // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
     // History: a pre-SPQR-redesign layout briefly used flat fields here
@@ -610,6 +623,10 @@ pub struct CfeOrchestratorStateV1 {
     /// Device → SHA-256 of its pinned hybrid identity key, sorted by device.
     #[serde(rename = "hip", default, skip_serializing_if = "Vec::is_empty")]
     pub hybrid_identity_pins: Vec<CfeHybridPinV1>,
+    /// Device → SHA-256 of the KEM identity key its first message named, sorted by device.
+    /// Same shape as a hybrid pin.
+    #[serde(rename = "kip", default, skip_serializing_if = "Vec::is_empty")]
+    pub kem_identity_pins: Vec<CfeHybridPinV1>,
 }
 
 /// A pinned hybrid identity key.

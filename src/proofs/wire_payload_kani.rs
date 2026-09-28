@@ -34,6 +34,8 @@ fn proof_pack_unpack_roundtrip_no_pqc() {
         prev_chain_len,
         suite_id,
         None,
+        None,
+        None,
         &sealed_box,
         0,
         None,
@@ -79,6 +81,8 @@ fn proof_pack_unpack_roundtrip_with_pqc() {
         0,
         1,
         Some(&kem_ct),
+        None,
+        None,
         &sealed_box,
         0,
         None,
@@ -127,7 +131,20 @@ fn proof_pack_rejects_bad_dh_key() {
     let bad_key: Vec<u8> = (0..bad_len).map(|_| kani::any()).collect();
     let sealed_box: Vec<u8> = vec![0xAA; 60];
 
-    let result = pack(&bad_key, 0, 0, 0, 0, 1, None, &sealed_box, 0, None);
+    let result = pack(
+        &bad_key,
+        0,
+        0,
+        0,
+        0,
+        1,
+        None,
+        None,
+        None,
+        &sealed_box,
+        0,
+        None,
+    );
 
     assert!(
         result.is_err(),
@@ -145,7 +162,21 @@ fn proof_packed_length_correct() {
     kani::assume(sealed_len >= 60 && sealed_len <= 128);
     let sealed_box: Vec<u8> = (0..sealed_len).map(|_| kani::any()).collect();
 
-    let packed = pack(&dh_key, 0, 0, 0, 0, 1, None, &sealed_box, 0, None).unwrap();
+    let packed = pack(
+        &dh_key,
+        0,
+        0,
+        0,
+        0,
+        1,
+        None,
+        None,
+        None,
+        &sealed_box,
+        0,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         packed.len(),
@@ -171,6 +202,8 @@ fn proof_suite3_no_field_roundtrip() {
         0,
         5,
         3, // Suite 3
+        None,
+        None,
         None,
         &sealed_box,
         pq_epoch,

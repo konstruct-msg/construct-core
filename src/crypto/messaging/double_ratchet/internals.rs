@@ -103,6 +103,80 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.pending_pq_exchange = s.pending_pq_exchange;
             self.pending_pq_ciphertext = s.pending_pq_ciphertext;
             self.pq_pending_since = s.pq_pending_since;
+            self.identity_proof = s.identity_proof;
+            self.pq_authentication = s.pq_authentication;
+        }
+    }
+
+    /// INITIATOR: this session's first receiving ratchet step will mix the answer to our KEM
+    /// identity key (`IdentityProof::AwaitingAnswer`). Set when the first flight names the key.
+    pub fn expect_identity_answer(&mut self) {
+        self.identity_proof = IdentityProof::AwaitingAnswer;
+    }
+
+    /// RESPONDER, right after the session is built and before anything is sent on it: mix the
+    /// secret encapsulated to the initiator's KEM identity key into the root and the first
+    /// sending chain, and carry `ciphertext` on every message until the initiator proves itself.
+    ///
+    /// Mixing into the *first* sending chain is the point: a peer without the key cannot read even
+    /// the first reply. The initiator mixes the same secret on the same step from its side
+    /// (`perform_dh_ratchet`), so both derive from the same root afterwards.
+    pub fn answer_initiator_identity(
+        &mut self,
+        secret: &[u8],
+        ciphertext: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.sending_chain_length != 0 || self.identity_proof != IdentityProof::None {
+            return Err(
+                "KEM identity answer: the session has already sent or already answered".into(),
+            );
+        }
+        let (root, chain) =
+            Self::mix_identity_secret(&self.root_key, &self.sending_chain_key, secret)?;
+        self.root_key = root;
+        self.sending_chain_key = chain;
+        self.identity_proof = IdentityProof::Answered { ciphertext };
+        Ok(())
+    }
+
+    pub fn identity_proof(&self) -> &IdentityProof {
+        &self.identity_proof
+    }
+
+    /// `HKDF(salt = secret, ikm = key)` for the root and for the chain the step derived, under
+    /// separate labels — the Triple Ratchet's shape (PQ key as the salt), as in
+    /// `mix_pq_message_key`.
+    fn mix_identity_secret(
+        root: &P::AeadKey,
+        chain: &P::AeadKey,
+        secret: &[u8],
+    ) -> Result<(P::AeadKey, P::AeadKey), String> {
+        let root = P::hkdf_derive_key(secret, root.as_ref(), b"Construct-KEM-identity-root-v1", 32)
+            .map_err(|e| format!("KEM identity root mix failed: {e:?}"))?;
+        let chain = P::hkdf_derive_key(
+            secret,
+            chain.as_ref(),
+            b"Construct-KEM-identity-chain-v1",
+            32,
+        )
+        .map_err(|e| format!("KEM identity chain mix failed: {e:?}"))?;
+        Ok((
+            Self::bytes_to_aead_key(&root)?,
+            Self::bytes_to_aead_key(&chain)?,
+        ))
+    }
+
+    /// RESPONDER: a message on a chain the initiator derived after mixing our answer decrypted —
+    /// only the holder of the KEM identity key could derive it. Stop carrying the ciphertext.
+    pub(super) fn complete_identity_proof(&mut self) {
+        if matches!(self.identity_proof, IdentityProof::Answered { .. }) {
+            self.identity_proof = IdentityProof::None;
+            self.pq_authentication = PqAuthentication::ReceivedProven;
+            tracing::info!(
+                target: "crypto::double_ratchet",
+                session_id = %self.session_id,
+                "initiator proved its KEM identity key"
+            );
         }
     }
 
@@ -120,9 +194,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     ///    exchange — see `maybe_advance_pq_ratchet`. The PQ layer never touches
     ///    `root_key` or chain keys here: PQ secrets are mixed at the
     ///    message-key level only (see `mix_pq_message_key`).
+    ///
+    /// `identity_secret` — INITIATOR, first step only (`IdentityProof::AwaitingAnswer`): the
+    /// secret the responder encapsulated to our KEM identity key, mixed into the root and the
+    /// receiving chain exactly as the responder mixed it into its sending chain.
     pub(super) fn perform_dh_ratchet(
         &mut self,
         new_remote_dh: &P::KemPublicKey,
+        identity_secret: Option<&[u8]>,
     ) -> Result<(), String> {
         use tracing::debug;
 
@@ -146,6 +225,17 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.root_key = new_root_key;
         self.receiving_chain_key = new_receiving_chain;
         self.receiving_chain_length = 0;
+
+        if self.identity_proof == IdentityProof::AwaitingAnswer {
+            let secret = identity_secret.ok_or(
+                "KEM identity answer missing: the responder's first reply carries no ciphertext",
+            )?;
+            let (root, chain) =
+                Self::mix_identity_secret(&self.root_key, &self.receiving_chain_key, secret)?;
+            self.root_key = root;
+            self.receiving_chain_key = chain;
+            self.identity_proof = IdentityProof::None;
+        }
 
         // 2. Generate new DH pair for sending
         let (new_dh_private, new_dh_public) =

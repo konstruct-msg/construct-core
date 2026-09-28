@@ -59,6 +59,10 @@ pub struct PqxdhInput<'a> {
     pub kyber_public: &'a [u8],
     /// The ciphertext the first message carries (1568 bytes).
     pub kem_ciphertext: &'a [u8],
+    /// The initiator's ML-KEM-1024 identity key the first message carries (1568 bytes): the key
+    /// the responder answers to (`KeyManager::kem_identity_public`). Bound into the root key so
+    /// that one substituted in transit fails the first message instead of being pinned.
+    pub initiator_kem_identity: &'a [u8],
 }
 
 impl std::fmt::Debug for PqxdhInput<'_> {

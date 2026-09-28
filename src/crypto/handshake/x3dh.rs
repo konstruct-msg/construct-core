@@ -150,13 +150,15 @@ pub struct X3DHProtocol<P: CryptoProvider> {
 
 /// HKDF info of the classical X3DH root key (builds without `post-quantum`).
 const X3DH_ROOT_INFO_CLASSIC: &[u8] = b"Construct-X3DH-RootKey-v1";
-/// HKDF info prefix of the PQXDH v2 root key; followed by SHA-256 of the Kyber key and ciphertext.
-const X3DH_ROOT_INFO_PQXDH_V2: &[u8] = b"Construct-PQXDH-RootKey-v2";
+/// HKDF info prefix of the PQXDH root key; followed by SHA-256 of the Kyber key, the ciphertext
+/// and the initiator's KEM identity key. v2 carried the first two only; v3 added the third, and a
+/// v2 first message is refused rather than derived (decisions/responder-authenticates-initiator-by-kem.md).
+const X3DH_ROOT_INFO_PQXDH: &[u8] = b"Construct-PQXDH-RootKey-v3";
 
 /// The X3DH root key from the DH outputs `DH1‖DH2‖DH3[‖DH4]`, with the ML-KEM secret appended to
 /// the input when there is one (PQXDH v2, `PqxdhInput`). Salt `0xFF×32` as in Signal's X3DH §2.2.
 ///
-/// The Kyber key and ciphertext are bound through `info`. ML-KEM already hashes the encapsulation
+/// The Kyber key, the ciphertext and the initiator's KEM identity key are bound through `info`. ML-KEM already hashes the encapsulation
 /// key into its secret; binding both explicitly costs nothing and removes any reliance on which
 /// properties a particular KEM has.
 pub fn derive_root_key<P: CryptoProvider>(
@@ -170,9 +172,10 @@ pub fn derive_root_key<P: CryptoProvider>(
         None => X3DH_ROOT_INFO_CLASSIC.to_vec(),
         Some(pq) => {
             ikm.extend_from_slice(pq.shared_secret);
-            let mut info = X3DH_ROOT_INFO_PQXDH_V2.to_vec();
+            let mut info = X3DH_ROOT_INFO_PQXDH.to_vec();
             info.extend_from_slice(&Sha256::digest(pq.kyber_public));
             info.extend_from_slice(&Sha256::digest(pq.kem_ciphertext));
+            info.extend_from_slice(&Sha256::digest(pq.initiator_kem_identity));
             info
         }
     };
@@ -574,20 +577,28 @@ mod root_key_tests {
     }
 
     /// Known answers, computed outside this crate (Python `hmac`/`hashlib` HKDF-SHA256) from the
-    /// formula in `PQXDH_V2_DESIGN.md` §5.1. Any change to the derivation fails here, not between
-    /// two devices.
+    /// formula in `PQXDH_V2_DESIGN.md` §5.1 with the KEM identity key appended to `info` (v3,
+    /// decisions/responder-authenticates-initiator-by-kem.md). The same script reproduces the v2
+    /// answer this test held before. Any change to the derivation fails here, not between two
+    /// devices.
     #[test]
     fn known_answers() {
         let dh = vec![1_u8; 128];
-        let (ss, pk, ct) = (vec![2_u8; 32], vec![3_u8; 1568], vec![4_u8; 1568]);
+        let (ss, pk, ct, ikk) = (
+            vec![2_u8; 32],
+            vec![3_u8; 1568],
+            vec![4_u8; 1568],
+            vec![5_u8; 1568],
+        );
         let pq = PqxdhInput {
             shared_secret: &ss,
             kyber_public: &pk,
             kem_ciphertext: &ct,
+            initiator_kem_identity: &ikk,
         };
         assert_eq!(
             hex(&derive_root_key::<ClassicSuiteProvider>(dh.clone(), Some(&pq)).unwrap()),
-            "c87b3cea317cffc64ea57b63f51eba0779534a58ec86cb69e135498b9c9082ae"
+            "6581c411f2c9126076bd82128a0f3b38d38bd6d7086f8aab9094c9c4f47bc05f"
         );
         assert_eq!(
             hex(&derive_root_key::<ClassicSuiteProvider>(dh, None).unwrap()),
@@ -595,15 +606,22 @@ mod root_key_tests {
         );
     }
 
-    /// Each PQ input changes the key: the secret, and the key and ciphertext it is bound to.
+    /// Each PQ input changes the key: the secret, the key and ciphertext it is bound to, and the
+    /// initiator's KEM identity key.
     #[test]
     fn every_pq_input_is_bound() {
         let dh = vec![1_u8; 96];
-        let (ss, pk, ct) = (vec![2_u8; 32], vec![3_u8; 1568], vec![4_u8; 1568]);
+        let (ss, pk, ct, ikk) = (
+            vec![2_u8; 32],
+            vec![3_u8; 1568],
+            vec![4_u8; 1568],
+            vec![5_u8; 1568],
+        );
         let base = PqxdhInput {
             shared_secret: &ss,
             kyber_public: &pk,
             kem_ciphertext: &ct,
+            initiator_kem_identity: &ikk,
         };
         let k = |pq: PqxdhInput<'_>| {
             derive_root_key::<ClassicSuiteProvider>(dh.clone(), Some(&pq)).unwrap()
@@ -628,6 +646,13 @@ mod root_key_tests {
             reference,
             k(PqxdhInput {
                 kem_ciphertext: &ct2,
+                ..base
+            })
+        );
+        assert_ne!(
+            reference,
+            k(PqxdhInput {
+                initiator_kem_identity: &ct2,
                 ..base
             })
         );

@@ -88,6 +88,8 @@ pub struct IncomingFirstMessage {
     pub kyber_prekey_id: u32,
     /// ML-KEM-1024 ciphertext (1568 bytes).
     pub kem_ciphertext: Vec<u8>,
+    /// The initiator's ML-KEM-1024 identity key (1568 bytes) — pinned and answered to.
+    pub kem_identity: Option<Vec<u8>>,
 }
 
 impl IncomingFirstMessage {
@@ -108,6 +110,7 @@ impl IncomingFirstMessage {
             pqxdh_v2: d.pqxdh_v2,
             kyber_prekey_id: d.kyber_otpk_id,
             kem_ciphertext: d.kem_ciphertext.unwrap_or_default(),
+            kem_identity: d.kem_identity,
         })
     }
 }
@@ -123,15 +126,16 @@ pub struct OutgoingEncrypted {
 }
 
 impl OutgoingEncrypted {
-    /// The wire payload. A KEM ciphertext in the header sets `PQXDH_V2_FLAG` (`wire_payload::pack`).
+    /// The wire payload. What is present sets the flags (`wire_payload::pack`).
     pub fn pack(&self) -> Result<Vec<u8>, crate::wire_payload::WirePayloadError> {
-        let (otpk_id, kyber_prekey_id, kem) = match &self.header {
+        let (otpk_id, kyber_prekey_id, kem, kem_identity) = match &self.header {
             Some(h) => (
                 h.one_time_prekey_id,
                 h.kyber_prekey_id,
                 (!h.kem_ciphertext.is_empty()).then_some(h.kem_ciphertext.as_slice()),
+                (!h.kem_identity.is_empty()).then_some(h.kem_identity.as_slice()),
             ),
-            None => (0, 0, None),
+            None => (0, 0, None, None),
         };
         crate::wire_payload::pack(
             &self.message.dh_public_key,
@@ -141,6 +145,8 @@ impl OutgoingEncrypted {
             self.message.previous_chain_length,
             self.message.suite_id,
             kem,
+            kem_identity,
+            self.message.identity_proof_ciphertext.as_deref(),
             &self.sealed_box,
             self.message.pq_message_epoch,
             self.message.pq_ratchet_field.clone(),
@@ -156,6 +162,8 @@ struct ResponderKem<'a> {
     kyber_prekey_id: u32,
     #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
     kem_ciphertext: &'a [u8],
+    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
+    kem_identity: Option<&'a [u8]>,
 }
 
 pub struct Orchestrator {
@@ -652,10 +660,17 @@ impl Orchestrator {
 
             let enc = crate::crypto::pq_x3dh::mlkem1024_encapsulate(&choice.kyber_public)
                 .map_err(|e| format!("PQXDH_ENCAPSULATION_FAILED: {e}"))?;
+            let kem_identity = self
+                .lifecycle
+                .client
+                .key_manager()
+                .kem_identity_public()
+                .map_err(|e| format!("KEM_IDENTITY_UNAVAILABLE: {e}"))?;
             let pq = PqxdhInput {
                 shared_secret: enc.shared_secret.expose(),
                 kyber_public: &choice.kyber_public,
                 kem_ciphertext: &enc.ciphertext,
+                initiator_kem_identity: &kem_identity,
             };
             self.lifecycle
                 .client
@@ -672,6 +687,7 @@ impl Orchestrator {
                 one_time_prekey_id,
                 kyber_prekey_id: choice.kyber_prekey_id,
                 kem_ciphertext: enc.ciphertext.clone(),
+                kem_identity,
             };
             (header, Some(choice.hybrid_identity_fingerprint))
         };
@@ -694,6 +710,7 @@ impl Orchestrator {
                 one_time_prekey_id,
                 kyber_prekey_id: 0,
                 kem_ciphertext: Vec::new(),
+                kem_identity: Vec::new(),
             };
             (header, None)
         };
@@ -710,6 +727,7 @@ impl Orchestrator {
                 ratchet.mark_pqxdh_v2(
                     crate::crypto::kyber_prekey_auth::PqAuthentication::Authenticated,
                 );
+                ratchet.expect_identity_answer();
             }
             ratchet.set_prekey_header(header);
         }
@@ -1087,6 +1105,8 @@ impl Orchestrator {
             suite_id: first_message.suite_id,
             pq_message_epoch: first_message.pq_message_epoch,
             pq_ratchet_field: first_message.pq_ratchet_field.clone(),
+            // A first flight is the initiator's: it names a KEM identity key, it never answers one.
+            identity_proof_ciphertext: None,
         };
 
         let remote_identity =
@@ -1105,6 +1125,7 @@ impl Orchestrator {
                 pqxdh_v2: first_message.pqxdh_v2,
                 kyber_prekey_id: first_message.kyber_prekey_id,
                 kem_ciphertext: &first_message.kem_ciphertext,
+                kem_identity: first_message.kem_identity.as_deref(),
             },
         )?;
         Ok(plaintext)
@@ -1129,10 +1150,13 @@ impl Orchestrator {
             kem.kem_ciphertext,
         )?;
         #[cfg(feature = "post-quantum")]
+        let (kem_identity, answer) = self.admit_kem_identity(contact_id, kem.kem_identity)?;
+        #[cfg(feature = "post-quantum")]
         let pq = Some(crate::crypto::handshake::PqxdhInput {
             shared_secret: shared.expose(),
             kyber_public: &kyber_public,
             kem_ciphertext: kem.kem_ciphertext,
+            initiator_kem_identity: kem_identity,
         });
         #[cfg(not(feature = "post-quantum"))]
         let pq: Option<crate::crypto::handshake::PqxdhInput<'_>> = if kem.pqxdh_v2 {
@@ -1156,8 +1180,65 @@ impl Orchestrator {
             )
             .map_err(|e| e.to_string())?;
         #[cfg(feature = "post-quantum")]
-        self.after_responder_init(contact_id, kem.kyber_prekey_id);
+        {
+            let answered = self
+                .lifecycle
+                .client
+                .get_session_mut(contact_id)
+                .ok_or_else(|| "responder init left no session".to_string())
+                .and_then(|session| {
+                    session.messaging_session_mut().answer_initiator_identity(
+                        answer.shared_secret.expose(),
+                        answer.ciphertext.clone(),
+                    )
+                });
+            if let Err(e) = answered {
+                self.lifecycle.client.remove_session(contact_id);
+                return Err(format!("KEM_IDENTITY_ANSWER_FAILED: {e}"));
+            }
+            // The first message decrypted under a root key bound to this key: only now is it
+            // worth pinning — as the initiator pins a hybrid key only after X3DH verified it.
+            self.lifecycle.pin_kem_identity(
+                contact_id,
+                crate::orchestration::pq_prekey_plan::kem_identity_fingerprint(kem_identity),
+            );
+            self.after_responder_init(contact_id, kem.kyber_prekey_id);
+        }
         Ok(plaintext)
+    }
+
+    /// RESPONDER: the initiator's KEM identity key, checked against the one pinned for its device,
+    /// and the answer to it (`IdentityProof`). Mandatory — a first flight that names no key is
+    /// refused, as one without an ML-KEM ciphertext is (decisions/responder-authenticates-initiator-by-kem.md).
+    #[cfg(feature = "post-quantum")]
+    fn admit_kem_identity<'a>(
+        &self,
+        contact_id: &str,
+        kem_identity: Option<&'a [u8]>,
+    ) -> Result<(&'a [u8], crate::crypto::pq_x3dh::MLKEMEncapsulation), String> {
+        let key = kem_identity.ok_or_else(|| {
+            format!(
+                "KEM_IDENTITY_REQUIRED: the first message from device {contact_id} names no KEM \
+                 identity key — sent by a core older than the responder's proof of the initiator"
+            )
+        })?;
+        let fingerprint = crate::orchestration::pq_prekey_plan::kem_identity_fingerprint(key);
+        if let Some(pinned) = self.lifecycle.pinned_kem_identity(contact_id)
+            && *pinned != fingerprint
+        {
+            tracing::error!(
+                target: "crypto::security",
+                contact_id = %contact_id,
+                "first message names a KEM identity key other than the one pinned for its device"
+            );
+            return Err(format!(
+                "KEM_IDENTITY_CHANGED: device {contact_id} presented a KEM identity key other than \
+                 the pinned one"
+            ));
+        }
+        let answer = crate::crypto::pq_x3dh::mlkem1024_encapsulate(key)
+            .map_err(|e| format!("KEM_IDENTITY_INVALID: {e}"))?;
+        Ok((key, answer))
     }
 
     /// RESPONDER init of one message that does not wait in the queue — a sibling's SENDER_SYNC.
@@ -1691,50 +1772,7 @@ impl Orchestrator {
             suite_id: decoded.suite_id,
             pq_message_epoch: decoded.pq_message_epoch,
             pq_ratchet_field: decoded.pq_ratchet_field,
-        };
-
-        self.lifecycle
-            .decrypt_ratchet_message(contact_id, &encrypted_message)
-    }
-
-    /// Component-based decrypt. The caller MUST pass the DR message's `suite_id`,
-    /// `pq_message_epoch` and `pq_ratchet_field` from the wire (task #12): defaulting them to
-    /// classic made `SuiteID::PQ_RATCHET` traffic fail to decrypt because the reconstructed AEAD
-    /// associated data omitted the suite-3 epoch tag. `(classic, 0, None)` reproduces the old
-    /// behaviour for non-PQ suites.
-    pub fn decrypt_message_for(
-        &mut self,
-        contact_id: &str,
-        ephemeral_public_key: Vec<u8>,
-        message_number: u32,
-        content: &[u8],
-        suite_id: u16,
-        pq_message_epoch: u32,
-        pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
-    ) -> Result<Vec<u8>, String> {
-        use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
-
-        let sealed_box = content;
-
-        if sealed_box.len() < 12 {
-            return Err("sealed_box too short".to_string());
-        }
-        let nonce = sealed_box[..12].to_vec();
-        let ciphertext = sealed_box[12..].to_vec();
-
-        let dh_public_key: [u8; 32] = ephemeral_public_key
-            .try_into()
-            .map_err(|_| "ephemeral_public_key must be 32 bytes".to_string())?;
-
-        let encrypted_message = EncryptedRatchetMessage {
-            dh_public_key,
-            message_number,
-            ciphertext,
-            nonce,
-            previous_chain_length: 0,
-            suite_id,
-            pq_message_epoch,
-            pq_ratchet_field,
+            identity_proof_ciphertext: decoded.identity_proof_ciphertext,
         };
 
         self.lifecycle
@@ -2365,7 +2403,7 @@ mod tests {
     /// orchestrator derives msg_num/kem_ct from `data` via the canonical parser.
     fn packed_wire(msg_num: u32, kem_ct: Option<&[u8]>) -> Vec<u8> {
         crate::wire_payload::pack(
-            &[7u8; 32], msg_num, 0, 0, 0, 1, kem_ct,
+            &[7u8; 32], msg_num, 0, 0, 0, 1, kem_ct, None, None,
             &[0u8; 32], // sealed box (never decrypted in these tests)
             0, None,
         )
@@ -2727,6 +2765,271 @@ mod pqxdh_v2_tests {
         alice
             .init_session_with_bundle("bob", x3dh, kyber, false)
             .unwrap();
+    }
+
+    // ── The initiator proves its KEM identity key (decisions/responder-authenticates-initiator-by-kem.md)
+
+    /// `wire` repacked without the answer to the KEM identity key — what a carrier that rebuilds
+    /// a message from components delivers.
+    fn without_answer(wire: &[u8]) -> Vec<u8> {
+        let d = crate::wire_payload::unpack(wire).unwrap();
+        crate::wire_payload::pack(
+            &d.dh_public_key,
+            d.message_number,
+            d.one_time_prekey_id,
+            d.kyber_otpk_id,
+            d.previous_chain_length,
+            d.suite_id,
+            d.kem_ciphertext.as_deref(),
+            d.kem_identity.as_deref(),
+            None,
+            &d.sealed_box,
+            d.pq_message_epoch,
+            d.pq_ratchet_field,
+        )
+        .unwrap()
+    }
+
+    /// A hybrid key other than the one `device` holds — and with it another KEM identity key.
+    fn another_hybrid_key() -> Vec<u8> {
+        use crate::crypto::provider::CryptoProvider;
+        use crate::crypto::suites::hybrid::HybridSuiteProvider;
+        HybridSuiteProvider::generate_signature_keys()
+            .unwrap()
+            .0
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn the_responder_knows_the_initiator_once_it_reads_the_answer() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        let first = crate::wire_payload::unpack(&msg0).unwrap();
+        assert_eq!(
+            first.kem_identity,
+            Some(
+                alice
+                    .lifecycle
+                    .client
+                    .key_manager()
+                    .kem_identity_public()
+                    .unwrap()
+            ),
+            "the first flight names the initiator's KEM identity key"
+        );
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+        assert_eq!(
+            bob.get_session_health("alice").unwrap().pq_authentication,
+            PqAuthentication::Received,
+            "not proven by the first flight"
+        );
+
+        let reply = bob.encrypt_bytes_for("alice", b"reply").unwrap();
+        let answer = crate::wire_payload::unpack(&reply).unwrap();
+        assert_eq!(
+            answer.identity_proof_ciphertext.map(|c| c.len()),
+            Some(1568)
+        );
+        assert_eq!(alice.decrypt_bytes_for("bob", &reply).unwrap(), b"reply");
+
+        let proof = alice.encrypt_bytes_for("bob", b"proof").unwrap();
+        assert_eq!(bob.decrypt_bytes_for("alice", &proof).unwrap(), b"proof");
+        assert_eq!(
+            bob.get_session_health("alice").unwrap().pq_authentication,
+            PqAuthentication::ReceivedProven
+        );
+        let after = bob.encrypt_bytes_for("alice", b"after").unwrap();
+        assert_eq!(
+            crate::wire_payload::unpack(&after)
+                .unwrap()
+                .identity_proof_ciphertext,
+            None,
+            "the answer stops once the initiator proved itself"
+        );
+        assert_eq!(alice.decrypt_bytes_for("bob", &after).unwrap(), b"after");
+    }
+
+    /// The point of it: a sender holding everything but the KEM identity key — the X25519 key and
+    /// a session that opened — cannot read the reply.
+    #[test]
+    fn an_initiator_without_the_kem_identity_key_cannot_read_the_answer() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+        let reply = bob.encrypt_bytes_for("alice", b"reply").unwrap();
+
+        alice
+            .lifecycle
+            .client
+            .key_manager_mut()
+            .set_hybrid_signature_private(another_hybrid_key())
+            .unwrap();
+        assert!(alice.decrypt_bytes_for("bob", &reply).is_err());
+        assert_eq!(
+            bob.get_session_health("alice").unwrap().pq_authentication,
+            PqAuthentication::Received
+        );
+    }
+
+    /// The answer must reach the core with the message: without it the reply does not read, and
+    /// nothing is lost — the same reply with it still does.
+    #[test]
+    fn a_reply_that_lost_its_answer_does_not_read() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+        let reply = bob.encrypt_bytes_for("alice", b"reply").unwrap();
+
+        let err = alice
+            .decrypt_bytes_for("bob", &without_answer(&reply))
+            .unwrap_err();
+        assert!(err.contains("KEM identity answer missing"), "{err}");
+        assert_eq!(alice.decrypt_bytes_for("bob", &reply).unwrap(), b"reply");
+    }
+
+    #[test]
+    fn a_first_flight_that_names_no_kem_identity_key_is_refused() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let out = alice.encrypt_message_for("bob", b"old").unwrap();
+        let mut header = out.header.clone().unwrap();
+        header.kem_identity.clear();
+        let stripped = OutgoingEncrypted {
+            header: Some(header),
+            ..out
+        }
+        .pack()
+        .unwrap();
+        let err = respond(&mut bob, &alice, "alice", &stripped).unwrap_err();
+        assert!(err.starts_with("KEM_IDENTITY_REQUIRED"), "{err}");
+        assert!(!bob.lifecycle.has_active_session("alice"));
+    }
+
+    /// Swapped in transit, the key is not pinned: it is bound into the root key, so the first
+    /// message stops decrypting.
+    #[test]
+    fn a_kem_identity_key_swapped_in_transit_fails_the_first_message() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let out = alice.encrypt_message_for("bob", b"first").unwrap();
+        let mut header = out.header.clone().unwrap();
+        let mut mallory = device("mallory");
+        header.kem_identity = mallory
+            .lifecycle
+            .client
+            .key_manager_mut()
+            .kem_identity_public()
+            .unwrap();
+        let swapped = OutgoingEncrypted {
+            header: Some(header),
+            ..out
+        }
+        .pack()
+        .unwrap();
+        assert!(respond(&mut bob, &alice, "alice", &swapped).is_err());
+        assert!(bob.lifecycle.pinned_kem_identity("alice").is_none());
+    }
+
+    /// Once pinned, a device that names another KEM identity key does not open a state — the case
+    /// where the X25519 key and the certificate are an adversary's to present, and this key is not.
+    #[test]
+    fn a_changed_kem_identity_key_is_refused_and_the_held_session_kept() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+        let held = bob.lifecycle.active_session_id("alice");
+
+        alice
+            .lifecycle
+            .client
+            .key_manager_mut()
+            .set_hybrid_signature_private(another_hybrid_key())
+            .unwrap();
+        alice.lifecycle.client.remove_session("bob");
+        open(&mut alice, &mut bob, false);
+        let renewal = alice.encrypt_bytes_for("bob", b"renewal").unwrap();
+        let err = respond(&mut bob, &alice, "alice", &renewal).unwrap_err();
+        assert!(err.starts_with("KEM_IDENTITY_CHANGED"), "{err}");
+        assert_eq!(bob.lifecycle.active_session_id("alice"), held);
+    }
+
+    /// Both halves of the proof live in the session record: an initiator that restarts before the
+    /// reply, and a responder that restarts before the proof, still complete it.
+    #[test]
+    fn the_proof_survives_a_restart_on_both_sides() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+
+        let restart = |o: &mut Orchestrator, peer: &str| {
+            let bytes = o.lifecycle.export_session_bytes_for(peer).unwrap();
+            o.lifecycle.client.remove_session(peer);
+            o.lifecycle.import_session_bytes(peer, &bytes).unwrap();
+        };
+        restart(&mut alice, "bob");
+        restart(&mut bob, "alice");
+
+        let reply = bob.encrypt_bytes_for("alice", b"reply").unwrap();
+        assert!(
+            crate::wire_payload::unpack(&reply)
+                .unwrap()
+                .identity_proof_ciphertext
+                .is_some()
+        );
+        assert_eq!(alice.decrypt_bytes_for("bob", &reply).unwrap(), b"reply");
+        restart(&mut alice, "bob");
+        let proof = alice.encrypt_bytes_for("bob", b"proof").unwrap();
+        assert_eq!(bob.decrypt_bytes_for("alice", &proof).unwrap(), b"proof");
+        assert_eq!(
+            bob.get_session_health("alice").unwrap().pq_authentication,
+            PqAuthentication::ReceivedProven
+        );
+    }
+
+    /// The pin is part of the orchestrator state the platform persists.
+    #[test]
+    fn the_kem_identity_pin_survives_a_restart() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+        let pinned = *bob.lifecycle.pinned_kem_identity("alice").unwrap();
+
+        let state = bob
+            .lifecycle
+            .export_orchestrator_state_cfe(&Default::default())
+            .unwrap();
+        let mut restarted = device("bob");
+        restarted
+            .lifecycle
+            .import_orchestrator_state_cfe(&state)
+            .unwrap();
+        assert_eq!(
+            restarted.lifecycle.pinned_kem_identity("alice"),
+            Some(&pinned)
+        );
+    }
+
+    /// The key derives from the hybrid key the private-key record already carries, so a restore
+    /// from that record names the same key — no new storage to lose.
+    #[test]
+    fn the_kem_identity_key_is_restored_with_the_private_keys() {
+        let alice = device("alice");
+        let client = &alice.lifecycle.client;
+        let restored = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(
+            client.to_private_keys_cfe().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.key_manager().kem_identity_public().unwrap(),
+            client.key_manager().kem_identity_public().unwrap()
+        );
     }
 
     #[test]

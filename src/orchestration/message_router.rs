@@ -466,6 +466,8 @@ mod tests {
             0,
             1,
             Some(&[7; 1568]),
+            None,
+            None,
             &[9; 40],
             0,
             None,
@@ -674,7 +676,8 @@ mod tests {
         let mut router = MessageRouter::new();
         let mut lifecycle = make_lifecycle("alice");
         let wire_payload =
-            crate::wire_payload::pack(&[4; 32], 5, 0, 0, 0, 1, None, &[9; 40], 0, None).unwrap();
+            crate::wire_payload::pack(&[4; 32], 5, 0, 0, 0, 1, None, None, None, &[9; 40], 0, None)
+                .unwrap();
         let certificate = crate::crypto::sealed_sender::SenderCertificate {
             user_id: "bob-account".to_string(),
             domain: "konstruct.cc".to_string(),

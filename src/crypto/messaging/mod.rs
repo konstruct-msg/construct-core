@@ -216,6 +216,18 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
     /// - Может выполнить DH ratchet step
     fn decrypt(&mut self, message: &Self::EncryptedMessage) -> Result<Vec<u8>, String>;
 
+    /// `decrypt`, with the secret the responder encapsulated to our KEM identity key when the
+    /// message carried its ciphertext (decisions/responder-authenticates-initiator-by-kem.md).
+    /// Decapsulating needs the device's key manager, which the session does not hold.
+    fn decrypt_with_identity_secret(
+        &mut self,
+        message: &Self::EncryptedMessage,
+        identity_secret: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let _ = identity_secret;
+        self.decrypt(message)
+    }
+
     /// Получить session ID
     fn session_id(&self) -> &str;
 
