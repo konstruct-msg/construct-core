@@ -14,8 +14,10 @@
 //! Vectors: `construct-protos/conformance/knst_history_snapshot.json`, vendored in
 //! `tests/conformance/`.
 
+pub mod channel;
 pub mod cth1;
 pub mod discovery;
+pub mod frames;
 mod wire;
 
 /// 512 MiB. A record announcing more is malformed and nothing is allocated for it. A legal
@@ -107,13 +109,22 @@ pub(crate) mod vectors {
     //! `construct-protos/conformance/knst_history_snapshot.json` (construct-protos 4eb233d); a
     //! change there is copied here in the same change that makes the core pass it.
 
-    pub fn all() -> Vec<serde_json::Value> {
+    fn root() -> serde_json::Value {
         let text = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/conformance/knst_history_snapshot.json"
         ));
-        let root: serde_json::Value = serde_json::from_str(text).expect("vectors parse");
-        root["vectors"].as_array().expect("vectors array").clone()
+        serde_json::from_str(text).expect("vectors parse")
+    }
+
+    pub fn all() -> Vec<serde_json::Value> {
+        root()["vectors"].as_array().expect("vectors array").clone()
+    }
+
+    /// The fixed test keys the crypto vectors were made with (`$keys`).
+    #[cfg(feature = "post-quantum")]
+    pub fn keys() -> serde_json::Value {
+        root()["$keys"].clone()
     }
 
     pub fn named(name: &str) -> serde_json::Value {
