@@ -715,7 +715,7 @@ mod tests {
             }
             checked += 1;
         }
-        assert_eq!(checked, 16, "the CTH1 vectors did not all run");
+        assert_eq!(checked, 17, "the CTH1 vectors did not all run");
     }
 
     fn manifest(phase: u8) -> Vec<u8> {

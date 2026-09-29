@@ -285,6 +285,27 @@ mod tests {
     }
 
     #[test]
+    fn the_channel_key_vector_holds_for_both_salts() {
+        let v = crate::history::vectors::named("channel_key_both_salts");
+        let hex = |k: &str| crate::history::vectors::hex_field(&v, k);
+        let snapshot: [u8; 16] = hex("snapshot_id").try_into().unwrap();
+        let nearby = channel_key(
+            &hex("ecdh"),
+            &hex("kem_shared_secret"),
+            Salt::Nearby,
+            &snapshot,
+        );
+        let file = channel_key(
+            &hex("ecdh"),
+            &hex("kem_shared_secret"),
+            Salt::File,
+            &snapshot,
+        );
+        assert_eq!(nearby.to_vec(), hex("nearby_key"));
+        assert_eq!(file.to_vec(), hex("file_key"));
+    }
+
+    #[test]
     fn the_salts_keep_nearby_and_file_keys_apart() {
         let a = channel_key(&[1; 32], &[2; 32], Salt::Nearby, &SNAPSHOT);
         let b = channel_key(&[1; 32], &[2; 32], Salt::File, &SNAPSHOT);

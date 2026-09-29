@@ -752,6 +752,132 @@ mod tests {
 
     const USER: [u8; 16] = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1];
 
+    /// The receiving device of the vectors, from the secrets `$keys` publishes: enough to open a
+    /// file (identity agreement and Kyber decapsulation), nothing to sign with.
+    struct VectorReceiver;
+
+    impl VectorReceiver {
+        fn secret(name: &str) -> Vec<u8> {
+            crate::history::vectors::hex_field(&crate::history::vectors::keys(), name)
+        }
+    }
+
+    impl DeviceKeys for VectorReceiver {
+        fn identity_public(&self) -> Result<[u8; 32], HistoryFailure> {
+            Ok(Self::secret("receiver_identity_public").try_into().unwrap())
+        }
+        fn hybrid_public(&self) -> Result<Vec<u8>, HistoryFailure> {
+            Err(HistoryFailure::LocalKeysUnavailable)
+        }
+        fn current_kyber_key_id(&self) -> Result<u32, HistoryFailure> {
+            Ok(crate::history::vectors::keys()["kyber_key_id"]
+                .as_u64()
+                .unwrap() as u32)
+        }
+        fn sign_hybrid(&self, _: &[u8]) -> Result<Vec<u8>, HistoryFailure> {
+            Err(HistoryFailure::LocalKeysUnavailable)
+        }
+        fn kyber_decapsulate(
+            &self,
+            _: u32,
+            kem_ct: &[u8],
+        ) -> Result<Zeroizing<Vec<u8>>, HistoryFailure> {
+            #[allow(deprecated)]
+            use ml_kem::{Decapsulate, ExpandedKeyEncoding, MlKem1024};
+            let expanded = Self::secret("kyber_secret");
+            #[allow(deprecated)]
+            let dk = ml_kem::DecapsulationKey::<MlKem1024>::from_expanded_bytes(
+                expanded.as_slice().try_into().unwrap(),
+            )
+            .unwrap();
+            Ok(Zeroizing::new(
+                dk.decapsulate_slice(kem_ct).unwrap().to_vec(),
+            ))
+        }
+        fn file_channel_key(
+            &self,
+            sender_eph: &[u8; 32],
+            kem_key_id: u32,
+            kem_ct: &[u8],
+            snapshot_id: &[u8; 16],
+        ) -> Result<Zeroizing<[u8; 32]>, HistoryFailure> {
+            let secret: [u8; 32] = Self::secret("receiver_identity_secret").try_into().unwrap();
+            let ecdh = x25519_dalek::StaticSecret::from(secret)
+                .diffie_hellman(&x25519_dalek::PublicKey::from(*sender_eph));
+            let kem = self.kyber_decapsulate(kem_key_id, kem_ct)?;
+            Ok(channel::channel_key(
+                ecdh.as_bytes(),
+                &kem,
+                Salt::File,
+                snapshot_id,
+            ))
+        }
+    }
+
+    fn open_vector_file(bytes: &[u8]) -> Result<Vec<Event>, HistoryFailure> {
+        let keys = crate::history::vectors::keys();
+        let known = KnownKeys {
+            identity_public: crate::history::vectors::hex_field(&keys, "offering_identity_public"),
+            hybrid_public: crate::history::vectors::hex_field(&keys, "hybrid_public"),
+        };
+        let mut receiver = Receiver::new(Source::File, USER);
+        let (mut events, mut at) = (Vec::new(), 0);
+        drive(&mut receiver, bytes, &mut at, &mut events)?;
+        receiver.accept(&VectorReceiver, &known, &Pin::BundleOnly)?;
+        assert_eq!(
+            drive(&mut receiver, bytes, &mut at, &mut events)?,
+            Status::Done
+        );
+        receiver.end_of_input()?;
+        Ok(events)
+    }
+
+    /// The whole vector file — header, sealed chunks, EOF — opens with the vector's own receiver
+    /// keys, and the blob that crosses the chunk boundary arrives byte-exact.
+    #[test]
+    fn the_cthf_file_vector_opens_and_its_blob_is_byte_exact() {
+        use sha2::{Digest, Sha256};
+        let v = crate::history::vectors::named("cthf_file_stream");
+        let events = open_vector_file(&crate::history::vectors::hex_field(&v, "hex")).unwrap();
+        let blob = media_bytes(&events);
+        assert_eq!(blob.len() as u64, v["media_len"].as_u64().unwrap());
+        assert_eq!(
+            hex::encode(Sha256::digest(&blob)),
+            v["media_sha256"].as_str().unwrap()
+        );
+        assert!(events.contains(&Event::MediaStart {
+            media_id: v["media_id"].as_str().unwrap().to_owned(),
+            mime_type: "video/mp4".to_owned(),
+            byte_len: blob.len() as u64,
+        }));
+        assert_eq!(events.last(), Some(&Event::End));
+    }
+
+    #[test]
+    fn the_cthf_file_vector_with_its_chunks_swapped_does_not_open() {
+        let v = crate::history::vectors::named("cthf_chunks_swapped");
+        assert_eq!(v["from"], "V27");
+        let file = crate::history::vectors::hex_field(
+            &crate::history::vectors::named("cthf_file_stream"),
+            "hex",
+        );
+        // Frame boundaries from the length prefixes.
+        let first = CTHF_HEADER_LEN;
+        let first_len =
+            LEN_PREFIX + u32::from_le_bytes(file[first..first + 4].try_into().unwrap()) as usize;
+        let second = first + first_len;
+        let second_len =
+            LEN_PREFIX + u32::from_le_bytes(file[second..second + 4].try_into().unwrap()) as usize;
+        let mut swapped = file[..first].to_vec();
+        swapped.extend_from_slice(&file[second..second + second_len]);
+        swapped.extend_from_slice(&file[first..first + first_len]);
+        swapped.extend_from_slice(&file[second + second_len..]);
+        assert_eq!(
+            open_vector_file(&swapped),
+            Err(HistoryFailure::ChunkOpenFailed)
+        );
+    }
+
     fn manifest(snapshot_id: [u8; 16], phase: u8) -> Vec<u8> {
         let mut m = vec![wire::tag(1, 0), 1, wire::tag(2, 2), 16];
         m.extend_from_slice(&snapshot_id);
@@ -953,13 +1079,7 @@ mod tests {
         let impostor = TestDevice::new(7);
         let mut sender = Sender::nearby(&old, USER, &new.peer(), false, None).unwrap();
         let mut receiver = Receiver::new(Source::Nearby, USER);
-        drive(
-            &mut receiver,
-            sender.first_frame(),
-            &mut 0,
-            &mut Vec::new(),
-        )
-        .unwrap();
+        drive(&mut receiver, sender.first_frame(), &mut 0, &mut Vec::new()).unwrap();
         // The impostor cannot pass the opening's check (the opening names the new device) — so
         // build its reply by hand, signed with its own key.
         let opening = Opening::parse(sender.first_frame()).unwrap();

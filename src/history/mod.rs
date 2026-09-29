@@ -113,8 +113,8 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 pub(crate) mod vectors {
     //! The vendored cross-client vectors. A copy of
-    //! `construct-protos/conformance/knst_history_snapshot.json` (construct-protos 4eb233d); a
-    //! change there is copied here in the same change that makes the core pass it.
+    //! `construct-protos/conformance/knst_history_snapshot.json` (V1–V28); a change there is
+    //! copied here in the same change that makes the core pass it.
 
     fn root() -> serde_json::Value {
         let text = include_str!(concat!(
