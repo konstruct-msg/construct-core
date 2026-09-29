@@ -220,11 +220,12 @@ pub enum IncomingEvent {
         /// Server-assigned message UUID (used for ACK deduplication).
         message_id: String,
         from: String,
+        /// The wire payload as it arrived. Everything the core routes on — the message number,
+        /// the handshake header — is read from it here, never taken from a platform's copy of
+        /// the parse (the event carried `msg_num`, `kem_ct` and `otpk_id` beside it until
+        /// 2026-09-29; the core ignored two and used the third only when `data` did not parse,
+        /// which is exactly when nothing could decrypt it).
         data: Vec<u8>,
-        msg_num: u32,
-        /// ML-KEM-768 ciphertext (empty if no PQ contribution in this message).
-        kem_ct: Vec<u8>,
-        otpk_id: u32,
         /// Content-type from the server envelope (proto ContentType enum value).
         /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
         content_type: u8,
@@ -313,9 +314,9 @@ pub enum IncomingEvent {
     HeartbeatReceived {
         contact_id: String,
         message_id: String,
-        /// Encrypted heartbeat payload (wire format, same as regular DR message).
+        /// Encrypted heartbeat payload (wire format, same as regular DR message). The message
+        /// number is read from it, as for `MessageReceived`.
         data: Vec<u8>,
-        msg_num: u32,
     },
 }
 

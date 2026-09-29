@@ -24,6 +24,13 @@ namespace construct_core {
     [Throws=CryptoError]
     WirePayload wire_payload_unpack(bytes data);
 
+    /// What a received payload is, for routing: its message number and whether it can open a
+    /// receiving session. One parse, in the core, from the bytes as they arrived — a platform
+    /// keeps the payload and this, not a copy of the parse (`ChatMessage` carried nine parsed
+    /// fields beside the payload until 2026-09-29 and sent three of them back in with it).
+    [Throws=CryptoError]
+    WireSummary wire_summary(bytes wire_payload);
+
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
@@ -625,6 +632,12 @@ enum ReceivingInitKind {
     "MidRatchet",
 };
 
+/// See `wire_summary`.
+dictionary WireSummary {
+    u32 message_number;
+    ReceivingInitKind init_kind;
+};
+
 /// The wire-visible shape of a queued message, for `receiving_init_kind`.
 /// No ciphertext: deciding whether a message *could* open a session must not require its body.
 dictionary ReceivingInitCarrier {
@@ -704,7 +717,7 @@ interface RustAckStore {
 /// Platform creates one of these variants and passes to `handle_event()`.
 [Enum]
 interface CfeIncomingEvent {
-    MessageReceived(string message_id, string from, bytes data, u32 msg_num, bytes kem_ct, u32 otpk_id, u8 content_type, SenderCertificate? sender_certificate);
+    MessageReceived(string message_id, string from, bytes data, u8 content_type, SenderCertificate? sender_certificate);
     OutgoingMessage(string contact_id, string message_id, bytes plaintext, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
@@ -721,7 +734,7 @@ interface CfeIncomingEvent {
     /// Platform ACK DB lookup result — response to `CheckAckInDb` action.
     AckDbResult(string message_id, boolean is_processed);
     /// A heartbeat message was received from the peer.
-    HeartbeatReceived(string contact_id, string message_id, bytes data, u32 msg_num);
+    HeartbeatReceived(string contact_id, string message_id, bytes data);
     /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id` — the device its sender
     /// certificate names; `payload` is the envelope's sealed box. Answered with `SessionRetired` +
     /// `ResendMessage`, `ResendMessage` alone, or nothing when the error is stale.

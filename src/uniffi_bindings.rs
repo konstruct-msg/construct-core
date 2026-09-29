@@ -1411,6 +1411,31 @@ mod tests {
         orch.pending_message_count(contact_id)
     }
 
+    fn packed(message_number: u32, kem: Option<&[u8]>) -> Vec<u8> {
+        crate::wire_payload::pack(&[7u8; 32], message_number, 0, 0, 0, 1, kem, None, None, &[0u8; 32], 0, None)
+            .unwrap()
+    }
+
+    /// `wire_summary` reads the number and the kind from the payload itself. A handshake header
+    /// opens at any message number (`decisions/sessions-renew-by-sending.md`), so the kind must
+    /// not be derived from the number.
+    ///
+    /// Mutation: classify by `message_number == 0` — the renewal case (number 9 with a header)
+    /// reddens.
+    #[test]
+    fn wire_summary_reads_number_and_kind_from_the_payload() {
+        let first = wire_summary(packed(0, Some(&[5u8; 1568]))).unwrap();
+        assert_eq!(first, WireSummary { message_number: 0, init_kind: ReceivingInitKind::Handshake });
+
+        let renewal = wire_summary(packed(9, Some(&[5u8; 1568]))).unwrap();
+        assert_eq!(renewal, WireSummary { message_number: 9, init_kind: ReceivingInitKind::Handshake });
+
+        let plain = wire_summary(packed(9, None)).unwrap();
+        assert_eq!(plain, WireSummary { message_number: 9, init_kind: ReceivingInitKind::MidRatchet });
+
+        assert!(wire_summary(vec![0xFF; 7]).is_err(), "a payload that does not parse has no summary");
+    }
+
     /// A message carrying the handshake header from `from`, the shape that opens a receiving
     /// session.
     fn queued_first_message(id: &str, from: &str) -> CfeIncomingEvent {
@@ -1432,9 +1457,6 @@ mod tests {
                 None,
             )
             .unwrap(),
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: 0,
             sender_certificate: None,
         }
@@ -2222,6 +2244,31 @@ pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
         pqxdh_v2: decoded.pqxdh_v2,
         kem_identity: decoded.kem_identity,
         identity_proof_ciphertext: decoded.identity_proof_ciphertext,
+    })
+}
+
+/// See the UDL `wire_summary`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireSummary {
+    pub message_number: u32,
+    pub init_kind: ReceivingInitKind,
+}
+
+/// One parse of a received payload into what a platform routes on. The classification is the
+/// same `receiving_init_kind` the carrier form asks; only the input is the payload itself.
+pub fn wire_summary(wire_payload: Vec<u8>) -> Result<WireSummary, CryptoError> {
+    let d = crate::wire_payload::unpack(&wire_payload).map_err(|e| CryptoError::SerializationFailed {
+        message: format!("wire_summary: {e}"),
+    })?;
+    let carrier = crate::orchestration::ReceivingInitCarrier {
+        message_number: d.message_number,
+        one_time_prekey_id: d.one_time_prekey_id,
+        kem_ciphertext_bytes: d.kem_ciphertext.as_ref().map_or(0, |k| k.len() as u32),
+        pq_message_epoch: d.pq_message_epoch,
+    };
+    Ok(WireSummary {
+        message_number: d.message_number,
+        init_kind: crate::orchestration::receiving_init_kind(&carrier).into(),
     })
 }
 
@@ -3246,9 +3293,6 @@ pub enum CfeIncomingEvent {
         message_id: String,
         from: String,
         data: Vec<u8>,
-        msg_num: u32,
-        kem_ct: Vec<u8>,
-        otpk_id: u32,
         content_type: u8,
         sender_certificate: Option<SenderCertificate>,
     },
@@ -3293,7 +3337,6 @@ pub enum CfeIncomingEvent {
         contact_id: String,
         message_id: String,
         data: Vec<u8>,
-        msg_num: u32,
     },
     /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id`; `payload` is its sealed box.
     DecryptionErrorReceived {
@@ -3310,18 +3353,12 @@ impl CfeIncomingEvent {
                 message_id,
                 from,
                 data,
-                msg_num,
-                kem_ct,
-                otpk_id,
                 content_type,
                 sender_certificate,
             } => MessageReceived {
                 message_id,
                 from,
                 data,
-                msg_num,
-                kem_ct,
-                otpk_id,
                 content_type,
                 sender_certificate,
             },
@@ -3375,12 +3412,10 @@ impl CfeIncomingEvent {
                 contact_id,
                 message_id,
                 data,
-                msg_num,
             } => HeartbeatReceived {
                 contact_id,
                 message_id,
                 data,
-                msg_num,
             },
             Self::DecryptionErrorReceived {
                 contact_id,

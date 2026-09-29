@@ -278,21 +278,9 @@ impl Orchestrator {
                 message_id,
                 from,
                 data,
-                msg_num,
-                kem_ct,
-                otpk_id,
                 content_type,
                 sender_certificate,
-            } => self.handle_message_received(
-                message_id,
-                from,
-                data,
-                msg_num,
-                kem_ct,
-                otpk_id,
-                content_type,
-                sender_certificate,
-            ),
+            } => self.handle_message_received(message_id, from, data, content_type, sender_certificate),
             IncomingEvent::OutgoingMessage {
                 contact_id,
                 message_id,
@@ -327,8 +315,7 @@ impl Orchestrator {
                 contact_id,
                 message_id,
                 data,
-                msg_num,
-            } => self.handle_heartbeat_received(contact_id, message_id, data, msg_num),
+            } => self.handle_heartbeat_received(contact_id, message_id, data),
             IncomingEvent::DecryptionErrorReceived {
                 contact_id,
                 payload,
@@ -1781,37 +1768,35 @@ impl Orchestrator {
 
     // ── Event handlers ────────────────────────────────────────────────────────
 
+    /// The message number the router needs, read from the payload itself. `None` when the
+    /// payload does not parse: decrypt uses the same parser, so such a message can never open,
+    /// and routing it would spuriously start a receiving open or a DECRYPTION_ERROR.
+    fn routing_message_number(data: &[u8]) -> Result<u32, String> {
+        crate::wire_payload::unpack(data)
+            .map(|d| d.message_number)
+            .map_err(|e| e.to_string())
+    }
+
+    fn malformed(message_id: &str, from: &str, reason: String) -> Vec<Action> {
+        vec![Action::NotifyError {
+            code: "MALFORMED_WIRE_PAYLOAD".to_string(),
+            message: format!("{reason} (message {message_id} from {from})"),
+        }]
+    }
+
     fn handle_message_received(
         &mut self,
         message_id: String,
         from: String,
         data: Vec<u8>,
-        msg_num: u32,
-        kem_ct: Vec<u8>,
-        _otpk_id: u32,
         content_type: u8,
         sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
     ) -> Vec<Action> {
-        // `data` IS the wire payload — derive the routing fields from the canonical
-        // parser instead of trusting the platform's copy of the header parse.
-        // Android passes zeros (it has no wire-format knowledge at all); the event's
-        // msg_num/kem_ct stay only as a fallback for callers that still fill them
-        // (iOS).
-        let (msg_num, kem_ct) = {
-            match crate::wire_payload::unpack(&data) {
-                Ok(d) => (d.message_number, d.kem_ciphertext.unwrap_or_default()),
-                // Legacy caller supplied fields — keep its exact routing behavior.
-                Err(_) if msg_num != 0 || !kem_ct.is_empty() => (msg_num, kem_ct),
-                // Unparseable and nothing to fall back on: decrypt uses this same
-                // parser, so the payload can never decrypt — routing it would
-                // spuriously trigger a teardown.
-                Err(e) => {
-                    return vec![Action::NotifyError {
-                        code: "MALFORMED_WIRE_PAYLOAD".to_string(),
-                        message: format!("{e} (message {message_id} from {from})"),
-                    }];
-                }
-            }
+        // A KEM ciphertext on the wire is the initiator's handshake header (PQXDH v2); the core
+        // decapsulates it itself, when this message opens a session.
+        let msg_num = match Self::routing_message_number(&data) {
+            Ok(n) => n,
+            Err(e) => return Self::malformed(&message_id, &from, e),
         };
 
         // All content types — including CALL_SIGNAL (12) — go through the full
@@ -1825,9 +1810,6 @@ impl Orchestrator {
             content_type,
         };
 
-        // A KEM ciphertext on the wire is the initiator's handshake header (PQXDH v2). The core
-        // decapsulates it itself, when this message opens a session; nothing for the platform.
-        let _ = kem_ct;
         let mut actions = Vec::new();
 
         let decision = self.router.route_message(&mut self.lifecycle, &incoming);
@@ -2173,8 +2155,11 @@ impl Orchestrator {
         contact_id: String,
         message_id: String,
         data: Vec<u8>,
-        msg_num: u32,
     ) -> Vec<Action> {
+        let msg_num = match Self::routing_message_number(&data) {
+            Ok(n) => n,
+            Err(e) => return Self::malformed(&message_id, &contact_id, e),
+        };
         // Route the heartbeat through the normal decrypt path.
         // A content_type we treat as "heartbeat" — content type 13.
         let msg = crate::orchestration::message_router::IncomingMessage {
@@ -2418,9 +2403,6 @@ mod tests {
             message_id: "msg-001".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, Some(&[5; 1568])),
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: 0,
         });
         // A handshake with no session: open from it (no active session → NeedSessionInit).
@@ -2431,6 +2413,39 @@ mod tests {
         assert!(!fetches.is_empty(), "expected OpenReceiving action");
     }
 
+    /// The message number is read from the payload, so a payload that does not parse is refused
+    /// before routing: decrypt uses the same parser, and a routed message that can never open
+    /// would start a receiving open or answer with a DECRYPTION_ERROR. Until 2026-09-29 the event
+    /// also carried the platform's parse, and a non-zero `msg_num` there routed such a payload.
+    ///
+    /// Mutation: route on a default message number when the parse fails — both events here
+    /// produce routing actions and this reddens.
+    #[test]
+    fn an_unparseable_payload_is_refused_not_routed() {
+        let mut o = make_orchestrator("alice");
+        let garbage = vec![0xFFu8; 7];
+        for actions in [
+            o.handle_event(IncomingEvent::MessageReceived {
+                sender_certificate: None,
+                message_id: "m-garbage".to_string(),
+                from: "bob".to_string(),
+                data: garbage.clone(),
+                content_type: 0,
+            }),
+            o.handle_event(IncomingEvent::HeartbeatReceived {
+                contact_id: "bob".to_string(),
+                message_id: "hb-garbage".to_string(),
+                data: garbage.clone(),
+            }),
+        ] {
+            assert_eq!(actions.len(), 1, "one refusal and nothing else: {actions:?}");
+            assert!(
+                matches!(&actions[0], Action::NotifyError { code, .. } if code == "MALFORMED_WIRE_PAYLOAD"),
+                "{actions:?}"
+            );
+        }
+    }
+
     #[test]
     fn forget_contact_state_clears_pending_router_state_before_re_add() {
         let mut o = make_orchestrator("alice");
@@ -2439,9 +2454,6 @@ mod tests {
             message_id: "old-backlog".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, Some(&[5; 1568])),
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: 0,
         });
         assert!(
@@ -2472,9 +2484,6 @@ mod tests {
             message_id: "msg-002".to_string(),
             from: "bob".to_string(),
             data: packed_wire(0, Some(&kem)),
-            msg_num: 0,
-            kem_ct: kem.to_vec(),
-            otpk_id: 0,
             content_type: 0,
         });
         let printed = format!("{actions:?}");
@@ -2492,9 +2501,6 @@ mod tests {
             message_id: "msg-003".to_string(),
             from: "bob".to_string(),
             data: vec![0u8; 4], // not a wire payload
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: 0,
         });
         assert!(
@@ -3615,9 +3621,6 @@ mod pqxdh_v2_tests {
             message_id: id.to_string(),
             from: from.to_string(),
             data: wire,
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: ct,
         })
     }
@@ -3672,9 +3675,6 @@ mod pqxdh_v2_tests {
             message_id: id.to_string(),
             from: from.to_string(),
             data: wire,
-            msg_num: 0,
-            kem_ct: vec![],
-            otpk_id: 0,
             content_type: 0,
         })
     }
