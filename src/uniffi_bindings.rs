@@ -1476,6 +1476,86 @@ mod tests {
         assert!(!sibling.device_copy_tag_matches(tag, "m1".into(), sender_key));
     }
 
+    /// The receiver's channel key is the schedule the sender computes from public keys alone —
+    /// the Swift `TransferCrypto.deriveChannelKey(salt: .file)` it replaces.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn the_history_file_channel_key_is_the_one_the_sender_derives() {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        let (receiver, _) = named_core();
+        core_spk(&receiver);
+        let spk = receiver.current_kyber_spk_upload().unwrap().unwrap();
+        let identity = receiver
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+
+        // The sender's side: an ephemeral X25519 pair and an encapsulation to the Kyber SPK.
+        let eph = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let eph_pub = x25519_dalek::PublicKey::from(&eph).to_bytes().to_vec();
+        let peer: [u8; 32] = identity.try_into().unwrap();
+        let dh = eph.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
+        let enc = mlkem1024_encapsulate(spk.public_key.clone()).unwrap();
+        let snapshot = vec![7u8; 16];
+        let mut ikm = dh.as_bytes().to_vec();
+        ikm.extend_from_slice(&enc.shared_secret);
+        let mut expected = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(b"construct_history_file_v1"), &ikm)
+            .expand(&snapshot, &mut expected)
+            .unwrap();
+
+        let key = receiver
+            .history_file_channel_key(
+                eph_pub.clone(),
+                spk.key_id,
+                enc.ciphertext.clone(),
+                snapshot,
+            )
+            .unwrap();
+        assert_eq!(key, expected);
+
+        let other_snapshot = receiver
+            .history_file_channel_key(eph_pub, spk.key_id, enc.ciphertext, vec![8u8; 16])
+            .unwrap();
+        assert_ne!(
+            other_snapshot, expected,
+            "the snapshot id is bound into the key"
+        );
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn core_spk(core: &OrchestratorCore) {
+        if core.current_kyber_spk_upload().unwrap().is_none() {
+            core.begin_kyber_spk_rotation().unwrap();
+            assert!(core.commit_kyber_spk_rotation());
+        }
+    }
+
+    /// The bundle the core seals opens to this device's keys and id — the same format the
+    /// platform sealed from its Keychain copies.
+    #[test]
+    fn the_own_recovery_bundle_opens_to_this_devices_keys() {
+        let (core, id) = named_core();
+        let vault_key = sr_generate_vault_key().unwrap();
+        let sealed = core
+            .seal_own_recovery_bundle(vault_key.clone(), 1_700_000_000)
+            .unwrap();
+        let opened = sr_open_recovery_bundle(vault_key, sealed).unwrap();
+        assert_eq!(
+            opened.device_signing_key,
+            core.get_signing_key_bytes().unwrap()
+        );
+        assert_eq!(
+            opened.device_identity_key,
+            core.get_identity_key_bytes().unwrap()
+        );
+        assert_eq!(opened.device_id, id);
+        assert_eq!(opened.created_at, 1_700_000_000);
+        assert!(core.seal_own_recovery_bundle(vec![0; 31], 0).is_err());
+    }
+
     #[test]
     fn an_mls_store_from_the_core_survives_export_and_import() {
         let (core, _) = named_core();
@@ -3019,6 +3099,31 @@ impl OrchestratorCore {
     ) -> bool {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.device_copy_tag_matches(&tag, &base_message_id, &peer_identity_public)
+    }
+
+    pub fn history_file_channel_key(
+        &self,
+        sender_eph_pub: Vec<u8>,
+        kem_key_id: u32,
+        kem_ciphertext: Vec<u8>,
+        snapshot_id: Vec<u8>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.history_file_channel_key(&sender_eph_pub, kem_key_id, &kem_ciphertext, &snapshot_id)
+            .map_err(|message| CryptoError::DecryptionFailed { message })
+    }
+
+    pub fn seal_own_recovery_bundle(
+        &self,
+        vault_key: Vec<u8>,
+        created_at: i64,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let key: [u8; 32] = vault_key
+            .try_into()
+            .map_err(|_| CryptoError::InvalidKeyData)?;
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.seal_own_recovery_bundle(&key, created_at)
+            .map_err(|message| CryptoError::EncryptionFailed { message })
     }
 
     pub fn new_mls_store(&self) -> Result<Arc<MlsStore>, MlsError> {

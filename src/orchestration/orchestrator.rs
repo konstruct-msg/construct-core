@@ -1425,6 +1425,77 @@ impl Orchestrator {
         Ok((private, bundle.verifying_key))
     }
 
+    /// The history-file (CTHF) channel key on the receiving side:
+    /// `HKDF-SHA256(ikm = X25519(identity, sender_eph) ‖ ML-KEM decapsulation of kem_ciphertext,
+    /// salt = "construct_history_file_v1", info = snapshot_id)`, 32 bytes. The same schedule as
+    /// the Swift `TransferCrypto.deriveChannelKey(salt: .file)` it replaces on the receiver.
+    ///
+    /// Returns the channel key rather than the X25519 output on purpose: a bare agreement with the
+    /// identity key would open every box sealed to this device, which is the key's power without
+    /// its name. Until the history module lands (decisions/history-transfer-protocol-in-the-core)
+    /// this is the one piece of that schedule that needs the identity secret.
+    pub fn history_file_channel_key(
+        &self,
+        sender_eph_pub: &[u8],
+        kem_key_id: u32,
+        kem_ciphertext: &[u8],
+        snapshot_id: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use zeroize::Zeroize;
+        const HISTORY_FILE_SALT: &[u8] = b"construct_history_file_v1";
+
+        let eph: [u8; 32] = sender_eph_pub
+            .try_into()
+            .map_err(|_| format!("sender ephemeral key is {} bytes", sender_eph_pub.len()))?;
+        let km = self.lifecycle.client.key_manager();
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        let mut ours: [u8; 32] = <_ as AsRef<[u8]>>::as_ref(secret)
+            .try_into()
+            .map_err(|_| "identity key is not 32 bytes".to_string())?;
+        let shared = x25519_dalek::StaticSecret::from(ours)
+            .diffie_hellman(&x25519_dalek::PublicKey::from(eph));
+        ours.zeroize();
+        let kem = self.kyber_prekey_decapsulate(kem_key_id, kem_ciphertext)?;
+
+        let mut ikm = Vec::with_capacity(32 + kem.as_ref().len());
+        ikm.extend_from_slice(shared.as_bytes());
+        ikm.extend_from_slice(kem.as_ref());
+        let mut key = vec![0u8; 32];
+        let expanded = hkdf::Hkdf::<sha2::Sha256>::new(Some(HISTORY_FILE_SALT), &ikm)
+            .expand(snapshot_id, &mut key)
+            .map_err(|e| e.to_string());
+        ikm.zeroize();
+        expanded?;
+        Ok(key)
+    }
+
+    /// This device's social-recovery bundle, sealed under `vault_key`. The bundle carries the
+    /// device keys by design — it is the backup — so they are packed and sealed here and only the
+    /// ciphertext leaves; the platform read them from Keychain copies until 2026-09-29.
+    pub fn seal_own_recovery_bundle(
+        &self,
+        vault_key: &[u8; 32],
+        created_at: i64,
+    ) -> Result<Vec<u8>, String> {
+        use zeroize::Zeroize;
+        let km = self.lifecycle.client.key_manager();
+        let identity_public = km
+            .export_registration_bundle()
+            .map_err(|e| e.to_string())?
+            .identity_public;
+        let mut bundle = crate::crypto::social_recovery::RecoveryBundle {
+            device_signing_key: km.signing_secret_key_bytes().map_err(|e| e.to_string())?,
+            device_identity_key: km.identity_secret_key_bytes().map_err(|e| e.to_string())?,
+            device_id: crate::device_id::derive_device_id(&identity_public),
+            created_at,
+        };
+        let sealed = crate::crypto::social_recovery::seal_recovery_bundle(vault_key, &bundle)
+            .map_err(|e| e.to_string());
+        bundle.device_signing_key.zeroize();
+        bundle.device_identity_key.zeroize();
+        sealed
+    }
+
     // Hybrid signature key ownership (centralized; all crypto key material lives here)
     pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>, String> {
         self.lifecycle

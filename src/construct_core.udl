@@ -879,6 +879,19 @@ interface OrchestratorCore {
     /// from that key rather than taking it from the caller.
     boolean device_copy_tag_matches(string tag, string base_message_id, bytes peer_identity_public);
 
+    /// The history-file (CTHF) channel key on the receiving side: HKDF-SHA256 over
+    /// X25519(identity, sender_eph) ‖ the ML-KEM decapsulation of `kem_ciphertext` under Kyber
+    /// prekey `kem_key_id`, salt "construct_history_file_v1", info `snapshot_id`. The channel key,
+    /// not the X25519 output: that would open every box sealed to this device.
+    [Throws=CryptoError]
+    bytes history_file_channel_key(bytes sender_eph_pub, u32 kem_key_id, bytes kem_ciphertext, bytes snapshot_id);
+
+    /// This device's social-recovery bundle (device keys, derived device id, `created_at`) sealed
+    /// under the 32-byte `vault_key` — the `sr_seal_recovery_bundle` format, packed in the core so
+    /// only the ciphertext leaves it.
+    [Throws=CryptoError]
+    bytes seal_own_recovery_bundle(bytes vault_key, i64 created_at);
+
     /// A fresh MLS store signing with this device's Ed25519 key.
     [Throws=MlsError]
     MlsStore new_mls_store();
