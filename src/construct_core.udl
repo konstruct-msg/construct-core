@@ -293,14 +293,6 @@ interface ClassicCryptoCore {
     [Throws=CryptoError]
     RegistrationBundleFields get_registration_bundle_fields();
 
-    /// Raw Ed25519 signing secret key bytes (64 bytes).
-    [Throws=CryptoError]
-    bytes get_signing_key_bytes();
-
-    /// Raw identity secret key bytes (32 bytes, X25519).
-    [Throws=CryptoError]
-    bytes get_identity_key_bytes();
-
     [Throws=CryptoError]
     bytes sign_bundle_data(bytes bundle_data_json);
 
@@ -360,10 +352,6 @@ interface ClassicCryptoCore {
 dictionary EphemeralKeyPair {
     bytes secret_key;
     bytes public_key;
-};
-
-dictionary InviteSignature {
-    bytes signature;
 };
 
 // ============================================================================
@@ -456,9 +444,8 @@ namespace construct_core {
     // What a client needs before it knows its user id, without holding a
     // ClassicCryptoCore: make keys, register them, sign with them, then hand the
     // record to create_orchestrator_core_from_keys. `keys` / the result is the
-    // CFE key record (the bytes export_private_keys returns). Types mirror the
-    // methods each one replaces (export_private_keys, get_signing_key_bytes, …),
-    // so values pass between them unconverted. Stateless.
+    // CFE key record (the bytes export_private_keys returns): opaque to the
+    // platform, which stores it and never reads a key out of it. Stateless.
 
     /// Fresh device keys (identity, signing, signed prekey) as a key record.
     [Throws=CryptoError]
@@ -467,14 +454,6 @@ namespace construct_core {
     /// The public registration bundle of a key record.
     [Throws=CryptoError]
     RegistrationBundleFields registration_bundle_fields_from_keys(bytes keys);
-
-    /// The Ed25519 signing secret of a key record.
-    [Throws=CryptoError]
-    bytes signing_key_from_keys(bytes keys);
-
-    /// The X25519 identity secret of a key record.
-    [Throws=CryptoError]
-    bytes identity_key_from_keys(bytes keys);
 
     /// Ed25519 signature over bundle_data_json with the key record's signing key.
     [Throws=CryptoError]
@@ -485,13 +464,7 @@ namespace construct_core {
     EphemeralKeyPair generate_ephemeral_keypair();
     
     [Throws=CryptoError]
-    InviteSignature sign_invite_data(string data, bytes identity_secret_key);
-    
-    [Throws=CryptoError]
     boolean verify_invite_signature(string data, bytes signature, bytes verifying_key);
-    
-    [Throws=CryptoError]
-    bytes derive_verifying_key_from_secret(bytes identity_secret_key);
 
     // ── Account Recovery (BIP39 + SLIP-0010 Ed25519) ─────────────────────────
 
@@ -823,14 +796,6 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     RegistrationBundleFields get_registration_bundle_fields();
 
-    /// Raw Ed25519 signing secret key bytes (64 bytes).
-    [Throws=CryptoError]
-    bytes get_signing_key_bytes();
-
-    /// Raw identity secret key bytes (32 bytes, X25519).
-    [Throws=CryptoError]
-    bytes get_identity_key_bytes();
-
     /// Check if a message ID is in the in-memory ACK cache.
     AckCheckResult ack_is_processed(string message_id);
 
@@ -1071,13 +1036,6 @@ interface OrchestratorCore {
 
 // ── SLIP-39 Social Recovery ───────────────────────────────────────────────────
 
-/// Keys and metadata packed into the encrypted recovery bundle.
-dictionary SrRecoveryBundle {
-    bytes device_signing_key;
-    bytes device_identity_key;
-    string device_id;
-    i64 created_at;
-};
 
 namespace construct_core {
     /// Blind a 32-byte nonce for OPRF token issuance.
@@ -1142,15 +1100,6 @@ namespace construct_core {
         bytes recipient_identity_key
     );
 
-    /// Open a sealed sender box with our X25519 identity private key
-    /// (32 bytes). Returns the serialized SenderCertificate bytes — the caller
-    /// parses the proto and then calls sealed_verify_sender_cert.
-    [Throws=CryptoError]
-    bytes sealed_unseal_sender_cert(
-        bytes sealed_box,
-        bytes our_identity_priv
-    );
-
     // ── Device metadata (sealed device directory) ────────────────────────────
 
     /// Seal a device's own metadata to one of its account's devices.
@@ -1166,16 +1115,7 @@ namespace construct_core {
     [Throws=CryptoError]
     bytes seal_to_device_key(
         bytes plaintext,
-        bytes device_identity_key
-    );
-
-    /// Open one of those copies with this device's X25519 identity private key.
-    /// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying
-    /// each — the intended use, because the stored blob carries no recipient labels.
-    [Throws=CryptoError]
-    bytes open_with_device_key(
-        bytes sealed_box,
-        bytes our_identity_priv
+        bytes device_identity_public
     );
 
     /// Verify the server Ed25519 signature over a SenderCertificate's fields
@@ -1208,29 +1148,8 @@ namespace construct_core {
     //
     // Vectors: construct-protos/conformance/knst_device_copy_tag.json.
 
-    /// The tag a copy addressed to target_device_id travels under.
-    /// base_message_id carries no per-device or per-chunk suffix, so every chunk
-    /// of one message shares a tag.
-    [Throws=CryptoError]
-    string device_copy_tag(
-        string base_message_id,
-        string target_device_id,
-        bytes our_identity_private,
-        bytes peer_identity_public
-    );
-
-    /// Whether tag was written for our_device_id by the device behind
-    /// peer_identity_public. False for any unusable input: callers ask "is this
-    /// copy foreign?", and an undecidable answer there must be "not foreign" —
-    /// wrongly opening a copy costs failed decrypts, wrongly discarding one
-    /// loses a message from the transcript, silently.
-    boolean device_copy_tag_matches(
-        string tag,
-        string base_message_id,
-        string our_device_id,
-        bytes our_identity_private,
-        bytes peer_identity_public
-    );
+    // `device_copy_tag` / `device_copy_tag_matches` taking our identity private key were here;
+    // they are `OrchestratorCore` methods since 2026-09-29, and the core derives our device id.
 
     // ── SLIP-39 Social Recovery ───────────────────────────────────────────────
 
@@ -1248,13 +1167,9 @@ namespace construct_core {
     [Throws=CryptoError]
     bytes sr_reconstruct_vault_key(sequence<string> mnemonics);
 
-    /// Encrypt a RecoveryBundle to bytes using vault_key.
-    [Throws=CryptoError]
-    bytes sr_seal_recovery_bundle(bytes vault_key, SrRecoveryBundle bundle);
-
-    /// Decrypt bytes to RecoveryBundle using vault_key.
-    [Throws=CryptoError]
-    SrRecoveryBundle sr_open_recovery_bundle(bytes vault_key, bytes ciphertext);
+    // `sr_seal_recovery_bundle` / `sr_open_recovery_bundle` took and returned the device keys;
+    // sealing is `OrchestratorCore.seal_own_recovery_bundle` since 2026-09-29. A restore returns
+    // when there is a call that turns a bundle into a key record.
 };
 
 // ============================================================================
@@ -1282,17 +1197,6 @@ enum MlsError {
     "EncryptionError",
 };
 
-namespace construct_core {
-    /// Restore an MlsStore from a CFE blob previously produced by
-    /// `export_cfe()`. The device Ed25519 signer keys are passed separately —
-    /// they are never part of the blob.
-    [Throws=MlsError]
-    MlsStore import_mls_store_cfe(
-        bytes data,
-        bytes signer_private_key,
-        bytes signer_public_key
-    );
-};
 
 /// Device-level MLS store (RFC 9420): ONE long-lived OpenMLS storage holding
 /// all group states plus key-package private material. A Welcome can only be
@@ -1304,8 +1208,8 @@ namespace construct_core {
 /// generated key package — otherwise an inviter's Welcome will reference
 /// private keys the device no longer holds.
 interface MlsStore {
-    /// A fresh store bound to the device's Ed25519 identity keypair.
-    constructor(bytes signer_private_key, bytes signer_public_key);
+    // No constructor: `OrchestratorCore.new_mls_store` / `import_mls_store` bind the device's
+    // signing key, which never crosses the FFI (it was two constructor arguments until 2026-09-29).
 
     /// Generate a KeyPackage for publishing (PublishKeyPackage). Writes its
     /// private material into this store — persist before uploading.

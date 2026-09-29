@@ -311,11 +311,6 @@ pub struct EphemeralKeyPair {
     pub public_key: Vec<u8>, // 32 bytes
 }
 
-#[derive(Debug, Clone)]
-pub struct InviteSignature {
-    pub signature: Vec<u8>, // 64 bytes
-}
-
 // Post-quantum KEM types (exported via UDL)
 #[derive(Clone)]
 pub struct MLKEMEncapsulation {
@@ -336,30 +331,6 @@ impl ClassicCryptoCore {
             .export_registration_bundle()
             .map_err(|_| CryptoError::InitializationFailed)?;
         Ok(RegistrationBundleFields::from(bundle))
-    }
-
-    /// Raw Ed25519 signing secret key bytes (64 bytes seed+public).
-    pub fn get_signing_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client
-            .key_manager()
-            .signing_secret_key_bytes()
-            .map_err(|_| CryptoError::InitializationFailed)
-    }
-
-    /// Raw X25519 identity secret key bytes (32 bytes).
-    pub fn get_identity_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let client = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client
-            .key_manager()
-            .identity_secret_key_bytes()
-            .map_err(|_| CryptoError::InitializationFailed)
     }
 
     /// Sign BundleData JSON string with Ed25519 signing key
@@ -824,24 +795,6 @@ pub fn registration_bundle_fields_from_keys(
         .map_err(|_| CryptoError::InitializationFailed)
 }
 
-/// The Ed25519 signing secret of a key record — `get_signing_key_bytes` on a core built from it.
-pub fn signing_key_from_keys(keys: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    let client = client_from_key_record(&keys, "signing_key_from_keys/decode")?;
-    client
-        .key_manager()
-        .signing_secret_key_bytes()
-        .map_err(|_| CryptoError::InitializationFailed)
-}
-
-/// The X25519 identity secret of a key record — `get_identity_key_bytes` on a core built from it.
-pub fn identity_key_from_keys(keys: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    let client = client_from_key_record(&keys, "identity_key_from_keys/decode")?;
-    client
-        .key_manager()
-        .identity_secret_key_bytes()
-        .map_err(|_| CryptoError::InitializationFailed)
-}
-
 /// Ed25519 signature over `bundle_data_json` with the key record's signing key —
 /// `sign_bundle_data` on a core built from it.
 pub fn sign_bundle_data_with_keys(
@@ -871,18 +824,6 @@ pub fn generate_ephemeral_keypair() -> Result<EphemeralKeyPair, CryptoError> {
     })
 }
 
-/// Sign invite data with Ed25519 identity key
-/// Creates a detached signature proving authenticity.
-pub fn sign_invite_data(
-    data: String,
-    identity_secret_key: Vec<u8>,
-) -> Result<InviteSignature, CryptoError> {
-    let sig = invite_crypto::sign_invite_data(&data, &identity_secret_key)?;
-    Ok(InviteSignature {
-        signature: sig.signature,
-    })
-}
-
 /// Verify invite signature with Ed25519 verifying key
 /// Returns true if signature is valid, false otherwise.
 pub fn verify_invite_signature(
@@ -894,16 +835,6 @@ pub fn verify_invite_signature(
         &data,
         &signature,
         &verifying_key,
-    )?)
-}
-
-/// Derive verifying (public) key from identity secret key
-/// Used for debugging signature verification issues.
-pub fn derive_verifying_key_from_secret(
-    identity_secret_key: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
-    Ok(invite_crypto::derive_verifying_key_from_secret(
-        &identity_secret_key,
     )?)
 }
 
@@ -1181,7 +1112,7 @@ pub struct MlsStore {
 }
 
 impl MlsStore {
-    pub fn new(signer_private_key: Vec<u8>, signer_public_key: Vec<u8>) -> Self {
+    fn new(signer_private_key: Vec<u8>, signer_public_key: Vec<u8>) -> Self {
         Self {
             inner: std::sync::Mutex::new(crate::group::MlsStore::new(
                 signer_private_key,
@@ -1247,8 +1178,9 @@ impl MlsStore {
     }
 }
 
-/// Restore an MlsStore from a CFE blob previously produced by `export_cfe()`.
-pub fn import_mls_store_cfe(
+/// Restore an MlsStore from a CFE blob previously produced by `export_cfe()`, signing with the
+/// given keys — reached only through `OrchestratorCore::import_mls_store`.
+fn import_mls_store_cfe(
     data: Vec<u8>,
     signer_private_key: Vec<u8>,
     signer_public_key: Vec<u8>,
@@ -1403,16 +1335,29 @@ mod tests {
     }
 
     // ── Operations with the device's own keys ─────────────────────────────────
-    // Each is checked against the path it replaces — the exported secret handed to the free
-    // function — so a platform moving to it changes no byte on the wire.
+    // Each is checked against the path it replaces — the secret handed to the crypto function
+    // directly — so a platform moving to it changed no byte on the wire. The secrets are read
+    // through the inner lock: nothing exported returns them since 2026-09-29.
+
+    fn signing_secret(core: &OrchestratorCore) -> Vec<u8> {
+        core.inner.lock().unwrap().get_signing_key_bytes().unwrap()
+    }
+
+    fn identity_secret(core: &OrchestratorCore) -> Vec<u8> {
+        core.inner.lock().unwrap().get_identity_key_bytes().unwrap()
+    }
 
     #[test]
     fn signing_with_the_device_key_is_the_signature_the_exported_key_made() {
         let (core, _) = named_core();
         let message = b"device-id1700000000".to_vec();
         let signature = core.sign_with_device_key(message.clone()).unwrap();
-        let exported = core.get_signing_key_bytes().unwrap();
-        let old = sign_invite_data(String::from_utf8(message.clone()).unwrap(), exported).unwrap();
+        let exported = signing_secret(&core);
+        let old = crate::crypto::invite_crypto::sign_invite_data(
+            std::str::from_utf8(&message).unwrap(),
+            &exported,
+        )
+        .unwrap();
         assert_eq!(signature, old.signature);
         let verifying_key = core.get_registration_bundle_fields().unwrap().verifying_key;
         assert!(
@@ -1439,7 +1384,8 @@ mod tests {
             b"metadata"
         );
         assert_eq!(
-            open_with_device_key(sealed.clone(), ours.get_identity_key_bytes().unwrap()).unwrap(),
+            crate::crypto::sealed_sender::open_with_x25519_secret(&sealed, &identity_secret(&ours))
+                .unwrap(),
             b"metadata"
         );
         assert!(theirs.open_sealed_to_device(sealed).is_err());
@@ -1462,11 +1408,11 @@ mod tests {
         let tag = sender
             .device_copy_tag("m1".into(), target_id.clone(), target_key.clone())
             .unwrap();
-        let old = device_copy_tag(
-            "m1".into(),
-            target_id,
-            sender.get_identity_key_bytes().unwrap(),
-            target_key,
+        let old = crate::crypto::device_copy_tag::device_copy_tag(
+            "m1",
+            &target_id,
+            &identity_secret(&sender),
+            &target_key,
         )
         .unwrap();
         assert_eq!(tag, old);
@@ -1542,15 +1488,10 @@ mod tests {
         let sealed = core
             .seal_own_recovery_bundle(vault_key.clone(), 1_700_000_000)
             .unwrap();
-        let opened = sr_open_recovery_bundle(vault_key, sealed).unwrap();
-        assert_eq!(
-            opened.device_signing_key,
-            core.get_signing_key_bytes().unwrap()
-        );
-        assert_eq!(
-            opened.device_identity_key,
-            core.get_identity_key_bytes().unwrap()
-        );
+        let key: [u8; 32] = vault_key.try_into().unwrap();
+        let opened = crate::crypto::social_recovery::open_recovery_bundle(&key, &sealed).unwrap();
+        assert_eq!(opened.device_signing_key, signing_secret(&core));
+        assert_eq!(opened.device_identity_key, identity_secret(&core));
         assert_eq!(opened.device_id, id);
         assert_eq!(opened.created_at, 1_700_000_000);
         assert!(core.seal_own_recovery_bundle(vec![0; 31], 0).is_err());
@@ -2270,14 +2211,9 @@ mod tests {
             assert_eq!(fields.suite_id, other.suite_id, "{name}");
         }
 
-        let signing = signing_key_from_keys(keys.clone()).unwrap();
-        assert_eq!(signing, classic.get_signing_key_bytes().unwrap());
-        assert_eq!(signing, orch.get_signing_key_bytes().unwrap());
-
-        let identity = identity_key_from_keys(keys.clone()).unwrap();
-        assert_eq!(identity, classic.get_identity_key_bytes().unwrap());
-        assert_eq!(identity, orch.get_identity_key_bytes().unwrap());
-
+        // No secret comes out of a record any more (`signing_key_from_keys` and
+        // `identity_key_from_keys` went 2026-09-29): the same signature below shows the three
+        // hold one signing key, and the same bundle above one identity key.
         // Ed25519 is deterministic: the same key over the same bytes is the same signature.
         let data = b"{\"bundle\":1}".to_vec();
         let sig = sign_bundle_data_with_keys(keys.clone(), data.clone()).unwrap();
@@ -2298,7 +2234,6 @@ mod tests {
 
         for bad in [vec![], vec![0u8; 40], b"not a key record".to_vec()] {
             assert!(registration_bundle_fields_from_keys(bad.clone()).is_err());
-            assert!(signing_key_from_keys(bad.clone()).is_err());
             assert!(sign_bundle_data_with_keys(bad, b"x".to_vec()).is_err());
         }
     }
@@ -3000,20 +2935,6 @@ impl OrchestratorCore {
             .get_registration_bundle_fields()
             .map_err(|_| CryptoError::InitializationFailed)?;
         Ok(RegistrationBundleFields::from(bundle))
-    }
-
-    /// Raw Ed25519 signing secret key bytes (64 bytes).
-    pub fn get_signing_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.get_signing_key_bytes()
-            .map_err(|_| CryptoError::InitializationFailed)
-    }
-
-    /// Raw X25519 identity secret key bytes (32 bytes).
-    pub fn get_identity_key_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.get_identity_key_bytes()
-            .map_err(|_| CryptoError::InitializationFailed)
     }
 
     pub fn ack_is_processed(&self, message_id: String) -> AckCheckResult {
@@ -4010,17 +3931,6 @@ pub fn sealed_seal_sender_cert(
         })
 }
 
-pub fn sealed_unseal_sender_cert(
-    sealed_box: Vec<u8>,
-    our_identity_priv: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
-        |e| CryptoError::DecryptionFailed {
-            message: e.to_string(),
-        },
-    )
-}
-
 /// Seal a device's own metadata to one of its account's devices.
 ///
 /// Same box and the same implementation as `sealed_seal_sender_cert` — deliberately, because
@@ -4035,30 +3945,12 @@ pub fn sealed_unseal_sender_cert(
 /// re-seal, rather than keeping the ability to read until someone rotates a key.
 pub fn seal_to_device_key(
     plaintext: Vec<u8>,
-    device_identity_key: Vec<u8>,
+    device_identity_public: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::seal_to_x25519_public(&plaintext, &device_identity_key).map_err(
-        |e| CryptoError::EncryptionFailed {
+    crate::crypto::sealed_sender::seal_to_x25519_public(&plaintext, &device_identity_public)
+        .map_err(|e| CryptoError::EncryptionFailed {
             message: e.to_string(),
-        },
-    )
-}
-
-/// Open one of those copies with this device's X25519 identity private key.
-///
-/// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying each.
-/// That is the intended use, not a fallback: the stored blob carries no recipient labels, on
-/// purpose — the server promised not to parse it, and a field that makes parsing convenient is
-/// an invitation to start.
-pub fn open_with_device_key(
-    sealed_box: Vec<u8>,
-    our_identity_priv: Vec<u8>,
-) -> Result<Vec<u8>, CryptoError> {
-    crate::crypto::sealed_sender::open_with_x25519_secret(&sealed_box, &our_identity_priv).map_err(
-        |e| CryptoError::DecryptionFailed {
-            message: e.to_string(),
-        },
-    )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4086,76 +3978,7 @@ pub fn sealed_verify_sender_cert(
 
 // ── Per-device copy tag UniFFI bindings ──────────────────────────────────────
 
-/// The tag a copy addressed to `target_device_id` travels under.
-/// See `crypto::device_copy_tag` for the construction and why the target is bound into the MAC.
-pub fn device_copy_tag(
-    base_message_id: String,
-    target_device_id: String,
-    our_identity_private: Vec<u8>,
-    peer_identity_public: Vec<u8>,
-) -> Result<String, CryptoError> {
-    // Mapped explicitly rather than through `From<crate::error::CryptoError>`: that impl funnels
-    // every unlisted variant into `SessionInitializationFailed`, and the only way this can fail is
-    // key material that is not 32 bytes. Reporting that as a session-init failure would send the
-    // reader looking at the session layer for a caller's argument bug.
-    crate::crypto::device_copy_tag::device_copy_tag(
-        &base_message_id,
-        &target_device_id,
-        &our_identity_private,
-        &peer_identity_public,
-    )
-    .map_err(|_| CryptoError::InvalidKeyData)
-}
-
-/// Whether `tag` was written for `our_device_id` by the device behind `peer_identity_public`.
-pub fn device_copy_tag_matches(
-    tag: String,
-    base_message_id: String,
-    our_device_id: String,
-    our_identity_private: Vec<u8>,
-    peer_identity_public: Vec<u8>,
-) -> bool {
-    crate::crypto::device_copy_tag::device_copy_tag_matches(
-        &tag,
-        &base_message_id,
-        &our_device_id,
-        &our_identity_private,
-        &peer_identity_public,
-    )
-}
-
 // ── SLIP-39 Social Recovery UniFFI bindings ───────────────────────────────────
-
-/// Mirror of `crypto::social_recovery::RecoveryBundle` with UniFFI-compatible types.
-#[derive(Debug, Clone)]
-pub struct SrRecoveryBundle {
-    pub device_signing_key: Vec<u8>,
-    pub device_identity_key: Vec<u8>,
-    pub device_id: String,
-    pub created_at: i64,
-}
-
-impl From<crate::crypto::social_recovery::RecoveryBundle> for SrRecoveryBundle {
-    fn from(b: crate::crypto::social_recovery::RecoveryBundle) -> Self {
-        Self {
-            device_signing_key: b.device_signing_key,
-            device_identity_key: b.device_identity_key,
-            device_id: b.device_id,
-            created_at: b.created_at,
-        }
-    }
-}
-
-impl From<SrRecoveryBundle> for crate::crypto::social_recovery::RecoveryBundle {
-    fn from(b: SrRecoveryBundle) -> Self {
-        Self {
-            device_signing_key: b.device_signing_key,
-            device_identity_key: b.device_identity_key,
-            device_id: b.device_id,
-            created_at: b.created_at,
-        }
-    }
-}
 
 pub fn sr_generate_vault_key() -> Result<Vec<u8>, CryptoError> {
     Ok(crate::crypto::social_recovery::generate_vault_key().to_vec())
@@ -4179,35 +4002,6 @@ pub fn sr_create_recovery_shares(
 pub fn sr_reconstruct_vault_key(mnemonics: Vec<String>) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::social_recovery::reconstruct_vault_key(mnemonics)
         .map(|k| k.to_vec())
-        .map_err(|e| CryptoError::DecryptionFailed {
-            message: e.to_string(),
-        })
-}
-
-pub fn sr_seal_recovery_bundle(
-    vault_key: Vec<u8>,
-    bundle: SrRecoveryBundle,
-) -> Result<Vec<u8>, CryptoError> {
-    let key: [u8; 32] = vault_key
-        .try_into()
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let inner: crate::crypto::social_recovery::RecoveryBundle = bundle.into();
-    crate::crypto::social_recovery::seal_recovery_bundle(&key, &inner).map_err(|e| {
-        CryptoError::EncryptionFailed {
-            message: e.to_string(),
-        }
-    })
-}
-
-pub fn sr_open_recovery_bundle(
-    vault_key: Vec<u8>,
-    ciphertext: Vec<u8>,
-) -> Result<SrRecoveryBundle, CryptoError> {
-    let key: [u8; 32] = vault_key
-        .try_into()
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    crate::crypto::social_recovery::open_recovery_bundle(&key, &ciphertext)
-        .map(SrRecoveryBundle::from)
         .map_err(|e| CryptoError::DecryptionFailed {
             message: e.to_string(),
         })
