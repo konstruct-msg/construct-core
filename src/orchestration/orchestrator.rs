@@ -280,7 +280,13 @@ impl Orchestrator {
                 data,
                 content_type,
                 sender_certificate,
-            } => self.handle_message_received(message_id, from, data, content_type, sender_certificate),
+            } => self.handle_message_received(
+                message_id,
+                from,
+                data,
+                content_type,
+                sender_certificate,
+            ),
             IncomingEvent::OutgoingMessage {
                 contact_id,
                 message_id,
@@ -298,7 +304,7 @@ impl Orchestrator {
             } => self.handle_session_init_completed(contact_id, session_data),
             IncomingEvent::AckReceived { message_id } => self.handle_ack_received(message_id),
             IncomingEvent::SessionBundleFetched { contact_id, bundle } => {
-                self.handle_session_bundle_fetched(contact_id, bundle)
+                self.handle_session_bundle_fetched(contact_id, *bundle)
             }
             IncomingEvent::SessionBundleUnavailable { contact_id } => {
                 self.reopen_refused(&contact_id);
@@ -2438,7 +2444,11 @@ mod tests {
                 data: garbage.clone(),
             }),
         ] {
-            assert_eq!(actions.len(), 1, "one refusal and nothing else: {actions:?}");
+            assert_eq!(
+                actions.len(),
+                1,
+                "one refusal and nothing else: {actions:?}"
+            );
             assert!(
                 matches!(&actions[0], Action::NotifyError { code, .. } if code == "MALFORMED_WIRE_PAYLOAD"),
                 "{actions:?}"
@@ -3439,7 +3449,7 @@ mod pqxdh_v2_tests {
     ) -> Vec<Action> {
         o.handle_event(IncomingEvent::SessionBundleFetched {
             contact_id: contact_id.to_string(),
-            bundle,
+            bundle: Box::new(bundle),
         })
     }
 

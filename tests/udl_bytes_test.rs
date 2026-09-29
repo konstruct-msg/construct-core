@@ -8,13 +8,19 @@
 
 #[test]
 fn the_udl_has_no_sequence_of_u8() {
-    let udl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/construct_core.udl"))
-        .expect("read the UDL");
+    let udl = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/construct_core.udl"
+    ))
+    .expect("read the UDL");
     let hits: Vec<(usize, &str)> = udl
         .lines()
         .enumerate()
         .filter(|(_, line)| line.replace(' ', "").contains("sequence<u8>"))
         .map(|(i, line)| (i + 1, line.trim()))
         .collect();
-    assert!(hits.is_empty(), "use `bytes` for byte data across the FFI: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "use `bytes` for byte data across the FFI: {hits:?}"
+    );
 }

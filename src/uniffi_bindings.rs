@@ -1412,8 +1412,21 @@ mod tests {
     }
 
     fn packed(message_number: u32, kem: Option<&[u8]>) -> Vec<u8> {
-        crate::wire_payload::pack(&[7u8; 32], message_number, 0, 0, 0, 1, kem, None, None, &[0u8; 32], 0, None)
-            .unwrap()
+        crate::wire_payload::pack(
+            &[7u8; 32],
+            message_number,
+            0,
+            0,
+            0,
+            1,
+            kem,
+            None,
+            None,
+            &[0u8; 32],
+            0,
+            None,
+        )
+        .unwrap()
     }
 
     /// `wire_summary` reads the number and the kind from the payload itself. A handshake header
@@ -1425,15 +1438,36 @@ mod tests {
     #[test]
     fn wire_summary_reads_number_and_kind_from_the_payload() {
         let first = wire_summary(packed(0, Some(&[5u8; 1568]))).unwrap();
-        assert_eq!(first, WireSummary { message_number: 0, init_kind: ReceivingInitKind::Handshake });
+        assert_eq!(
+            first,
+            WireSummary {
+                message_number: 0,
+                init_kind: ReceivingInitKind::Handshake
+            }
+        );
 
         let renewal = wire_summary(packed(9, Some(&[5u8; 1568]))).unwrap();
-        assert_eq!(renewal, WireSummary { message_number: 9, init_kind: ReceivingInitKind::Handshake });
+        assert_eq!(
+            renewal,
+            WireSummary {
+                message_number: 9,
+                init_kind: ReceivingInitKind::Handshake
+            }
+        );
 
         let plain = wire_summary(packed(9, None)).unwrap();
-        assert_eq!(plain, WireSummary { message_number: 9, init_kind: ReceivingInitKind::MidRatchet });
+        assert_eq!(
+            plain,
+            WireSummary {
+                message_number: 9,
+                init_kind: ReceivingInitKind::MidRatchet
+            }
+        );
 
-        assert!(wire_summary(vec![0xFF; 7]).is_err(), "a payload that does not parse has no summary");
+        assert!(
+            wire_summary(vec![0xFF; 7]).is_err(),
+            "a payload that does not parse has no summary"
+        );
     }
 
     /// A message carrying the handshake header from `from`, the shape that opens a receiving
@@ -2257,8 +2291,10 @@ pub struct WireSummary {
 /// One parse of a received payload into what a platform routes on. The classification is the
 /// same `receiving_init_kind` the carrier form asks; only the input is the payload itself.
 pub fn wire_summary(wire_payload: Vec<u8>) -> Result<WireSummary, CryptoError> {
-    let d = crate::wire_payload::unpack(&wire_payload).map_err(|e| CryptoError::SerializationFailed {
-        message: format!("wire_summary: {e}"),
+    let d = crate::wire_payload::unpack(&wire_payload).map_err(|e| {
+        CryptoError::SerializationFailed {
+            message: format!("wire_summary: {e}"),
+        }
     })?;
     let carrier = crate::orchestration::ReceivingInitCarrier {
         message_number: d.message_number,
@@ -3393,7 +3429,7 @@ impl CfeIncomingEvent {
             Self::SessionBundleFetched { contact_id, bundle } => SessionBundleFetched {
                 contact_id,
                 // Refused here or in the core, a bundle ends the same way: the handler's refusal.
-                bundle: parse_bundle_for_reopen(&bundle).map_err(|e| e.to_string()),
+                bundle: Box::new(parse_bundle_for_reopen(&bundle).map_err(|e| e.to_string())),
             },
             Self::SessionBundleUnavailable { contact_id } => {
                 SessionBundleUnavailable { contact_id }
