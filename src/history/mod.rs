@@ -18,6 +18,7 @@ pub mod channel;
 pub mod cth1;
 pub mod discovery;
 pub mod frames;
+pub mod session;
 mod wire;
 
 /// 512 MiB. A record announcing more is malformed and nothing is allocated for it. A legal
@@ -48,6 +49,8 @@ pub enum HistoryFailure {
     Truncated,
     /// A manifest `format_version` this reader does not speak.
     UnknownVersion,
+    /// A file for another account than this device's.
+    UserMismatch,
     /// A record the phase does not allow, or one out of the required order.
     RecordOrder,
     /// The manifest names a different snapshot or account than the envelope it arrived in.
@@ -68,6 +71,8 @@ pub enum HistoryFailure {
     SignatureInvalid,
     /// A sealed chunk did not open: wrong key, reordered, spliced or corrupted.
     ChunkOpenFailed,
+    /// This device lacks a key the transfer needs (hybrid identity, Kyber signed prekey).
+    LocalKeysUnavailable,
 }
 
 impl HistoryFailure {
@@ -76,6 +81,7 @@ impl HistoryFailure {
             Self::Malformed => "malformed",
             Self::Truncated => "truncated",
             Self::UnknownVersion => "unknown_version",
+            Self::UserMismatch => "user_mismatch",
             Self::RecordOrder => "record_order",
             Self::EnvelopeManifestMismatch => "envelope_manifest_mismatch",
             Self::V1RefusedForHistory => "v1_refused_for_history",
@@ -86,6 +92,7 @@ impl HistoryFailure {
             Self::NoHybridKey => "no_hybrid_key",
             Self::SignatureInvalid => "signature_invalid",
             Self::ChunkOpenFailed => "chunk_open_failed",
+            Self::LocalKeysUnavailable => "local_keys_unavailable",
         }
     }
 }

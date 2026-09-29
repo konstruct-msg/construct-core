@@ -1102,6 +1102,305 @@ pub fn recommended_send_delay_ms(is_high_priority: bool, battery_level: f32) -> 
 }
 
 // ============================================================================
+// History transfer — construct-docs/decisions/history-transfer-protocol-in-the-core.md
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HistoryError {
+    #[error("malformed")]
+    Malformed,
+    #[error("truncated")]
+    Truncated,
+    #[error("unknown_version")]
+    UnknownVersion,
+    #[error("user_mismatch")]
+    UserMismatch,
+    #[error("record_order")]
+    RecordOrder,
+    #[error("envelope_manifest_mismatch")]
+    EnvelopeManifestMismatch,
+    #[error("v1_refused_for_history")]
+    V1RefusedForHistory,
+    #[error("identity_mismatch")]
+    IdentityMismatch,
+    #[error("kem_key_id_mismatch")]
+    KemKeyIdMismatch,
+    #[error("qr_pin_mismatch")]
+    QrPinMismatch,
+    #[error("qr_pin_absent")]
+    QrPinAbsent,
+    #[error("no_hybrid_key")]
+    NoHybridKey,
+    #[error("signature_invalid")]
+    SignatureInvalid,
+    #[error("chunk_open_failed")]
+    ChunkOpenFailed,
+    #[error("local_keys_unavailable")]
+    LocalKeysUnavailable,
+}
+
+impl From<crate::history::HistoryFailure> for HistoryError {
+    fn from(f: crate::history::HistoryFailure) -> Self {
+        use crate::history::HistoryFailure as F;
+        match f {
+            F::Malformed => Self::Malformed,
+            F::Truncated => Self::Truncated,
+            F::UnknownVersion => Self::UnknownVersion,
+            F::UserMismatch => Self::UserMismatch,
+            F::RecordOrder => Self::RecordOrder,
+            F::EnvelopeManifestMismatch => Self::EnvelopeManifestMismatch,
+            F::V1RefusedForHistory => Self::V1RefusedForHistory,
+            F::IdentityMismatch => Self::IdentityMismatch,
+            F::KemKeyIdMismatch => Self::KemKeyIdMismatch,
+            F::QrPinMismatch => Self::QrPinMismatch,
+            F::QrPinAbsent => Self::QrPinAbsent,
+            F::NoHybridKey => Self::NoHybridKey,
+            F::SignatureInvalid => Self::SignatureInvalid,
+            F::ChunkOpenFailed => Self::ChunkOpenFailed,
+            F::LocalKeysUnavailable => Self::LocalKeysUnavailable,
+        }
+    }
+}
+
+fn history_user_id(user_id: Vec<u8>) -> Result<[u8; 16], HistoryError> {
+    user_id.try_into().map_err(|_| HistoryError::Malformed)
+}
+
+pub struct HistoryPeerKeys {
+    pub identity_public: Vec<u8>,
+    pub hybrid_public: Vec<u8>,
+    pub kyber_prekey_public: Vec<u8>,
+    pub kyber_prekey_id: u32,
+}
+
+impl HistoryPeerKeys {
+    fn into_core(self) -> Result<crate::history::session::PeerKeys, HistoryError> {
+        if self.hybrid_public.is_empty() || self.kyber_prekey_public.is_empty() {
+            return Err(HistoryError::NoHybridKey);
+        }
+        Ok(crate::history::session::PeerKeys {
+            identity_public: self
+                .identity_public
+                .try_into()
+                .map_err(|_| HistoryError::Malformed)?,
+            hybrid_public: self.hybrid_public,
+            kyber_prekey_public: self.kyber_prekey_public,
+            kyber_prekey_id: self.kyber_prekey_id,
+        })
+    }
+}
+
+pub struct HistoryKnownKeys {
+    pub identity_public: Vec<u8>,
+    pub hybrid_public: Vec<u8>,
+}
+
+pub enum HistoryPin {
+    Fingerprint { fingerprint: Vec<u8> },
+    BundleOnly,
+    Absent,
+}
+
+pub struct HistoryRecordOut {
+    pub record_type: u8,
+    pub proto: Vec<u8>,
+}
+
+pub enum HistoryEvent {
+    Record {
+        record_type: u8,
+        proto: Vec<u8>,
+    },
+    Skipped {
+        record_type: u8,
+    },
+    MediaStart {
+        media_id: String,
+        mime_type: String,
+        byte_len: u64,
+    },
+    MediaBytes {
+        data: Vec<u8>,
+    },
+    MediaEnd,
+    End,
+}
+
+impl From<crate::history::cth1::Event> for HistoryEvent {
+    fn from(e: crate::history::cth1::Event) -> Self {
+        use crate::history::cth1::Event as E;
+        match e {
+            E::Record { record_type, proto } => Self::Record { record_type, proto },
+            E::Skipped { record_type } => Self::Skipped { record_type },
+            E::MediaStart {
+                media_id,
+                mime_type,
+                byte_len,
+            } => Self::MediaStart {
+                media_id,
+                mime_type,
+                byte_len,
+            },
+            E::MediaBytes(data) => Self::MediaBytes { data },
+            E::MediaEnd => Self::MediaEnd,
+            E::End => Self::End,
+        }
+    }
+}
+
+pub enum HistoryStatus {
+    NeedMore,
+    AwaitKeys { sender_device_id: String },
+    Skipped,
+    Done,
+}
+
+pub struct HistoryStep {
+    pub events: Vec<HistoryEvent>,
+    pub status: HistoryStatus,
+}
+
+pub struct HistorySender {
+    inner: Mutex<crate::history::session::Sender>,
+    first_frame: Vec<u8>,
+    snapshot_id: Vec<u8>,
+}
+
+impl HistorySender {
+    fn new(sender: crate::history::session::Sender) -> Self {
+        Self {
+            first_frame: sender.first_frame().to_vec(),
+            snapshot_id: sender.snapshot_id().to_vec(),
+            inner: Mutex::new(sender),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, crate::history::session::Sender> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn first_frame(&self) -> Vec<u8> {
+        self.first_frame.clone()
+    }
+
+    pub fn snapshot_id(&self) -> Vec<u8> {
+        self.snapshot_id.clone()
+    }
+
+    pub fn accept_reply(&self, reply: Vec<u8>) -> Result<(), HistoryError> {
+        Ok(self.lock().accept_reply(&reply)?)
+    }
+
+    pub fn push_records(&self, records: Vec<HistoryRecordOut>) -> Result<Vec<u8>, HistoryError> {
+        let mut sender = self.lock();
+        let mut out = Vec::new();
+        for r in &records {
+            sender.push_record(r.record_type, &r.proto, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    pub fn begin_media(
+        &self,
+        media_id: String,
+        mime_type: String,
+        byte_len: u64,
+    ) -> Result<Vec<u8>, HistoryError> {
+        let mut out = Vec::new();
+        self.lock()
+            .begin_media(&media_id, &mime_type, byte_len, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn push_media(&self, piece: Vec<u8>) -> Result<Vec<u8>, HistoryError> {
+        let mut out = Vec::with_capacity(piece.len() + 64);
+        self.lock().push_media(&piece, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn finish(&self) -> Result<Vec<u8>, HistoryError> {
+        let mut out = Vec::new();
+        self.lock().finish(&mut out)?;
+        Ok(out)
+    }
+}
+
+pub struct HistoryReceiver {
+    core: Arc<OrchestratorCore>,
+    inner: Mutex<crate::history::session::Receiver>,
+}
+
+impl HistoryReceiver {
+    fn lock(&self) -> std::sync::MutexGuard<'_, crate::history::session::Receiver> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn need(&self) -> u32 {
+        self.lock().need() as u32
+    }
+
+    pub fn feed(&self, data: Vec<u8>) -> Result<HistoryStep, HistoryError> {
+        use crate::history::session::Status;
+        let (events, status) = self.lock().feed(&data)?;
+        Ok(HistoryStep {
+            events: events.into_iter().map(HistoryEvent::from).collect(),
+            status: match status {
+                Status::NeedMore => HistoryStatus::NeedMore,
+                Status::AwaitKeys { sender_device_id } => HistoryStatus::AwaitKeys {
+                    sender_device_id: hex::encode(sender_device_id),
+                },
+                Status::Skipped => HistoryStatus::Skipped,
+                Status::Done => HistoryStatus::Done,
+            },
+        })
+    }
+
+    pub fn accept(
+        &self,
+        known: HistoryKnownKeys,
+        pin: HistoryPin,
+    ) -> Result<Option<Vec<u8>>, HistoryError> {
+        use crate::history::frames::{KnownKeys, Pin};
+        let pin = match pin {
+            HistoryPin::Fingerprint { fingerprint } => Pin::Fingerprint(
+                fingerprint
+                    .try_into()
+                    .map_err(|_| HistoryError::QrPinMismatch)?,
+            ),
+            HistoryPin::BundleOnly => Pin::BundleOnly,
+            HistoryPin::Absent => Pin::Absent,
+        };
+        let known = KnownKeys {
+            identity_public: known.identity_public,
+            hybrid_public: known.hybrid_public,
+        };
+        let mut receiver = self.lock();
+        let orch = self.core.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(receiver.accept(&*orch, &known, &pin)?)
+    }
+
+    pub fn end_of_input(&self) -> Result<(), HistoryError> {
+        Ok(self.lock().end_of_input()?)
+    }
+}
+
+pub fn history_reply_len() -> u32 {
+    crate::history::frames::REPLY_LEN as u32
+}
+
+pub fn history_discovery_tag(user_id_dashed: String, device_id_hex: String) -> String {
+    crate::history::discovery::discovery_tag(&user_id_dashed, &device_id_hex)
+}
+
+pub fn history_discovery_instance_name(tag: String) -> String {
+    crate::history::discovery::discovery_instance_name(&tag)
+}
+
+pub fn history_qr_fingerprint(identity_public: Vec<u8>, hybrid_public: Vec<u8>) -> Vec<u8> {
+    crate::history::discovery::qr_fingerprint(&identity_public, &hybrid_public).to_vec()
+}
+
+// ============================================================================
 // MLS Group Chat (RFC 9420) — device-level MlsStore
 // ============================================================================
 
@@ -1469,6 +1768,171 @@ mod tests {
             other_snapshot, expected,
             "the snapshot id is bound into the key"
         );
+    }
+
+    /// The directory entry a device publishes, as `HistoryPeerKeys`.
+    #[cfg(feature = "post-quantum")]
+    fn history_peer(core: &OrchestratorCore) -> HistoryPeerKeys {
+        core_spk(core);
+        let spk = core.current_kyber_spk_upload().unwrap().unwrap();
+        HistoryPeerKeys {
+            identity_public: core
+                .get_registration_bundle_fields()
+                .unwrap()
+                .identity_public,
+            hybrid_public: core.hybrid_signature_public_key().unwrap(),
+            kyber_prekey_public: spk.public_key,
+            kyber_prekey_id: spk.key_id,
+        }
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn history_known(peer: &HistoryPeerKeys) -> HistoryKnownKeys {
+        HistoryKnownKeys {
+            identity_public: peer.identity_public.clone(),
+            hybrid_public: peer.hybrid_public.clone(),
+        }
+    }
+
+    /// A platform's read loop: exactly `need()` bytes at a time from `stream`.
+    #[cfg(feature = "post-quantum")]
+    fn history_pump(
+        receiver: &HistoryReceiver,
+        stream: &[u8],
+        at: &mut usize,
+        events: &mut Vec<HistoryEvent>,
+    ) -> Result<HistoryStatus, HistoryError> {
+        loop {
+            let need = receiver.need() as usize;
+            if need == 0 || *at + need > stream.len() {
+                return Ok(HistoryStatus::NeedMore);
+            }
+            let step = receiver.feed(stream[*at..*at + need].to_vec())?;
+            *at += need;
+            events.extend(step.events);
+            if !matches!(step.status, HistoryStatus::NeedMore) {
+                return Ok(step.status);
+            }
+        }
+    }
+
+    /// Two real cores, the whole nearby exchange through the exported surface: opening, the
+    /// directory keys, the reply, a transcript and a blob. What the new device's core signs and
+    /// decapsulates with never leaves it.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn two_cores_move_history_over_the_local_network() {
+        let (old, old_id) = named_core();
+        let (new, _) = named_core();
+        let user = vec![0x11; 16];
+        let old_peer = history_peer(&old);
+        let sender = old
+            .history_offer_nearby(user.clone(), history_peer(&new), false, None)
+            .unwrap();
+        let receiver = new.clone().history_receive(user.clone(), false);
+
+        let (mut events, mut at) = (Vec::new(), 0);
+        let opening = sender.first_frame();
+        match history_pump(&receiver, &opening, &mut at, &mut events).unwrap() {
+            HistoryStatus::AwaitKeys { sender_device_id } => assert_eq!(sender_device_id, old_id),
+            _ => panic!("expected AwaitKeys"),
+        }
+        let reply = receiver
+            .accept(history_known(&old_peer), HistoryPin::BundleOnly)
+            .unwrap()
+            .expect("a nearby reply");
+        assert_eq!(reply.len() as u32, history_reply_len());
+        sender.accept_reply(reply).unwrap();
+
+        let mut manifest = vec![0x08, 1, 0x12, 16];
+        manifest.extend_from_slice(&sender.snapshot_id());
+        manifest.extend_from_slice(&[0x1a, 16]);
+        manifest.extend_from_slice(&user);
+        manifest.extend_from_slice(&[0x68, 3]);
+        let blob = vec![0x5a; 150_000];
+        let mut stream = sender
+            .push_records(vec![
+                HistoryRecordOut {
+                    record_type: 1,
+                    proto: manifest,
+                },
+                HistoryRecordOut {
+                    record_type: 4,
+                    proto: vec![0x32, 0],
+                },
+            ])
+            .unwrap();
+        stream.extend(
+            sender
+                .begin_media("m".into(), "image/jpeg".into(), blob.len() as u64)
+                .unwrap(),
+        );
+        stream.extend(sender.push_media(blob.clone()).unwrap());
+        stream.extend(sender.finish().unwrap());
+
+        let mut at = 0;
+        assert!(matches!(
+            history_pump(&receiver, &stream, &mut at, &mut events).unwrap(),
+            HistoryStatus::Done
+        ));
+        receiver.end_of_input().unwrap();
+        let received: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                HistoryEvent::MediaBytes { data } => Some(data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(received, blob);
+        assert!(matches!(events.last(), Some(HistoryEvent::End)));
+    }
+
+    /// A file for the new device opens there and nowhere else: a third device of the account
+    /// fails the recipient check, before any secret is touched.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn a_history_file_opens_only_on_the_device_it_was_made_for() {
+        let (old, _) = named_core();
+        let (new, _) = named_core();
+        let (third, _) = named_core();
+        let user = vec![0x22; 16];
+        let old_peer = history_peer(&old);
+        let sender = old
+            .history_offer_file(user.clone(), history_peer(&new))
+            .unwrap();
+        let mut manifest = vec![0x08, 1, 0x12, 16];
+        manifest.extend_from_slice(&sender.snapshot_id());
+        manifest.extend_from_slice(&[0x1a, 16]);
+        manifest.extend_from_slice(&user);
+        manifest.extend_from_slice(&[0x68, 3]);
+        let mut file = sender.first_frame();
+        file.extend(
+            sender
+                .push_records(vec![HistoryRecordOut {
+                    record_type: 1,
+                    proto: manifest,
+                }])
+                .unwrap(),
+        );
+        file.extend(sender.finish().unwrap());
+
+        let open = |core: &Arc<OrchestratorCore>| -> Result<usize, HistoryError> {
+            history_peer(core);
+            let receiver = core.clone().history_receive(user.clone(), true);
+            let (mut events, mut at) = (Vec::new(), 0);
+            history_pump(&receiver, &file, &mut at, &mut events)?;
+            assert!(
+                receiver
+                    .accept(history_known(&old_peer), HistoryPin::BundleOnly)?
+                    .is_none()
+            );
+            history_pump(&receiver, &file, &mut at, &mut events)?;
+            receiver.end_of_input()?;
+            Ok(events.len())
+        };
+        assert_eq!(open(&new), Ok(2), "manifest and End");
+        assert_eq!(open(&third), Err(HistoryError::IdentityMismatch));
     }
 
     #[cfg(feature = "post-quantum")]
@@ -3045,6 +3509,56 @@ impl OrchestratorCore {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.seal_own_recovery_bundle(&key, created_at)
             .map_err(|message| CryptoError::EncryptionFailed { message })
+    }
+
+    pub fn history_offer_nearby(
+        &self,
+        user_id: Vec<u8>,
+        peer: HistoryPeerKeys,
+        skip: bool,
+        pinned_receiver_identity: Option<Vec<u8>>,
+    ) -> Result<Arc<HistorySender>, HistoryError> {
+        let user_id = history_user_id(user_id)?;
+        let peer = peer.into_core()?;
+        let pinned = match pinned_receiver_identity {
+            Some(p) => Some(<[u8; 32]>::try_from(p).map_err(|_| HistoryError::Malformed)?),
+            None => None,
+        };
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = crate::history::session::Sender::nearby(&*orch, user_id, &peer, skip, pinned)?;
+        Ok(Arc::new(HistorySender::new(sender)))
+    }
+
+    pub fn history_offer_file(
+        &self,
+        user_id: Vec<u8>,
+        peer: HistoryPeerKeys,
+    ) -> Result<Arc<HistorySender>, HistoryError> {
+        let user_id = history_user_id(user_id)?;
+        let peer = peer.into_core()?;
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = crate::history::session::Sender::file(&*orch, user_id, &peer)?;
+        Ok(Arc::new(HistorySender::new(sender)))
+    }
+
+    pub fn history_receive(
+        self: Arc<Self>,
+        user_id: Vec<u8>,
+        from_file: bool,
+    ) -> Arc<HistoryReceiver> {
+        use crate::history::session::{Receiver, Source};
+        let source = if from_file {
+            Source::File
+        } else {
+            Source::Nearby
+        };
+        // A malformed id cannot match any stream; the receiver refuses it at the first check
+        // that reads it rather than here, so this constructor cannot fail.
+        let user_id: [u8; 16] = user_id.try_into().unwrap_or([0; 16]);
+        Arc::new(HistoryReceiver {
+            core: self,
+            inner: Mutex::new(Receiver::new(source, user_id)),
+        })
     }
 
     pub fn new_mls_store(&self) -> Result<Arc<MlsStore>, MlsError> {

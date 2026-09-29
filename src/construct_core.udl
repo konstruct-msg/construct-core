@@ -865,6 +865,26 @@ interface OrchestratorCore {
     [Throws=MlsError]
     MlsStore import_mls_store(bytes data);
 
+    // ── History transfer ─────────────────────────────────────────────────────
+    // The whole protocol: CTH1 records, the sealed chunk stream, CTT1 v2 and CTHF. Sans-I/O —
+    // the platform moves bytes, the core decides. `user_id` is this account's 16 raw UUID bytes.
+    // See construct-docs/decisions/history-transfer-protocol-in-the-core.md.
+
+    /// Offer history over the local network to the device `peer` names. Write
+    /// `first_frame()`, read `HISTORY_REPLY_LEN` bytes into `accept_reply`, then stream. A skip
+    /// is the same signed opening and nothing after it. `pinned_receiver_identity` is the new
+    /// device's identity from a Flow B QR, when this side scanned one.
+    [Throws=HistoryError]
+    HistorySender history_offer_nearby(bytes user_id, HistoryPeerKeys peer, boolean skip, bytes? pinned_receiver_identity);
+
+    /// Offer history as a CTHF file for `peer`: write `first_frame()`, then stream.
+    [Throws=HistoryError]
+    HistorySender history_offer_file(bytes user_id, HistoryPeerKeys peer);
+
+    /// Receive history, over the local network or from a file.
+    [Self=ByArc]
+    HistoryReceiver history_receive(bytes user_id, boolean from_file);
+
     // High-level helpers to avoid duplicating message construction in every client.
     // These match the domain-separated formats used for SPK/Kyber-SPK hybrid signatures
     // and the hybrid<->classic identity binding cross-signature.
@@ -1030,6 +1050,134 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     void import_orchestrator_state(bytes data);
 
+};
+
+// ── History transfer ─────────────────────────────────────────────────────────
+
+/// The other device's keys from our own account's directory entry (`GetPreKeyBundles`).
+dictionary HistoryPeerKeys {
+    bytes identity_public;
+    bytes hybrid_public;
+    bytes kyber_prekey_public;
+    u32 kyber_prekey_id;
+};
+
+/// The keys the directory holds for the device a frame names. Checked against the frame's own,
+/// and the signature is verified with these.
+dictionary HistoryKnownKeys {
+    bytes identity_public;
+    bytes hybrid_public;
+};
+
+/// What the link QR pinned for the other device.
+[Enum]
+interface HistoryPin {
+    /// Flow A: SHA256(identity ‖ hybrid) of the offering device (`history_qr_fingerprint`).
+    Fingerprint(bytes fingerprint);
+    /// Flow B, or a file outside the link session: the directory is the only pin.
+    BundleOnly();
+    /// Nothing pins the other device: refused.
+    Absent();
+};
+
+/// One transcript record to send: its type (0x01 manifest … 0x07 call) and protobuf bytes.
+dictionary HistoryRecordOut {
+    u8 record_type;
+    bytes proto;
+};
+
+/// What the receiver hands back, in stream order. A transcript record is its protobuf bytes,
+/// already checked against the protocol rules: decode it straight into the store. Media arrives
+/// in pieces — append each to the file.
+[Enum]
+interface HistoryEvent {
+    Record(u8 record_type, bytes proto);
+    Skipped(u8 record_type);
+    MediaStart(string media_id, string mime_type, u64 byte_len);
+    MediaBytes(bytes data);
+    MediaEnd();
+    End();
+};
+
+[Enum]
+interface HistoryStatus {
+    /// Read `need()` more bytes and feed them.
+    NeedMore();
+    /// Fetch the keys of `sender_device_id` from our own account's directory, then `accept`.
+    AwaitKeys(string sender_device_id);
+    /// A verified skip: nothing follows.
+    Skipped();
+    /// Ended with End and EOF. Commit.
+    Done();
+};
+
+dictionary HistoryStep {
+    sequence<HistoryEvent> events;
+    HistoryStatus status;
+};
+
+/// Why a transfer was refused. Each case's message is the spec's name for it (`record_order`,
+/// `qr_pin_mismatch`, …) — log that, map the case to what a person reads.
+[Error]
+enum HistoryError {
+    "Malformed",
+    "Truncated",
+    "UnknownVersion",
+    "UserMismatch",
+    "RecordOrder",
+    "EnvelopeManifestMismatch",
+    "V1RefusedForHistory",
+    "IdentityMismatch",
+    "KemKeyIdMismatch",
+    "QrPinMismatch",
+    "QrPinAbsent",
+    "NoHybridKey",
+    "SignatureInvalid",
+    "ChunkOpenFailed",
+    "LocalKeysUnavailable",
+};
+
+/// The offering device's end. Every call returns bytes to write verbatim: frames, sealed
+/// chunks, the EOF — the platform never frames.
+interface HistorySender {
+    bytes first_frame();
+    /// The snapshot id the manifest must carry.
+    bytes snapshot_id();
+    [Throws=HistoryError]
+    void accept_reply(bytes reply);
+    /// A batch of transcript records; returns every chunk they completed.
+    [Throws=HistoryError]
+    bytes push_records(sequence<HistoryRecordOut> records);
+    [Throws=HistoryError]
+    bytes begin_media(string media_id, string mime_type, u64 byte_len);
+    /// The next piece of the blob, in any size; exactly `byte_len` in all.
+    [Throws=HistoryError]
+    bytes push_media(bytes piece);
+    /// End record, last chunk, EOF.
+    [Throws=HistoryError]
+    bytes finish();
+};
+
+/// The new device's end. Read exactly `need()` bytes, `feed` them, act on the status.
+interface HistoryReceiver {
+    u32 need();
+    [Throws=HistoryError]
+    HistoryStep feed(bytes data);
+    /// After `AwaitKeys`: the directory's keys for that device and the QR pin. Returns the reply
+    /// to write back (nearby), or nothing (file, or a verified skip).
+    [Throws=HistoryError]
+    bytes? accept(HistoryKnownKeys known, HistoryPin pin);
+    /// The socket closed or the file ended: `Truncated` unless the stream finished.
+    [Throws=HistoryError]
+    void end_of_input();
+};
+
+namespace construct_core {
+    /// Bytes the receiver's reply takes on the local network.
+    u32 history_reply_len();
+    string history_discovery_tag(string user_id_dashed, string device_id_hex);
+    string history_discovery_instance_name(string tag);
+    bytes history_qr_fingerprint(bytes identity_public, bytes hybrid_public);
 };
 
 // ── ConstructPrivacyPass ──────────────────────────────────────────────────────
