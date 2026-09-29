@@ -22,7 +22,7 @@ const PREAMBLE_LEN: usize = 5;
 const RECORD_HEADER_LEN: usize = 9;
 /// A media blob's `media_id` and `mime_type` must fit in this much of its payload, ahead of the
 /// blob. Both are short strings; a longer head is an attempt to make the reader buffer.
-const MEDIA_HEAD_CAP: usize = 4096;
+pub(crate) const MEDIA_HEAD_CAP: usize = 4096;
 
 /// What the reader hands the platform, in stream order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -894,6 +894,28 @@ mod tests {
             Event::Skipped {
                 record_type: record_type::MESSAGE
             }
+        );
+    }
+
+    /// The limit exported to encoders (`history_max_blob_bytes`) is one the writer accepts, and
+    /// the whole record limit is not: an encoder that checks against it never fails a stream.
+    #[test]
+    fn a_blob_at_the_exported_limit_is_accepted_and_one_at_the_record_limit_is_not() {
+        let limit = MAX_RECORD_BYTES - MEDIA_HEAD_CAP as u64;
+        let long_id = "m".repeat(200);
+        let mut w = Writer::new();
+        let mut out = Vec::new();
+        w.record(record_type::MANIFEST, &manifest(2), &mut out)
+            .unwrap();
+        w.begin_media(&long_id, "video/quicktime", limit, &mut out)
+            .unwrap();
+
+        let mut w = Writer::new();
+        w.record(record_type::MANIFEST, &manifest(2), &mut out)
+            .unwrap();
+        assert_eq!(
+            w.begin_media(&long_id, "video/quicktime", MAX_RECORD_BYTES, &mut out),
+            Err(HistoryFailure::Malformed)
         );
     }
 

@@ -1388,6 +1388,12 @@ pub fn history_reply_len() -> u32 {
     crate::history::frames::REPLY_LEN as u32
 }
 
+/// The largest blob whose record — head (at most `MEDIA_HEAD_CAP`) and blob — fits
+/// `MAX_RECORD_BYTES`.
+pub fn history_max_blob_bytes() -> u64 {
+    crate::history::MAX_RECORD_BYTES - crate::history::cth1::MEDIA_HEAD_CAP as u64
+}
+
 pub fn history_discovery_tag(user_id_dashed: String, device_id_hex: String) -> String {
     crate::history::discovery::discovery_tag(&user_id_dashed, &device_id_hex)
 }

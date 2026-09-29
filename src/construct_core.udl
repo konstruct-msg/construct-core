@@ -1175,6 +1175,9 @@ interface HistoryReceiver {
 namespace construct_core {
     /// Bytes the receiver's reply takes on the local network.
     u32 history_reply_len();
+    /// The largest media file a snapshot carries. An encoder leaves a file of this size or more
+    /// out (and counts it) rather than fail the stream: the core refuses the record.
+    u64 history_max_blob_bytes();
     string history_discovery_tag(string user_id_dashed, string device_id_hex);
     string history_discovery_instance_name(string tag);
     bytes history_qr_fingerprint(bytes identity_public, bytes hybrid_public);
