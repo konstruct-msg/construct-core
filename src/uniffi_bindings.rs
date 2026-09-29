@@ -1402,6 +1402,94 @@ mod tests {
         create_orchestrator_core_from_keys(keys, user_id.to_string()).unwrap()
     }
 
+    // ── Operations with the device's own keys ─────────────────────────────────
+    // Each is checked against the path it replaces — the exported secret handed to the free
+    // function — so a platform moving to it changes no byte on the wire.
+
+    #[test]
+    fn signing_with_the_device_key_is_the_signature_the_exported_key_made() {
+        let (core, _) = named_core();
+        let message = b"device-id1700000000".to_vec();
+        let signature = core.sign_with_device_key(message.clone()).unwrap();
+        let exported = core.get_signing_key_bytes().unwrap();
+        let old = sign_invite_data(String::from_utf8(message.clone()).unwrap(), exported).unwrap();
+        assert_eq!(signature, old.signature);
+        let verifying_key = core.get_registration_bundle_fields().unwrap().verifying_key;
+        assert!(
+            verify_invite_signature(
+                String::from_utf8(message).unwrap(),
+                signature,
+                verifying_key
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_box_sealed_to_this_device_opens_and_one_sealed_to_another_does_not() {
+        let (ours, _) = named_core();
+        let (theirs, _) = named_core();
+        let our_key = ours
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        let sealed = seal_to_device_key(b"metadata".to_vec(), our_key).unwrap();
+        assert_eq!(
+            ours.open_sealed_to_device(sealed.clone()).unwrap(),
+            b"metadata"
+        );
+        assert_eq!(
+            open_with_device_key(sealed.clone(), ours.get_identity_key_bytes().unwrap()).unwrap(),
+            b"metadata"
+        );
+        assert!(theirs.open_sealed_to_device(sealed).is_err());
+    }
+
+    #[test]
+    fn a_copy_tag_is_recognised_by_the_device_it_names_and_by_no_sibling() {
+        let (sender, _) = named_core();
+        let (target, target_id) = named_core();
+        let (sibling, _) = named_core();
+        let sender_key = sender
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+        let target_key = target
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+
+        let tag = sender
+            .device_copy_tag("m1".into(), target_id.clone(), target_key.clone())
+            .unwrap();
+        let old = device_copy_tag(
+            "m1".into(),
+            target_id,
+            sender.get_identity_key_bytes().unwrap(),
+            target_key,
+        )
+        .unwrap();
+        assert_eq!(tag, old);
+        assert!(target.device_copy_tag_matches(tag.clone(), "m1".into(), sender_key.clone()));
+        assert!(!target.device_copy_tag_matches(tag.clone(), "m2".into(), sender_key.clone()));
+        // The sibling's id is derived from its own key: a tag for the target is not its copy.
+        assert!(!sibling.device_copy_tag_matches(tag, "m1".into(), sender_key));
+    }
+
+    #[test]
+    fn an_mls_store_from_the_core_survives_export_and_import() {
+        let (core, _) = named_core();
+        let store = core.new_mls_store().unwrap();
+        let group = store.create_group().unwrap();
+        let blob = store.export_cfe().unwrap();
+        let restored = core.import_mls_store(blob).unwrap();
+        assert_eq!(restored.member_count(group.clone()).unwrap(), 1);
+        assert!(
+            restored.encrypt(group, b"x".to_vec()).is_ok(),
+            "the restored store signs with the device key it was bound to"
+        );
+    }
+
     /// The orchestrator's queued-carrier count for `contact_id`. Read through the inner lock
     /// rather than a new UDL method: the leftover state this test is about is private to the
     /// crate on purpose, and widening the exported surface to observe it would be the opposite
@@ -2895,6 +2983,57 @@ impl OrchestratorCore {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.sign_hybrid(&message)
             .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    // ── Operations with this device's own keys (the secrets stay here) ────────
+
+    pub fn sign_with_device_key(&self, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.sign_with_device_key(&message)
+            .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    pub fn open_sealed_to_device(&self, sealed_box: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.open_sealed_to_device(&sealed_box)
+            .map_err(|message| CryptoError::DecryptionFailed { message })
+    }
+
+    pub fn device_copy_tag(
+        &self,
+        base_message_id: String,
+        target_device_id: String,
+        peer_identity_public: Vec<u8>,
+    ) -> Result<String, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // InvalidKeyData, as the free function: the only failure is key material of the wrong size.
+        orch.device_copy_tag(&base_message_id, &target_device_id, &peer_identity_public)
+            .map_err(|_| CryptoError::InvalidKeyData)
+    }
+
+    pub fn device_copy_tag_matches(
+        &self,
+        tag: String,
+        base_message_id: String,
+        peer_identity_public: Vec<u8>,
+    ) -> bool {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.device_copy_tag_matches(&tag, &base_message_id, &peer_identity_public)
+    }
+
+    pub fn new_mls_store(&self) -> Result<Arc<MlsStore>, MlsError> {
+        let (private, public) = self.mls_signer()?;
+        Ok(Arc::new(MlsStore::new(private, public)))
+    }
+
+    pub fn import_mls_store(&self, data: Vec<u8>) -> Result<Arc<MlsStore>, MlsError> {
+        let (private, public) = self.mls_signer()?;
+        import_mls_store_cfe(data, private, public)
+    }
+
+    fn mls_signer(&self) -> Result<(Vec<u8>, Vec<u8>), MlsError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.mls_signer().map_err(MlsError::CryptoError)
     }
 
     pub fn build_x3dh_sign_message(&self, suite_id: u8, public_key: Vec<u8>) -> Vec<u8> {

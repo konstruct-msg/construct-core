@@ -855,6 +855,38 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     bytes sign_hybrid(bytes message);
 
+    // ── Operations with this device's own keys ───────────────────────────────
+    // The platform asks for the operation, never for the key. Each replaced a platform reading
+    // the secret out (`get_signing_key_bytes`, `get_identity_key_bytes`, a Keychain copy) and
+    // doing the operation in CryptoKit / Tink or through a free function taking the secret.
+
+    /// Ed25519 over `message` with this device's signing key (device auth, invites). The same
+    /// signature `sign_invite_data` / CryptoKit made from the exported key: Ed25519 is deterministic.
+    [Throws=CryptoError]
+    bytes sign_with_device_key(bytes message);
+
+    /// Open a box sealed to this device's X25519 identity key (`sealed_seal_sender_cert`,
+    /// `seal_to_device_key`): a sender certificate, a sibling's device metadata. A box sealed to
+    /// another key fails with DecryptionFailed, which is how a caller finds its own copy.
+    [Throws=CryptoError]
+    bytes open_sealed_to_device(bytes sealed_box);
+
+    /// `device_copy_tag` with our identity key.
+    [Throws=CryptoError]
+    string device_copy_tag(string base_message_id, string target_device_id, bytes peer_identity_public);
+
+    /// `device_copy_tag_matches` with our identity key and our device id, which the core derives
+    /// from that key rather than taking it from the caller.
+    boolean device_copy_tag_matches(string tag, string base_message_id, bytes peer_identity_public);
+
+    /// A fresh MLS store signing with this device's Ed25519 key.
+    [Throws=MlsError]
+    MlsStore new_mls_store();
+
+    /// An MLS store restored from `MlsStore.export_cfe()`, signing with this device's key.
+    [Throws=MlsError]
+    MlsStore import_mls_store(bytes data);
+
     // High-level helpers to avoid duplicating message construction in every client.
     // These match the domain-separated formats used for SPK/Kyber-SPK hybrid signatures
     // and the hybrid<->classic identity binding cross-signature.

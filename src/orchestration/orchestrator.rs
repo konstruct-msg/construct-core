@@ -1348,6 +1348,83 @@ impl Orchestrator {
         Ok(<_ as AsRef<[u8]>>::as_ref(secret).to_vec())
     }
 
+    // ── Operations with this device's own keys ────────────────────────────────
+    // Each of these replaced a platform reading a secret out (`get_signing_key_bytes`,
+    // `get_identity_key_bytes`, a Keychain copy of either) to do the operation itself. The secret
+    // is borrowed here and never copied out.
+
+    /// Ed25519 over `message` with this device's signing key: device auth, invites.
+    pub fn sign_with_device_key(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        self.lifecycle
+            .client
+            .key_manager()
+            .sign(message)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Open a box sealed to this device's X25519 identity key — a sender certificate, a
+    /// sibling's device metadata.
+    pub fn open_sealed_to_device(&self, sealed_box: &[u8]) -> Result<Vec<u8>, String> {
+        let km = self.lifecycle.client.key_manager();
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        crate::crypto::sealed_sender::open_with_x25519_secret(
+            sealed_box,
+            <_ as AsRef<[u8]>>::as_ref(secret),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// The tag our copy for `target_device_id` travels under (`crypto::device_copy_tag`).
+    pub fn device_copy_tag(
+        &self,
+        base_message_id: &str,
+        target_device_id: &str,
+        peer_identity_public: &[u8],
+    ) -> Result<String, String> {
+        let km = self.lifecycle.client.key_manager();
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        crate::crypto::device_copy_tag::device_copy_tag(
+            base_message_id,
+            target_device_id,
+            <_ as AsRef<[u8]>>::as_ref(secret),
+            peer_identity_public,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Whether `tag` was written for this device by the device behind `peer_identity_public`.
+    /// This device's id is derived from its own identity key, not taken from the caller: a caller
+    /// passing the account id or a sibling's id would read every copy as foreign.
+    pub fn device_copy_tag_matches(
+        &self,
+        tag: &str,
+        base_message_id: &str,
+        peer_identity_public: &[u8],
+    ) -> bool {
+        let km = self.lifecycle.client.key_manager();
+        let (Ok(secret), Ok(bundle)) = (km.identity_secret_key(), km.export_registration_bundle())
+        else {
+            return false;
+        };
+        let our_device_id = crate::device_id::derive_device_id(&bundle.identity_public);
+        crate::crypto::device_copy_tag::device_copy_tag_matches(
+            tag,
+            base_message_id,
+            &our_device_id,
+            <_ as AsRef<[u8]>>::as_ref(secret),
+            peer_identity_public,
+        )
+    }
+
+    /// The MLS signer: this device's Ed25519 pair. Not in the UDL — it goes straight into an
+    /// `MlsStore`, which holds it for the store's lifetime and never returns it.
+    pub fn mls_signer(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let km = self.lifecycle.client.key_manager();
+        let bundle = km.export_registration_bundle().map_err(|e| e.to_string())?;
+        let private = km.signing_secret_key_bytes().map_err(|e| e.to_string())?;
+        Ok((private, bundle.verifying_key))
+    }
+
     // Hybrid signature key ownership (centralized; all crypto key material lives here)
     pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>, String> {
         self.lifecycle
