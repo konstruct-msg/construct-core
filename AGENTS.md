@@ -36,7 +36,11 @@
 
 ### 3. Cross-Platform Boundary (UniFFI)
 - When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
-- Prefer passing `bytes` (sequence<u8>) or `string` for complex data to ensure compatibility across languages.
+- Byte data is `bytes` in the UDL — never `sequence<u8>`. Both are `Vec<u8>` in Rust, so nothing
+  here tells them apart, but the bindings do: `bytes` is `Data` / `ByteArray`, copied as one block;
+  `sequence<u8>` is `[UInt8]` copied one byte at a time, and in Kotlin a `List<UByte>` — an object
+  per byte. This line used to say "`bytes` (sequence<u8>)" as if they were one thing, and the UDL
+  carried 195 of the slow kind until 2026-09-29. `tests/udl_bytes_test.rs` fails on a new one.
 - **`construct-tui` is paused** (2026-09-25) until iOS, Android and multi-device are settled. It
   uses this crate's `pub` Rust modules by path, and it already does not build against `main`. A
   change here does not have to keep it building or be checked against it; it will be brought up to

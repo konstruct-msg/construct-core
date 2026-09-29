@@ -1,6 +1,6 @@
 namespace construct_core {
     // Device ID functions
-    string derive_device_id(sequence<u8> identity_public_key);
+    string derive_device_id(bytes identity_public_key);
     string format_federated_id(string device_id, string server_hostname);
 
     // Intake credentials — what a sealed envelope carries instead of a Privacy Pass
@@ -8,10 +8,10 @@ namespace construct_core {
     // identical for every sender holding the key, which is what keeps it from becoming a
     // pseudonymous sender handle. See construct-docs/decisions/
     // contact-traffic-is-vouched-not-purchased.md.
-    sequence<u8> generate_intake_key();
+    bytes generate_intake_key();
     u64 intake_epoch(u64 unix_seconds);
     [Throws=CryptoError]
-    sequence<u8> intake_tag(sequence<u8> intake_key, string recipient_account_id, u64 epoch);
+    bytes intake_tag(bytes intake_key, string recipient_account_id, u64 epoch);
 
     // `supports_pq_ratchet()` was here: suite 3 is mandatory in every platform build, and the
     // unsigned bundle flag it fed was the downgrade (PQXDH v2 cutover).
@@ -22,7 +22,7 @@ namespace construct_core {
     // `wire_payload_pack` was here: rebuilding a payload from components is how suite-3 tags and
     // the PN field went missing, and it had no caller left.
     [Throws=CryptoError]
-    WirePayload wire_payload_unpack(sequence<u8> data);
+    WirePayload wire_payload_unpack(bytes data);
 
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
@@ -69,19 +69,19 @@ namespace construct_core {
 // serialized suite-3 field (empty = none); the core translates it to/from the
 // canonical wire encoding so platform SDKs never touch the byte layout.
 dictionary WirePayload {
-    sequence<u8> dh_public_key;        // 32-byte X25519 ephemeral public key
+    bytes dh_public_key;        // 32-byte X25519 ephemeral public key
     u32 message_number;
     u32 one_time_prekey_id;            // 0 = fallback 3-DH / not a first message
     u32 kyber_otpk_id;                 // the responder's Kyber prekey (SPK ids from 1, one-time from 1 000 000); 0 = none
     u32 previous_chain_length;         // Double Ratchet PN field
     u16 suite_id;                      // ratchet suite (1/3); the PQXDH v2 bit is stripped / set by the core
-    sequence<u8>? kem_ciphertext;      // ML-KEM-1024 ciphertext on the initiator's first flight
-    sequence<u8> sealed_box;           // nonce || ciphertext || auth_tag
+    bytes? kem_ciphertext;      // ML-KEM-1024 ciphertext on the initiator's first flight
+    bytes sealed_box;           // nonce || ciphertext || auth_tag
     u32 pq_message_epoch;              // suite-3 PQ epoch tag (0 otherwise)
-    sequence<u8> pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
+    bytes pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
     boolean pqxdh_v2 = false;          // the wire carried the PQXDH v2 flag
-    sequence<u8>? kem_identity = null;               // the initiator's ML-KEM-1024 identity key (first flight)
-    sequence<u8>? identity_proof_ciphertext = null;  // the responder's answer to it, until the initiator proves itself
+    bytes? kem_identity = null;               // the initiator's ML-KEM-1024 identity key (first flight)
+    bytes? identity_proof_ciphertext = null;  // the responder's answer to it, until the initiator proves itself
 };
 
 // ============================================================================
@@ -108,18 +108,18 @@ callback interface PowProgressCallback {
 // ============================================================================
 
 dictionary RegistrationBundleFields {
-    sequence<u8> identity_public;
-    sequence<u8> signed_prekey_public;
-    sequence<u8> signature;
-    sequence<u8> verifying_key;
+    bytes identity_public;
+    bytes signed_prekey_public;
+    bytes signature;
+    bytes verifying_key;
     u16 suite_id;
 };
 
 /// Result of a signed pre-key rotation.
 dictionary RotatedSpkBundle {
     u32 key_id;
-    sequence<u8> public_key;  // raw X25519 public key bytes (32 bytes)
-    sequence<u8> signature;   // raw Ed25519 signature bytes (64 bytes)
+    bytes public_key;  // raw X25519 public key bytes (32 bytes)
+    bytes signature;   // raw Ed25519 signature bytes (64 bytes)
 };
 
 // A sender certificate as the platform unsealed it: the fields the server signed and its
@@ -149,28 +149,28 @@ dictionary ReceivingOpenResult {
     sequence<string> tried_message_ids;
     sequence<string> dropped_message_ids;
     string? last_error;
-    sequence<u8>? kyber_prekeys;
+    bytes? kyber_prekeys;
     boolean awaiting_server_key;
 };
 
 dictionary SessionInitResult {
     string session_id;
-    sequence<u8> decrypted_message;  // raw plaintext bytes — may be binary or UTF-8
-    sequence<u8> storage_key;  // 32-byte random key for the first received message
+    bytes decrypted_message;  // raw plaintext bytes — may be binary or UTF-8
+    bytes storage_key;  // 32-byte random key for the first received message
     // The core's Kyber prekeys after this init burned a one-time key: persist it as the
     // `export_kyber_prekeys()` blob. Null when nothing changed.
-    sequence<u8>? kyber_prekeys;
+    bytes? kyber_prekeys;
 };
 
 /// Binary key bundle passed across the FFI boundary — no JSON encoding.
-/// Replaces the former sequence<u8> JSON payload for init_session / init_receiving_session.
+/// Replaces the former bytes JSON payload for init_session / init_receiving_session.
 dictionary BinaryKeyBundle {
-    sequence<u8> identity_public;
-    sequence<u8> signed_prekey_public;
-    sequence<u8> signature;
-    sequence<u8> verifying_key;
+    bytes identity_public;
+    bytes signed_prekey_public;
+    bytes signature;
+    bytes verifying_key;
     u16 suite_id;
-    sequence<u8>? one_time_prekey_public;
+    bytes? one_time_prekey_public;
     u32? one_time_prekey_id;
     u64 spk_uploaded_at;
     u32 spk_rotation_epoch;
@@ -181,21 +181,21 @@ dictionary BinaryKeyBundle {
     // Every Kyber prekey is signed, Ed25519 by `verifying_key` and hybrid by `hybrid_identity_key`,
     // over "KonstruktX3DH-v1" || 0x00 0x11 || created_at (u64 BE) || public key.
     /// Kyber signed prekey (ML-KEM-1024, 1568 bytes), its id and signed creation time.
-    sequence<u8>? kyber_pre_key_public;
+    bytes? kyber_pre_key_public;
     u32? kyber_pre_key_id = null;
     u64? kyber_pre_key_created_at = null;
-    sequence<u8>? kyber_pre_key_signature = null;
-    sequence<u8>? kyber_pre_key_hybrid_signature = null;
+    bytes? kyber_pre_key_signature = null;
+    bytes? kyber_pre_key_hybrid_signature = null;
     /// Kyber one-time prekey (id from 1 000 000), preferred when present and signed.
-    sequence<u8>? kyber_one_time_prekey_public;
+    bytes? kyber_one_time_prekey_public;
     u32? kyber_one_time_prekey_id;
     u64? kyber_one_time_prekey_created_at = null;
-    sequence<u8>? kyber_one_time_prekey_signature = null;
-    sequence<u8>? kyber_one_time_prekey_hybrid_signature = null;
+    bytes? kyber_one_time_prekey_signature = null;
+    bytes? kyber_one_time_prekey_hybrid_signature = null;
     /// Hybrid identity key (Ed25519 + ML-DSA-65, 1984 bytes; field 20) and the Ed25519
     /// cross-signature binding it to `verifying_key` (field 21). Pinned per device on first use.
-    sequence<u8>? hybrid_identity_key = null;
-    sequence<u8>? hybrid_identity_signature = null;
+    bytes? hybrid_identity_key = null;
+    bytes? hybrid_identity_signature = null;
 };
 
 /// How a session's post-quantum layer started.
@@ -230,8 +230,8 @@ dictionary SessionHealthReport {
 };
 
 dictionary DecryptedMessageResult {
-    sequence<u8> plaintext;
-    sequence<u8> storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
+    bytes plaintext;
+    bytes storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
 dictionary PrivateKeysJson {
@@ -261,13 +261,13 @@ enum CryptoError {
 
 dictionary OtpkPair {
     u32 key_id;
-    sequence<u8> public_key;
+    bytes public_key;
 };
 
 dictionary OtpkRecord {
     u32 key_id;
-    sequence<u8> private_key;
-    sequence<u8> public_key;
+    bytes private_key;
+    bytes public_key;
 };
 
 /// One ML-KEM-1024 Kyber prekey to upload (PQXDH v2). Both signatures are over
@@ -275,10 +275,10 @@ dictionary OtpkRecord {
 /// with the key — the signatures cover it.
 dictionary KyberPrekeyUpload {
     u32 key_id;                    // SPKs count from 1, one-time keys from 1_000_000
-    sequence<u8> public_key;       // 1568 bytes
+    bytes public_key;       // 1568 bytes
     u64 created_at;                // unix seconds
-    sequence<u8> signature;        // Ed25519, identity signing key
-    sequence<u8> hybrid_signature; // Ed25519 + ML-DSA-65, hybrid identity key (3373 bytes)
+    bytes signature;        // Ed25519, identity signing key
+    bytes hybrid_signature; // Ed25519 + ML-DSA-65, hybrid identity key (3373 bytes)
 };
 
 interface ClassicCryptoCore {
@@ -295,19 +295,19 @@ interface ClassicCryptoCore {
     bytes get_identity_key_bytes();
 
     [Throws=CryptoError]
-    sequence<u8> sign_bundle_data(sequence<u8> bundle_data_json);
+    bytes sign_bundle_data(bytes bundle_data_json);
 
     [Throws=CryptoError]
-    sequence<u8> export_private_keys();
+    bytes export_private_keys();
 
     [Throws=CryptoError]
-    void import_private_keys(sequence<u8> data);
+    void import_private_keys(bytes data);
 
     [Throws=CryptoError]
-    sequence<u8> export_session(string contact_id);
+    bytes export_session(string contact_id);
 
     [Throws=CryptoError]
-    string import_session(string contact_id, sequence<u8> data);
+    string import_session(string contact_id, bytes data);
 
     sequence<string> get_all_session_contact_ids();
 
@@ -328,10 +328,10 @@ interface ClassicCryptoCore {
     u32 one_time_prekey_count();
 
     [Throws=CryptoError]
-    sequence<u8> export_one_time_prekeys();
+    bytes export_one_time_prekeys();
 
     [Throws=CryptoError]
-    void import_one_time_prekeys(sequence<u8> data);
+    void import_one_time_prekeys(bytes data);
 
     u32 prune_one_time_prekeys_below(u32 min_keep_id);
 
@@ -351,12 +351,12 @@ interface ClassicCryptoCore {
 // ============================================================================
 
 dictionary EphemeralKeyPair {
-    sequence<u8> secret_key;
-    sequence<u8> public_key;
+    bytes secret_key;
+    bytes public_key;
 };
 
 dictionary InviteSignature {
-    sequence<u8> signature;
+    bytes signature;
 };
 
 // ============================================================================
@@ -364,8 +364,8 @@ dictionary InviteSignature {
 // ============================================================================
 
 dictionary RecoveryKeypair {
-    sequence<u8> private_key;
-    sequence<u8> public_key;
+    bytes private_key;
+    bytes public_key;
 };
 
 // ============================================================================
@@ -402,7 +402,7 @@ interface TrafficProtectionManager {
     void update_battery_level(float level);
     void record_real_message_sent();
     boolean should_send_dummy();
-    sequence<u8> generate_dummy();
+    bytes generate_dummy();
     EnergyMetrics get_metrics();
     void reset_metrics();
     u64 current_interval_ms();
@@ -413,8 +413,8 @@ interface TrafficProtectionManager {
 
 /// Result of an ML-KEM-1024 encapsulation (history transfer to a peer's Kyber SPK).
 dictionary MLKEMEncapsulation {
-    sequence<u8> ciphertext;
-    sequence<u8> shared_secret;
+    bytes ciphertext;
+    bytes shared_secret;
 };
 
 // ── Post-Quantum Signatures (ML-DSA-65) ─────────────────────────────────────
@@ -422,9 +422,9 @@ dictionary MLKEMEncapsulation {
 /// Generated ML-DSA-65 keypair for post-quantum identity signatures.
 dictionary MLDSAKeyPair {
     /// Secret key: 32-byte signing seed (RustCrypto ml-dsa; expanded key re-derived on sign)
-    sequence<u8> secret_key;
+    bytes secret_key;
     /// Public key: 1952 bytes
-    sequence<u8> public_key;
+    bytes public_key;
 };
 
 /// Hybrid signature keypair (Ed25519 + ML-DSA-65).
@@ -432,10 +432,10 @@ dictionary MLDSAKeyPair {
 dictionary HybridSignatureKeyPair {
     /// Hybrid private key: 2016 bytes
     /// [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
-    sequence<u8> private_key;
+    bytes private_key;
     /// Hybrid public key: 1984 bytes
     /// [ed25519_pk (32)] [mldsa65_pk (1952)]
-    sequence<u8> public_key;
+    bytes public_key;
 };
 
 namespace construct_core {
@@ -443,7 +443,7 @@ namespace construct_core {
     ClassicCryptoCore create_crypto_core();
 
     [Throws=CryptoError]
-    ClassicCryptoCore create_crypto_core_from_keys(sequence<u8> keys);
+    ClassicCryptoCore create_crypto_core_from_keys(bytes keys);
 
     // ── The key record without a core object ────────────────────────────────
     // What a client needs before it knows its user id, without holding a
@@ -455,36 +455,36 @@ namespace construct_core {
 
     /// Fresh device keys (identity, signing, signed prekey) as a key record.
     [Throws=CryptoError]
-    sequence<u8> generate_private_keys();
+    bytes generate_private_keys();
 
     /// The public registration bundle of a key record.
     [Throws=CryptoError]
-    RegistrationBundleFields registration_bundle_fields_from_keys(sequence<u8> keys);
+    RegistrationBundleFields registration_bundle_fields_from_keys(bytes keys);
 
     /// The Ed25519 signing secret of a key record.
     [Throws=CryptoError]
-    bytes signing_key_from_keys(sequence<u8> keys);
+    bytes signing_key_from_keys(bytes keys);
 
     /// The X25519 identity secret of a key record.
     [Throws=CryptoError]
-    bytes identity_key_from_keys(sequence<u8> keys);
+    bytes identity_key_from_keys(bytes keys);
 
     /// Ed25519 signature over bundle_data_json with the key record's signing key.
     [Throws=CryptoError]
-    sequence<u8> sign_bundle_data_with_keys(sequence<u8> keys, sequence<u8> bundle_data_json);
+    bytes sign_bundle_data_with_keys(bytes keys, bytes bundle_data_json);
 
     // Invite Crypto Functions
     [Throws=CryptoError]
     EphemeralKeyPair generate_ephemeral_keypair();
     
     [Throws=CryptoError]
-    InviteSignature sign_invite_data(string data, sequence<u8> identity_secret_key);
+    InviteSignature sign_invite_data(string data, bytes identity_secret_key);
     
     [Throws=CryptoError]
-    boolean verify_invite_signature(string data, sequence<u8> signature, sequence<u8> verifying_key);
+    boolean verify_invite_signature(string data, bytes signature, bytes verifying_key);
     
     [Throws=CryptoError]
-    sequence<u8> derive_verifying_key_from_secret(sequence<u8> identity_secret_key);
+    bytes derive_verifying_key_from_secret(bytes identity_secret_key);
 
     // ── Account Recovery (BIP39 + SLIP-0010 Ed25519) ─────────────────────────
 
@@ -494,19 +494,19 @@ namespace construct_core {
     boolean validate_mnemonic(string mnemonic);
 
     [Throws=CryptoError]
-    sequence<u8> mnemonic_to_seed(string mnemonic);
+    bytes mnemonic_to_seed(string mnemonic);
 
     [Throws=CryptoError]
-    RecoveryKeypair derive_recovery_keypair(sequence<u8> seed);
+    RecoveryKeypair derive_recovery_keypair(bytes seed);
 
     [Throws=CryptoError]
-    sequence<u8> sign_recovery_challenge(sequence<u8> private_key, string message);
+    bytes sign_recovery_challenge(bytes private_key, string message);
 
-    boolean verify_recovery_signature(sequence<u8> public_key, string message, sequence<u8> signature);
+    boolean verify_recovery_signature(bytes public_key, string message, bytes signature);
 
     // Traffic Protection Functions
-    sequence<u8> generate_dummy_message(u64 size);
-    boolean is_dummy_message(sequence<u8> data);
+    bytes generate_dummy_message(u64 size);
+    boolean is_dummy_message(bytes data);
 
     // Timing Functions
     u64 jittered_interval_ms(u64 base_ms, u64 jitter_ms);
@@ -522,7 +522,7 @@ namespace construct_core {
 
     /// Encapsulate to an ML-KEM-1024 public key (1568 bytes).
     [Throws=CryptoError]
-    MLKEMEncapsulation mlkem1024_encapsulate(sequence<u8> public_key);
+    MLKEMEncapsulation mlkem1024_encapsulate(bytes public_key);
 
     // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────
 
@@ -532,11 +532,11 @@ namespace construct_core {
 
     /// Sign a message with an ML-DSA-65 secret key. Returns a detached signature (3309 bytes).
     [Throws=CryptoError]
-    sequence<u8> mldsa65_sign(sequence<u8> secret_key, sequence<u8> message);
+    bytes mldsa65_sign(bytes secret_key, bytes message);
 
     /// Verify an ML-DSA-65 detached signature. Returns true if valid.
     [Throws=CryptoError]
-    boolean mldsa65_verify(sequence<u8> public_key, sequence<u8> message, sequence<u8> signature);
+    boolean mldsa65_verify(bytes public_key, bytes message, bytes signature);
 
     /// Generate a hybrid signature keypair (Ed25519 + ML-DSA-65).
     /// Both signatures must verify for the hybrid signature to be valid.
@@ -546,22 +546,22 @@ namespace construct_core {
     /// Sign a message with a hybrid private key (Ed25519 + ML-DSA-65).
     /// Returns a hybrid signature: [ed25519_sig (64)] [mldsa65_sig (3309)] = 3373 bytes.
     [Throws=CryptoError]
-    sequence<u8> hybrid_sign(sequence<u8> private_key, sequence<u8> message);
+    bytes hybrid_sign(bytes private_key, bytes message);
 
     /// Verify a hybrid signature. Both Ed25519 and ML-DSA-65 signatures must be valid.
     [Throws=CryptoError]
-    boolean hybrid_verify(sequence<u8> public_key, sequence<u8> message, sequence<u8> signature);
+    boolean hybrid_verify(bytes public_key, bytes message, bytes signature);
 
     /// Derive the hybrid public key from a hybrid private key.
     [Throws=CryptoError]
-    sequence<u8> hybrid_public_key_from_private(sequence<u8> private_key);
+    bytes hybrid_public_key_from_private(bytes private_key);
 
     // ── Orchestration (Phase 0) ───────────────────────────────────────────────
 
     /// Create an OrchestratorCore from CFE binary or legacy JSON key bytes.
     /// Accepts both formats — Rust handles detection and migration internally.
     [Throws=CryptoError]
-    OrchestratorCore create_orchestrator_core_from_keys(sequence<u8> keys_data, string my_user_id);
+    OrchestratorCore create_orchestrator_core_from_keys(bytes keys_data, string my_user_id);
 
     /// Verify that a PlatformBridge implementation correctly round-trips a
     /// save → load through the platform secure store.
@@ -828,40 +828,40 @@ interface OrchestratorCore {
     // ── Session crypto (delegation from ClassicCryptoCore) ───────────────────
 
     [Throws=CryptoError]
-    sequence<u8> export_private_keys();
+    bytes export_private_keys();
 
     [Throws=CryptoError]
-    sequence<u8> sign_bundle_data(sequence<u8> bundle_data_json);
+    bytes sign_bundle_data(bytes bundle_data_json);
 
     // Hybrid PQ identity signature key (Ed25519+ML-DSA-65). Centralized in core.
     [Throws=CryptoError]
-    sequence<u8> ensure_hybrid_signature_key();
+    bytes ensure_hybrid_signature_key();
 
-    sequence<u8>? hybrid_signature_public_key();
+    bytes? hybrid_signature_public_key();
 
     [Throws=CryptoError]
-    sequence<u8> sign_hybrid(sequence<u8> message);
+    bytes sign_hybrid(bytes message);
 
     // High-level helpers to avoid duplicating message construction in every client.
     // These match the domain-separated formats used for SPK/Kyber-SPK hybrid signatures
     // and the hybrid<->classic identity binding cross-signature.
 
-    sequence<u8> build_x3dh_sign_message(u8 suite_id, sequence<u8> public_key);
+    bytes build_x3dh_sign_message(u8 suite_id, bytes public_key);
 
-    sequence<u8> build_hybrid_identity_bind_message(sequence<u8> hybrid_public_key);
+    bytes build_hybrid_identity_bind_message(bytes hybrid_public_key);
 
     [Throws=CryptoError]
-    sequence<u8> sign_hybrid_prekey(u8 suite_id, sequence<u8> public_key);
+    bytes sign_hybrid_prekey(u8 suite_id, bytes public_key);
 
     // For migration: import a hybrid sig private key that was previously stored outside the core CFE.
     [Throws=CryptoError]
-    void import_hybrid_signature_private_key(sequence<u8> priv_bytes);
+    void import_hybrid_signature_private_key(bytes priv_bytes);
 
     [Throws=CryptoError]
-    sequence<u8> export_session(string contact_id);
+    bytes export_session(string contact_id);
 
     [Throws=CryptoError]
-    string import_session(string contact_id, sequence<u8> data);
+    string import_session(string contact_id, bytes data);
 
     sequence<string> get_all_session_contact_ids();
 
@@ -896,7 +896,7 @@ interface OrchestratorCore {
     // opened with the key `sender_certificate` names, under the device it names, after the core
     // has checked it; no bundle is fetched.
     [Throws=CryptoError]
-    SessionInitResult init_receiving_session_from_wire_payload(SenderCertificate sender_certificate, sequence<u8> wire_payload);
+    SessionInitResult init_receiving_session_from_wire_payload(SenderCertificate sender_certificate, bytes wire_payload);
 
     // Open a receiving session from the messages the core holds under `device`. Each opens with
     // the key its own sender certificate names, once the core has checked that certificate; one
@@ -946,10 +946,10 @@ interface OrchestratorCore {
     u32 one_time_prekey_count();
 
     [Throws=CryptoError]
-    sequence<u8> export_one_time_prekeys();
+    bytes export_one_time_prekeys();
 
     [Throws=CryptoError]
-    void import_one_time_prekeys(sequence<u8> data);
+    void import_one_time_prekeys(bytes data);
 
     u32 prune_one_time_prekeys_below(u32 min_keep_id);
 
@@ -983,13 +983,13 @@ interface OrchestratorCore {
     /// Decapsulate with our Kyber prekey `key_id` (0 = current SPK). For history transfer; the
     /// handshake decapsulates inside the core.
     [Throws=CryptoError]
-    sequence<u8> kyber_prekey_decapsulate(u32 key_id, sequence<u8> ciphertext);
+    bytes kyber_prekey_decapsulate(u32 key_id, bytes ciphertext);
 
     [Throws=CryptoError]
-    sequence<u8> export_kyber_prekeys();
+    bytes export_kyber_prekeys();
 
     [Throws=CryptoError]
-    void import_kyber_prekeys(sequence<u8> data);
+    void import_kyber_prekeys(bytes data);
 
     void set_local_user_id(string user_id);
 
@@ -1000,12 +1000,12 @@ interface OrchestratorCore {
     /// CFE binary blob.
     /// Persist under CfeSecureStoreSlot::OrchestratorState.
     [Throws=CryptoError]
-    sequence<u8> export_orchestrator_state();
+    bytes export_orchestrator_state();
 
     /// Restore the full orchestrator coordination state from a CFE blob.
     /// Call at app start before processing any messages.
     [Throws=CryptoError]
-    void import_orchestrator_state(sequence<u8> data);
+    void import_orchestrator_state(bytes data);
 
 };
 
@@ -1026,7 +1026,7 @@ namespace construct_core {
     /// Returns packed 64 bytes: blinded_point[0..32] || blind_factor[32..64].
     /// blinded_point is sent to server; blind_factor is kept secret until finalize().
     [Throws=CryptoError]
-    sequence<u8> pp_blind_token(sequence<u8> nonce);
+    bytes pp_blind_token(bytes nonce);
 
     /// Finalize a blind token after server evaluation.
     /// evaluated_bytes  — 32-byte Ristretto point returned by server (Z = k * blinded)
@@ -1034,19 +1034,19 @@ namespace construct_core {
     /// nonce            — original 32-byte nonce passed to pp_blind_token
     /// Returns 32-byte token to store in the wallet.
     [Throws=CryptoError]
-    sequence<u8> pp_finalize_token(
-        sequence<u8> evaluated_bytes,
-        sequence<u8> blind_factor_bytes,
-        sequence<u8> nonce
+    bytes pp_finalize_token(
+        bytes evaluated_bytes,
+        bytes blind_factor_bytes,
+        bytes nonce
     );
 
     /// Verify the evaluated point is a valid Ristretto255 curve point.
     /// server_pubkey_bytes is reserved for future DLEQ batch proof verification.
     /// Returns false if evaluated_bytes cannot be decompressed.
     boolean pp_verify_client(
-        sequence<u8> evaluated_bytes,
-        sequence<u8> nonce,
-        sequence<u8> server_pubkey_bytes
+        bytes evaluated_bytes,
+        bytes nonce,
+        bytes server_pubkey_bytes
     );
 
     /// Verify a batched DLEQ proof (IssueTokensResponse.dleq_proof) against the
@@ -1056,10 +1056,10 @@ namespace construct_core {
     /// (blinded as sent to IssueTokens, evaluated as returned); proof is 64 bytes;
     /// issuer_public is the pinned 32-byte K. False on any malformed input.
     boolean pp_verify_dleq(
-        sequence<sequence<u8>> blinded,
-        sequence<sequence<u8>> evaluated,
-        sequence<u8> proof,
-        sequence<u8> issuer_public
+        sequence<bytes> blinded,
+        sequence<bytes> evaluated,
+        bytes proof,
+        bytes issuer_public
     );
 
     /// Seal a finalized 32-byte token to the server's X25519 token-encryption
@@ -1067,9 +1067,9 @@ namespace construct_core {
     /// operators cannot read spent tokens. Returns
     /// ephemeral_pub(32) || nonce(12) || ciphertext || tag(16).
     [Throws=CryptoError]
-    sequence<u8> pp_seal_token_bytes(
-        sequence<u8> token,
-        sequence<u8> server_encryption_key
+    bytes pp_seal_token_bytes(
+        bytes token,
+        bytes server_encryption_key
     );
 
     // ── ConstructSEALED (sealed sender, stealth-sealed-sender-v2 Phase 5) ────
@@ -1079,18 +1079,18 @@ namespace construct_core {
     /// ephemeral_pub(32) || nonce(12) || ciphertext || tag(16).
     /// Bit-compatible with the iOS CryptoKit implementation.
     [Throws=CryptoError]
-    sequence<u8> sealed_seal_sender_cert(
-        sequence<u8> cert_bytes,
-        sequence<u8> recipient_identity_key
+    bytes sealed_seal_sender_cert(
+        bytes cert_bytes,
+        bytes recipient_identity_key
     );
 
     /// Open a sealed sender box with our X25519 identity private key
     /// (32 bytes). Returns the serialized SenderCertificate bytes — the caller
     /// parses the proto and then calls sealed_verify_sender_cert.
     [Throws=CryptoError]
-    sequence<u8> sealed_unseal_sender_cert(
-        sequence<u8> sealed_box,
-        sequence<u8> our_identity_priv
+    bytes sealed_unseal_sender_cert(
+        bytes sealed_box,
+        bytes our_identity_priv
     );
 
     // ── Device metadata (sealed device directory) ────────────────────────────
@@ -1106,18 +1106,18 @@ namespace construct_core {
     /// revoked device stops being sealed to on the next re-seal instead of keeping the
     /// ability to read until a key is rotated.
     [Throws=CryptoError]
-    sequence<u8> seal_to_device_key(
-        sequence<u8> plaintext,
-        sequence<u8> device_identity_key
+    bytes seal_to_device_key(
+        bytes plaintext,
+        bytes device_identity_key
     );
 
     /// Open one of those copies with this device's X25519 identity private key.
     /// A copy sealed to a sibling fails the AEAD tag, so a caller finds its own by trying
     /// each — the intended use, because the stored blob carries no recipient labels.
     [Throws=CryptoError]
-    sequence<u8> open_with_device_key(
-        sequence<u8> sealed_box,
-        sequence<u8> our_identity_priv
+    bytes open_with_device_key(
+        bytes sealed_box,
+        bytes our_identity_priv
     );
 
     /// Verify the server Ed25519 signature over a SenderCertificate's fields
@@ -1128,12 +1128,12 @@ namespace construct_core {
     boolean sealed_verify_sender_cert(
         string user_id,
         string domain,
-        sequence<u8> identity_key,
+        bytes identity_key,
         string device_id,
         i64 issued_at,
         i64 expires_at,
-        sequence<u8> signature,
-        sequence<u8> server_verifying_key
+        bytes signature,
+        bytes server_verifying_key
     );
 
     // ── Per-device copy tag ───────────────────────────────────────────────────
@@ -1157,8 +1157,8 @@ namespace construct_core {
     string device_copy_tag(
         string base_message_id,
         string target_device_id,
-        sequence<u8> our_identity_private,
-        sequence<u8> peer_identity_public
+        bytes our_identity_private,
+        bytes peer_identity_public
     );
 
     /// Whether tag was written for our_device_id by the device behind
@@ -1170,33 +1170,33 @@ namespace construct_core {
         string tag,
         string base_message_id,
         string our_device_id,
-        sequence<u8> our_identity_private,
-        sequence<u8> peer_identity_public
+        bytes our_identity_private,
+        bytes peer_identity_public
     );
 
     // ── SLIP-39 Social Recovery ───────────────────────────────────────────────
 
     /// Generate a 32-byte random vault key.
     [Throws=CryptoError]
-    sequence<u8> sr_generate_vault_key();
+    bytes sr_generate_vault_key();
 
     /// Split vault_key into share_count shares, requiring threshold to reconstruct.
     /// threshold must be <= share_count, both must be 2-10.
     /// Returns one 28-word mnemonic string per share.
     [Throws=CryptoError]
-    sequence<string> sr_create_recovery_shares(sequence<u8> vault_key, u8 threshold, u8 share_count);
+    sequence<string> sr_create_recovery_shares(bytes vault_key, u8 threshold, u8 share_count);
 
     /// Reconstruct vault_key from at least threshold share mnemonics.
     [Throws=CryptoError]
-    sequence<u8> sr_reconstruct_vault_key(sequence<string> mnemonics);
+    bytes sr_reconstruct_vault_key(sequence<string> mnemonics);
 
     /// Encrypt a RecoveryBundle to bytes using vault_key.
     [Throws=CryptoError]
-    sequence<u8> sr_seal_recovery_bundle(sequence<u8> vault_key, SrRecoveryBundle bundle);
+    bytes sr_seal_recovery_bundle(bytes vault_key, SrRecoveryBundle bundle);
 
     /// Decrypt bytes to RecoveryBundle using vault_key.
     [Throws=CryptoError]
-    SrRecoveryBundle sr_open_recovery_bundle(sequence<u8> vault_key, sequence<u8> ciphertext);
+    SrRecoveryBundle sr_open_recovery_bundle(bytes vault_key, bytes ciphertext);
 };
 
 // ============================================================================
@@ -1207,8 +1207,8 @@ namespace construct_core {
 /// `commit` is broadcast to current members (SubmitCommit); `welcome` is
 /// delivered to the new member (InviteToGroup).
 dictionary MemberAddition {
-    sequence<u8> commit;
-    sequence<u8> welcome;
+    bytes commit;
+    bytes welcome;
     u32 member_count;
 };
 
@@ -1230,9 +1230,9 @@ namespace construct_core {
     /// they are never part of the blob.
     [Throws=MlsError]
     MlsStore import_mls_store_cfe(
-        sequence<u8> data,
-        sequence<u8> signer_private_key,
-        sequence<u8> signer_public_key
+        bytes data,
+        bytes signer_private_key,
+        bytes signer_public_key
     );
 };
 
@@ -1247,58 +1247,58 @@ namespace construct_core {
 /// private keys the device no longer holds.
 interface MlsStore {
     /// A fresh store bound to the device's Ed25519 identity keypair.
-    constructor(sequence<u8> signer_private_key, sequence<u8> signer_public_key);
+    constructor(bytes signer_private_key, bytes signer_public_key);
 
     /// Generate a KeyPackage for publishing (PublishKeyPackage). Writes its
     /// private material into this store — persist before uploading.
     [Throws=MlsError]
-    sequence<u8> generate_key_package();
+    bytes generate_key_package();
 
     /// Create a new group with this device as the sole member.
     /// Returns the group id — the handle for every other group call.
     [Throws=MlsError]
-    sequence<u8> create_group();
+    bytes create_group();
 
     /// Join a group from a Welcome message addressed to a KeyPackage
     /// generated by this store. Returns the joined group's id.
     [Throws=MlsError]
-    sequence<u8> join_from_welcome(sequence<u8> welcome);
+    bytes join_from_welcome(bytes welcome);
 
     /// Encrypt an application message to the group.
     [Throws=MlsError]
-    sequence<u8> encrypt(sequence<u8> group_id, sequence<u8> plaintext);
+    bytes encrypt(bytes group_id, bytes plaintext);
 
     /// Decrypt an application message from another member.
     [Throws=MlsError]
-    sequence<u8> decrypt(sequence<u8> group_id, sequence<u8> ciphertext);
+    bytes decrypt(bytes group_id, bytes ciphertext);
 
     /// Add a member by their published KeyPackage. The commit is merged
     /// locally — call only when about to SubmitCommit.
     [Throws=MlsError]
-    MemberAddition add_member(sequence<u8> group_id, sequence<u8> key_package);
+    MemberAddition add_member(bytes group_id, bytes key_package);
 
     /// Remove a member by leaf index. Commit is merged locally.
     [Throws=MlsError]
-    sequence<u8> remove_member(sequence<u8> group_id, u32 leaf_index);
+    bytes remove_member(bytes group_id, u32 leaf_index);
 
     /// Propose leaving. Broadcast the returned message; another member's
     /// commit actually removes us.
     [Throws=MlsError]
-    sequence<u8> leave_group(sequence<u8> group_id);
+    bytes leave_group(bytes group_id);
 
     /// Process and merge a commit produced by another member.
     [Throws=MlsError]
-    void process_commit(sequence<u8> group_id, sequence<u8> commit);
+    void process_commit(bytes group_id, bytes commit);
 
     /// Current number of members in the group.
     [Throws=MlsError]
-    u32 member_count(sequence<u8> group_id);
+    u32 member_count(bytes group_id);
 
     /// Current MLS epoch. Increments on every commit.
     [Throws=MlsError]
-    u64 epoch(sequence<u8> group_id);
+    u64 epoch(bytes group_id);
 
     /// Snapshot the entire MLS storage as a CFE blob (msg_type 0x44).
     [Throws=MlsError]
-    sequence<u8> export_cfe();
+    bytes export_cfe();
 };
