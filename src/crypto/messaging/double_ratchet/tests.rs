@@ -1566,18 +1566,17 @@ fn test_skipped_keys_dos_limit_returns_error_and_session_survives() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// AD v2 → v3 graceful migration tests
+// AD version: one, no fallback (SEC-006)
 //
-// When AD_VERSION was bumped from 2 to 3 (marking the session_id v2 era),
-// in-flight messages from old clients (still using AD v2) must be decryptable
-// by new clients via the fallback in `decrypt_with_key`.
+// From 2026-05-18 to 0.24.2 a failed decrypt was retried with AD v2 for writers that
+// predated the bump. Every session this build opens is PQXDH v2 (2026-09-25), so no
+// writer of v2 AD can reach it; the retry was removed rather than left to double the
+// work of every failure.
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Core assertion: `decrypt_with_key` retries with the previous AD version
-/// when the current version fails, so "old-client" messages don't cause
-/// a session rupture during a rolling upgrade.
+/// A message sealed under AD v2 is refused, not retried under the old version.
 #[test]
-fn test_ad_v2_fallback_decrypts_legacy_messages() {
+fn test_ad_v2_message_is_refused() {
     use crate::traffic_protection::padding::pad_message_default;
 
     let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000031";
@@ -1597,9 +1596,9 @@ fn test_ad_v2_fallback_decrypts_legacy_messages() {
     let plaintext = b"hello from old client";
     let padded = pad_message_default(plaintext).unwrap();
 
-    // Build v2 AD (AD_VERSION_PREV = 2).
+    // Build v2 AD — the version before the 2026-05-18 bump.
     let mut ad_v2: Vec<u8> = Vec::new();
-    ad_v2.push(2u8); // AD_VERSION_PREV
+    ad_v2.push(2u8);
     ad_v2.extend_from_slice(alice_uuid.as_bytes()); // contact_id
     ad_v2.extend_from_slice(bob_uuid.as_bytes()); // local_user_id
     ad_v2.extend_from_slice(&session_id_bytes);
@@ -1623,29 +1622,14 @@ fn test_ad_v2_fallback_decrypts_legacy_messages() {
         identity_proof_ciphertext: None,
     };
 
-    // Current AD version (v3) must NOT decrypt a v2-encrypted message.
+    let result = bob.decrypt_with_key(&message_key, &old_msg);
     assert!(
-        bob.try_aead_decrypt(&message_key, &old_msg, 3u8).is_err(),
-        "v3 AD must not decrypt a v2-encrypted message — these are different AD bytes"
+        result.is_err(),
+        "a message sealed under AD v2 must not open: {:?}",
+        result
+            .ok()
+            .map(|p| String::from_utf8_lossy(&p).into_owned())
     );
-
-    // Previous AD version (v2) must succeed (direct call).
-    let result_v2 = bob.try_aead_decrypt(&message_key, &old_msg, 2u8);
-    assert!(
-        result_v2.is_ok(),
-        "v2 AD fallback must succeed: {:?}",
-        result_v2.err()
-    );
-    assert_eq!(result_v2.unwrap(), plaintext);
-
-    // `decrypt_with_key` (tries v3, falls back to v2) must also succeed.
-    let fallback_result = bob.decrypt_with_key(&message_key, &old_msg);
-    assert!(
-        fallback_result.is_ok(),
-        "decrypt_with_key must succeed via AD v2 fallback: {:?}",
-        fallback_result.err()
-    );
-    assert_eq!(fallback_result.unwrap(), plaintext);
 }
 
 /// Current AD version (v3) messages must still decrypt normally (no regression).

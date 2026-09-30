@@ -721,9 +721,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// `mix_pq_message_key`) — this also covers skipped-message keys, which are
     /// stored pre-mix.
     ///
-    /// Tries the current `AD_VERSION` first. If AEAD fails, retries with `AD_VERSION_PREV`
-    /// to handle in-flight messages from peers that encrypted before the AD version bump.
-    /// Returns the error from the current-version attempt if both attempts fail.
+    /// One AEAD attempt, with `AD_VERSION`. Until 0.24.2 a failure was retried with AD v2 for
+    /// writers older than 2026-05-18 (SEC-006); every session this build can open was made by
+    /// PQXDH v2 (2026-09-25), whose writers all use v3, so the retry could no longer succeed —
+    /// it only doubled the work of every failure.
     pub(super) fn decrypt_with_key(
         &mut self,
         message_key: &P::AeadKey,
@@ -751,37 +752,16 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
         let message_key = &mixed?;
 
-        // Try current AD version first.
-        match self.try_aead_decrypt(message_key, encrypted, AD_VERSION) {
-            Ok(plaintext) => Ok(plaintext),
-            Err(primary_err) => {
-                // Graceful migration: retry with the previous AD version for in-flight
-                // messages from peers that haven't upgraded yet. Once all clients are on
-                // AD_VERSION, remove this fallback.
-                tracing::warn!(
-                    target: "crypto::double_ratchet",
-                    msg_num = %encrypted.message_number,
-                    ad_version = AD_VERSION,
-                    fallback_version = AD_VERSION_PREV,
-                    "AEAD failed with current AD version; retrying with previous version \
-                     (migration fallback — peer may not have upgraded yet)"
-                );
-                self.try_aead_decrypt(message_key, encrypted, AD_VERSION_PREV)
-                    .map_err(|_| primary_err)
-            }
-        }
+        self.try_aead_decrypt(message_key, encrypted)
     }
 
-    /// Attempt AEAD decryption with a specific `ad_version` byte.
-    ///
-    /// `decrypt_with_key` calls this twice during a rolling upgrade: first with
-    /// `AD_VERSION`, then (on failure) with `AD_VERSION_PREV`.
+    /// AEAD decryption with the associated data rebuilt from the session and the header.
     pub(super) fn try_aead_decrypt(
         &self,
         message_key: &P::AeadKey,
         encrypted: &EncryptedRatchetMessage,
-        ad_version: u8,
     ) -> Result<Vec<u8>, String> {
+        let ad_version = AD_VERSION;
         use super::storage::id_prefix;
         use tracing::debug;
 
