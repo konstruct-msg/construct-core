@@ -470,6 +470,7 @@ mod tests {
             None,
             &[9; 40],
             0,
+            0,
             None,
         )
         .unwrap();
@@ -675,9 +676,10 @@ mod tests {
     fn the_error_names_the_headers_key_and_the_certificates_identity() {
         let mut router = MessageRouter::new();
         let mut lifecycle = make_lifecycle("alice");
-        let wire_payload =
-            crate::wire_payload::pack(&[4; 32], 5, 0, 0, 0, 1, None, None, None, &[9; 40], 0, None)
-                .unwrap();
+        let wire_payload = crate::wire_payload::pack(
+            &[4; 32], 5, 0, 0, 0, 1, None, None, None, &[9; 40], 0, 0, None,
+        )
+        .unwrap();
         let certificate = crate::crypto::sealed_sender::SenderCertificate {
             user_id: "bob-account".to_string(),
             domain: "konstruct.cc".to_string(),

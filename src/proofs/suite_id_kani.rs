@@ -1,7 +1,7 @@
 //! Kani proofs for SuiteID invariants
 //!
 //! Verifies:
-//! - S1: SuiteID::new accepts exactly {1, 2, 3}
+//! - S1: SuiteID::new accepts exactly {1, 2, 4} (3 is retired)
 //! - S2: is_supported agrees with new() success
 //! - S3: name returns correct string for each valid suite
 //! - S4: from_u16_unchecked round-trips through as_u16
@@ -9,9 +9,9 @@
 
 use crate::crypto::SuiteID;
 
-/// S1: SuiteID::new accepts exactly 1, 2, 3 and rejects all others
+/// S1: SuiteID::new accepts exactly 1, 2, 4 and rejects all others — 3 included
 #[kani::proof]
-fn proof_suite_id_new_exactly_123() {
+fn proof_suite_id_new_exactly_124() {
     let id: u16 = kani::any();
 
     let result = SuiteID::new(id);
@@ -22,7 +22,7 @@ fn proof_suite_id_new_exactly_123() {
     } else if id == 2 {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), SuiteID::PQ_HYBRID);
-    } else if id == 3 {
+    } else if id == 4 {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), SuiteID::PQ_RATCHET);
     } else {
@@ -47,7 +47,7 @@ fn proof_is_supported_agrees_with_new() {
 /// S3: name() returns the correct string for each valid suite
 #[kani::proof]
 fn proof_suite_id_name_correct() {
-    for (id, expected_name) in [(1, "CLASSIC"), (2, "PQ_HYBRID"), (3, "PQ_RATCHET")] {
+    for (id, expected_name) in [(1, "CLASSIC"), (2, "PQ_HYBRID"), (4, "PQ_RATCHET")] {
         let suite = SuiteID::new(id).unwrap();
         assert_eq!(
             suite.name(),
@@ -61,7 +61,7 @@ fn proof_suite_id_name_correct() {
 #[kani::proof]
 fn proof_unchecked_roundtrip() {
     let id: u16 = kani::any();
-    kani::assume(id >= 1 && id <= 3);
+    kani::assume(id == 1 || id == 2 || id == 4);
 
     let suite = SuiteID::from_u16_unchecked(id);
     assert_eq!(
@@ -74,7 +74,7 @@ fn proof_unchecked_roundtrip() {
 /// S5: Each suite's predicate methods are mutually exclusive
 #[kani::proof]
 fn proof_suite_predicates_mutually_exclusive() {
-    for id in [1u16, 2, 3] {
+    for id in [1u16, 2, 4] {
         let suite = SuiteID::new(id).unwrap();
 
         let is_classic = suite.is_classic();
@@ -95,7 +95,7 @@ fn proof_suite_predicates_mutually_exclusive() {
         match id {
             1 => assert!(is_classic && !is_hybrid && !is_ratchet),
             2 => assert!(!is_classic && is_hybrid && !is_ratchet),
-            3 => assert!(!is_classic && !is_hybrid && is_ratchet),
+            4 => assert!(!is_classic && !is_hybrid && is_ratchet),
             _ => unreachable!(),
         }
     }
@@ -126,7 +126,7 @@ fn proof_try_from_equivalent_to_new() {
 /// S7: From<SuiteID> for u16 round-trips
 #[kani::proof]
 fn proof_from_suite_id_for_u16() {
-    for id in [1u16, 2, 3] {
+    for id in [1u16, 2, 4] {
         let suite = SuiteID::new(id).unwrap();
         let back: u16 = suite.into();
         assert_eq!(back, id, "From<SuiteID> for u16 must round-trip");

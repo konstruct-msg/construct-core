@@ -227,6 +227,7 @@ impl SessionLifecycleManager {
             previous_chain_length: decoded.previous_chain_length,
             suite_id: decoded.suite_id,
             pq_message_epoch: decoded.pq_message_epoch,
+            pq_key_index: decoded.pq_key_index,
             pq_ratchet_field: decoded.pq_ratchet_field,
             identity_proof_ciphertext: decoded.identity_proof_ciphertext,
         };
@@ -645,6 +646,15 @@ impl SessionLifecycleManager {
         serializable.verify_identity(contact_id, self.client.local_user_id())?;
         let mut states = Vec::with_capacity(previous.len());
         for entry in previous {
+            // A previous state of the retired epoch-granular PQ ratchet reads nothing a peer on
+            // this build still sends; it is dropped rather than failing the current state with it.
+            if u16::from(entry.state.suite_id) == crate::crypto::SuiteID::RETIRED_PQ_RATCHET_V1 {
+                tracing::info!(
+                    target: "crypto::session",
+                    "dropping a previous suite-3 state from the record (suite retired)"
+                );
+                continue;
+            }
             let state = SerializableSession::from_cfe_v1(entry.state)
                 .map_err(|e| format!("from_cfe_v1 (previous): {}", e))?;
             state.verify_identity(contact_id, self.client.local_user_id())?;

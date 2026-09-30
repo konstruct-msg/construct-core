@@ -153,12 +153,57 @@ impl Zeroize for PendingPqExchange {
     }
 }
 
+/// One direction's symmetric chain inside a PQ epoch (PQR-2). `index` is the number the next key
+/// it yields carries on the wire; `key` derives that key and the chain's next state
+/// (`pq_chain_step`). Advancing overwrites the old key, which is what gives the post-quantum half
+/// per-message forward secrecy.
+#[derive(Clone)]
+pub(super) struct PqChain {
+    pub(super) index: u32,
+    pub(super) key: Vec<u8>,
+}
+
+impl Zeroize for PqChain {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for PqChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PqChain")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A completed (or, at the responder, provisional) epoch: the chain this side sends on and the
+/// one it receives on, both seeded from the epoch's ML-KEM secret, which is then gone
+/// (`pq_epoch_chains`). `send` is `None` once a newer epoch sends — only late messages of this
+/// one are still read.
+#[derive(Clone, Debug)]
+pub(super) struct PqEpochChains {
+    pub(super) epoch: u32,
+    pub(super) send: Option<PqChain>,
+    pub(super) recv: PqChain,
+}
+
+impl Zeroize for PqEpochChains {
+    fn zeroize(&mut self) {
+        if let Some(send) = self.send.as_mut() {
+            send.zeroize();
+        }
+        self.recv.zeroize();
+    }
+}
+
 /// Responder-side state for a PQ exchange we've encapsulated but the initiator
 /// hasn't provably completed yet: the ciphertext we re-attach to every outgoing
-/// message, plus the *provisional* epoch secret. The secret is promoted to
-/// `pq_epoch_secrets` (and `epoch` becomes `current_pq_epoch`) only once we
-/// successfully decrypt a peer message tagged `>= epoch` — which proves the
-/// initiator decapsulated the same secret.
+/// message, plus the *provisional* epoch's chains (the secret itself is spent on them at
+/// encapsulation). They move to `pq_chains` (and `epoch` becomes `current_pq_epoch`) only once
+/// we successfully decrypt a peer message tagged `>= epoch` — which proves the initiator
+/// decapsulated the same secret. Until then the receive chain already reads the initiator's
+/// messages of that epoch; the send chain waits.
 #[derive(Debug, Clone)]
 pub(super) struct PendingPqCiphertext {
     pub(super) epoch: u32,
@@ -167,17 +212,17 @@ pub(super) struct PendingPqCiphertext {
     /// stale ciphertext — see the SPQR-style design doc.
     pub(super) ek_hash: [u8; 8],
     pub(super) ciphertext: Vec<u8>,
-    pub(super) secret: Vec<u8>,
+    pub(super) chains: PqEpochChains,
 }
 
 impl Zeroize for PendingPqCiphertext {
     fn zeroize(&mut self) {
-        self.secret.zeroize();
+        self.chains.zeroize();
     }
 }
 
 /// Wire-level representation of the optional sparse PQ-ratchet field carried on
-/// a suite-3 message, alongside the always-present `pq_message_epoch` tag.
+/// a PQ-ratchet message, alongside the always-present `pq_message_epoch` tag.
 /// Serialized/parsed by `wire_payload.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PqRatchetWireField {
@@ -192,11 +237,12 @@ pub enum PqRatchetWireField {
     },
 }
 
-/// How many completed PQ epoch secrets to retain for decrypting out-of-order
-/// messages tagged with older epochs. Epochs advance every ~`pq_ratchet_interval`
-/// DH turns, so even the oldest retained epoch is far beyond the classical
-/// skipped-message window in practice.
-pub(super) const PQ_EPOCH_RETENTION: usize = 4;
+/// How many epochs' chains are kept: the current one and the one before it, whose receive chain
+/// still reads messages sent before the peer saw the new epoch. Keys a late message of an older
+/// epoch needs survive as skipped keys (bounded like the classical ones: count and age), not as a
+/// chain — a chain would derive every later key of that epoch too. Replaces the four retained
+/// epoch *secrets* of suite 3, each of which derived every key of its epoch (PQR-2, PQR-4).
+pub(super) const PQ_CHAIN_RETENTION: usize = 2;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -345,7 +391,7 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     pq_turns_since_mix: u32,
 
     /// Whether this side starts PQ exchanges. `true` only for the DR session
-    /// initiator on suite-3 sessions (single-initiator discipline — see the
+    /// initiator on PQ-ratchet sessions (single-initiator discipline — see the
     /// SPQR-style design doc). The responder only ever answers.
     is_pq_initiator: bool,
 
@@ -353,9 +399,13 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// outgoing message key (`pq_message_epoch` tag). 0 = no epoch yet (pure DR).
     current_pq_epoch: u32,
 
-    /// Completed epoch secrets, newest last, capped at `PQ_EPOCH_RETENTION`.
-    /// Needed to decrypt out-of-order messages tagged with older epochs.
-    pq_epoch_secrets: Vec<(u32, Vec<u8>)>,
+    /// Completed epochs' chains, newest last, capped at `PQ_CHAIN_RETENTION`.
+    pq_chains: Vec<PqEpochChains>,
+
+    /// PQ chain keys passed over on the way to a later index, by `(epoch, index)` — the
+    /// counterpart of `skipped_message_keys`, bounded by the same count and age.
+    pq_skipped_keys: HashMap<(u32, u32), Vec<u8>>,
+    pq_skipped_key_timestamps: HashMap<(u32, u32), u64>,
 
     /// Initiator only: exchange in flight (fresh keypair proposing `current_pq_epoch + 1`).
     pending_pq_exchange: Option<PendingPqExchange>,
@@ -406,7 +456,9 @@ struct DecryptSnapshot<P: CryptoProvider> {
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
     pq_turns_since_mix: u32,
     current_pq_epoch: u32,
-    pq_epoch_secrets: Vec<(u32, Vec<u8>)>,
+    pq_chains: Vec<PqEpochChains>,
+    pq_skipped_keys: HashMap<(u32, u32), Vec<u8>>,
+    pq_skipped_key_timestamps: HashMap<(u32, u32), u64>,
     pending_pq_exchange: Option<PendingPqExchange>,
     pending_pq_ciphertext: Option<PendingPqCiphertext>,
     pq_pending_since: u64,
@@ -430,7 +482,9 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
             pq_turns_since_mix: self.pq_turns_since_mix,
             current_pq_epoch: self.current_pq_epoch,
-            pq_epoch_secrets: self.pq_epoch_secrets.clone(),
+            pq_chains: self.pq_chains.clone(),
+            pq_skipped_keys: self.pq_skipped_keys.clone(),
+            pq_skipped_key_timestamps: self.pq_skipped_key_timestamps.clone(),
             pending_pq_exchange: self.pending_pq_exchange.clone(),
             pending_pq_ciphertext: self.pending_pq_ciphertext.clone(),
             pq_pending_since: self.pq_pending_since,
@@ -455,10 +509,14 @@ pub struct EncryptedRatchetMessage {
     pub nonce: Vec<u8>,
     pub previous_chain_length: u32,
     pub suite_id: u16,
-    /// Suite-3 only: the PQ epoch whose secret was mixed into this message's key
+    /// PQ-ratchet suite only: the PQ epoch whose chain keyed this message
     /// (0 = none — pure DR key). Always 0 for other suites.
     pub pq_message_epoch: u32,
-    /// PQ ratchet field for SuiteID::PQ_RATCHET=3 (sparse continuous). None for other suites.
+    /// PQ-ratchet suite only: the index of this message's key in the sender's chain of
+    /// `pq_message_epoch` (0 when the epoch is 0). Bound in the AD with the epoch.
+    #[serde(default)]
+    pub pq_key_index: u32,
+    /// PQ ratchet field for SuiteID::PQ_RATCHET (sparse continuous). None for other suites.
     /// Present only on messages carrying a PQ exchange (EK or CT). Resent until acked.
     pub pq_ratchet_field: Option<PqRatchetWireField>,
     /// RESPONDER: the answer to the initiator's KEM identity key (ML-KEM-1024 ciphertext), carried
@@ -483,8 +541,11 @@ impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
         if let Some(ct) = self.pending_pq_ciphertext.as_mut() {
             ct.zeroize();
         }
-        for (_, secret) in self.pq_epoch_secrets.iter_mut() {
-            secret.zeroize();
+        for chains in self.pq_chains.iter_mut() {
+            chains.zeroize();
+        }
+        for key in self.pq_skipped_keys.values_mut() {
+            key.zeroize();
         }
         for key in self.skipped_message_keys.values_mut() {
             key.zeroize();

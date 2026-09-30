@@ -116,7 +116,7 @@ pub struct X3DHPublicKeyBundle {
     /// 0 = not provided.
     #[serde(default)]
     pub kyber_spk_rotation_epoch: u32,
-    // `supports_pq_ratchet` was here: suite 3 is mandatory now, and an unsigned flag the server
+    // `supports_pq_ratchet` was here: the PQ-ratchet suite is mandatory now, and an unsigned flag the server
     // could drop was the downgrade. Serialized bundles that still carry it are read as before.
 }
 

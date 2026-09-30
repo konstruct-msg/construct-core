@@ -65,7 +65,29 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 Some(SerializablePqRatchetState {
                     is_initiator: self.is_pq_initiator,
                     current_epoch: self.current_pq_epoch,
-                    epoch_secrets: self.pq_epoch_secrets.clone(),
+                    chains: self
+                        .pq_chains
+                        .iter()
+                        .map(SerializablePqEpochChains::from)
+                        .collect(),
+                    skipped: {
+                        let mut skipped: Vec<_> = self
+                            .pq_skipped_keys
+                            .iter()
+                            .map(|(&(epoch, index), key)| SerializablePqSkippedKey {
+                                epoch,
+                                index,
+                                key: key.clone(),
+                                at: self
+                                    .pq_skipped_key_timestamps
+                                    .get(&(epoch, index))
+                                    .copied()
+                                    .unwrap_or(0),
+                            })
+                            .collect();
+                        skipped.sort_by_key(|s| (s.epoch, s.index));
+                        skipped
+                    },
                     pending_exchange: self.pending_pq_exchange.as_ref().map(|ex| {
                         SerializablePqPendingExchange {
                             epoch: ex.epoch,
@@ -78,7 +100,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                             epoch: p.epoch,
                             ek_hash: p.ek_hash.to_vec(),
                             ciphertext: p.ciphertext.clone(),
-                            secret: p.secret.clone(),
+                            chains: SerializablePqEpochChains::from(&p.chains),
                         }
                     }),
                     pending_since: self.pq_pending_since,
@@ -152,12 +174,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .map(PqHandshake::from_u8)
                 .unwrap_or_else(|| PqHandshake::legacy(data.pq_applied)),
             // PQ ratchet state is restored below from `data.pq_ratchet` after
-            // validation; defaults here cover non-suite-3 sessions and blobs
+            // validation; defaults here cover non-PQ-ratchet sessions and blobs
             // whose PQ state fails validation (degrade-not-fail).
             pq_turns_since_mix: 0,
             is_pq_initiator: false,
             current_pq_epoch: 0,
-            pq_epoch_secrets: Vec::new(),
+            pq_chains: Vec::new(),
+            pq_skipped_keys: HashMap::new(),
+            pq_skipped_key_timestamps: HashMap::new(),
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
@@ -204,7 +228,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             if data.pq_ratchet.is_some() {
                 tracing::warn!(
                     target: "crypto::double_ratchet",
-                    "ignoring PQ ratchet state on a non-suite-3 session blob"
+                    "ignoring PQ ratchet state on a non-PQ-ratchet session blob"
                 );
             }
             return;
@@ -212,7 +236,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         let Some(pq) = &data.pq_ratchet else {
             tracing::warn!(
                 target: "crypto::double_ratchet",
-                "suite-3 session blob without PQ ratchet state (pre-persistence \
+                "PQ-ratchet session blob without PQ ratchet state (pre-persistence \
                  build?) — PQ state reset; peer messages tagged with an epoch \
                  will not decrypt"
             );
@@ -228,7 +252,13 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
         self.is_pq_initiator = pq.is_initiator;
         self.current_pq_epoch = pq.current_epoch;
-        self.pq_epoch_secrets = pq.epoch_secrets.clone();
+        self.pq_chains = pq.chains.iter().map(PqEpochChains::from).collect();
+        for s in &pq.skipped {
+            self.pq_skipped_keys
+                .insert((s.epoch, s.index), s.key.clone());
+            self.pq_skipped_key_timestamps
+                .insert((s.epoch, s.index), s.at);
+        }
         self.pending_pq_exchange = pq.pending_exchange.as_ref().map(|ex| PendingPqExchange {
             epoch: ex.epoch,
             keypair: PqRatchetKeyPair {
@@ -243,7 +273,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 epoch: p.epoch,
                 ek_hash,
                 ciphertext: p.ciphertext.clone(),
-                secret: p.secret.clone(),
+                chains: PqEpochChains::from(&p.chains),
             }
         });
         self.pq_pending_since = pq.pending_since;
@@ -255,33 +285,65 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 const MLKEM768_PUBLIC_LEN: usize = 1184;
 const MLKEM768_SECRET_LEN: usize = 2400;
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
-const MLKEM768_SHARED_SECRET_LEN: usize = 32;
+/// A PQ chain key and a key it yields are 32 bytes (`pq_chain_step`).
+const PQ_CHAIN_KEY_LEN: usize = 32;
 
 /// Structural validation of a persisted PQ ratchet state. These are invariants
 /// the runtime state machine maintains by construction; a blob violating them
 /// is corrupted (or from an incompatible future format) and must not be
 /// applied, since bad epoch secrets produce undecryptable messages anyway.
 fn validate_pq_ratchet_state(pq: &SerializablePqRatchetState) -> Result<(), String> {
-    if pq.epoch_secrets.len() > PQ_EPOCH_RETENTION {
+    if pq.chains.len() > PQ_CHAIN_RETENTION {
         return Err(format!(
-            "{} epoch secrets exceeds retention bound {PQ_EPOCH_RETENTION}",
-            pq.epoch_secrets.len()
+            "{} epochs' chains exceed retention bound {PQ_CHAIN_RETENTION}",
+            pq.chains.len()
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for (epoch, secret) in &pq.epoch_secrets {
-        if *epoch == 0 || *epoch > pq.current_epoch {
+    for chains in &pq.chains {
+        let epoch = chains.epoch;
+        if epoch == 0 || epoch > pq.current_epoch {
             return Err(format!(
-                "epoch secret id {epoch} outside (0, current={}]",
+                "epoch chains id {epoch} outside (0, current={}]",
                 pq.current_epoch
             ));
         }
-        if secret.len() != MLKEM768_SHARED_SECRET_LEN {
-            return Err(format!("epoch {epoch} secret is {} bytes", secret.len()));
+        validate_pq_epoch_chains(chains)?;
+        // Only the current epoch still sends.
+        if chains.send.is_some() && epoch != pq.current_epoch {
+            return Err(format!(
+                "epoch {epoch} keeps a send chain behind current {}",
+                pq.current_epoch
+            ));
         }
-        if !seen.insert(*epoch) {
-            return Err(format!("duplicate epoch secret id {epoch}"));
+        if !seen.insert(epoch) {
+            return Err(format!("duplicate epoch chains id {epoch}"));
         }
+    }
+    if pq.current_epoch > 0
+        && !pq
+            .chains
+            .iter()
+            .any(|c| c.epoch == pq.current_epoch && c.send.is_some())
+    {
+        return Err(format!(
+            "current epoch {} has no send chain",
+            pq.current_epoch
+        ));
+    }
+    if pq.skipped.len() > crate::config::Config::global().max_skipped_messages as usize {
+        return Err(format!(
+            "{} skipped PQ keys exceed the skipped-key bound",
+            pq.skipped.len()
+        ));
+    }
+    if let Some(bad) = pq.skipped.iter().find(|s| s.key.len() != PQ_CHAIN_KEY_LEN) {
+        return Err(format!(
+            "skipped PQ key {}/{} is {} bytes",
+            bad.epoch,
+            bad.index,
+            bad.key.len()
+        ));
     }
     if let Some(ex) = &pq.pending_exchange {
         // The initiator only ever proposes current + 1 (single exchange in flight).
@@ -310,21 +372,39 @@ fn validate_pq_ratchet_state(pq: &SerializablePqRatchetState) -> Result<(), Stri
         if ct.ek_hash.len() != 8 {
             return Err(format!("ek_hash is {} bytes, expected 8", ct.ek_hash.len()));
         }
-        if ct.ciphertext.len() != MLKEM768_CIPHERTEXT_LEN
-            || ct.secret.len() != MLKEM768_SHARED_SECRET_LEN
-        {
+        if ct.ciphertext.len() != MLKEM768_CIPHERTEXT_LEN {
             return Err(format!(
-                "pending ciphertext sizes {}/{} invalid",
-                ct.ciphertext.len(),
-                ct.secret.len()
+                "pending ciphertext is {} bytes",
+                ct.ciphertext.len()
             ));
         }
+        if ct.chains.epoch != ct.epoch {
+            return Err(format!(
+                "pending ciphertext epoch {} carries chains of epoch {}",
+                ct.epoch, ct.chains.epoch
+            ));
+        }
+        validate_pq_epoch_chains(&ct.chains)?;
     }
     // A pending exchange and a pending ciphertext are mutually exclusive by
     // the single-initiator discipline (initiator holds only exchanges,
     // responder only ciphertexts).
     if pq.pending_exchange.is_some() && pq.pending_ciphertext.is_some() {
         return Err("both pending exchange and pending ciphertext present".to_string());
+    }
+    Ok(())
+}
+
+fn validate_pq_epoch_chains(chains: &SerializablePqEpochChains) -> Result<(), String> {
+    let lengths = std::iter::once(&chains.recv).chain(chains.send.as_ref());
+    for chain in lengths {
+        if chain.key.len() != PQ_CHAIN_KEY_LEN {
+            return Err(format!(
+                "epoch {} chain key is {} bytes",
+                chains.epoch,
+                chain.key.len()
+            ));
+        }
     }
     Ok(())
 }
@@ -443,14 +523,14 @@ pub struct SerializableSession {
     /// `IdentityProof::Answered` (responder): the ciphertext carried until the initiator proves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity_proof_ciphertext: Option<Vec<u8>>,
-    /// Sparse continuous PQ ratchet (suite 3) sub-state — SPQR-style
-    /// message-key mixing design. Present only for suite-3 sessions. Mirrors
+    /// Sparse continuous PQ ratchet (suite 4) sub-state — epoch chains, per-message
+    /// keys (PQR-2). Present only for PQ-ratchet sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pq_ratchet: Option<SerializablePqRatchetState>,
 }
 
-/// JSON-side mirror of `CfePqRatchetStateV1` (see `cfe/types.rs` for the field
+/// JSON-side mirror of `CfePqRatchetStateV2` (see `cfe/types.rs` for the field
 /// semantics and why `pending_ciphertext` must be persisted). Secrets are
 /// zeroized on drop.
 #[derive(Serialize, Deserialize, Clone)]
@@ -458,7 +538,9 @@ pub(crate) struct SerializablePqRatchetState {
     pub(crate) is_initiator: bool,
     pub(crate) current_epoch: u32,
     #[serde(default)]
-    pub(crate) epoch_secrets: Vec<(u32, Vec<u8>)>,
+    pub(crate) chains: Vec<SerializablePqEpochChains>,
+    #[serde(default)]
+    pub(crate) skipped: Vec<SerializablePqSkippedKey>,
     #[serde(default)]
     pub(crate) pending_exchange: Option<SerializablePqPendingExchange>,
     #[serde(default)]
@@ -469,10 +551,64 @@ pub(crate) struct SerializablePqRatchetState {
     pub(crate) turns_since_mix: u32,
 }
 
-impl Drop for SerializablePqRatchetState {
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqChain {
+    pub(crate) index: u32,
+    pub(crate) key: Vec<u8>,
+}
+
+impl Drop for SerializablePqChain {
     fn drop(&mut self) {
-        for (_, secret) in &mut self.epoch_secrets {
-            secret.zeroize();
+        self.key.zeroize();
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqEpochChains {
+    pub(crate) epoch: u32,
+    #[serde(default)]
+    pub(crate) send: Option<SerializablePqChain>,
+    pub(crate) recv: SerializablePqChain,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SerializablePqSkippedKey {
+    pub(crate) epoch: u32,
+    pub(crate) index: u32,
+    pub(crate) key: Vec<u8>,
+    pub(crate) at: u64,
+}
+
+impl Drop for SerializablePqSkippedKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl From<&PqEpochChains> for SerializablePqEpochChains {
+    fn from(c: &PqEpochChains) -> Self {
+        let chain = |ch: &PqChain| SerializablePqChain {
+            index: ch.index,
+            key: ch.key.clone(),
+        };
+        Self {
+            epoch: c.epoch,
+            send: c.send.as_ref().map(chain),
+            recv: chain(&c.recv),
+        }
+    }
+}
+
+impl From<&SerializablePqEpochChains> for PqEpochChains {
+    fn from(c: &SerializablePqEpochChains) -> Self {
+        let chain = |ch: &SerializablePqChain| PqChain {
+            index: ch.index,
+            key: ch.key.clone(),
+        };
+        Self {
+            epoch: c.epoch,
+            send: c.send.as_ref().map(chain),
+            recv: chain(&c.recv),
         }
     }
 }
@@ -495,13 +631,7 @@ pub(crate) struct SerializablePqPendingCiphertext {
     pub(crate) epoch: u32,
     pub(crate) ek_hash: Vec<u8>,
     pub(crate) ciphertext: Vec<u8>,
-    pub(crate) secret: Vec<u8>,
-}
-
-impl Drop for SerializablePqPendingCiphertext {
-    fn drop(&mut self) {
-        self.secret.zeroize();
-    }
+    pub(crate) chains: SerializablePqEpochChains,
 }
 
 impl Drop for SerializableSession {
@@ -654,15 +784,18 @@ impl SerializableSession {
             pqr: self
                 .pq_ratchet
                 .as_ref()
-                .map(|pq| crate::cfe::CfePqRatchetStateV1 {
+                .map(|pq| crate::cfe::CfePqRatchetStateV2 {
                     is_initiator: pq.is_initiator,
                     current_epoch: pq.current_epoch,
-                    epoch_secrets: pq
-                        .epoch_secrets
+                    chains: pq.chains.iter().map(cfe_epoch_chains).collect(),
+                    skipped: pq
+                        .skipped
                         .iter()
-                        .map(|(epoch, secret)| crate::cfe::CfePqEpochSecretV1 {
-                            epoch: *epoch,
-                            secret: crate::crypto::SecretBytes::from(secret.clone()),
+                        .map(|s| crate::cfe::CfePqSkippedKeyV2 {
+                            epoch: s.epoch,
+                            index: s.index,
+                            key: crate::crypto::SecretBytes::from(s.key.clone()),
+                            at: s.at,
                         })
                         .collect(),
                     pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
@@ -673,11 +806,11 @@ impl SerializableSession {
                         }
                     }),
                     pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
-                        crate::cfe::CfePqPendingCiphertextV1 {
+                        crate::cfe::CfePqPendingCiphertextV2 {
                             epoch: p.epoch,
                             ek_hash: ByteBuf::from(p.ek_hash.clone()),
                             ciphertext: ByteBuf::from(p.ciphertext.clone()),
-                            secret: crate::crypto::SecretBytes::from(p.secret.clone()),
+                            chains: cfe_epoch_chains(&p.chains),
                         }
                     }),
                     pending_since: pq.pending_since,
@@ -737,10 +870,16 @@ impl SerializableSession {
             pq_ratchet: data.pqr.map(|pq| SerializablePqRatchetState {
                 is_initiator: pq.is_initiator,
                 current_epoch: pq.current_epoch,
-                epoch_secrets: pq
-                    .epoch_secrets
+                chains: pq.chains.iter().map(serializable_epoch_chains).collect(),
+                skipped: pq
+                    .skipped
                     .iter()
-                    .map(|e| (e.epoch, e.secret.expose().to_vec()))
+                    .map(|s| SerializablePqSkippedKey {
+                        epoch: s.epoch,
+                        index: s.index,
+                        key: s.key.expose().to_vec(),
+                        at: s.at,
+                    })
                     .collect(),
                 pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
                     SerializablePqPendingExchange {
@@ -754,12 +893,36 @@ impl SerializableSession {
                         epoch: p.epoch,
                         ek_hash: p.ek_hash.to_vec(),
                         ciphertext: p.ciphertext.to_vec(),
-                        secret: p.secret.expose().to_vec(),
+                        chains: serializable_epoch_chains(&p.chains),
                     }
                 }),
                 pending_since: pq.pending_since,
                 turns_since_mix: pq.turns_since_mix,
             }),
         })
+    }
+}
+
+fn cfe_epoch_chains(c: &SerializablePqEpochChains) -> crate::cfe::CfePqEpochChainsV2 {
+    let chain = |ch: &SerializablePqChain| crate::cfe::CfePqChainV2 {
+        index: ch.index,
+        key: crate::crypto::SecretBytes::from(ch.key.clone()),
+    };
+    crate::cfe::CfePqEpochChainsV2 {
+        epoch: c.epoch,
+        send: c.send.as_ref().map(chain),
+        recv: chain(&c.recv),
+    }
+}
+
+fn serializable_epoch_chains(c: &crate::cfe::CfePqEpochChainsV2) -> SerializablePqEpochChains {
+    let chain = |ch: &crate::cfe::CfePqChainV2| SerializablePqChain {
+        index: ch.index,
+        key: ch.key.expose().to_vec(),
+    };
+    SerializablePqEpochChains {
+        epoch: c.epoch,
+        send: c.send.as_ref().map(chain),
+        recv: chain(&c.recv),
     }
 }

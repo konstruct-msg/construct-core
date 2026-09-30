@@ -74,12 +74,14 @@ pub struct IncomingFirstMessage {
     pub content: Vec<u8>,
     pub one_time_prekey_id: u32,
     /// DR message suite (the NEGOTIATED suite the initiator encrypted with, e.g.
-    /// `SuiteID::PQ_RATCHET`=3), distinct from the bundle's crypto suite. Must be carried from
+    /// `SuiteID::PQ_RATCHET`), distinct from the bundle's crypto suite. Must be carried from
     /// the wire so the responder rebuilds the exact AEAD associated data — see task #12.
     pub suite_id: u16,
-    /// Suite-3 PQ epoch tag the initiator authenticated into the AD (0 for other suites).
+    /// PQ epoch tag the initiator authenticated into the AD (0 for other suites).
     pub pq_message_epoch: u32,
-    /// Suite-3 sparse PQ-ratchet field (initiator KEM public / responder ciphertext); `None`
+    /// Its key's index in the sender's chain of that epoch (0 with epoch 0).
+    pub pq_key_index: u32,
+    /// Sparse PQ-ratchet field (initiator KEM public / responder ciphertext); `None`
     /// for other suites.
     pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
     /// The wire carried `PQXDH_V2_FLAG` (`DecodedWirePayload::pqxdh_v2`).
@@ -95,7 +97,7 @@ pub struct IncomingFirstMessage {
 impl IncomingFirstMessage {
     /// The first message as the envelope carries it (`encrypted_payload`), unpacked here so that
     /// no field the responder needs — the PQXDH v2 flag, the Kyber prekey id, the KEM ciphertext,
-    /// the suite-3 tags — passes through a platform copy on the way in.
+    /// the PQ-ratchet tags — passes through a platform copy on the way in.
     pub fn from_wire_payload(wire_payload: &[u8]) -> Result<Self, String> {
         let d = crate::wire_payload::unpack(wire_payload)
             .map_err(|e| format!("wire_payload unpack failed: {e}"))?;
@@ -106,6 +108,7 @@ impl IncomingFirstMessage {
             one_time_prekey_id: d.one_time_prekey_id,
             suite_id: d.suite_id,
             pq_message_epoch: d.pq_message_epoch,
+            pq_key_index: d.pq_key_index,
             pq_ratchet_field: d.pq_ratchet_field,
             pqxdh_v2: d.pqxdh_v2,
             kyber_prekey_id: d.kyber_otpk_id,
@@ -149,6 +152,7 @@ impl OutgoingEncrypted {
             self.message.identity_proof_ciphertext.as_deref(),
             &self.sealed_box,
             self.message.pq_message_epoch,
+            self.message.pq_key_index,
             self.message.pq_ratchet_field.clone(),
         )
     }
@@ -1007,7 +1011,7 @@ impl Orchestrator {
         }
         if ratchet_suite_id != crate::crypto::SuiteID::PQ_RATCHET.as_u16() {
             return Err(format!(
-                "PQXDH_REQUIRED: first message on suite {ratchet_suite_id}; suite 3 is mandatory"
+                "PQXDH_REQUIRED: first message on suite {ratchet_suite_id}; the PQ-ratchet suite is mandatory"
             ));
         }
         let key_manager = self.lifecycle.client.key_manager();
@@ -1093,10 +1097,11 @@ impl Orchestrator {
             previous_chain_length: 0,
             // Carry the DR message's NEGOTIATED suite / PQ tags from the wire — NOT the bundle's
             // crypto suite. The responder must reconstruct the exact AEAD associated data the
-            // initiator authenticated; defaulting these to the bundle suite made suite-3 msg0
-            // fail to decrypt (task #12).
+            // initiator authenticated; defaulting these to the bundle suite made PQ-ratchet msg0
+            // fail to decrypt (task #12). The key index rides with the epoch.
             suite_id: first_message.suite_id,
             pq_message_epoch: first_message.pq_message_epoch,
+            pq_key_index: first_message.pq_key_index,
             pq_ratchet_field: first_message.pq_ratchet_field.clone(),
             // A first flight is the initiator's: it names a KEM identity key, it never answers one.
             identity_proof_ciphertext: None,
@@ -1833,7 +1838,7 @@ impl Orchestrator {
     /// Returns `(ephemeral_public_key, message_number, content_b64, one_time_prekey_id)`.
     /// Returns `(ephemeral_public_key, message_number, sealed_box, one_time_prekey_id, suite_id,
     /// pq_message_epoch, pq_ratchet_field)`. The last three carry the DR message's negotiated
-    /// suite + suite-3 PQ section so the responder can reconstruct the exact AEAD associated data
+    /// suite + PQ-ratchet section so the responder can reconstruct the exact AEAD associated data
     /// (task #12); they are `(1/2, 0, None)`-equivalent for non-PQ_RATCHET suites.
     /// Encrypt for `contact_id`: the ratchet message, its sealed box, and the handshake header it
     /// must carry (the initiator's first flight, until the peer answers).
@@ -1912,6 +1917,7 @@ impl Orchestrator {
             previous_chain_length: decoded.previous_chain_length,
             suite_id: decoded.suite_id,
             pq_message_epoch: decoded.pq_message_epoch,
+            pq_key_index: decoded.pq_key_index,
             pq_ratchet_field: decoded.pq_ratchet_field,
             identity_proof_ciphertext: decoded.identity_proof_ciphertext,
         };
@@ -2544,7 +2550,7 @@ mod tests {
         crate::wire_payload::pack(
             &[7u8; 32], msg_num, 0, 0, 0, 1, kem_ct, None, None,
             &[0u8; 32], // sealed box (never decrypted in these tests)
-            0, None,
+            0, 0, None,
         )
         .unwrap()
     }
@@ -2949,6 +2955,7 @@ mod pqxdh_v2_tests {
             None,
             &d.sealed_box,
             d.pq_message_epoch,
+            0,
             d.pq_ratchet_field,
         )
         .unwrap()

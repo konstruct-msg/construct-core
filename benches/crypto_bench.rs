@@ -179,6 +179,7 @@ fn bench_wire_payload(c: &mut Criterion) {
                 None,
                 &sealed_box,
                 0,
+                0,
                 None,
             )
             .expect("pack failed")
@@ -196,6 +197,7 @@ fn bench_wire_payload(c: &mut Criterion) {
         None,
         None,
         &sealed_box,
+        0,
         0,
         None,
     )

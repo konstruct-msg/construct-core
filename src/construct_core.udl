@@ -81,14 +81,15 @@ dictionary WirePayload {
     u32 one_time_prekey_id;            // 0 = fallback 3-DH / not a first message
     u32 kyber_otpk_id;                 // the responder's Kyber prekey (SPK ids from 1, one-time from 1 000 000); 0 = none
     u32 previous_chain_length;         // Double Ratchet PN field
-    u16 suite_id;                      // ratchet suite (1/3); the PQXDH v2 bit is stripped / set by the core
+    u16 suite_id;                      // ratchet suite (1 classic, 4 PQ ratchet); the PQXDH v2 bit is stripped / set by the core
     bytes? kem_ciphertext;      // ML-KEM-1024 ciphertext on the initiator's first flight
     bytes sealed_box;           // nonce || ciphertext || auth_tag
-    u32 pq_message_epoch;              // suite-3 PQ epoch tag (0 otherwise)
-    bytes pq_ratchet_field;     // suite-3 sparse PQ field, serialized (empty = none)
+    u32 pq_message_epoch;              // PQ-ratchet epoch tag (0 otherwise)
+    bytes pq_ratchet_field;     // PQ-ratchet sparse field, serialized (empty = none)
     boolean pqxdh_v2 = false;          // the wire carried the PQXDH v2 flag
     bytes? kem_identity = null;               // the initiator's ML-KEM-1024 identity key (first flight)
     bytes? identity_proof_ciphertext = null;  // the responder's answer to it, until the initiator proves itself
+    u32 pq_key_index = 0;              // the key's index in the sender's chain of pq_message_epoch
 };
 
 // ============================================================================

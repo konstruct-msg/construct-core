@@ -1582,7 +1582,7 @@ fn test_ad_v2_fallback_decrypts_legacy_messages() {
 
     let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000031";
     let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000032";
-    let (_alice, bob) = make_session_pair(alice_uuid, bob_uuid);
+    let (_alice, mut bob) = make_session_pair(alice_uuid, bob_uuid);
 
     // Bob is the receiver. His decrypt-side AD is:
     //   ad_version || contact_id (alice) || local_user_id (bob) || session_id || dh_pub || msg_num
@@ -1618,6 +1618,7 @@ fn test_ad_v2_fallback_decrypts_legacy_messages() {
         previous_chain_length: 0,
         suite_id: SuiteID::CLASSIC.as_u16(),
         pq_message_epoch: 0,
+        pq_key_index: 0,
         pq_ratchet_field: None,
         identity_proof_ciphertext: None,
     };
@@ -1767,9 +1768,67 @@ fn pq_drive_to_epoch(
     );
 }
 
-/// The §A.2 blocker test: a full conversation on suite 3 through the real
+#[cfg(feature = "post-quantum")]
+type Dr = DoubleRatchetSession<ClassicSuiteProvider>;
+
+/// This side's chain of `epoch` in the initiator→responder direction (`i2r`) or back — its send
+/// chain for its own direction, its receive chain for the other. Provisional (responder, not yet
+/// promoted) chains count.
+#[cfg(feature = "post-quantum")]
+fn pq_chain(s: &Dr, epoch: u32, i2r: bool) -> Option<super::PqChain> {
+    let chains = s.pq_chains.iter().find(|c| c.epoch == epoch).or_else(|| {
+        s.pending_pq_ciphertext
+            .as_ref()
+            .filter(|p| p.epoch == epoch)
+            .map(|p| &p.chains)
+    })?;
+    if i2r == s.is_pq_initiator {
+        chains.send.clone()
+    } else {
+        Some(chains.recv.clone())
+    }
+}
+
+/// The key a chain yields at `index`; `None` if the chain is already past it.
+#[cfg(feature = "post-quantum")]
+fn pq_key_at(mut chain: super::PqChain, index: u32) -> Option<Vec<u8>> {
+    if chain.index > index {
+        return None;
+    }
+    loop {
+        let (i, key) = Dr::pq_chain_step(&mut chain).ok()?;
+        if i == index {
+            return Some(key);
+        }
+    }
+}
+
+/// Two sessions hold the same chains of `epoch`: every direction both still hold yields the same
+/// key at the further of their two positions.
+#[cfg(feature = "post-quantum")]
+fn assert_pq_epoch_agrees(a: &Dr, b: &Dr, epoch: u32) {
+    let mut compared = 0;
+    for i2r in [true, false] {
+        let (Some(x), Some(y)) = (pq_chain(a, epoch, i2r), pq_chain(b, epoch, i2r)) else {
+            continue;
+        };
+        let at = x.index.max(y.index);
+        assert_eq!(
+            pq_key_at(x, at),
+            pq_key_at(y, at),
+            "epoch {epoch} chain (i2r={i2r}) must be the same on both sides"
+        );
+        compared += 1;
+    }
+    assert!(
+        compared > 0,
+        "no chain of epoch {epoch} is held on both sides"
+    );
+}
+
+/// The §A.2 blocker test: a full conversation on the PQ-ratchet suite through the real
 /// encrypt/decrypt path, past multiple cadence firings, with every message
-/// decrypting and both sides converging on identical epoch secrets. Under the
+/// decrypting and both sides converging on identical epoch chains. Under the
 /// removed root-key fold this scenario bricked at the first cadence firing.
 #[cfg(feature = "post-quantum")]
 #[test]
@@ -1783,22 +1842,20 @@ fn test_pq_ratchet_full_conversation_advances_epochs() {
 
     assert_eq!(alice.current_pq_epoch, 2);
     assert_eq!(bob.current_pq_epoch, 2);
-    for epoch in [1u32, 2] {
-        let a = alice
-            .lookup_pq_epoch_secret(epoch)
-            .expect("alice must retain the epoch secret");
-        let b = bob
-            .lookup_pq_epoch_secret(epoch)
-            .expect("bob must retain the epoch secret");
-        assert_eq!(
-            a, b,
-            "epoch {epoch} secrets must be identical on both sides"
-        );
-        assert_eq!(a.len(), 32, "ML-KEM-768 shared secret is 32 bytes");
-    }
+    // Epoch 2 sends, and both sides agree on it. Epoch 1 only reads late messages now: neither
+    // side can derive another key it would send on it.
+    assert_pq_epoch_agrees(&alice, &bob, 2);
+    assert!(
+        pq_chain(&alice, 1, true).is_none() && pq_chain(&bob, 1, false).is_none(),
+        "both sides stopped sending on epoch 1 when epoch 2 began"
+    );
+    assert!(
+        pq_chain(&bob, 1, true).is_some() && pq_chain(&alice, 1, false).is_some(),
+        "epoch 1 keeps its receive chains for late messages"
+    );
     assert_ne!(
-        alice.lookup_pq_epoch_secret(1).unwrap(),
-        alice.lookup_pq_epoch_secret(2).unwrap(),
+        pq_chain(&alice, 1, false).unwrap().key,
+        pq_chain(&alice, 2, false).unwrap().key,
         "each epoch must contribute fresh key material"
     );
 
@@ -1817,16 +1874,14 @@ fn test_pq_ratchet_secret_participates_in_message_key() {
     );
     pq_drive_to_epoch(&mut alice, &mut bob, 1);
 
-    // Corrupt Bob's copy of the epoch-1 secret.
+    // Corrupt Bob's receive chain of epoch 1.
     let original = {
-        let slot = bob
-            .pq_epoch_secrets
+        let chains = bob
+            .pq_chains
             .iter_mut()
-            .find(|(e, _)| *e == 1)
+            .find(|c| c.epoch == 1)
             .expect("bob holds epoch 1");
-        let orig = slot.1.clone();
-        slot.1 = vec![0u8; 32];
-        orig
+        std::mem::replace(&mut chains.recv.key, vec![0u8; 32])
     };
 
     let msg = alice.encrypt(b"tagged with epoch 1").unwrap();
@@ -1836,13 +1891,14 @@ fn test_pq_ratchet_secret_participates_in_message_key() {
         "a wrong epoch secret must fail AEAD — the PQ mix is load-bearing"
     );
 
-    // Restore the real secret: the same message must now decrypt (proves the
+    // Restore the real chain: the same message must now decrypt (proves the
     // failed attempt rolled back chain state instead of corrupting it).
-    bob.pq_epoch_secrets
+    bob.pq_chains
         .iter_mut()
-        .find(|(e, _)| *e == 1)
+        .find(|c| c.epoch == 1)
         .unwrap()
-        .1 = original;
+        .recv
+        .key = original;
     assert_eq!(bob.decrypt(&msg).unwrap(), b"tagged with epoch 1");
 }
 
@@ -1969,10 +2025,7 @@ fn test_pq_ratchet_lost_ek_carrier_healed_by_resend() {
 
     pq_round(&mut alice, &mut bob, "post-loss convergence");
     assert_eq!(bob.current_pq_epoch, 1);
-    assert_eq!(
-        alice.lookup_pq_epoch_secret(1).unwrap(),
-        bob.lookup_pq_epoch_secret(1).unwrap()
-    );
+    assert_pq_epoch_agrees(&alice, &bob, 1);
 }
 
 /// A lost CT-carrying reply is healed the same way: the responder re-attaches
@@ -2008,10 +2061,7 @@ fn test_pq_ratchet_lost_ct_carrier_healed_by_resend() {
 
     pq_round(&mut alice, &mut bob, "post-ct-loss convergence");
     assert_eq!(bob.current_pq_epoch, 1);
-    assert_eq!(
-        alice.lookup_pq_epoch_secret(1).unwrap(),
-        bob.lookup_pq_epoch_secret(1).unwrap()
-    );
+    assert_pq_epoch_agrees(&alice, &bob, 1);
 }
 
 /// Duplicate EK delivery must NOT re-encapsulate: re-encapsulating would
@@ -2035,7 +2085,7 @@ fn test_pq_ratchet_duplicate_ek_is_idempotent() {
     bob.decrypt(&m1).unwrap();
     let (ct_before, secret_before) = {
         let p = bob.pending_pq_ciphertext.as_ref().unwrap();
-        (p.ciphertext.clone(), p.secret.clone())
+        (p.ciphertext.clone(), p.chains.recv.key.clone())
     };
 
     // Same EK arrives again on the next message.
@@ -2050,7 +2100,10 @@ fn test_pq_ratchet_duplicate_ek_is_idempotent() {
         p.ciphertext, ct_before,
         "duplicate EK must not re-encapsulate"
     );
-    assert_eq!(p.secret, secret_before, "provisional secret must be stable");
+    assert_eq!(
+        p.chains.recv.key, secret_before,
+        "provisional chains must be stable"
+    );
 }
 
 /// Abandon + re-propose: a ciphertext built against an abandoned keypair is
@@ -2113,10 +2166,7 @@ fn test_pq_ratchet_stale_ct_for_abandoned_keypair_ignored() {
     assert_eq!(alice.current_pq_epoch, 1);
     pq_round(&mut alice, &mut bob, "post-reproposal convergence");
     assert_eq!(bob.current_pq_epoch, 1);
-    assert_eq!(
-        alice.lookup_pq_epoch_secret(1).unwrap(),
-        bob.lookup_pq_epoch_secret(1).unwrap()
-    );
+    assert_pq_epoch_agrees(&alice, &bob, 1);
 }
 
 /// A malformed EK must be logged-and-dropped without affecting classical
@@ -2216,26 +2266,32 @@ fn test_pq_ratchet_cadence_fires_after_default_interval() {
     );
 }
 
-/// Epoch secret retention is bounded: only the last `PQ_EPOCH_RETENTION`
-/// epochs are kept, oldest evicted.
+/// Chain retention is bounded: the current epoch and the one before it, and only the current one
+/// sends.
 #[cfg(feature = "post-quantum")]
 #[test]
-fn test_pq_ratchet_epoch_retention_bounded() {
+fn test_pq_ratchet_chain_retention_bounded() {
     let (mut alice, _bob) = make_pq_session_pair(
         "aaaaaaaa-0000-4000-8000-0000000000d3",
         "bbbbbbbb-0000-4000-8000-0000000000d4",
     );
-    for epoch in 1..=(super::PQ_EPOCH_RETENTION as u32 + 2) {
-        alice.insert_pq_epoch_secret(epoch, vec![epoch as u8; 32]);
+    let last = super::PQ_CHAIN_RETENTION as u32 + 2;
+    for epoch in 1..=last {
+        let chains = DoubleRatchetSession::<ClassicSuiteProvider>::pq_epoch_chains(
+            &[epoch as u8; 32],
+            epoch,
+            true,
+        )
+        .unwrap();
+        alice.insert_pq_epoch_chains(chains);
     }
-    assert_eq!(alice.pq_epoch_secrets.len(), super::PQ_EPOCH_RETENTION);
-    assert!(alice.lookup_pq_epoch_secret(1).is_none(), "oldest evicted");
-    assert!(alice.lookup_pq_epoch_secret(2).is_none(), "oldest evicted");
+    let kept: Vec<u32> = alice.pq_chains.iter().map(|c| c.epoch).collect();
+    assert_eq!(kept, [last - 1, last], "oldest evicted");
     assert!(
-        alice
-            .lookup_pq_epoch_secret(super::PQ_EPOCH_RETENTION as u32 + 2)
-            .is_some()
+        alice.pq_chains[0].send.is_none(),
+        "an older epoch no longer sends"
     );
+    assert!(alice.pq_chains[1].send.is_some());
 }
 
 // ── PQ ratchet state persistence (step 3 of the activation sequence) ─────────
@@ -2309,11 +2365,7 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
     assert!(!bob2.is_pq_initiator);
     assert_eq!(alice2.current_pq_epoch, 1);
     assert_eq!(bob2.current_pq_epoch, 1);
-    assert_eq!(
-        alice2.lookup_pq_epoch_secret(1).unwrap(),
-        bob2.lookup_pq_epoch_secret(1).unwrap(),
-        "epoch-1 secret survives on both sides"
-    );
+    assert_pq_epoch_agrees(&alice2, &bob2, 1);
     assert!(
         alice2.pending_pq_exchange.is_some(),
         "in-flight exchange survives"
@@ -2339,10 +2391,7 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
     assert_eq!(m_tag2.pq_message_epoch, 2);
     assert_eq!(bob2.decrypt(&m_tag2).unwrap(), b"tagged 2 after restore");
     assert_eq!(bob2.current_pq_epoch, 2, "restored responder promoted");
-    assert_eq!(
-        alice2.lookup_pq_epoch_secret(2).unwrap(),
-        bob2.lookup_pq_epoch_secret(2).unwrap()
-    );
+    assert_pq_epoch_agrees(&alice2, &bob2, 2);
 
     // Cadence survives restore: the restored pair reaches epoch 3 unassisted.
     pq_drive_to_epoch(&mut alice2, &mut bob2, 3);
@@ -2432,17 +2481,16 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
     );
     pq_drive_to_epoch(&mut alice, &mut bob, 1);
 
-    // Corrupt variant 1: wrong secret length.
+    // Corrupt variant 1: wrong chain key length.
     let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
-    cfe.pqr.as_mut().unwrap().epoch_secrets[0].secret =
-        crate::crypto::SecretBytes::from(vec![0u8; 5]);
+    cfe.pqr.as_mut().unwrap().chains[0].recv.key = crate::crypto::SecretBytes::from(vec![0u8; 5]);
     let ser = super::SerializableSession::from_cfe_v1(cfe).unwrap();
     let restored = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(ser).unwrap();
     assert_eq!(
         restored.current_pq_epoch, 0,
         "corrupted state must be dropped"
     );
-    assert!(restored.pq_epoch_secrets.is_empty());
+    assert!(restored.pq_chains.is_empty());
 
     // Corrupt variant 2: pending-exchange epoch violating the current+1 invariant.
     let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
@@ -2474,8 +2522,190 @@ fn test_pq_ratchet_state_survives_json_round_trip() {
 
     assert!(alice2.is_pq_initiator);
     assert_eq!(alice2.current_pq_epoch, 1);
-    assert_eq!(
-        alice2.lookup_pq_epoch_secret(1).unwrap(),
-        alice.lookup_pq_epoch_secret(1).unwrap()
+    assert_pq_epoch_agrees(&alice2, &alice, 1);
+}
+
+// ── PQR-2: one PQ key per message ─────────────────────────────────────────────
+//
+// construct-docs `decisions/pq-ratchet-per-message-chain.md`. Suite 3 keyed every message of an
+// epoch from one stored epoch secret; these pin the chain that replaced it.
+
+/// Forward secrecy of the PQ half, per message: once a message is read, neither side holds
+/// anything that yields its PQ key again — no chain at or before its index, no skipped key for
+/// it. Under suite 3 the epoch secret stayed for four epochs and derived every such key.
+///
+/// Mutation: stop advancing the receive chain in `pq_receive_key` (return a key without
+/// stepping) — the key is still derivable and this reddens.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr2_a_read_message_key_is_gone_from_both_sides() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001a1",
+        "bbbbbbbb-0000-4000-8000-0000000001a2",
     );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let epoch = alice.current_pq_epoch;
+
+    let before = pq_chain(&alice, epoch, true).expect("alice sends on the epoch");
+    let msg = alice.encrypt(b"read once").unwrap();
+    assert_eq!(msg.pq_key_index, before.index);
+    let used = pq_key_at(before, msg.pq_key_index).unwrap();
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"read once");
+
+    for (side, s) in [("alice", &alice), ("bob", &bob)] {
+        for i2r in [true, false] {
+            if let Some(chain) = pq_chain(s, epoch, i2r) {
+                assert!(
+                    pq_key_at(chain, msg.pq_key_index) != Some(used.clone()),
+                    "{side} can still derive the PQ key of a message already read"
+                );
+            }
+        }
+        assert!(
+            !s.pq_skipped_keys.values().any(|k| *k == used),
+            "{side} kept the used key as a skipped one"
+        );
+    }
+    assert!(
+        bob.pq_receive_key(epoch, msg.pq_key_index)
+            .unwrap_err()
+            .starts_with(super::MESSAGE_KEY_CONSUMED),
+        "asking for the key again is a consumed key, not a fresh derivation"
+    );
+}
+
+/// Out of order inside an epoch: later keys first, the passed-over keys kept as skipped ones and
+/// spent when their messages arrive.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr2_messages_of_one_epoch_read_in_any_order() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001a3",
+        "bbbbbbbb-0000-4000-8000-0000000001a4",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    let m1 = alice.encrypt(b"one").unwrap();
+    let m2 = alice.encrypt(b"two").unwrap();
+    let m3 = alice.encrypt(b"three").unwrap();
+    assert_eq!(
+        [m1.pq_key_index + 1, m1.pq_key_index + 2],
+        [m2.pq_key_index, m3.pq_key_index],
+        "consecutive messages take consecutive keys"
+    );
+
+    assert_eq!(bob.decrypt(&m3).unwrap(), b"three");
+    assert_eq!(
+        bob.pq_skipped_keys.len(),
+        2,
+        "the two passed-over keys are kept"
+    );
+    assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+    assert_eq!(bob.decrypt(&m2).unwrap(), b"two");
+    assert!(
+        bob.pq_skipped_keys.is_empty(),
+        "each kept key is spent once"
+    );
+    pq_round(&mut alice, &mut bob, "after reordering");
+}
+
+/// The index is authenticated: a message moved to another index fails, and the failed attempt
+/// consumes nothing — the original still decrypts.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr2_a_tampered_key_index_is_rejected_and_rolled_back() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001a5",
+        "bbbbbbbb-0000-4000-8000-0000000001a6",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+
+    let msg = alice.encrypt(b"index integrity").unwrap();
+    let mut moved = msg.clone();
+    moved.pq_key_index += 3;
+    assert!(
+        bob.decrypt(&moved).is_err(),
+        "a moved index must not decrypt"
+    );
+    assert!(
+        bob.pq_skipped_keys.is_empty(),
+        "the failed attempt kept nothing"
+    );
+
+    let mut far = msg.clone();
+    far.pq_key_index = u32::MAX;
+    assert!(
+        bob.decrypt(&far).is_err(),
+        "a jump past the bound is refused"
+    );
+
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"index integrity");
+    let replay = bob.decrypt(&msg).unwrap_err();
+    assert!(
+        replay.starts_with(super::MESSAGE_KEY_CONSUMED),
+        "a second copy is a duplicate: {replay}"
+    );
+}
+
+/// Known answers for the three derivations, so another implementation can be checked against
+/// this one byte for byte (to be published with the conformance vectors). Changing any label,
+/// order or length changes them — and the wire with them.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr2_derivations_known_answers() {
+    let chains = Dr::pq_epoch_chains(&[0x42; 32], 1, true).unwrap();
+    let mut send = chains.send.clone().unwrap();
+    let recv = chains.recv.clone();
+    let (i0, k0) = Dr::pq_chain_step(&mut send).unwrap();
+    let (i1, k1) = Dr::pq_chain_step(&mut send).unwrap();
+    let dr_key = Dr::bytes_to_aead_key(&[0x07; 32]).unwrap();
+    let mixed = Dr::mix_pq_message_key(&dr_key, Some(&k0)).unwrap();
+
+    let hex = |b: &[u8]| hex::encode(b);
+    let got = [
+        hex(&chains.send.as_ref().unwrap().key),
+        hex(&recv.key),
+        hex(&k0),
+        hex(&k1),
+        hex(mixed.as_ref()),
+    ];
+    assert_eq!((i0, i1), (0, 1));
+    assert_eq!(got, KNOWN_ANSWERS, "a PQR-2 derivation changed");
+
+    // The responder's chains are the initiator's, crossed.
+    let other = Dr::pq_epoch_chains(&[0x42; 32], 1, false).unwrap();
+    assert_eq!(other.recv.key, chains.send.unwrap().key);
+    assert_eq!(other.send.unwrap().key, chains.recv.key);
+}
+
+/// secret = 0x42×32, epoch = 1, DR key = 0x07×32: the initiator's send chain key, its receive
+/// chain key, the keys at index 0 and 1, and the message key mixed from index 0. All HKDF-SHA256
+/// (RFC 5869, empty salt except the mix); recomputed with a separate RFC 5869 implementation
+/// (Python `hmac`) when pinned, 2026-09-30.
+#[cfg(feature = "post-quantum")]
+const KNOWN_ANSWERS: [&str; 5] = [
+    "1580b9a74a9abc6d8cefbaf561c65c64adc8b33849656f1b0051db2d9af8842f",
+    "30730bf58df681adddf740b817d1c5ff17b8517b05e383fbe1dea05ead8ae57b",
+    "c03bff04f55cd6c9b7b1952306a32de0347e12307f0c9265cd88f4111f7e9325",
+    "7fc0bad75c864e2a790dbfbb04e1e102763d88098ba1d8b7e7210c8cafd002d3",
+    "bd28758bb7c74d3d64fee6e4002b4f6e716169c1148aea322b9800a505976966",
+];
+
+/// A stored suite-3 session does not come back: restore refuses the suite, and the caller holds
+/// no session, so the next send opens a suite-4 one. Reading it as suite 4 would key every message
+/// from chains it does not have.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr2_a_stored_suite_3_session_is_refused() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001a7",
+        "bbbbbbbb-0000-4000-8000-0000000001a8",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let mut ser = alice.to_serializable();
+    ser.suite_id = SuiteID::RETIRED_PQ_RATCHET_V1;
+    let refused = Dr::from_serializable(ser)
+        .err()
+        .expect("suite 3 must not restore");
+    assert!(refused.contains("Invalid suite_id"), "{refused}");
 }

@@ -99,7 +99,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.skipped_key_timestamps = s.skipped_key_timestamps;
             self.pq_turns_since_mix = s.pq_turns_since_mix;
             self.current_pq_epoch = s.current_pq_epoch;
-            self.pq_epoch_secrets = s.pq_epoch_secrets;
+            self.pq_chains = s.pq_chains;
+            self.pq_skipped_keys = s.pq_skipped_keys;
+            self.pq_skipped_key_timestamps = s.pq_skipped_key_timestamps;
             self.pending_pq_exchange = s.pending_pq_exchange;
             self.pending_pq_ciphertext = s.pending_pq_ciphertext;
             self.pq_pending_since = s.pq_pending_since;
@@ -376,10 +378,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             .as_ref()
             .is_some_and(|p| encrypted.pq_message_epoch >= p.epoch)
         {
-            let mut p = self.pending_pq_ciphertext.take().expect("checked above");
+            let p = self.pending_pq_ciphertext.take().expect("checked above");
             self.current_pq_epoch = self.current_pq_epoch.max(p.epoch);
-            let secret = std::mem::take(&mut p.secret);
-            self.insert_pq_epoch_secret(p.epoch, secret);
+            self.insert_pq_epoch_chains(p.chains.clone());
         }
 
         // 2. Field ingestion.
@@ -410,6 +411,21 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 // any previous provisional state.
                 match crate::crypto::pq_x3dh::mlkem768_encapsulate(key) {
                     Ok(enc) => {
+                        // The secret is spent on the epoch's chains here and never stored.
+                        let chains = match Self::pq_epoch_chains(
+                            enc.shared_secret.as_ref(),
+                            *epoch,
+                            self.is_pq_initiator,
+                        ) {
+                            Ok(chains) => chains,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "crypto::double_ratchet",
+                                    "PQ epoch chains failed (classical delivery unaffected): {e}"
+                                );
+                                return;
+                            }
+                        };
                         if let Some(mut old) = self.pending_pq_ciphertext.take() {
                             old.zeroize();
                         }
@@ -417,7 +433,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                             epoch: *epoch,
                             ek_hash: incoming_hash,
                             ciphertext: enc.ciphertext,
-                            secret: enc.shared_secret.into_vec(),
+                            chains,
                         });
                     }
                     Err(e) => {
@@ -437,12 +453,26 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 }
                 match crate::crypto::pq_x3dh::mlkem768_decapsulate(&p.keypair.secret, ct) {
                     Ok(shared_secret) => {
-                        // Activate: we (the initiator) start tagging this epoch
-                        // immediately; the responder promotes on our first tag.
+                        let chains = match Self::pq_epoch_chains(
+                            shared_secret.as_ref(),
+                            *epoch,
+                            self.is_pq_initiator,
+                        ) {
+                            Ok(chains) => chains,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "crypto::double_ratchet",
+                                    "PQ epoch chains failed (classical delivery unaffected): {e}"
+                                );
+                                return;
+                            }
+                        };
+                        // Activate: we (the initiator) start sending on this epoch's chain
+                        // immediately; the responder promotes on our first message of it.
                         let mut ex = self.pending_pq_exchange.take().expect("checked above");
                         ex.zeroize();
                         self.current_pq_epoch = *epoch;
-                        self.insert_pq_epoch_secret(*epoch, shared_secret.into_vec());
+                        self.insert_pq_epoch_chains(chains);
                         self.pq_pending_since = 0;
                     }
                     Err(e) => {
@@ -456,56 +486,176 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
     }
 
-    /// Store a completed epoch secret, evicting (and zeroizing) the oldest
-    /// beyond `PQ_EPOCH_RETENTION`.
-    pub(super) fn insert_pq_epoch_secret(&mut self, epoch: u32, secret: Vec<u8>) {
-        self.pq_epoch_secrets.retain(|(e, _)| *e != epoch);
-        self.pq_epoch_secrets.push((epoch, secret));
-        self.pq_epoch_secrets.sort_by_key(|(e, _)| *e);
-        while self.pq_epoch_secrets.len() > PQ_EPOCH_RETENTION {
-            let (_, mut old) = self.pq_epoch_secrets.remove(0);
+    /// The two chains of epoch `epoch`, from its ML-KEM shared secret (PQR-2):
+    /// `HKDF(ikm = secret, info = "construct-pqr-chains-v2" ‖ epoch BE, 64)` split into the chain
+    /// the PQ-exchange initiator sends on (first half) and the one the responder sends on. The
+    /// caller drops the secret after this; nothing else is ever derived from it.
+    pub(super) fn pq_epoch_chains(
+        secret: &[u8],
+        epoch: u32,
+        is_pq_initiator: bool,
+    ) -> Result<PqEpochChains, String> {
+        let mut info = b"construct-pqr-chains-v2".to_vec();
+        info.extend_from_slice(&epoch.to_be_bytes());
+        let mut out = P::hkdf_derive_key(&[], secret, &info, 64)
+            .map_err(|e| format!("PQ epoch chains: {e:?}"))?;
+        let initiator_sends = PqChain {
+            index: 0,
+            key: out[..32].to_vec(),
+        };
+        let responder_sends = PqChain {
+            index: 0,
+            key: out[32..].to_vec(),
+        };
+        out.zeroize();
+        let (send, recv) = if is_pq_initiator {
+            (initiator_sends, responder_sends)
+        } else {
+            (responder_sends, initiator_sends)
+        };
+        Ok(PqEpochChains {
+            epoch,
+            send: Some(send),
+            recv,
+        })
+    }
+
+    /// One step of a PQ chain: `HKDF(ikm = key, info = "construct-pqr-step-v2", 64)` — the first
+    /// half replaces the chain key, the second is the key for index `chain.index`, which the
+    /// chain then moves past. Returns `(index, key)`.
+    pub(super) fn pq_chain_step(chain: &mut PqChain) -> Result<(u32, Vec<u8>), String> {
+        let mut out = P::hkdf_derive_key(&[], &chain.key, b"construct-pqr-step-v2", 64)
+            .map_err(|e| format!("PQ chain step: {e:?}"))?;
+        let index = chain.index;
+        chain.index = index
+            .checked_add(1)
+            .ok_or("PQ chain index overflow: an epoch has exceeded u32::MAX messages")?;
+        chain.key.zeroize();
+        chain.key = out[..32].to_vec();
+        let key = out[32..].to_vec();
+        out.zeroize();
+        Ok((index, key))
+    }
+
+    /// Keep a completed epoch's chains. Every older epoch stops sending (its send chain is
+    /// erased: nothing is written on it again), and beyond `PQ_CHAIN_RETENTION` the oldest
+    /// epoch goes entirely.
+    pub(super) fn insert_pq_epoch_chains(&mut self, chains: PqEpochChains) {
+        let epoch = chains.epoch;
+        if let Some(mut replaced) = self
+            .pq_chains
+            .iter()
+            .position(|c| c.epoch == epoch)
+            .map(|i| self.pq_chains.remove(i))
+        {
+            replaced.zeroize();
+        }
+        for older in self.pq_chains.iter_mut().filter(|c| c.epoch < epoch) {
+            if let Some(mut send) = older.send.take() {
+                send.zeroize();
+            }
+        }
+        self.pq_chains.push(chains);
+        self.pq_chains.sort_by_key(|c| c.epoch);
+        while self.pq_chains.len() > PQ_CHAIN_RETENTION {
+            let mut old = self.pq_chains.remove(0);
             old.zeroize();
         }
     }
 
-    /// Look up the secret for a completed epoch. Also consults the responder's
-    /// provisional state: the initiator's first message tagged with a new epoch
-    /// arrives *before* we've promoted it (successfully decrypting that very
-    /// message is the promotion trigger).
-    pub(super) fn lookup_pq_epoch_secret(&self, epoch: u32) -> Option<&[u8]> {
-        if let Some((_, s)) = self.pq_epoch_secrets.iter().find(|(e, _)| *e == epoch) {
-            return Some(s.as_slice());
+    /// The key for the next outgoing message: `(epoch, index, key)`, or `(0, 0, None)` before the
+    /// first epoch completes. The send chain advances here, before the AEAD — a message that is
+    /// then not sent leaves a gap the receiver skips like any lost message.
+    pub(super) fn pq_send_key(&mut self) -> Result<(u32, u32, Option<Vec<u8>>), String> {
+        let epoch = self.current_pq_epoch;
+        if !self.suite_id.is_pq_ratchet() || epoch == 0 {
+            return Ok((0, 0, None));
         }
-        self.pending_pq_ciphertext
-            .as_ref()
-            .filter(|p| p.epoch == epoch)
-            .map(|p| p.secret.as_slice())
+        let chain = self
+            .pq_chains
+            .iter_mut()
+            .find(|c| c.epoch == epoch)
+            .and_then(|c| c.send.as_mut())
+            .ok_or_else(|| format!("PQ epoch {epoch} has no send chain"))?;
+        let (index, key) = Self::pq_chain_step(chain)?;
+        Ok((epoch, index, Some(key)))
     }
 
-    /// Hybridize a Double Ratchet message key with a completed PQ epoch secret:
-    /// `HKDF(salt = epoch_secret, ikm = dr_message_key)` — the same shape as
-    /// libsignal's Triple Ratchet message-key derivation, where the PQ key is
-    /// the HKDF salt. `epoch == 0` means "no PQ epoch yet" and returns the DR
-    /// key unchanged (also the path for non-suite-3 sessions).
+    /// The key a received message names by `(epoch, index)`: a skipped key if one was kept,
+    /// otherwise the epoch's receive chain moved up to `index` — keeping the keys it passes, up
+    /// to the skipped-key bound. Mutates the chains; `decrypt` restores its snapshot if the
+    /// message then fails, so a forged index cannot consume a slot.
     ///
-    /// Failing to find the epoch's secret is a hard error: silently skipping
-    /// the mix would be a downgrade, so the message is rejected instead.
-    pub(super) fn mix_pq_message_key(
-        &self,
-        dr_key: &P::AeadKey,
+    /// An epoch without chains is a hard error — silently skipping the mix would be a downgrade.
+    pub(super) fn pq_receive_key(
+        &mut self,
         epoch: u32,
-    ) -> Result<P::AeadKey, String> {
-        if epoch == 0 {
-            return Ok(dr_key.clone());
+        index: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if !self.suite_id.is_pq_ratchet() || epoch == 0 {
+            if index != 0 {
+                return Err(format!("PQ key index {index} without an epoch"));
+            }
+            return Ok(None);
         }
-        let secret = self.lookup_pq_epoch_secret(epoch).ok_or_else(|| {
-            format!(
-                "PQ epoch {epoch} secret unavailable (current epoch {}) — \
-                 message tagged with an unknown/evicted epoch",
-                self.current_pq_epoch
-            )
-        })?;
-        let mixed = P::hkdf_derive_key(secret, dr_key.as_ref(), b"construct-pqr-msg-v1", 32)
+        if let Some(key) = self.pq_skipped_keys.remove(&(epoch, index)) {
+            self.pq_skipped_key_timestamps.remove(&(epoch, index));
+            return Ok(Some(key));
+        }
+        let current = self.current_pq_epoch;
+        let max_jump = Config::global().max_message_jump;
+        let max_skipped = Config::global().max_skipped_messages as usize;
+        let chain = match self.pq_chains.iter_mut().find(|c| c.epoch == epoch) {
+            Some(c) => &mut c.recv,
+            None => match self.pending_pq_ciphertext.as_mut() {
+                Some(p) if p.epoch == epoch => &mut p.chains.recv,
+                _ => {
+                    return Err(format!(
+                        "PQ epoch {epoch} has no chain (current epoch {current}) — \
+                         message tagged with an unknown/evicted epoch"
+                    ));
+                }
+            },
+        };
+        if index < chain.index {
+            return Err(format!(
+                "{}: PQ key {epoch}/{index} already used (chain at {})",
+                super::MESSAGE_KEY_CONSUMED,
+                chain.index
+            ));
+        }
+        if index > chain.index.saturating_add(max_jump) {
+            return Err(format!(
+                "PQ key index jump too large: {} -> {index} (limit +{max_jump})",
+                chain.index
+            ));
+        }
+        let now = crate::utils::time::now();
+        loop {
+            let (i, key) = Self::pq_chain_step(chain)?;
+            if i == index {
+                return Ok(Some(key));
+            }
+            if self.pq_skipped_keys.len() >= max_skipped {
+                return Err("Too many skipped PQ keys".to_string());
+            }
+            self.pq_skipped_keys.insert((epoch, i), key);
+            self.pq_skipped_key_timestamps.insert((epoch, i), now);
+        }
+    }
+
+    /// Hybridize a Double Ratchet message key with the message's PQ chain key:
+    /// `HKDF(salt = pq_key, ikm = dr_message_key, "construct-pqr-msg-v2")` — the same shape as
+    /// libsignal's Triple Ratchet, where the PQ key is the HKDF salt. `None` (no epoch yet, or not
+    /// the PQ suite) returns the DR key unchanged.
+    pub(super) fn mix_pq_message_key(
+        dr_key: &P::AeadKey,
+        pq_key: Option<&[u8]>,
+    ) -> Result<P::AeadKey, String> {
+        let Some(pq_key) = pq_key else {
+            return Ok(dr_key.clone());
+        };
+        let mixed = P::hkdf_derive_key(pq_key, dr_key.as_ref(), b"construct-pqr-msg-v2", 32)
             .map_err(|e| format!("PQ message-key mix failed: {e:?}"))?;
         Self::bytes_to_aead_key(&mixed)
     }
@@ -537,7 +687,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
     /// Расшифровать с заданным message key.
     ///
-    /// For suite-3 sessions the stored DR key is first hybridized with the PQ
+    /// For PQ-ratchet sessions the stored DR key is first hybridized with the PQ
     /// epoch secret named by the message's `pq_message_epoch` tag (see
     /// `mix_pq_message_key`) — this also covers skipped-message keys, which are
     /// stored pre-mix.
@@ -546,7 +696,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// to handle in-flight messages from peers that encrypted before the AD version bump.
     /// Returns the error from the current-version attempt if both attempts fail.
     pub(super) fn decrypt_with_key(
-        &self,
+        &mut self,
         message_key: &P::AeadKey,
         encrypted: &EncryptedRatchetMessage,
     ) -> Result<Vec<u8>, String> {
@@ -560,12 +710,17 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             "Decrypting with message key"
         );
 
-        let pq_epoch = if self.suite_id.is_pq_ratchet() {
-            encrypted.pq_message_epoch
+        let (pq_epoch, pq_index) = if self.suite_id.is_pq_ratchet() {
+            (encrypted.pq_message_epoch, encrypted.pq_key_index)
         } else {
-            0
+            (0, 0)
         };
-        let message_key = &self.mix_pq_message_key(message_key, pq_epoch)?;
+        let mut pq_key = self.pq_receive_key(pq_epoch, pq_index)?;
+        let mixed = Self::mix_pq_message_key(message_key, pq_key.as_deref());
+        if let Some(k) = pq_key.as_mut() {
+            k.zeroize();
+        }
+        let message_key = &mixed?;
 
         // Try current AD version first.
         match self.try_aead_decrypt(message_key, encrypted, AD_VERSION) {
@@ -611,7 +766,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             )
         })?;
         let mut associated_data = Vec::with_capacity(
-            1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4 + 4,
+            1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4 + 8,
         );
         associated_data.push(ad_version);
         associated_data.extend_from_slice(self.contact_id.as_bytes());
@@ -620,8 +775,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         associated_data.extend_from_slice(&encrypted.dh_public_key);
         associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
         if self.suite_id.is_pq_ratchet() {
-            // Mirrors encrypt(): suite-3 AD binds the PQ epoch tag (see encrypt's doc).
+            // Mirrors encrypt(): the AD binds the PQ epoch and key index (see encrypt's doc).
             associated_data.extend_from_slice(&encrypted.pq_message_epoch.to_be_bytes());
+            associated_data.extend_from_slice(&encrypted.pq_key_index.to_be_bytes());
         }
 
         // Prefixes, at debug — the failure branch below is deliberately limited to lengths, and

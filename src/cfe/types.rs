@@ -344,20 +344,15 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "ipc", default, skip_serializing_if = "Option::is_none")]
     pub identity_proof_ciphertext: Option<ByteBuf>,
 
-    // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET) ──────────────────
-    // History: a pre-SPQR-redesign layout briefly used flat fields here
-    // (`pqt`, `pq_pend_pk`/`sk`/`ct`, `pq_pend_ts`). They were removed rather
-    // than deprecated: suite 3 never shipped, so no production blob ever
-    // carried data in them, and the msgpack named-map codec ignores the keys
-    // if an old dev blob still has them. Do not reuse those key names.
-    /// Sparse continuous PQ ratchet (suite 3) sub-state, SPQR-style message-key
-    /// mixing design (see `decisions/pq-ratchet-spqr-message-key-mixing.md`).
-    /// Present only for suite-3 sessions; absent on pre-feature blobs and
-    /// non-suite-3 sessions. Atomic: either the whole PQ state is here or the
-    /// session has none — no partial-field combinations to validate.
-    #[serde(rename = "pqr")]
+    // ── Sparse continuous PQ ratchet (suite_id = PQ_RATCHET = 4) ──────────────
+    // `pqr` held the suite-3 state (epoch secrets). Suite 3 is retired: its blobs are refused at
+    // the suite id, and the key is not reused — the named-map codec ignores it on an old blob.
+    /// PQ-ratchet sub-state: epoch chains and skipped PQ keys (PQR-2,
+    /// `decisions/pq-ratchet-per-message-chain.md`). Present only for PQ-ratchet sessions.
+    /// Atomic: either the whole PQ state is here or the session has none.
+    #[serde(rename = "pqr2")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pqr: Option<CfePqRatchetStateV1>,
+    pub pqr: Option<CfePqRatchetStateV2>,
 
     /// The states this one replaced with the same device, newest first — what a message the peer
     /// sent before it saw the replacement still decrypts on. Set on the current state of a record
@@ -396,14 +391,38 @@ pub struct CfePreviousStateV1 {
     pub held_back: bool,
 }
 
-/// One completed PQ-ratchet epoch: id + 32-byte ML-KEM-768 shared secret.
-/// Secret is zeroized on drop.
+/// One direction's PQ chain: the index its next key carries, and the 32-byte chain key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfePqEpochSecretV1 {
+pub struct CfePqChainV2 {
+    #[serde(rename = "i")]
+    pub index: u32,
+    #[serde(rename = "k")]
+    pub key: SecretBytes,
+}
+
+/// One epoch's chains. `send` is absent once a newer epoch sends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqEpochChainsV2 {
     #[serde(rename = "e")]
     pub epoch: u32,
-    #[serde(rename = "ss")]
-    pub secret: SecretBytes,
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub send: Option<CfePqChainV2>,
+    #[serde(rename = "r")]
+    pub recv: CfePqChainV2,
+}
+
+/// A PQ chain key kept for a message not yet received: `(epoch, index)`, the key, and when it
+/// was kept (unix seconds — ages out with the classical skipped keys).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfePqSkippedKeyV2 {
+    #[serde(rename = "e")]
+    pub epoch: u32,
+    #[serde(rename = "i")]
+    pub index: u32,
+    #[serde(rename = "k")]
+    pub key: SecretBytes,
+    #[serde(rename = "t")]
+    pub at: u64,
 }
 
 /// Initiator-side in-flight PQ exchange: fresh ML-KEM-768 keypair proposing
@@ -418,12 +437,11 @@ pub struct CfePqPendingExchangeV1 {
     pub secret: SecretBytes,
 }
 
-/// Responder-side pending PQ ciphertext plus the *provisional* epoch secret.
-/// This may be the only copy of an epoch the initiator already activated —
-/// losing it on restore would make that epoch permanently undecryptable,
-/// which is why it must be persisted. The secret is `SecretBytes`.
+/// Responder-side pending PQ ciphertext plus the *provisional* epoch's chains. This may be the
+/// only copy of an epoch the initiator already activated — losing it on restore would make that
+/// epoch permanently undecryptable, which is why it must be persisted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfePqPendingCiphertextV1 {
+pub struct CfePqPendingCiphertextV2 {
     #[serde(rename = "e")]
     pub epoch: u32,
     /// 8-byte hash of the encapsulation key this ciphertext was built against.
@@ -431,31 +449,31 @@ pub struct CfePqPendingCiphertextV1 {
     pub ek_hash: ByteBuf,
     #[serde(rename = "c")]
     pub ciphertext: ByteBuf,
-    #[serde(rename = "ss")]
-    pub secret: SecretBytes,
+    #[serde(rename = "ch")]
+    pub chains: CfePqEpochChainsV2,
 }
 
-/// Complete sparse-PQ-ratchet sub-state for a suite-3 session — everything a
-/// restored session needs to keep mixing, completing in-flight exchanges, and
-/// driving the cadence exactly as before serialization.
+/// Complete PQ-ratchet sub-state — everything a restored session needs to keep deriving keys,
+/// completing in-flight exchanges, and driving the cadence exactly as before serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfePqRatchetStateV1 {
+pub struct CfePqRatchetStateV2 {
     /// Whether this side drives the exchange cadence (DR initiator).
     #[serde(rename = "ini")]
     pub is_initiator: bool,
-    /// Highest completed epoch — mixed into every outgoing message key.
+    /// Highest completed epoch — the one outgoing messages are keyed on.
     #[serde(rename = "cur")]
     pub current_epoch: u32,
-    /// Completed epoch secrets (bounded by PQ_EPOCH_RETENTION).
-    #[serde(rename = "eps")]
-    #[serde(default)]
-    pub epoch_secrets: Vec<CfePqEpochSecretV1>,
+    /// Completed epochs' chains (bounded by `PQ_CHAIN_RETENTION`).
+    #[serde(rename = "chs", default)]
+    pub chains: Vec<CfePqEpochChainsV2>,
+    #[serde(rename = "skp", default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<CfePqSkippedKeyV2>,
     #[serde(rename = "pend")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_exchange: Option<CfePqPendingExchangeV1>,
     #[serde(rename = "ct")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_ciphertext: Option<CfePqPendingCiphertextV1>,
+    pub pending_ciphertext: Option<CfePqPendingCiphertextV2>,
     /// Unix timestamp when `pending_exchange` was created (abandonment cutoff).
     #[serde(rename = "ts")]
     #[serde(default)]
@@ -618,7 +636,7 @@ pub struct CfeOrchestratorStateV1 {
     #[serde(rename = "ptk")]
     pub prekey_tracker: Vec<(String, u32)>,
     // `skd` (devices that had signed a v1 Kyber SPK) and `prd` (devices that had advertised the
-    // PQ ratchet) were here; PQXDH v2 refuses every unsigned bundle and makes suite 3 mandatory,
+    // PQ ratchet) were here; PQXDH v2 refuses every unsigned bundle and makes the PQ-ratchet suite mandatory,
     // so neither ledger has anything left to remember. Old keys are ignored on read.
     /// Device → SHA-256 of its pinned hybrid identity key, sorted by device.
     #[serde(rename = "hip", default, skip_serializing_if = "Vec::is_empty")]

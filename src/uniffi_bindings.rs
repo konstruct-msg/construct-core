@@ -215,7 +215,7 @@ pub struct WirePayload {
     pub kem_ciphertext: Option<Vec<u8>>,
     pub sealed_box: Vec<u8>,
     pub pq_message_epoch: u32,
-    /// Suite-3 sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
+    /// PQ-ratchet sparse PQ-ratchet field, serialized (empty = none). Opaque to the transport.
     pub pq_ratchet_field: Vec<u8>,
     /// The wire carried `PQXDH_V2_FLAG`.
     pub pqxdh_v2: bool,
@@ -223,9 +223,11 @@ pub struct WirePayload {
     pub kem_identity: Option<Vec<u8>>,
     /// The responder's answer to it, until the initiator proves itself.
     pub identity_proof_ciphertext: Option<Vec<u8>>,
+    /// The key's index in the sender's chain of `pq_message_epoch` (PQR-2).
+    pub pq_key_index: u32,
 }
 
-/// Serialize the optional suite-3 sparse PQ-ratchet field for the FFI/wire boundary.
+/// Serialize the optional PQ-ratchet sparse PQ-ratchet field for the FFI/wire boundary.
 /// Empty vec = `None`. Opaque bytes as far as the transport (iOS) is concerned.
 fn pq_field_to_bytes(
     field: &Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
@@ -2003,6 +2005,7 @@ mod tests {
             None,
             &[0u8; 32],
             0,
+            0,
             None,
         )
         .unwrap()
@@ -2066,6 +2069,7 @@ mod tests {
                 None,
                 None,
                 &[0u8; 32], // sealed box — never decrypted here
+                0,
                 0,
                 None,
             )
@@ -2276,7 +2280,7 @@ mod tests {
 
     /// A DEVICE-SHAPED bundle through the exported API, end to end: classic crypto suite (1), a
     /// real X25519 one-time prekey, the Kyber SPK and a Kyber one-time prekey from the core, fresh
-    /// timestamps. PQXDH v2 opens a suite-3 session on the one-time Kyber key; the first message's
+    /// timestamps. PQXDH v2 opens a PQ-ratchet session on the one-time Kyber key; the first message's
     /// components carry the handshake; the responder opens the session from them, burns the key
     /// and hands back the prekeys to persist.
     #[cfg(feature = "post-quantum")]
@@ -2375,7 +2379,7 @@ mod tests {
         assert_eq!(
             alice.get_session_suite_id(bob_id.clone()),
             SuiteID::PQ_RATCHET.as_u16(),
-            "suite 3 is mandatory"
+            "the PQ-ratchet suite is mandatory"
         );
 
         let wire = alice
@@ -2459,7 +2463,7 @@ mod tests {
     /// GUARD (task #12): a session that negotiates `SuiteID::PQ_RATCHET` (3) must round-trip its
     /// FIRST message through the uniffi wire API the apps use — `encrypt_to_wire`, opened from the
     /// payload. The responder rebuilds the exact
-    /// AEAD associated data from the suite and the suite-3 tags on the wire; before task #12 it
+    /// AEAD associated data from the suite and the PQ-ratchet tags on the wire; before task #12 it
     /// defaulted the suite to the bundle's crypto suite and failed with
     /// `"All 1 prekey(s) failed. AEAD decryption failed"`. The pure-core
     /// `test_client_negotiates_pq_ratchet_from_bundle_capability` cannot catch this: it hands the
@@ -2477,11 +2481,11 @@ mod tests {
             .init_session(bob_id.clone(), pq_bundle(&bob))
             .expect("init_session should succeed");
 
-        // Precondition: the sending session must really be suite 3, else this test proves nothing.
+        // Precondition: the sending session must really be the PQ-ratchet suite, else this test proves nothing.
         assert_eq!(
             alice.get_session_suite_id(bob_id),
             SuiteID::PQ_RATCHET.as_u16(),
-            "setup must negotiate suite 3 (PQ_RATCHET_ENABLED is on in test builds)"
+            "setup must negotiate the PQ-ratchet suite (PQ_RATCHET_ENABLED is on in test builds)"
         );
 
         let plaintext = b"pq ratchet over the wire".to_vec();
@@ -2489,7 +2493,7 @@ mod tests {
 
         let bob_result = bob
             .init_receiving_session_from_wire_payload(certified(&server, &alice, &bob), wire)
-            .expect("Bob must establish a receiving session from a suite-3 first message");
+            .expect("Bob must establish a receiving session from a PQ-ratchet first message");
 
         assert_eq!(bob_result.decrypted_message, plaintext);
     }
@@ -2499,7 +2503,7 @@ mod tests {
     /// original wire-drop). If the reader ever loses a field, this fails.
     #[cfg(feature = "post-quantum")]
     #[test]
-    fn test_wire_payload_pack_roundtrip_suite3() {
+    fn test_wire_payload_pack_roundtrip_pq_ratchet() {
         use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
 
         let field = PqRatchetWireField::PublicKey {
@@ -2512,7 +2516,7 @@ mod tests {
             one_time_prekey_id: 42,
             kyber_otpk_id: 3,
             previous_chain_length: 5,
-            suite_id: 3,
+            suite_id: 4,
             kem_ciphertext: Some(vec![0x22; 1088]),
             sealed_box: vec![0x33; 60],
             pq_message_epoch: 9,
@@ -2520,6 +2524,7 @@ mod tests {
             pqxdh_v2: true,
             kem_identity: Some(vec![0x44; 1568]),
             identity_proof_ciphertext: Some(vec![0x55; 1568]),
+            pq_key_index: 300,
         };
 
         let bytes = crate::wire_payload::pack(
@@ -2534,6 +2539,7 @@ mod tests {
             original.identity_proof_ciphertext.as_deref(),
             &original.sealed_box,
             original.pq_message_epoch,
+            original.pq_key_index,
             Some(field.clone()),
         )
         .expect("pack must succeed");
@@ -2545,7 +2551,11 @@ mod tests {
         );
         assert!(decoded.pqxdh_v2);
 
-        assert_eq!(decoded.suite_id, 3, "suite_id must survive the wire");
+        assert_eq!(decoded.suite_id, 4, "suite_id must survive the wire");
+        assert_eq!(
+            decoded.pq_key_index, 300,
+            "a two-byte key index must survive the wire"
+        );
         assert_eq!(
             decoded.pq_message_epoch, 9,
             "pq_message_epoch must survive the wire"
@@ -2847,6 +2857,7 @@ pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
         kem_ciphertext: decoded.kem_ciphertext,
         sealed_box: decoded.sealed_box,
         pq_message_epoch: decoded.pq_message_epoch,
+        pq_key_index: decoded.pq_key_index,
         pq_ratchet_field: pq_field_to_bytes(&decoded.pq_ratchet_field),
         pqxdh_v2: decoded.pqxdh_v2,
         kem_identity: decoded.kem_identity,
@@ -3786,7 +3797,7 @@ impl OrchestratorCore {
 
     /// Encrypt for `contact_id` and return the wire payload, handshake header and every other
     /// field included. The platform sends the bytes as they are: a copy rebuilt from components
-    /// is how fields went missing on the way (the suite-3 tags; the PN field; the answer to a
+    /// is how fields went missing on the way (the PQ-ratchet tags; the PN field; the answer to a
     /// KEM identity key — decisions/responder-authenticates-initiator-by-kem.md).
     pub fn encrypt_to_wire(
         &self,

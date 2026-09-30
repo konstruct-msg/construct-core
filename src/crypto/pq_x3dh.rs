@@ -5,7 +5,7 @@
 //!   long-lived and guards the start of every session, so it gets the margin — the split Signal
 //!   (PQXDH on Kyber-1024) and Apple PQ3 (1024 to establish) make too. Secrets are held as the
 //!   FIPS 203 64-byte seed `d ‖ z`, not the 3168-byte expanded key.
-//! - **ML-KEM-768** for the legacy deferred contribution and the suite-3 sparse ratchet, whose
+//! - **ML-KEM-768** for the legacy deferred contribution and the PQ-ratchet sparse ratchet, whose
 //!   keys are fresh and frequent.
 //!
 //! Provides standalone KEM primitives used by the PQXDH protocol:

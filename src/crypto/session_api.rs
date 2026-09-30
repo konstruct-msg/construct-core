@@ -58,17 +58,17 @@ use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use std::marker::PhantomData;
 
-/// Whether this build runs `SuiteID::PQ_RATCHET` (suite 3) sessions — the sparse continuous PQ
+/// Whether this build runs `SuiteID::PQ_RATCHET` (suite 4) sessions — the sparse continuous PQ
 /// ratchet needs the ML-KEM-768 primitives behind `post-quantum`.
 ///
-/// Suite 3 is mandatory where it exists (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`):
+/// The PQ-ratchet suite is mandatory where it exists (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`):
 /// an initiator with `post-quantum` always negotiates it, and there is no capability flag to read
 /// or to strip — the unsigned `supports_pq_ratchet` bundle flag and its downgrade ledger are gone.
 pub const fn local_supports_pq_ratchet() -> bool {
     cfg!(feature = "post-quantum")
 }
 
-/// The suite a session this build initiates runs: suite 3 with `post-quantum`, classic without.
+/// The suite a session this build initiates runs: the PQ-ratchet suite with `post-quantum`, classic without.
 fn negotiated_initiator_suite() -> SuiteID {
     if local_supports_pq_ratchet() {
         SuiteID::PQ_RATCHET

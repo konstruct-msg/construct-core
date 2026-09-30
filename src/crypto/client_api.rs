@@ -1325,8 +1325,8 @@ mod tests {
         );
     }
 
-    /// Suite 3 is mandatory with `post-quantum`: every session is suite 3 end-to-end (initiator
-    /// tags suite 3 on the wire, the responder adopts it from the first message and interops).
+    /// The PQ-ratchet suite is mandatory with `post-quantum`: every session is the PQ-ratchet suite end-to-end (initiator
+    /// tags it on the wire, the responder adopts it from the first message and interops).
     /// There is no capability flag to read.
     #[cfg(feature = "post-quantum")]
     #[test]
@@ -1369,7 +1369,7 @@ mod tests {
         assert_eq!(
             encrypted1.suite_id,
             SuiteID::PQ_RATCHET.as_u16(),
-            "capable bundle must negotiate suite 3"
+            "capable bundle must negotiate the PQ-ratchet suite"
         );
         assert_eq!(encrypted1.pq_message_epoch, 0, "no PQ epoch at bootstrap");
 
@@ -1403,7 +1403,7 @@ mod tests {
         );
     }
 
-    /// Without `post-quantum` there is no suite 3 to negotiate: the session is classic.
+    /// Without `post-quantum` there is no PQ-ratchet suite to negotiate: the session is classic.
     #[cfg(not(feature = "post-quantum"))]
     #[test]
     fn test_client_without_post_quantum_stays_classic() {

@@ -16,7 +16,7 @@
 //! [N bytes]  kem_ciphertext        (present only when kem_ciphertext_len > 0)
 //! [2+N]      kem_identity          (u16 LE len + key; only with KEM_IDENTITY_FLAG)
 //! [2+N]      identity_proof_ct     (u16 LE len + ciphertext; only with IDENTITY_PROOF_FLAG)
-//! [..]       suite-3 PQ section    (suite 3 only; see `pack`)
+//! [..]       PQ-ratchet section    (suite 4 only; see `pack`)
 //! [rest]     sealed_box            (nonce || ciphertext || auth_tag)
 //! ```
 //!
@@ -80,11 +80,14 @@ pub struct DecodedWirePayload {
     pub identity_proof_ciphertext: Option<Vec<u8>>,
     /// `nonce || ciphertext || auth_tag` — the ChaCha20-Poly1305 sealed box.
     pub sealed_box: Vec<u8>,
-    /// Suite 3 only: PQ epoch whose secret was mixed into this message's key
+    /// PQ-ratchet suite only: the PQ epoch whose chain keyed this message
     /// (0 = pure DR key). Always 0 for other suites.
     pub pq_message_epoch: u32,
-    /// Sparse PQ ratchet field (EK proposal or CT completion) for Suite 3 sessions.
-    /// Only parsed/produced when suite_id == 3; additive after kem block.
+    /// PQ-ratchet suite only: the index of this message's key in the sender's chain of
+    /// `pq_message_epoch`. Always 0 for other suites and for epoch 0.
+    pub pq_key_index: u32,
+    /// Sparse PQ ratchet field (EK proposal or CT completion) for PQ-ratchet sessions.
+    /// Only parsed/produced for `SuiteID::PQ_RATCHET`; additive after kem block.
     pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 }
 
@@ -101,12 +104,14 @@ pub struct DecodedWirePayload {
 /// - `kem_identity`           — the initiator's ML-KEM-1024 identity key, with `kem_ciphertext`
 /// - `identity_proof_ct`      — the responder's answer to it, until the initiator proves itself
 /// - `sealed_box`             — `nonce || ciphertext || auth_tag`
-/// - `pq_message_epoch`       — Suite 3 only: PQ epoch mixed into this message's key (0 otherwise)
-/// - `pq_ratchet_field`       — Suite 3 only: optional EK/CT exchange field
+/// - `pq_message_epoch`       — PQ-ratchet suite only: the epoch keying this message (0 otherwise)
+/// - `pq_key_index`           — PQ-ratchet suite only: the key's index in that epoch's chain
+/// - `pq_ratchet_field`       — PQ-ratchet suite only: optional EK/CT exchange field
 ///
-/// # Suite-3 PQ section layout (between kem_ciphertext and sealed_box)
+/// # PQ-ratchet section layout (suite 4; between kem_ciphertext and sealed_box)
 /// ```text
-/// [4 bytes] pq_message_epoch (u32 LE)          — always present for suite 3
+/// [4 bytes] pq_message_epoch (u32 LE)          — always present
+/// [1–5 B]   pq_key_index (LEB128, minimal)     — always present; 1 byte below 128
 /// [1 byte]  field type: 0 = none, 1 = EK, 2 = CT
 /// type 1:   [4B field epoch][2B len][len bytes EK]
 /// type 2:   [4B field epoch][8B ek_hash][2B len][len bytes CT]
@@ -124,6 +129,7 @@ pub fn pack(
     identity_proof_ct: Option<&[u8]>,
     sealed_box: &[u8],
     pq_message_epoch: u32,
+    pq_key_index: u32,
     pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
 ) -> Result<Vec<u8>, WirePayloadError> {
     use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
@@ -145,7 +151,7 @@ pub fn pack(
         }
     }
 
-    // Suite-3 PQ section (see layout above). Empty for other suites.
+    // PQ-ratchet section (see layout above). Empty for other suites.
     // The flags are the wire's business: derived from what is present, never taken from the caller.
     let suite_id = suite_id & !WIRE_FLAGS;
     let mut wire_suite_id = suite_id;
@@ -159,9 +165,10 @@ pub fn pack(
         wire_suite_id |= IDENTITY_PROOF_FLAG;
     }
 
-    let pq_bytes: Vec<u8> = if suite_id == 3 {
-        let mut b = Vec::with_capacity(5);
+    let pq_bytes: Vec<u8> = if suite_id == PQ_RATCHET_SUITE {
+        let mut b = Vec::with_capacity(10);
         b.extend_from_slice(&pq_message_epoch.to_le_bytes());
+        write_leb128(&mut b, pq_key_index);
         match pq_ratchet_field {
             None => b.push(0u8),
             Some(PqRatchetWireField::PublicKey { epoch, key }) => {
@@ -300,20 +307,34 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
     let kem_identity = kem_identity_object(has_kem_identity)?;
     let identity_proof_ciphertext = kem_identity_object(has_identity_proof)?;
 
-    // Suite-3 PQ section (strict — suite 3 messages are only produced by code
-    // that always writes it; a malformed section is a hard error, not a fallback):
-    // [4B pq_message_epoch][1B type][type-specific payload]. See pack()'s doc.
+    // PQ-ratchet section (strict — these messages are only produced by code that always writes
+    // it; a malformed section is a hard error, not a fallback):
+    // [4B pq_message_epoch][LEB128 pq_key_index][1B type][type-specific payload].
+    // See pack()'s doc. Suite 3, which had no index, is refused outright rather than read as a
+    // message whose section is shorter by the index.
+    if suite_id == crate::crypto::SuiteID::RETIRED_PQ_RATCHET_V1 {
+        return Err(WirePayloadError::RetiredSuite(suite_id));
+    }
     let mut pq_message_epoch = 0u32;
+    let mut pq_key_index = 0u32;
     let mut pq_ratchet_field = None;
-    if suite_id == 3 {
+    if suite_id == PQ_RATCHET_SUITE {
         use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
 
-        if data.len() < cursor + 5 {
+        if data.len() < cursor + 4 {
             return Err(WirePayloadError::TooShort(data.len()));
         }
         pq_message_epoch = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
-        let typ = data[cursor + 4];
-        cursor += 5;
+        cursor += 4;
+        pq_key_index = read_leb128(data, &mut cursor)?;
+        if pq_message_epoch == 0 && pq_key_index != 0 {
+            return Err(WirePayloadError::PqKeyIndexWithoutEpoch(pq_key_index));
+        }
+        if data.len() < cursor + 1 {
+            return Err(WirePayloadError::TooShort(data.len()));
+        }
+        let typ = data[cursor];
+        cursor += 1;
         match typ {
             0 => {}
             1 => {
@@ -375,8 +396,50 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
         identity_proof_ciphertext,
         sealed_box,
         pq_message_epoch,
+        pq_key_index,
         pq_ratchet_field,
     })
+}
+
+/// The PQ-ratchet suite, as the wire carries it.
+const PQ_RATCHET_SUITE: u16 = crate::crypto::SuiteID::PQ_RATCHET.as_u16();
+
+/// Unsigned LEB128: seven bits per byte, low first, high bit = more follows.
+fn write_leb128(out: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Reads a `u32` written by `write_leb128`, and only that: at most five bytes, no bits beyond
+/// 32, and no trailing zero group. The value is bound in the AD, but its bytes are not — a
+/// second encoding of the same number would let a relay alter a message without breaking it.
+fn read_leb128(data: &[u8], cursor: &mut usize) -> Result<u32, WirePayloadError> {
+    let mut value: u32 = 0;
+    for i in 0..5 {
+        let Some(&byte) = data.get(*cursor + i) else {
+            return Err(WirePayloadError::TooShort(data.len()));
+        };
+        let group = u32::from(byte & 0x7f);
+        if i == 4 && group > 0x0f {
+            return Err(WirePayloadError::NonCanonicalKeyIndex);
+        }
+        value |= group << (7 * i);
+        if byte & 0x80 == 0 {
+            if i > 0 && byte == 0 {
+                return Err(WirePayloadError::NonCanonicalKeyIndex);
+            }
+            *cursor += i + 1;
+            return Ok(value);
+        }
+    }
+    Err(WirePayloadError::NonCanonicalKeyIndex)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -397,6 +460,12 @@ pub enum WirePayloadError {
     KemIdentityWithoutHandshake,
     #[error("KEM identity key or answer of {0} bytes (expected 1568)")]
     KemIdentityObjectSize(usize),
+    #[error("suite {0} is retired: this build reads only the per-message PQ ratchet (suite 4)")]
+    RetiredSuite(u16),
+    #[error("PQ key index {0} on a message with no PQ epoch")]
+    PqKeyIndexWithoutEpoch(u32),
+    #[error("PQ key index is not minimal LEB128")]
+    NonCanonicalKeyIndex,
 }
 
 #[cfg(test)]
@@ -423,11 +492,12 @@ mod tests {
             0,
             1_000_001,
             0,
-            3,
+            4,
             Some(&kem),
             None,
             None,
             &sealed,
+            0,
             0,
             None,
         )
@@ -436,14 +506,14 @@ mod tests {
             u16::from_le_bytes(packed[HEADER_SIZE - 2..HEADER_SIZE].try_into().unwrap());
         assert_eq!(
             wire_suite,
-            3 | PQXDH_V2_FLAG,
-            "an older core sees suite 0x0103 and refuses"
+            4 | PQXDH_V2_FLAG,
+            "an older core sees suite 0x0104 and refuses"
         );
         let decoded = unpack(&packed).unwrap();
         assert!(decoded.pqxdh_v2);
         assert_eq!(
-            decoded.suite_id, 3,
-            "stripped: the AEAD authenticated suite 3"
+            decoded.suite_id, 4,
+            "stripped: the AEAD authenticated the PQ-ratchet suite"
         );
         assert_eq!(decoded.kem_ciphertext.as_deref(), Some(kem.as_slice()));
 
@@ -453,21 +523,22 @@ mod tests {
             0,
             0,
             0,
-            3 | PQXDH_V2_FLAG,
+            4 | PQXDH_V2_FLAG,
             None,
             None,
             None,
             &sealed,
+            0,
             0,
             None,
         )
         .unwrap();
         let decoded = unpack(&plain).unwrap();
         assert!(!decoded.pqxdh_v2, "the caller's bit is not the wire's");
-        assert_eq!(decoded.suite_id, 3);
+        assert_eq!(decoded.suite_id, 4);
 
         let mut forged = plain.clone();
-        forged[HEADER_SIZE - 2..HEADER_SIZE].copy_from_slice(&(3 | PQXDH_V2_FLAG).to_le_bytes());
+        forged[HEADER_SIZE - 2..HEADER_SIZE].copy_from_slice(&(4 | PQXDH_V2_FLAG).to_le_bytes());
         assert!(matches!(
             unpack(&forged),
             Err(WirePayloadError::PqxdhFlagWithoutCiphertext)
@@ -475,7 +546,7 @@ mod tests {
     }
 
     /// The KEM identity key rides only in a handshake header, the answer to it on any message.
-    /// Both survive the round trip ahead of the suite-3 section, their flags follow presence, and
+    /// Both survive the round trip ahead of the PQ-ratchet section, their flags follow presence, and
     /// a key outside a handshake or an object of the wrong size is refused both ways.
     #[test]
     fn the_kem_identity_and_its_answer_round_trip() {
@@ -496,18 +567,19 @@ mod tests {
             0,
             1,
             0,
-            3,
+            4,
             Some(&kem),
             Some(&ikk),
             None,
             &sealed,
             0,
+            0,
             Some(field.clone()),
         )
         .unwrap();
-        assert_eq!(suite_of(&first), 3 | PQXDH_V2_FLAG | KEM_IDENTITY_FLAG);
+        assert_eq!(suite_of(&first), 4 | PQXDH_V2_FLAG | KEM_IDENTITY_FLAG);
         let d = unpack(&first).unwrap();
-        assert_eq!(d.suite_id, 3);
+        assert_eq!(d.suite_id, 4);
         assert_eq!(d.kem_identity.as_deref(), Some(ikk.as_slice()));
         assert_eq!(d.identity_proof_ciphertext, None);
         assert_eq!(d.pq_ratchet_field, Some(field));
@@ -519,16 +591,17 @@ mod tests {
             0,
             0,
             0,
-            3,
+            4,
             None,
             None,
             Some(&answer),
             &sealed,
             0,
+            0,
             None,
         )
         .unwrap();
-        assert_eq!(suite_of(&reply), 3 | IDENTITY_PROOF_FLAG);
+        assert_eq!(suite_of(&reply), 4 | IDENTITY_PROOF_FLAG);
         let d = unpack(&reply).unwrap();
         assert!(!d.pqxdh_v2);
         assert_eq!(
@@ -544,11 +617,12 @@ mod tests {
                 0,
                 0,
                 0,
-                3,
+                4,
                 None,
                 Some(&ikk),
                 None,
                 &sealed,
+                0,
                 0,
                 None
             ),
@@ -568,11 +642,12 @@ mod tests {
                 0,
                 0,
                 0,
-                3,
+                4,
                 None,
                 None,
                 Some(&[0u8; 100]),
                 &sealed,
+                0,
                 0,
                 None
             ),
@@ -584,7 +659,10 @@ mod tests {
     fn round_trip_no_pqc() {
         let dh_key = vec![0xAA; 32];
         let sealed = make_sealed_box(0xBB);
-        let packed = pack(&dh_key, 7, 42, 0, 3, 1, None, None, None, &sealed, 0, None).unwrap();
+        let packed = pack(
+            &dh_key, 7, 42, 0, 3, 1, None, None, None, &sealed, 0, 0, None,
+        )
+        .unwrap();
         assert_eq!(packed.len(), HEADER_SIZE + sealed.len());
 
         let decoded = unpack(&packed).unwrap();
@@ -616,6 +694,7 @@ mod tests {
             None,
             None,
             &sealed,
+            0,
             0,
             None,
         )
@@ -651,6 +730,7 @@ mod tests {
             None,
             &make_sealed_box(0),
             0,
+            0,
             None,
         )
         .unwrap_err();
@@ -658,22 +738,25 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_suite3_no_field() {
+    fn round_trip_pq_ratchet_no_field() {
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x44);
-        let packed = pack(&dh_key, 3, 0, 0, 1, 3, None, None, None, &sealed, 7, None).unwrap();
-        // header + 5-byte PQ section (epoch + type 0)
-        assert_eq!(packed.len(), HEADER_SIZE + 5 + sealed.len());
+        let packed = pack(
+            &dh_key, 3, 0, 0, 1, 4, None, None, None, &sealed, 7, 0, None,
+        )
+        .unwrap();
+        // header + 6-byte PQ section (epoch + index 0 in one LEB128 byte + type 0)
+        assert_eq!(packed.len(), HEADER_SIZE + 6 + sealed.len());
 
         let decoded = unpack(&packed).unwrap();
-        assert_eq!(decoded.suite_id, 3);
+        assert_eq!(decoded.suite_id, 4);
         assert_eq!(decoded.pq_message_epoch, 7);
         assert!(decoded.pq_ratchet_field.is_none());
         assert_eq!(decoded.sealed_box, sealed);
     }
 
     #[test]
-    fn round_trip_suite3_public_key_field() {
+    fn round_trip_pq_ratchet_public_key_field() {
         use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x55);
@@ -688,12 +771,13 @@ mod tests {
             0,
             0,
             1,
-            3,
+            4,
             None,
             None,
             None,
             &sealed,
             7,
+            0,
             Some(field),
         )
         .unwrap();
@@ -711,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_suite3_ciphertext_field() {
+    fn round_trip_pq_ratchet_ciphertext_field() {
         use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x77);
@@ -728,12 +812,13 @@ mod tests {
             0,
             0,
             1,
-            3,
+            4,
             None,
             None,
             None,
             &sealed,
             8,
+            0,
             Some(field),
         )
         .unwrap();
@@ -756,11 +841,14 @@ mod tests {
     }
 
     #[test]
-    fn suite3_truncated_pq_section_errors() {
+    fn pq_ratchet_truncated_section_errors() {
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x44);
-        let packed = pack(&dh_key, 3, 0, 0, 1, 3, None, None, None, &sealed, 7, None).unwrap();
-        // Cut into the 5-byte PQ section: parsing must fail loudly, not misparse.
+        let packed = pack(
+            &dh_key, 3, 0, 0, 1, 4, None, None, None, &sealed, 7, 0, None,
+        )
+        .unwrap();
+        // Cut into the 6-byte PQ section: parsing must fail loudly, not misparse.
         let truncated = &packed[..HEADER_SIZE + 2];
         assert!(matches!(
             unpack(truncated),
@@ -774,7 +862,10 @@ mod tests {
     fn known_byte_vector() {
         let dh_key = vec![0x01; 32];
         let sealed = vec![0xAA; 60];
-        let packed = pack(&dh_key, 1, 2, 0, 5, 1, None, None, None, &sealed, 0, None).unwrap();
+        let packed = pack(
+            &dh_key, 1, 2, 0, 5, 1, None, None, None, &sealed, 0, 0, None,
+        )
+        .unwrap();
 
         // message_number = 1 LE → [01 00 00 00]
         assert_eq!(&packed[0..4], &[0x01, 0x00, 0x00, 0x00]);
@@ -792,5 +883,69 @@ mod tests {
         assert_eq!(&packed[50..52], &[0x01, 0x00]);
         // sealed box starts at 52
         assert_eq!(&packed[52..], vec![0xAAu8; 60].as_slice());
+    }
+
+    /// PQR-2: the key index is LEB128 — one byte below 128, two below 16 384 — and only its
+    /// minimal form is read: the AD binds the value, not its bytes, so a second encoding of the
+    /// same number would let a relay change a message without breaking it.
+    #[test]
+    fn the_key_index_is_minimal_leb128() {
+        for (value, bytes) in [
+            (0u32, vec![0x00]),
+            (127, vec![0x7f]),
+            (128, vec![0x80, 0x01]),
+            (16_383, vec![0xff, 0x7f]),
+            (16_384, vec![0x80, 0x80, 0x01]),
+            (u32::MAX, vec![0xff, 0xff, 0xff, 0xff, 0x0f]),
+        ] {
+            let mut out = Vec::new();
+            write_leb128(&mut out, value);
+            assert_eq!(out, bytes, "{value}");
+            let mut cursor = 0;
+            assert_eq!(read_leb128(&out, &mut cursor).unwrap(), value);
+            assert_eq!(cursor, bytes.len());
+        }
+        for bad in [
+            vec![0x80, 0x00],                   // 0 in two bytes
+            vec![0xff, 0x80, 0x00],             // 127 padded
+            vec![0xff, 0xff, 0xff, 0xff, 0x1f], // beyond 32 bits
+            vec![0x80, 0x80, 0x80, 0x80, 0x80], // six bytes
+        ] {
+            let mut cursor = 0;
+            assert!(
+                matches!(
+                    read_leb128(&bad, &mut cursor),
+                    Err(WirePayloadError::NonCanonicalKeyIndex)
+                ),
+                "{bad:02x?}"
+            );
+        }
+    }
+
+    /// Suite 3 had no key index, so its section read as suite 4 would shift every later byte.
+    /// It is refused by name instead; and an index without an epoch is malformed.
+    #[test]
+    fn suite_3_is_refused_and_an_index_needs_an_epoch() {
+        let dh_key = vec![0x11; 32];
+        let sealed = make_sealed_box(0x44);
+        let mut packed = pack(
+            &dh_key, 3, 0, 0, 1, 1, None, None, None, &sealed, 0, 0, None,
+        )
+        .unwrap();
+        packed[HEADER_SIZE - 2..HEADER_SIZE].copy_from_slice(&3u16.to_le_bytes());
+        assert!(matches!(
+            unpack(&packed),
+            Err(WirePayloadError::RetiredSuite(3))
+        ));
+
+        let mut packed = pack(
+            &dh_key, 3, 0, 0, 1, 4, None, None, None, &sealed, 0, 0, None,
+        )
+        .unwrap();
+        packed[HEADER_SIZE + 4] = 0x05; // index 5 on epoch 0
+        assert!(matches!(
+            unpack(&packed),
+            Err(WirePayloadError::PqKeyIndexWithoutEpoch(5))
+        ));
     }
 }

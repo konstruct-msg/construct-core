@@ -5,7 +5,7 @@
 //! - W2: unpack rejects payloads shorter than HEADER_SIZE
 //! - W3: pack rejects DH keys that aren't 32 bytes
 //! - W4: sealed_box is always at the end of the packed payload
-//! - W5: Suite-3 PQ section round-trip (no field)
+//! - W5: PQ-ratchet section round-trip (no field)
 
 use crate::wire_payload::{DecodedWirePayload, HEADER_SIZE, pack, unpack};
 
@@ -18,7 +18,7 @@ fn proof_pack_unpack_roundtrip_no_pqc() {
     let kyber_otpk_id: u32 = kani::any();
     let prev_chain_len: u32 = kani::any();
     let suite_id: u16 = kani::any();
-    kani::assume(suite_id == 1 || suite_id == 2); // Non-suite-3 for this test
+    kani::assume(suite_id == 1 || suite_id == 2); // Not the PQ-ratchet suite for this test
 
     let dh_key: [u8; 32] = kani::any();
 
@@ -37,6 +37,7 @@ fn proof_pack_unpack_roundtrip_no_pqc() {
         None,
         None,
         &sealed_box,
+        0,
         0,
         None,
     )
@@ -84,6 +85,7 @@ fn proof_pack_unpack_roundtrip_with_pqc() {
         None,
         None,
         &sealed_box,
+        0,
         0,
         None,
     )
@@ -143,6 +145,7 @@ fn proof_pack_rejects_bad_dh_key() {
         None,
         &sealed_box,
         0,
+        0,
         None,
     );
 
@@ -153,7 +156,7 @@ fn proof_pack_rejects_bad_dh_key() {
 }
 
 /// W4: Packed payload length equals HEADER_SIZE + kem_len + sealed_box_len
-/// (plus PQ section for suite 3)
+/// (plus PQ section for the PQ-ratchet suite)
 #[kani::proof]
 fn proof_packed_length_correct() {
     let dh_key: [u8; 32] = kani::any();
@@ -174,6 +177,7 @@ fn proof_packed_length_correct() {
         None,
         &sealed_box,
         0,
+        0,
         None,
     )
     .unwrap();
@@ -185,11 +189,14 @@ fn proof_packed_length_correct() {
     );
 }
 
-/// W5: Suite-3 with no PQ field round-trips correctly
+/// W5: The PQ-ratchet suite with no PQ field round-trips correctly, key index included
 #[kani::proof]
-fn proof_suite3_no_field_roundtrip() {
+fn proof_pq_ratchet_no_field_roundtrip() {
     let dh_key: [u8; 32] = kani::any();
     let pq_epoch: u32 = kani::any();
+    kani::assume(pq_epoch >= 1);
+    let pq_index: u32 = kani::any();
+    kani::assume(pq_index < 128); // one LEB128 byte
 
     let sealed_len: usize = kani::any();
     kani::assume(sealed_len >= 60 && sealed_len <= 128);
@@ -201,22 +208,24 @@ fn proof_suite3_no_field_roundtrip() {
         0,
         0,
         5,
-        3, // Suite 3
+        4, // PQ_RATCHET
         None,
         None,
         None,
         &sealed_box,
         pq_epoch,
+        pq_index,
         None,
     )
     .unwrap();
 
-    // Suite-3 always writes 5-byte PQ section (epoch + type 0)
-    assert_eq!(packed.len(), HEADER_SIZE + 5 + sealed_len);
+    // The section: epoch (4) + index (1 byte below 128) + type 0
+    assert_eq!(packed.len(), HEADER_SIZE + 6 + sealed_len);
 
     let decoded = unpack(&packed).unwrap();
 
-    assert_eq!(decoded.suite_id, 3);
+    assert_eq!(decoded.suite_id, 4);
+    assert_eq!(decoded.pq_key_index, pq_index);
     assert_eq!(decoded.message_number, 42);
     assert_eq!(decoded.previous_chain_length, 5);
     assert_eq!(decoded.pq_message_epoch, pq_epoch);
