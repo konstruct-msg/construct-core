@@ -62,10 +62,15 @@ pub struct Config {
     pub max_skipped_message_age_seconds: i64,
 
     /// Интервал (в DH-ratchet-поворотах) между подмешиваниями свежего
-    /// ML-KEM-768 материала в sparse continuous PQ ratchet (suite_id=3, `PQ_RATCHET`).
+    /// ML-KEM-768 материала в sparse continuous PQ ratchet (`PQ_RATCHET`).
     /// По умолчанию: 16 поворотов — тот же порядок величины, что и у публично
     /// описанного Signal SPQR (2025).
     pub pq_ratchet_interval: u32,
+
+    /// PQR-1: the longest a PQ epoch lasts before the exchange initiator proposes a new one on its
+    /// next send, turns or not. The turn count alone never fires in a conversation that does not
+    /// change direction. 7 days — the floor Apple PQ3 guarantees.
+    pub pq_ratchet_max_age_seconds: u64,
 
     // ============================================
     // ВАЛИДАЦИЯ
@@ -139,6 +144,7 @@ impl Default for Config {
             max_message_jump: 2000,
             max_skipped_message_age_seconds: 7 * 24 * 60 * 60, // 7 days
             pq_ratchet_interval: 16,
+            pq_ratchet_max_age_seconds: 7 * 24 * 60 * 60,
 
             // Валидация
             username_min_length: 3,

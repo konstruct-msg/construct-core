@@ -421,6 +421,11 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// initiator already activated the epoch would make that epoch undecryptable.
     pq_pending_since: u64,
 
+    /// Unix time the current PQ epoch began — its completion, or the session's creation while
+    /// the epoch is 0. PQR-1: past `pq_ratchet_max_age_seconds` the initiator proposes a new
+    /// epoch on its next send.
+    pq_epoch_since: u64,
+
     session_id: String,
     contact_id: String,
     local_user_id: String,

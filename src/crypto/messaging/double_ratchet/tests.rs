@@ -2709,3 +2709,78 @@ fn test_pqr2_a_stored_suite_3_session_is_refused() {
         .expect("suite 3 must not restore");
     assert!(refused.contains("Invalid suite_id"), "{refused}");
 }
+
+// ── PQR-1: an epoch has a maximum age ─────────────────────────────────────────
+
+/// A conversation that never changes direction never takes a DH turn, so the turn count alone
+/// never proposes a new epoch. Past `pq_ratchet_max_age_seconds` the initiator's next message
+/// carries a proposal anyway.
+///
+/// Mutation: drop the age check from `maybe_start_pq_exchange_by_age` — this reddens.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr1_a_one_way_conversation_rekeys_once_the_epoch_is_old() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001b1",
+        "bbbbbbbb-0000-4000-8000-0000000001b2",
+    );
+    // One-way: many messages, no replies, no turns — and no proposal while the epoch is young.
+    for i in 0..40 {
+        let m = alice.encrypt(format!("one-way {i}").as_bytes()).unwrap();
+        assert!(
+            m.pq_ratchet_field.is_none(),
+            "no proposal at {i} while the epoch is young"
+        );
+        bob.decrypt(&m).unwrap();
+    }
+
+    let max_age = crate::config::Config::global().pq_ratchet_max_age_seconds;
+    alice.pq_epoch_since = super::unix_now().saturating_sub(max_age + 1);
+    let m = alice.encrypt(b"old epoch").unwrap();
+    assert!(
+        matches!(
+            m.pq_ratchet_field,
+            Some(PqRatchetWireField::PublicKey { .. })
+        ),
+        "an old epoch gets a proposal on the next send"
+    );
+    bob.decrypt(&m).unwrap();
+
+    // The exchange completes as any other and restarts the clock.
+    let reply = bob.encrypt(b"ct").unwrap();
+    alice.decrypt(&reply).unwrap();
+    assert_eq!(alice.current_pq_epoch, 1);
+    assert!(!alice.pq_epoch_is_old(), "a completed epoch is young again");
+}
+
+/// Only the exchange initiator proposes, however old the epoch: two proposers would race for
+/// the same epoch id.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr1_the_responder_does_not_propose() {
+    let (_alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001b3",
+        "bbbbbbbb-0000-4000-8000-0000000001b4",
+    );
+    bob.pq_epoch_since = 0;
+    let m = bob.encrypt(b"responder writes").unwrap();
+    assert!(!matches!(
+        m.pq_ratchet_field,
+        Some(PqRatchetWireField::PublicKey { .. })
+    ));
+    assert!(bob.pending_pq_exchange.is_none());
+}
+
+/// The epoch's start survives a restore, so a restart neither resets the clock nor fires early.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr1_the_epoch_age_survives_restore() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001b5",
+        "bbbbbbbb-0000-4000-8000-0000000001b6",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    alice.pq_epoch_since = 1_700_000_000;
+    let restored = cfe_round_trip(&alice);
+    assert_eq!(restored.pq_epoch_since, 1_700_000_000);
+}

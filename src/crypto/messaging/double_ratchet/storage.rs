@@ -104,6 +104,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         }
                     }),
                     pending_since: self.pq_pending_since,
+                    epoch_since: self.pq_epoch_since,
                     turns_since_mix: self.pq_turns_since_mix,
                 })
             } else {
@@ -185,6 +186,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
+            // A blob without the field reads as an epoch of unknown age: old, so the initiator
+            // proposes a new one on its next send rather than trusting an age it cannot know.
+            pq_epoch_since: 0,
             session_id: data.session_id.clone(),
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
@@ -277,6 +281,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             }
         });
         self.pq_pending_since = pq.pending_since;
+        self.pq_epoch_since = pq.epoch_since;
         self.pq_turns_since_mix = pq.turns_since_mix;
     }
 }
@@ -548,6 +553,8 @@ pub(crate) struct SerializablePqRatchetState {
     #[serde(default)]
     pub(crate) pending_since: u64,
     #[serde(default)]
+    pub(crate) epoch_since: u64,
+    #[serde(default)]
     pub(crate) turns_since_mix: u32,
 }
 
@@ -814,6 +821,7 @@ impl SerializableSession {
                         }
                     }),
                     pending_since: pq.pending_since,
+                    epoch_since: pq.epoch_since,
                     turns_since_mix: pq.turns_since_mix,
                 }),
             // The ratchet knows only itself; the record's previous states are the lifecycle
@@ -897,6 +905,7 @@ impl SerializableSession {
                     }
                 }),
                 pending_since: pq.pending_since,
+                epoch_since: pq.epoch_since,
                 turns_since_mix: pq.turns_since_mix,
             }),
         })

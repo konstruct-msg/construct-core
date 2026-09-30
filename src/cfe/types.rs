@@ -482,6 +482,10 @@ pub struct CfePqRatchetStateV2 {
     #[serde(rename = "turns")]
     #[serde(default)]
     pub turns_since_mix: u32,
+    /// Unix time the current epoch began (PQR-1 age trigger). 0 = unknown, read as old.
+    #[serde(rename = "since")]
+    #[serde(default)]
+    pub epoch_since: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

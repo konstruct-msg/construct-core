@@ -309,11 +309,40 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         if !self.suite_id.is_pq_ratchet() || !self.is_pq_initiator {
             return Ok(());
         }
+        self.abandon_unanswered_pq_exchange();
+        self.pq_turns_since_mix = self.pq_turns_since_mix.saturating_add(1);
+        if self.pq_turns_since_mix < Config::global().pq_ratchet_interval && !self.pq_epoch_is_old()
+        {
+            return Ok(());
+        }
+        self.start_pq_exchange()
+    }
 
-        // Abandon an exchange nobody answered — bandwidth hygiene only. Safe
-        // because nothing was activated: the peer's provisional state (if any)
-        // is superseded by the next proposal's fresh keypair, disambiguated by
-        // `ek_hash`.
+    /// PQR-1: the same proposal on a send, when the epoch has outlived
+    /// `pq_ratchet_max_age_seconds`. A conversation that never changes direction never takes a DH
+    /// turn, so the turn count above never reaches the interval and the epoch would last forever —
+    /// the state suite 3 existed to leave. Initiator only, like every proposal: a conversation in
+    /// which only the responder writes still cannot rekey (that needs roles that alternate).
+    pub(super) fn maybe_start_pq_exchange_by_age(&mut self) -> Result<(), String> {
+        if !self.suite_id.is_pq_ratchet() || !self.is_pq_initiator {
+            return Ok(());
+        }
+        self.abandon_unanswered_pq_exchange();
+        if !self.pq_epoch_is_old() {
+            return Ok(());
+        }
+        self.start_pq_exchange()
+    }
+
+    pub(super) fn pq_epoch_is_old(&self) -> bool {
+        unix_now().saturating_sub(self.pq_epoch_since)
+            >= Config::global().pq_ratchet_max_age_seconds
+    }
+
+    /// Abandon an exchange nobody answered — bandwidth hygiene only. Safe because nothing was
+    /// activated: the peer's provisional state (if any) is superseded by the next proposal's fresh
+    /// keypair, disambiguated by `ek_hash`.
+    fn abandon_unanswered_pq_exchange(&mut self) {
         let max_age = Config::global().max_skipped_message_age_seconds.max(0) as u64;
         if self.pq_pending_since != 0
             && unix_now().saturating_sub(self.pq_pending_since) > max_age
@@ -322,16 +351,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             ex.zeroize();
             self.pq_pending_since = 0;
         }
+    }
 
-        self.pq_turns_since_mix = self.pq_turns_since_mix.saturating_add(1);
-        if self.pq_turns_since_mix < Config::global().pq_ratchet_interval {
-            return Ok(());
-        }
+    /// Propose epoch `current + 1` with a fresh ML-KEM-768 keypair, unless one is in flight — one
+    /// at a time; the next turn or send tries again.
+    fn start_pq_exchange(&mut self) -> Result<(), String> {
         if self.pending_pq_exchange.is_some() {
-            // Exchange already in flight — one at a time; try again next turn.
             return Ok(());
         }
-
         let keypair = crate::crypto::pq_x3dh::mlkem768_keygen()
             .map_err(|e| format!("PQ ratchet keygen failed: {e}"))?;
         self.pending_pq_exchange = Some(PendingPqExchange {
@@ -381,6 +408,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             let p = self.pending_pq_ciphertext.take().expect("checked above");
             self.current_pq_epoch = self.current_pq_epoch.max(p.epoch);
             self.insert_pq_epoch_chains(p.chains.clone());
+            self.pq_epoch_since = unix_now();
         }
 
         // 2. Field ingestion.
@@ -474,6 +502,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         self.current_pq_epoch = *epoch;
                         self.insert_pq_epoch_chains(chains);
                         self.pq_pending_since = 0;
+                        self.pq_epoch_since = unix_now();
                     }
                     Err(e) => {
                         tracing::warn!(

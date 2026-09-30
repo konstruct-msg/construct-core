@@ -102,6 +102,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
+            pq_epoch_since: unix_now(),
             session_id: shared_session_id,
             contact_id,
             local_user_id,
@@ -217,6 +218,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             pending_pq_exchange: None,
             pending_pq_ciphertext: None,
             pq_pending_since: 0,
+            pq_epoch_since: unix_now(),
             session_id: shared_session_id,
             contact_id: contact_id.clone(),
             local_user_id,
@@ -287,6 +289,8 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         // PQ-ratchet suite: hybridize the DR message key with the next key of the current
         // epoch's send chain, and name both (epoch, index) so the receiver takes the same key
         // (see pq_send_key, mix_pq_message_key).
+        // PQR-1 first: an epoch past its age gets a proposal on this very message.
+        self.maybe_start_pq_exchange_by_age()?;
         let (pq_message_epoch, pq_key_index, mut pq_key) = self.pq_send_key()?;
         let mixed = Self::mix_pq_message_key(&message_key, pq_key.as_deref());
         if let Some(k) = pq_key.as_mut() {
