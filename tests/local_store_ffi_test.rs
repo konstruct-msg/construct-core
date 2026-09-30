@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use construct_core::{
-    LocalChat, LocalContact, LocalInsert, LocalMessage, LocalStore, LocalStoreChange,
-    LocalStoreError, LocalStoreObserver, LocalStoreTable,
+    LocalChat, LocalContact, LocalInsert, LocalMessage, LocalPeerDevice, LocalStore,
+    LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -157,4 +157,32 @@ fn a_wrong_key_is_its_own_error() {
         LocalStore::in_memory(vec![0; 8]),
         Err(LocalStoreError::KeyLength)
     ));
+}
+
+#[test]
+fn a_peer_device_is_found_by_id_and_listed() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    let device = |id: &str, at: i64| LocalPeerDevice {
+        device_id: id.into(),
+        account_id: "alice".into(),
+        identity_key: vec![9; 32],
+        first_seen_at: at,
+    };
+    store.record_peer_device(device("later", 2)).unwrap();
+    store.record_peer_device(device("earlier", 1)).unwrap();
+
+    assert_eq!(
+        store
+            .peer_device("later".into())
+            .unwrap()
+            .map(|d| d.first_seen_at),
+        Some(2)
+    );
+    assert!(store.peer_device("none".into()).unwrap().is_none());
+    let ids = |v: Vec<LocalPeerDevice>| v.into_iter().map(|d| d.device_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.peer_devices("alice".into()).unwrap()),
+        ["earlier", "later"]
+    );
+    assert_eq!(ids(store.all_peer_devices().unwrap()), ["earlier", "later"]);
 }

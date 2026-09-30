@@ -290,6 +290,12 @@ impl LocalStore {
     pub fn peer_devices(&self, account_id: String) -> Result<Vec<LocalPeerDevice>> {
         Ok(all(self.with(|s| s.peer_devices(&account_id))?))
     }
+    pub fn peer_device(&self, device_id: String) -> Result<Option<LocalPeerDevice>> {
+        Ok(self.with(|s| s.peer_device(&device_id))?.map(Into::into))
+    }
+    pub fn all_peer_devices(&self) -> Result<Vec<LocalPeerDevice>> {
+        Ok(all(self.with(|s| s.all_peer_devices())?))
+    }
     pub fn retain_peer_devices(
         &self,
         account_id: String,

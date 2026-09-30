@@ -376,6 +376,50 @@ fn a_device_keeps_its_first_account_and_an_empty_list_forgets_nothing() {
     assert!(store.peer_devices("mallory").unwrap().is_empty());
 }
 
+/// Oldest first, so a single-device peer's device stays first; one bundle answer records several
+/// devices in the same millisecond, and the id orders those the same way on every run.
+#[test]
+fn an_accounts_devices_come_oldest_first_and_ties_break_by_id() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let d = |id: &str, account: &str, at: i64| PeerDevice {
+        device_id: id.into(),
+        account_id: account.into(),
+        identity_key: vec![1],
+        first_seen_at: at,
+    };
+    store.record_peer_device(&d("c", "alice", 5)).unwrap();
+    store
+        .record_peer_device(&d("zz-first", "alice", 1))
+        .unwrap();
+    store.record_peer_device(&d("b", "alice", 5)).unwrap();
+    store.record_peer_device(&d("a", "bob", 9)).unwrap();
+
+    let ids = |v: Vec<PeerDevice>| v.into_iter().map(|d| d.device_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.peer_devices("alice").unwrap()),
+        ["zz-first", "b", "c"]
+    );
+    assert_eq!(
+        ids(store.all_peer_devices().unwrap()),
+        ["zz-first", "b", "c", "a"]
+    );
+}
+
+#[test]
+fn a_device_is_found_by_id_under_the_account_it_was_first_recorded_for() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let d = |account: &str| PeerDevice {
+        device_id: "d1".into(),
+        account_id: account.into(),
+        identity_key: vec![7],
+        first_seen_at: 3,
+    };
+    assert_eq!(store.peer_device("d1").unwrap(), None);
+    store.record_peer_device(&d("alice")).unwrap();
+    store.record_peer_device(&d("mallory")).unwrap();
+    assert_eq!(store.peer_device("d1").unwrap(), Some(d("alice")));
+}
+
 // MARK: - Observer, wipe, schema
 
 struct Recorder {

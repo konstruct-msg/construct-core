@@ -1613,8 +1613,13 @@ interface LocalStore {
     /// An id already known keeps its first account.
     [Throws=LocalStoreError]
     LocalInsert record_peer_device(LocalPeerDevice device);
+    /// Oldest first; devices first seen in the same millisecond by id.
     [Throws=LocalStoreError]
     sequence<LocalPeerDevice> peer_devices(string account_id);
+    [Throws=LocalStoreError]
+    LocalPeerDevice? peer_device(string device_id);
+    [Throws=LocalStoreError]
+    sequence<LocalPeerDevice> all_peer_devices();
     /// Forget devices the server no longer lists; an empty list forgets nothing. Returns the removed.
     [Throws=LocalStoreError]
     sequence<string> retain_peer_devices(string account_id, sequence<string> active);

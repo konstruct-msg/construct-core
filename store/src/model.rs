@@ -88,6 +88,7 @@ pub struct PeerDevice {
     pub device_id: String,
     pub account_id: String,
     pub identity_key: Vec<u8>,
+    /// Milliseconds since the Unix epoch.
     pub first_seen_at: i64,
 }
 

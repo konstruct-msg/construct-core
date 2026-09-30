@@ -530,14 +530,39 @@ impl Store {
         }
     }
 
+    /// An account's devices, oldest first. The device a single-device peer has always had stays
+    /// first, and the order is the same on every run: devices recorded from one bundle answer
+    /// share a millisecond, so `device_id` breaks the tie rather than the table's row order.
     pub fn peer_devices(&self, account_id: &str) -> Result<Vec<PeerDevice>> {
+        self.select_peer_devices(
+            "WHERE account_id = ?1 ORDER BY first_seen_at, device_id",
+            [account_id],
+        )
+    }
+
+    /// One device by id, whichever account it was recorded for.
+    pub fn peer_device(&self, device_id: &str) -> Result<Option<PeerDevice>> {
+        Ok(self
+            .select_peer_devices("WHERE device_id = ?1", [device_id])?
+            .pop())
+    }
+
+    /// Every recorded device of every account, in the per-account order above.
+    pub fn all_peer_devices(&self) -> Result<Vec<PeerDevice>> {
+        self.select_peer_devices("ORDER BY account_id, first_seen_at, device_id", [])
+    }
+
+    fn select_peer_devices<P: rusqlite::Params>(
+        &self,
+        clause: &str,
+        params: P,
+    ) -> Result<Vec<PeerDevice>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT device_id, account_id, identity_key, first_seen_at FROM peer_devices
-             WHERE account_id = ?1 ORDER BY device_id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT device_id, account_id, identity_key, first_seen_at FROM peer_devices {clause}"
+        ))?;
         let rows = stmt
-            .query_map([account_id], |row| {
+            .query_map(params, |row| {
                 Ok(PeerDevice {
                     device_id: row.get(0)?,
                     account_id: row.get(1)?,
