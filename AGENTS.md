@@ -80,6 +80,19 @@ been reimplemented or ignored client-side at least once.
 - Use **Serde JSON** only for legacy compatibility or human-readable exports.
 - All persistent state should be versioned.
 
+### 5. Versioning
+- **A commit that changes what a client can observe bumps `version` in `Cargo.toml` in the same
+  commit**, with `Cargo.lock`, and names the new version in its subject in parentheses —
+  `feat(pqxdh)!: … (0.22.0)`. Observable means: the UDL (`construct_core.udl`), a wire or file
+  format, persisted state, or a protocol decision.
+- `0.x.y`: a breaking change (`!`) or a new export is **minor** (`0.22.0 → 0.23.0`); a fix that
+  changes no signature is **patch** (`0.20.1`). Refactors, tests and docs do not bump.
+- The same rule holds for `construct-store` (`store/Cargo.toml`), on its own version.
+- Why: the version is what the apps stamp next to the hash (`0.22.0+<hash>`) and what Android's
+  pairing lock and the release notes name. Between 2026-09-26 and 2026-09-30 fifteen commits —
+  four of them breaking — shipped as `0.22.0`, so two different ABIs carried the same number and
+  only the hash told them apart.
+
 ## Key Files
 - `src/construct_core.udl`: UniFFI interface definition (The "Source of Truth" for the cross-platform API).
 - `src/orchestration/orchestrator.rs`: Implementation of the main event loop.
