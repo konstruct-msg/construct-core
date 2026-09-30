@@ -80,6 +80,12 @@ mod uniffi_bindings;
 #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 pub use uniffi_bindings::*;
 
+// The local store (`construct-store`) in this library's UniFFI component.
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+mod local_store_bindings;
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+pub use local_store_bindings::*;
+
 // Include UniFFI generated scaffolding when a binding feature is enabled.
 // Without `android` in this list, the Android cdylib contains none of the
 // uniffi_construct_core_* symbols and linker GC strips ~everything as

@@ -1,0 +1,160 @@
+//! The local store as iOS, macOS and Android see it: the UniFFI surface over `construct-store`.
+//! The store's own behaviour is `store/tests/store_test.rs`; this checks the crossing.
+#![cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+
+use std::sync::{Arc, Mutex};
+
+use construct_core::{
+    LocalChat, LocalContact, LocalInsert, LocalMessage, LocalStore, LocalStoreChange,
+    LocalStoreError, LocalStoreObserver, LocalStoreTable,
+};
+
+const KEY: [u8; 32] = [3; 32];
+
+fn contact(id: &str) -> LocalContact {
+    LocalContact {
+        id: id.into(),
+        username: String::new(),
+        display_name: "Bob".into(),
+        local_alias: None,
+        avatar: None,
+        public_key: None,
+        known_identity_key: None,
+        account_address: None,
+        is_contact: true,
+        is_blocked: false,
+        is_sharing_with_me: false,
+        am_i_sharing_with: false,
+        shared_with_me_at: None,
+        added_at: None,
+        kt_status: 0,
+        hybrid_capable: false,
+        security_notice: 0,
+    }
+}
+
+fn message(id: &str, order_key: &str) -> LocalMessage {
+    LocalMessage {
+        id: id.into(),
+        chat_id: "c1".into(),
+        from_user_id: "a".into(),
+        to_user_id: "b".into(),
+        is_sent_by_me: true,
+        timestamp: 1,
+        order_key: order_key.into(),
+        body: vec![1, 2, 3],
+        content_type: 0,
+        delivery_status: 0,
+        retry_count: 0,
+        suite_id: 0,
+        is_edited: false,
+        edited_at: None,
+        reply_to_message_id: None,
+        reply_to_content: None,
+        transcript_text: None,
+        transcript_language: None,
+        transcript_generated_at: None,
+    }
+}
+
+struct Seen(Arc<Mutex<Vec<(String, Vec<String>)>>>);
+
+impl LocalStoreObserver for Seen {
+    fn on_change(&self, change: LocalStoreChange) {
+        let table = match change.table {
+            LocalStoreTable::Contacts => "contacts",
+            LocalStoreTable::Chats => "chats",
+            LocalStoreTable::Messages => "messages",
+            _ => "other",
+        };
+        self.0.lock().unwrap().push((table.into(), change.ids));
+    }
+}
+
+#[test]
+fn a_client_writes_reads_pages_and_hears_about_it() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    store.set_observer(Some(Box::new(Seen(seen.clone()))));
+
+    store.upsert_contact(contact("peer")).unwrap();
+    store
+        .upsert_chat(LocalChat {
+            id: "c1".into(),
+            peer_id: "peer".into(),
+            last_message_text: None,
+            last_message_time: Some(1),
+            session_id: None,
+            is_pinned: false,
+            is_muted: false,
+            unread_count: 0,
+        })
+        .unwrap();
+    assert!(matches!(
+        store
+            .insert_message(message("m1", "k1"), Some("hello there".into()))
+            .unwrap(),
+        LocalInsert::Inserted
+    ));
+    assert!(matches!(
+        store.insert_message(message("m1", "k1"), None).unwrap(),
+        LocalInsert::AlreadyPresent
+    ));
+    store.insert_message(message("m2", "k2"), None).unwrap();
+
+    let newest = store.messages_before("c1".into(), None, None, 1).unwrap();
+    assert_eq!(
+        newest.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m2"]
+    );
+    let earlier = store
+        .messages_before("c1".into(), Some("k2".into()), Some("m2".into()), 5)
+        .unwrap();
+    assert_eq!(
+        earlier.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m1"]
+    );
+    assert_eq!(earlier[0].body, [1, 2, 3]);
+    assert_eq!(store.search("hello".into(), 5).unwrap()[0].message_id, "m1");
+
+    assert_eq!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>(),
+        ["contacts", "chats", "messages", "messages"]
+    );
+}
+
+/// After a wipe the object is closed, not a fresh store — and the file is gone.
+#[test]
+fn a_wiped_store_answers_closed_and_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local.db");
+    let store = LocalStore::new(path.to_string_lossy().into(), KEY.to_vec()).unwrap();
+    store.upsert_contact(contact("peer")).unwrap();
+
+    store.wipe().unwrap();
+    assert!(matches!(store.contacts(), Err(LocalStoreError::Closed)));
+    assert!(matches!(store.wipe(), Err(LocalStoreError::Closed)));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_wrong_key_is_its_own_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path: String = dir.path().join("local.db").to_string_lossy().into();
+    LocalStore::new(path.clone(), KEY.to_vec())
+        .unwrap()
+        .upsert_contact(contact("peer"))
+        .unwrap();
+    assert!(matches!(
+        LocalStore::new(path, vec![4; 32]),
+        Err(LocalStoreError::WrongKey)
+    ));
+    assert!(matches!(
+        LocalStore::in_memory(vec![0; 8]),
+        Err(LocalStoreError::KeyLength)
+    ));
+}

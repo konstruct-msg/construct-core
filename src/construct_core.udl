@@ -1415,3 +1415,214 @@ interface MlsStore {
     [Throws=MlsError]
     bytes export_cfe();
 };
+
+// ============================================================================
+// Local store — construct-store, the one store every client keeps
+// construct-docs/decisions/local-store-in-the-core.md
+// ============================================================================
+// SQLCipher-encrypted whole; the key is 32 random bytes the platform keeps in its key store.
+// Times are Unix milliseconds. Writes are announced to the observer after they commit.
+
+[Error]
+enum LocalStoreError {
+    "WrongKey",
+    "KeyLength",
+    "SchemaTooNew",
+    "Closed",
+    "Storage",
+};
+
+enum LocalStoreTable {
+    "Contacts",
+    "Chats",
+    "Messages",
+    "Reactions",
+    "Calls",
+    "PeerDevices",
+};
+
+enum LocalInsert {
+    "Inserted",
+    "AlreadyPresent",
+};
+
+dictionary LocalStoreChange {
+    LocalStoreTable table;
+    sequence<string> ids;
+};
+
+/// Told after every committed write, on the writing thread, never under the store's lock.
+callback interface LocalStoreObserver {
+    void on_change(LocalStoreChange change);
+};
+
+dictionary LocalContact {
+    string id;
+    string username;
+    string display_name;
+    string? local_alias;
+    bytes? avatar;
+    string? public_key;
+    bytes? known_identity_key;
+    bytes? account_address;
+    boolean is_contact;
+    boolean is_blocked;
+    boolean is_sharing_with_me;
+    boolean am_i_sharing_with;
+    i64? shared_with_me_at;
+    i64? added_at;
+    i16 kt_status;
+    boolean hybrid_capable;
+    i16 security_notice;
+};
+
+dictionary LocalChat {
+    string id;
+    string peer_id;
+    string? last_message_text;
+    i64? last_message_time;
+    string? session_id;
+    boolean is_pinned;
+    boolean is_muted;
+    i32 unread_count;
+};
+
+dictionary LocalMessage {
+    string id;
+    string chat_id;
+    string from_user_id;
+    string to_user_id;
+    boolean is_sent_by_me;
+    i64 timestamp;
+    string order_key;
+    bytes body;
+    i16 content_type;
+    i16 delivery_status;
+    i16 retry_count;
+    i16 suite_id;
+    boolean is_edited;
+    i64? edited_at;
+    string? reply_to_message_id;
+    string? reply_to_content;
+    string? transcript_text;
+    string? transcript_language;
+    i64? transcript_generated_at;
+};
+
+dictionary LocalReaction {
+    string target_message_id;
+    string reactor_user_id;
+    string emoji;
+    i64 timestamp_ms;
+    i64? received_at;
+};
+
+dictionary LocalCall {
+    string id;
+    string peer_user_id;
+    string peer_name;
+    i16 direction;
+    i16 status;
+    i64? started_at;
+    i64? ended_at;
+    i32 duration_seconds;
+};
+
+dictionary LocalPeerDevice {
+    string device_id;
+    string account_id;
+    bytes identity_key;
+    i64 first_seen_at;
+};
+
+dictionary LocalSearchHit {
+    string message_id;
+    string chat_id;
+    i64 timestamp;
+};
+
+interface LocalStore {
+    /// Open — creating if absent — the store at `path` under `key`. A key that does not open it
+    /// is `WrongKey`, never a fresh empty store.
+    [Throws=LocalStoreError]
+    constructor(string path, bytes key);
+
+    /// A store in memory only, under the same encryption path. Tests and previews.
+    [Throws=LocalStoreError, Name=in_memory]
+    constructor(bytes key);
+
+    void set_observer(LocalStoreObserver? observer);
+
+    /// Close and delete every file of the store. Every later call is `Closed`. The platform
+    /// deletes the key.
+    [Throws=LocalStoreError]
+    void wipe();
+
+    [Throws=LocalStoreError]
+    void upsert_contact(LocalContact contact);
+    [Throws=LocalStoreError]
+    LocalContact? contact(string id);
+    /// People marked as contacts, by the name shown for them.
+    [Throws=LocalStoreError]
+    sequence<LocalContact> contacts();
+    /// Takes the contact's chats and their messages with it.
+    [Throws=LocalStoreError]
+    void delete_contact(string id);
+
+    [Throws=LocalStoreError]
+    void upsert_chat(LocalChat chat);
+    [Throws=LocalStoreError]
+    LocalChat? chat(string id);
+    /// Pinned first, then most recent, chats with no message last.
+    [Throws=LocalStoreError]
+    sequence<LocalChat> chats();
+    [Throws=LocalStoreError]
+    void delete_chat(string id);
+
+    /// `search_text` is what the message says, for the full-text index; null for media/control.
+    [Throws=LocalStoreError]
+    LocalInsert insert_message(LocalMessage message, string? search_text);
+    [Throws=LocalStoreError]
+    boolean edit_message(string id, bytes body, string? search_text, i64 edited_at);
+    [Throws=LocalStoreError]
+    boolean set_delivery_status(string id, i16 status);
+    [Throws=LocalStoreError]
+    LocalMessage? message(string id);
+    /// Up to `limit` messages just before (`before_order_key`, `before_id`) — both null for the
+    /// newest page — oldest first.
+    [Throws=LocalStoreError]
+    sequence<LocalMessage> messages_before(string chat_id, string? before_order_key, string? before_id, u32 limit);
+    [Throws=LocalStoreError]
+    void delete_message(string id);
+    /// Messages whose text contains `query` (one phrase, three characters at least), newest first.
+    [Throws=LocalStoreError]
+    sequence<LocalSearchHit> search(string query, u32 limit);
+
+    [Throws=LocalStoreError]
+    void upsert_reaction(LocalReaction reaction);
+    [Throws=LocalStoreError]
+    sequence<LocalReaction> reactions(string target_message_id);
+    [Throws=LocalStoreError]
+    void delete_reaction(string target_message_id, string reactor_user_id);
+
+    [Throws=LocalStoreError]
+    void upsert_call(LocalCall call);
+    [Throws=LocalStoreError]
+    sequence<LocalCall> calls(u32 limit);
+
+    /// An id already known keeps its first account.
+    [Throws=LocalStoreError]
+    LocalInsert record_peer_device(LocalPeerDevice device);
+    [Throws=LocalStoreError]
+    sequence<LocalPeerDevice> peer_devices(string account_id);
+    /// Forget devices the server no longer lists; an empty list forgets nothing. Returns the removed.
+    [Throws=LocalStoreError]
+    sequence<string> retain_peer_devices(string account_id, sequence<string> active);
+
+    [Throws=LocalStoreError]
+    void put(string key, bytes value);
+    [Throws=LocalStoreError]
+    bytes? get(string key);
+    [Throws=LocalStoreError]
+    void remove(string key);
+};

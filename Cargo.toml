@@ -31,12 +31,12 @@ default = []
 # the build command (iOS release and Android CI passed it; CI's iOS/mac checks and the UniFFI
 # test run did not, so the configuration that ships was not the one tested). `lib.rs` has a
 # `compile_error!` for a platform feature without it, should this list ever lose it.
-ios = ["post-quantum", "uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+ios = ["post-quantum", "uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-veil TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["post-quantum", "uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+mac = ["post-quantum", "uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # android = UniFFI JNI bindings (Kotlin) + construct-veil transport
-android = ["post-quantum", "uniffi", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+android = ["post-quantum", "uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 post-quantum = [
     "dep:ml-kem",
     "dep:getrandom_pq",
@@ -103,9 +103,13 @@ uniffi = { version = "0.30", features = ["build"], optional = true }
 #
 # Bump `rev` to take a veil change. To build against a local checkout while working on both,
 # patch it outside this file (see README, "Working on construct-veil at the same time").
+# The local store every client keeps — exported through this library's UDL on the platform
+# features; the Tauri desktops and the TUI depend on it directly.
+construct-store = { path = "store", optional = true }
 construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b", features = ["ffi"], optional = true }
 
 [dev-dependencies]
+tempfile = "3"
 # openmls `test-utils` lives here, not in [dependencies]: the MLS unit tests need
 # SignatureKeyPair::private(), but the feature also unlocks unvalidated KeyPackage
 # conversions that must stay unreachable from shipped code. resolver = "2" keeps
