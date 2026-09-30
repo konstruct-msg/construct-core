@@ -1,0 +1,27 @@
+[package]
+name = "construct-store"
+version = "0.1.0"
+authors = ["Construct Team"]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/konstruct-msg/construct-core"
+description = "The local store every Construct client keeps: one schema, encrypted whole with SQLCipher"
+
+[features]
+default = []
+# Android, Linux and Windows have no system crypto SQLCipher can use; Apple builds use
+# CommonCrypto and do not need it.
+vendored-openssl = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
+[dependencies]
+# 0.32 is the rusqlite on libsqlite3-sys 0.30 — the version already in this workspace's lock
+# (via sqlx-sqlite). `links = "sqlite3"` allows one libsqlite3-sys per resolve.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+thiserror = "2"
+zeroize = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+# The schema-version test writes `user_version` itself.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

@@ -1,0 +1,153 @@
+//! The schema, as numbered steps. `PRAGMA user_version` is the step a store has reached; a store
+//! ahead of this build is refused rather than opened, since an older schema would lose what the
+//! newer one wrote.
+//!
+//! Version 1 carries what the iOS Core Data model 12 holds, minus what whole-database encryption
+//! makes pointless: a message body is one blob, not ciphertext plus a key kept elsewhere plus a
+//! clear fallback column (`encryptedContent` / `contentKeyRef` / `decryptedContent`).
+
+use rusqlite::Connection;
+
+use crate::error::{Result, StoreError};
+
+const STEPS: &[&str] = &[
+    // 1 — the model of iOS Core Data model 12.
+    r#"
+    CREATE TABLE contacts (
+        id                 TEXT PRIMARY KEY NOT NULL,   -- account UUID
+        username           TEXT NOT NULL DEFAULT '',
+        display_name       TEXT NOT NULL DEFAULT '',
+        local_alias        TEXT,
+        avatar             BLOB,
+        public_key         TEXT,
+        known_identity_key BLOB,
+        account_address    BLOB,
+        is_contact         INTEGER NOT NULL DEFAULT 0,
+        is_blocked         INTEGER NOT NULL DEFAULT 0,
+        is_sharing_with_me INTEGER NOT NULL DEFAULT 0,
+        am_i_sharing_with  INTEGER NOT NULL DEFAULT 0,
+        shared_with_me_at  INTEGER,
+        added_at           INTEGER,
+        kt_status          INTEGER NOT NULL DEFAULT 0,
+        hybrid_capable     INTEGER NOT NULL DEFAULT 0,
+        security_notice    INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE chats (
+        id                TEXT PRIMARY KEY NOT NULL,
+        peer_id           TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        last_message_text TEXT,
+        last_message_time INTEGER,
+        session_id        TEXT,
+        is_pinned         INTEGER NOT NULL DEFAULT 0,
+        is_muted          INTEGER NOT NULL DEFAULT 0,
+        unread_count      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX chats_by_peer ON chats(peer_id);
+
+    CREATE TABLE messages (
+        id                    TEXT PRIMARY KEY NOT NULL,
+        chat_id               TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        from_user_id          TEXT NOT NULL,
+        to_user_id            TEXT NOT NULL,
+        is_sent_by_me         INTEGER NOT NULL,
+        timestamp             INTEGER NOT NULL,
+        -- The transcript order: server-assigned where the server placed the message, local
+        -- otherwise (`ServerMessageOrder` on iOS). Total — ties broken by id in queries.
+        order_key             TEXT NOT NULL,
+        body                  BLOB NOT NULL,           -- the local payload (CTM1 on iOS)
+        content_type          INTEGER NOT NULL DEFAULT 0,
+        delivery_status       INTEGER NOT NULL DEFAULT 0,
+        retry_count           INTEGER NOT NULL DEFAULT 0,
+        suite_id              INTEGER NOT NULL DEFAULT 0,
+        is_edited             INTEGER NOT NULL DEFAULT 0,
+        edited_at             INTEGER,
+        reply_to_message_id   TEXT,
+        reply_to_content      TEXT,
+        transcript_text       TEXT,
+        transcript_language   TEXT,
+        transcript_generated_at INTEGER
+    );
+    CREATE INDEX messages_in_order ON messages(chat_id, order_key, id);
+
+    -- Search over what a message says, fed by the client (it knows which part of a body is
+    -- text). Contentless: the text lives only in the index. Trigram, because a word tokenizer
+    -- does not segment Japanese; the cost is that a query needs three characters.
+    CREATE VIRTUAL TABLE message_search USING fts5(
+        text, content = '', contentless_delete = 1, tokenize = 'trigram'
+    );
+    -- Every way a message goes — itself, its chat, its contact (cascades fire triggers) — takes
+    -- its search entry with it. Nothing a person deleted stays findable.
+    CREATE TRIGGER messages_leave_search AFTER DELETE ON messages BEGIN
+        DELETE FROM message_search WHERE rowid = old.rowid;
+    END;
+
+    CREATE TABLE reactions (
+        target_message_id TEXT NOT NULL,
+        reactor_user_id   TEXT NOT NULL,
+        emoji             TEXT NOT NULL,
+        timestamp_ms      INTEGER NOT NULL DEFAULT 0,
+        received_at       INTEGER,
+        PRIMARY KEY (target_message_id, reactor_user_id)
+    );
+
+    CREATE TABLE calls (
+        id               TEXT PRIMARY KEY NOT NULL,
+        peer_user_id     TEXT NOT NULL,
+        peer_name        TEXT NOT NULL DEFAULT '',
+        direction        INTEGER NOT NULL DEFAULT 0,
+        status           INTEGER NOT NULL DEFAULT 0,
+        started_at       INTEGER,
+        ended_at         INTEGER,
+        duration_seconds INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE processed_messages (
+        message_id   TEXT PRIMARY KEY NOT NULL,
+        sender_id    TEXT NOT NULL,
+        processed_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE healing_messages (
+        message_id      TEXT PRIMARY KEY NOT NULL,
+        sender_id       TEXT NOT NULL,
+        received_at     INTEGER NOT NULL,
+        message_data    BLOB NOT NULL,
+        heal_attempts   INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER
+    );
+
+    CREATE TABLE peer_devices (
+        device_id     TEXT PRIMARY KEY NOT NULL,   -- 32 hex, hash of the identity key
+        account_id    TEXT NOT NULL,
+        identity_key  BLOB NOT NULL,
+        first_seen_at INTEGER NOT NULL
+    );
+    CREATE INDEX peer_devices_by_account ON peer_devices(account_id);
+
+    -- Small state that is not a row of anything: stream cursors, owner, flags.
+    CREATE TABLE kv (
+        key   TEXT PRIMARY KEY NOT NULL,
+        value BLOB NOT NULL
+    );
+    "#,
+];
+
+pub(crate) const VERSION: i64 = STEPS.len() as i64;
+
+pub(crate) fn run(conn: &mut Connection) -> Result<()> {
+    let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if found > VERSION {
+        return Err(StoreError::SchemaTooNew {
+            found,
+            supported: VERSION,
+        });
+    }
+    for (index, step) in STEPS.iter().enumerate().skip(found as usize) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(step)?;
+        tx.pragma_update(None, "user_version", index as i64 + 1)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
