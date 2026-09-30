@@ -1624,6 +1624,14 @@ interface LocalStore {
     [Throws=LocalStoreError]
     sequence<string> retain_peer_devices(string account_id, sequence<string> active);
 
+    /// The server's id of a sealed copy we sent → our message id; lowercase, kept 30 days.
+    [Throws=LocalStoreError]
+    void record_server_message_id(string server_id, string local_id, i64 recorded_at);
+    [Throws=LocalStoreError]
+    string? local_message_id(string server_id);
+    [Throws=LocalStoreError]
+    u64 forget_server_message_ids_before(i64 cutoff);
+
     [Throws=LocalStoreError]
     void put(string key, bytes value);
     [Throws=LocalStoreError]

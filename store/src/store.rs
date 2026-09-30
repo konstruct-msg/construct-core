@@ -602,6 +602,50 @@ impl Store {
         Ok(removed)
     }
 
+    // MARK: - Server message ids
+
+    /// Remember that the server named our message `local_id` as `server_id`. Ids compare
+    /// case-insensitively (UUID text), so both are kept lowercase. A server id recorded again
+    /// takes the new message: the server never reuses one, so that is a correction.
+    pub fn record_server_message_id(
+        &self,
+        server_id: &str,
+        local_id: &str,
+        recorded_at: i64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO server_message_ids (server_id, local_id, recorded_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(server_id) DO UPDATE SET local_id = excluded.local_id,
+                                                  recorded_at = excluded.recorded_at",
+            params![
+                server_id.to_ascii_lowercase(),
+                local_id.to_ascii_lowercase(),
+                recorded_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Our message id for a server id, if we sent under it.
+    pub fn local_message_id(&self, server_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT local_id FROM server_message_ids WHERE server_id = ?1",
+                [server_id.to_ascii_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Forget ids recorded before `cutoff` (ms); returns how many.
+    pub fn forget_server_message_ids_before(&self, cutoff: i64) -> Result<u64> {
+        Ok(self.lock().execute(
+            "DELETE FROM server_message_ids WHERE recorded_at < ?1",
+            [cutoff],
+        )? as u64)
+    }
+
     // MARK: - Small state
 
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {

@@ -504,3 +504,32 @@ fn a_store_from_a_newer_build_is_refused() {
         Err(StoreError::SchemaTooNew { .. })
     ));
 }
+
+// MARK: - Server message ids
+
+/// A receipt or decryption error names the server's id of a sealed copy; the store answers with
+/// ours, in any case, until the ids are older than the server's queue.
+#[test]
+fn a_server_id_maps_back_to_our_message_until_it_is_forgotten() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store
+        .record_server_message_id("E474825E-AAAA", "8B403CE9-BBBB", 100)
+        .unwrap();
+    store
+        .record_server_message_id("f00d-0001", "8b403ce9-bbbb", 200)
+        .unwrap();
+
+    assert_eq!(
+        store.local_message_id("e474825e-aaaa").unwrap().as_deref(),
+        Some("8b403ce9-bbbb")
+    );
+    assert_eq!(
+        store.local_message_id("F00D-0001").unwrap().as_deref(),
+        Some("8b403ce9-bbbb")
+    );
+    assert_eq!(store.local_message_id("unknown").unwrap(), None);
+
+    assert_eq!(store.forget_server_message_ids_before(150).unwrap(), 1);
+    assert_eq!(store.local_message_id("e474825e-aaaa").unwrap(), None);
+    assert!(store.local_message_id("f00d-0001").unwrap().is_some());
+}

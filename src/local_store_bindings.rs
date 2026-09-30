@@ -304,6 +304,21 @@ impl LocalStore {
         self.with(|s| s.retain_peer_devices(&account_id, &active))
     }
 
+    pub fn record_server_message_id(
+        &self,
+        server_id: String,
+        local_id: String,
+        recorded_at: i64,
+    ) -> Result<()> {
+        self.with(|s| s.record_server_message_id(&server_id, &local_id, recorded_at))
+    }
+    pub fn local_message_id(&self, server_id: String) -> Result<Option<String>> {
+        self.with(|s| s.local_message_id(&server_id))
+    }
+    pub fn forget_server_message_ids_before(&self, cutoff: i64) -> Result<u64> {
+        self.with(|s| s.forget_server_message_ids_before(cutoff))
+    }
+
     pub fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.with(|s| s.put(&key, &value))
     }

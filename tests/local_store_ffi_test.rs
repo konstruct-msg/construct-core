@@ -186,3 +186,20 @@ fn a_peer_device_is_found_by_id_and_listed() {
     );
     assert_eq!(ids(store.all_peer_devices().unwrap()), ["earlier", "later"]);
 }
+
+#[test]
+fn a_server_message_id_maps_back_across_the_crossing() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    store
+        .record_server_message_id("SERVER-1".into(), "Local-1".into(), 10)
+        .unwrap();
+    assert_eq!(
+        store
+            .local_message_id("server-1".into())
+            .unwrap()
+            .as_deref(),
+        Some("local-1")
+    );
+    assert_eq!(store.forget_server_message_ids_before(11).unwrap(), 1);
+    assert_eq!(store.local_message_id("server-1".into()).unwrap(), None);
+}

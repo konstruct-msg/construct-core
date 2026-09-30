@@ -125,6 +125,16 @@ const STEPS: &[&str] = &[
     );
     CREATE INDEX peer_devices_by_account ON peer_devices(account_id);
 
+    -- The server's id of each sealed copy we sent, and the message it carries. On the sealed path
+    -- the server assigns the id the recipient sees, so a receipt or a decryption error names that
+    -- one; kept as long as the server keeps a queue (30 days), since nothing older can be named.
+    CREATE TABLE server_message_ids (
+        server_id   TEXT PRIMARY KEY NOT NULL,   -- lowercase
+        local_id    TEXT NOT NULL,               -- lowercase
+        recorded_at INTEGER NOT NULL             -- ms since the epoch
+    );
+    CREATE INDEX server_message_ids_by_age ON server_message_ids(recorded_at);
+
     -- Small state that is not a row of anything: stream cursors, owner, flags.
     CREATE TABLE kv (
         key   TEXT PRIMARY KEY NOT NULL,
