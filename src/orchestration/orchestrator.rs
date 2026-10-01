@@ -657,7 +657,7 @@ impl Orchestrator {
         let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
 
         #[cfg(feature = "post-quantum")]
-        let (header, hybrid_pin) = {
+        let (header, hybrid_pin, first_flight) = {
             use crate::crypto::handshake::PqxdhInput;
             use crate::orchestration::pq_prekey_plan::{
                 KyberPrekeyOffer, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,
@@ -754,17 +754,31 @@ impl Orchestrator {
                     Some(&pq),
                 )
                 .map_err(|e| e.to_string())?;
+            let first_flight = (
+                crate::crypto::sealed_sender::first_flight::ciphertext_hash(&enc.ciphertext),
+                crate::crypto::sealed_sender::first_flight::FirstFlightKey::from_kem_secret(
+                    enc.shared_secret.expose(),
+                ),
+            );
             let header = PrekeyHeader {
                 one_time_prekey_id,
                 kyber_prekey_id: choice.kyber_prekey_id,
                 kem_ciphertext: enc.ciphertext.clone(),
                 kem_identity,
             };
-            (header, Some(choice.hybrid_identity_fingerprint))
+            (
+                header,
+                Some(choice.hybrid_identity_fingerprint),
+                Some(first_flight),
+            )
         };
 
         #[cfg(not(feature = "post-quantum"))]
-        let (header, hybrid_pin): (PrekeyHeader, Option<[u8; 32]>) = {
+        let (header, hybrid_pin, first_flight): (
+            PrekeyHeader,
+            Option<[u8; 32]>,
+            Option<crate::crypto::sealed_sender::first_flight::FiledFirstFlightKey>,
+        ) = {
             let _ = &kyber;
             self.lifecycle
                 .client
@@ -783,7 +797,7 @@ impl Orchestrator {
                 kem_ciphertext: Vec::new(),
                 kem_identity: Vec::new(),
             };
-            (header, None)
+            (header, None, None)
         };
 
         // The header carries the OTPK id now; the client's own copy would only go stale.
@@ -801,6 +815,19 @@ impl Orchestrator {
                 ratchet.expect_identity_answer();
             }
             ratchet.set_prekey_header(header);
+        }
+        // The key every first flight of this session is sealed with, until the peer answers.
+        if let Some((hash, key)) = first_flight
+            && let Some(session_id) = self
+                .lifecycle
+                .client
+                .get_session(contact_id)
+                .map(|s| s.session_id().to_string())
+        {
+            self.lifecycle
+                .client
+                .envelopes_mut()
+                .set_first_flight(&session_id, hash, key);
         }
         tracing::info!(
             target: "crypto::orchestrator",
@@ -1279,6 +1306,21 @@ impl Orchestrator {
                 crate::orchestration::pq_prekey_plan::kem_identity_fingerprint(kem_identity),
             );
             self.after_responder_init(contact_id, kem.kyber_prekey_id);
+            // The later first flights of this handshake name a one-time prekey just burned: they
+            // open with this, until the initiator proves itself.
+            if let Some(session_id) = self
+                .lifecycle
+                .client
+                .get_session(contact_id)
+                .map(|s| s.session_id().to_string())
+            {
+                use crate::crypto::sealed_sender::first_flight::{FirstFlightKey, ciphertext_hash};
+                self.lifecycle.client.envelopes_mut().set_first_flight(
+                    &session_id,
+                    ciphertext_hash(kem.kem_ciphertext),
+                    FirstFlightKey::from_kem_secret(shared.expose()),
+                );
+            }
         }
         Ok(plaintext)
     }
@@ -1424,6 +1466,97 @@ impl Orchestrator {
                 wire_payload,
             )
             .ok()
+    }
+
+    /// Seal a first flight to `contact_id` — `wire_payload` written on a session whose peer has not
+    /// answered yet — with the sender `certificate`, under the session's first-flight key
+    /// (`crypto::sealed_sender::first_flight`). `recipient_identity` is the X25519 identity key the
+    /// session was opened to; it must derive to `contact_id`.
+    ///
+    /// `None` when `wire_payload` carries no PQXDH handshake — not a first flight (a
+    /// DECRYPTION_ERROR body, a mid-ratchet message): it goes with a certificate. Fails when it is
+    /// a first flight that cannot be sealed: never send that one any other way, the header names
+    /// the sender.
+    pub fn seal_first_flight(
+        &self,
+        contact_id: &str,
+        recipient_identity: &[u8],
+        wire_payload: &[u8],
+        certificate: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        use crate::crypto::sealed_sender::first_flight;
+        if crate::device_id::derive_device_id(recipient_identity) != contact_id {
+            return Err(format!(
+                "FIRST_FLIGHT_WRONG_KEY: the identity key given does not derive to {}",
+                crate::crypto::messaging::double_ratchet::id_prefix(contact_id)
+            ));
+        }
+        let Some(handshake) = first_flight::handshake_of_wire(wire_payload) else {
+            return Ok(None);
+        };
+        let session = self
+            .lifecycle
+            .client
+            .get_session(contact_id)
+            .ok_or_else(|| format!("FIRST_FLIGHT_NO_SESSION: {}", contact_id))?;
+        let (hash, key) = self
+            .lifecycle
+            .client
+            .envelopes()
+            .first_flight_of_session(session.session_id())
+            .ok_or_else(|| {
+                "FIRST_FLIGHT_NO_KEY: the session has no first-flight key — answered, or made by \
+                 a core older than 0.27"
+                    .to_string()
+            })?;
+        if &handshake.ciphertext_hash() != hash {
+            return Err(
+                "FIRST_FLIGHT_OTHER_HANDSHAKE: the payload was written on another state".into(),
+            );
+        }
+        first_flight::seal(key, recipient_identity, wire_payload, certificate)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Open a first flight sealed to this device: the handshake's key from the book when an
+    /// earlier first flight of it opened the session, otherwise by decapsulating with the Kyber
+    /// prekey it names. Changes nothing — the platform then hands the certificate and the wire
+    /// payload over as before.
+    pub fn open_first_flight(
+        &self,
+        sealed: &[u8],
+    ) -> Result<crate::crypto::sealed_sender::first_flight::OpenedFirstFlight, String> {
+        use crate::crypto::sealed_sender::first_flight::{self, FirstFlightKey};
+        let handshake = first_flight::handshake_of_box(sealed).map_err(|e| e.to_string())?;
+        let km = self.lifecycle.client.key_manager();
+        let key = match self
+            .lifecycle
+            .client
+            .envelopes()
+            .first_flight_by_handshake(&handshake.ciphertext_hash())
+        {
+            Some(key) => key.clone(),
+            None => {
+                let prekey = km
+                    .kyber_prekeys()
+                    .find(handshake.kyber_prekey_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "FIRST_FLIGHT_KEY_UNAVAILABLE: Kyber prekey {} is not held",
+                            handshake.kyber_prekey_id
+                        )
+                    })?;
+                let shared = crate::crypto::pq_x3dh::mlkem1024_decapsulate(
+                    prekey.seed(),
+                    handshake.kem_ciphertext,
+                )?;
+                FirstFlightKey::from_kem_secret(shared.expose())
+            }
+        };
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        first_flight::open(&key, <_ as AsRef<[u8]>>::as_ref(secret), sealed)
+            .map_err(|e| e.to_string())
     }
 
     /// Find who wrote `envelope` by its tag and open it. `None` when no pair this device holds
@@ -4388,6 +4521,128 @@ mod pqxdh_v2_tests {
             envelope_session: Some(opened.session_id.clone()),
         });
         (opened, actions)
+    }
+
+    // ── First flight sealed whole (decisions/first-flight-sealed-whole.md) ───────────────
+
+    /// FF-1: until the peer answers, the initiator's messages are sealed whole under the
+    /// handshake's hybrid key — its KEM identity key is not readable outside. The second one opens
+    /// after the first has burned the one-time Kyber prekey it names, and the key is dropped on
+    /// both sides once the first flights are over.
+    ///
+    /// Mutation: skip `set_first_flight` in `complete_responder_init` — the second open reddens.
+    #[test]
+    fn first_flights_are_sealed_whole_and_the_later_ones_open_after_the_prekey_burns() {
+        use crate::crypto::sealed_sender::first_flight::{ciphertext_hash, handshake_of_wire};
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let bob_identity = x3dh.identity_public.clone();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let m1 = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        let s0 = alice
+            .seal_first_flight(&bob_id, &bob_identity, &m0, b"certificate")
+            .unwrap()
+            .unwrap();
+        let s1 = alice
+            .seal_first_flight(&bob_id, &bob_identity, &m1, b"certificate")
+            .unwrap()
+            .unwrap();
+        let kem_identity = alice
+            .lifecycle
+            .client
+            .key_manager()
+            .kem_identity_public()
+            .unwrap();
+        assert!(
+            !s0.windows(32).any(|w| w == &kem_identity[..32]),
+            "the initiator's KEM identity key is readable outside the box"
+        );
+        assert!(
+            alice
+                .seal_first_flight(&alice_id, &bob_identity, &m0, b"c")
+                .is_err(),
+            "a key that does not derive to the device is refused"
+        );
+
+        let o0 = bob.open_first_flight(&s0).unwrap();
+        assert_eq!(o0.certificate, b"certificate");
+        assert_eq!(o0.wire_payload, m0);
+        let actions = receive(&mut bob, &alice, &alice_id, &server, "m0", o0.wire_payload);
+        assert!(!reports_unreadable(&actions), "{actions:?}");
+
+        let o1 = bob
+            .open_first_flight(&s1)
+            .expect("a later first flight opens after its one-time prekey was burned");
+        assert_eq!(o1.wire_payload, m1);
+        let actions = receive(&mut bob, &alice, &alice_id, &server, "m1", o1.wire_payload);
+        assert!(!reports_unreadable(&actions), "{actions:?}");
+
+        // Bob answers: Alice's first flights are over.
+        let reply = bob.encrypt_bytes_for(&alice_id, b"hi").unwrap();
+        alice.decrypt_bytes_for(&bob_id, &reply).unwrap();
+        let m2 = alice.encrypt_bytes_for(&bob_id, b"proved").unwrap();
+        assert!(handshake_of_wire(&m2).is_none());
+        assert_eq!(
+            alice.seal_first_flight(&bob_id, &bob_identity, &m2, b"c"),
+            Ok(None),
+            "a message that is not a first flight goes another way"
+        );
+        assert!(alice.seal_envelope(&bob_id, &m2).is_some());
+        let hash = ciphertext_hash(handshake_of_wire(&m0).unwrap().kem_ciphertext);
+        assert!(
+            alice
+                .lifecycle
+                .client
+                .envelopes()
+                .first_flight_by_handshake(&hash)
+                .is_none()
+        );
+        assert!(
+            bob.lifecycle
+                .client
+                .envelopes()
+                .first_flight_by_handshake(&hash)
+                .is_some()
+        );
+
+        // Alice's message on the answered chain proves her: Bob's are over too.
+        bob.decrypt_bytes_for(&alice_id, &m2).unwrap();
+        assert!(
+            bob.lifecycle
+                .client
+                .envelopes()
+                .first_flight_by_handshake(&hash)
+                .is_none()
+        );
+    }
+
+    /// A first flight whose handshake this device cannot reconstruct — a Kyber prekey no longer
+    /// held, and no earlier first flight filed its key — does not open, and names no one.
+    #[test]
+    fn a_first_flight_to_a_prekey_not_held_does_not_open() {
+        let ((mut alice, _), (mut bob, bob_id)) = named_pair();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let bob_identity = x3dh.identity_public.clone();
+        let otpk = kyber.one_time_prekey_id.unwrap();
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let s0 = alice
+            .seal_first_flight(&bob_id, &bob_identity, &m0, b"c")
+            .unwrap()
+            .unwrap();
+        bob.lifecycle
+            .client
+            .key_manager_mut()
+            .kyber_prekeys_mut()
+            .remove_otpk(otpk);
+        let err = bob.open_first_flight(&s0).unwrap_err();
+        assert!(err.starts_with("FIRST_FLIGHT_KEY_UNAVAILABLE"), "{err}");
     }
 
     /// Once both sides hold the state, a message goes in an envelope with no certificate: the tag

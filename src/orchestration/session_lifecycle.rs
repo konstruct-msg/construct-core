@@ -298,6 +298,7 @@ impl SessionLifecycleManager {
                         self.reorder_stats
                             .record_decrypted(before, &after, msg.pq_message_epoch);
                     }
+                    self.close_first_flights(contact_id);
                     return Ok(plaintext);
                 }
                 Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => return Err(e),
@@ -353,7 +354,27 @@ impl SessionLifecycleManager {
             "a previous state decrypted — promoted to current"
         );
         self.install_current(contact_id, promoted.session);
+        self.close_first_flights(contact_id);
         Ok(plaintext)
+    }
+
+    /// Drop the current session's first-flight key once no first flight can be written or arrive
+    /// on it: the initiator has its answer (no header to attach), and the responder has the
+    /// initiator's proof. Until then the initiator seals with it and the responder opens the later
+    /// first flights with it (`crypto::sealed_sender::first_flight`).
+    fn close_first_flights(&mut self, contact_id: &str) {
+        use crate::crypto::kyber_prekey_auth::PqAuthentication;
+        let Some(session) = self.client.get_session(contact_id) else {
+            return;
+        };
+        let ratchet = session.messaging_session();
+        if ratchet.prekey_header().is_some()
+            || ratchet.pq_authentication() == PqAuthentication::Received
+        {
+            return;
+        }
+        let session_id = session.session_id().to_string();
+        self.client.envelopes_mut().clear_first_flight(&session_id);
     }
 
     /// How late messages have arrived since the process started (PQR-4).
@@ -735,6 +756,24 @@ impl SessionLifecycleManager {
         if !self.client.envelopes().has_session(ratchet.session_id()) {
             return Err(format!(
                 "{SESSION_PREDATES_ENVELOPE}: session {} has no envelope keys",
+                crate::crypto::messaging::double_ratchet::id_prefix(ratchet.session_id())
+            ));
+        }
+        // A session still in its first flights needs their key — the initiator to seal them, the
+        // responder to open the later ones. One made by core 0.26 has none: renewed like the above.
+        let in_first_flights = ratchet.prekey_header().is_some()
+            || ratchet.pq_authentication()
+                == crate::crypto::kyber_prekey_auth::PqAuthentication::Received;
+        if in_first_flights
+            && self
+                .client
+                .envelopes()
+                .first_flight_of_session(ratchet.session_id())
+                .is_none()
+        {
+            return Err(format!(
+                "{SESSION_PREDATES_ENVELOPE}: session {} is in its first flights and has no \
+                 first-flight key",
                 crate::crypto::messaging::double_ratchet::id_prefix(ratchet.session_id())
             ));
         }

@@ -16,6 +16,7 @@
 //! message.
 
 use super::envelope::{EnvelopeKind, EnvelopePair};
+use super::first_flight::{FiledFirstFlightKey, FirstFlightKey};
 use crate::error::CryptoError;
 
 /// How long a retired pair still names its writer: the server's queue window (30 days).
@@ -31,6 +32,11 @@ pub struct BookEntry {
     pub keys: EnvelopePair,
     /// When its ratchet state went away; `None` while it is held.
     pub retired_at: Option<u64>,
+    /// The handshake's first-flight key, by the hash of its ML-KEM ciphertext, while first flights
+    /// may still be written on this session (`first_flight`): the initiator seals with it until
+    /// the peer answers, the responder opens the later ones with it until the initiator proves
+    /// itself.
+    pub first_flight: Option<FiledFirstFlightKey>,
 }
 
 /// An envelope opened by the book.
@@ -73,8 +79,45 @@ impl EnvelopeBook {
                 session_id: session_id.to_string(),
                 keys,
                 retired_at: None,
+                first_flight: None,
             },
         );
+    }
+
+    /// File the first-flight key of `session_id`'s handshake. No-op for a session not filed.
+    pub fn set_first_flight(
+        &mut self,
+        session_id: &str,
+        ciphertext_hash: [u8; 32],
+        key: FirstFlightKey,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.session_id == session_id) {
+            e.first_flight = Some((ciphertext_hash, key));
+        }
+    }
+
+    /// The first flights of `session_id` are over: no more will be written or need opening.
+    pub fn clear_first_flight(&mut self, session_id: &str) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.session_id == session_id) {
+            e.first_flight = None;
+        }
+    }
+
+    /// The first-flight key of `session_id`, if its first flights are not over.
+    pub fn first_flight_of_session(&self, session_id: &str) -> Option<&FiledFirstFlightKey> {
+        self.entries
+            .iter()
+            .find(|e| e.session_id == session_id)
+            .and_then(|e| e.first_flight.as_ref())
+    }
+
+    /// The key of the handshake whose ML-KEM ciphertext hashes to `ciphertext_hash` — a later first
+    /// flight of a session the first one opened.
+    pub fn first_flight_by_handshake(&self, ciphertext_hash: &[u8; 32]) -> Option<&FirstFlightKey> {
+        self.entries.iter().find_map(|e| match &e.first_flight {
+            Some((hash, key)) if hash == ciphertext_hash => Some(key),
+            _ => None,
+        })
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
@@ -173,11 +216,17 @@ impl EnvelopeBook {
             .map(|e| {
                 let mut keys = e.keys.send.to_bytes();
                 keys.extend_from_slice(&e.keys.recv.to_bytes());
+                let first_flight = e.first_flight.as_ref().map(|(hash, key)| {
+                    let mut bytes = hash.to_vec();
+                    bytes.extend_from_slice(&key.to_bytes());
+                    crate::crypto::SecretBytes::new(bytes)
+                });
                 crate::cfe::CfeEnvelopeEntryV1 {
                     device_id: e.device.clone(),
                     session_id: e.session_id.clone(),
                     keys: crate::crypto::SecretBytes::new(keys),
                     retired_at: e.retired_at,
+                    first_flight,
                 }
             })
             .collect()
@@ -201,6 +250,13 @@ impl EnvelopeBook {
                         recv: super::envelope::DirectionKeys::from_bytes(&k[64..]).ok()?,
                     },
                     retired_at: e.retired_at,
+                    // A malformed first-flight record costs only the later first flights.
+                    first_flight: e.first_flight.as_ref().and_then(|f| {
+                        let f = f.expose();
+                        (f.len() == 64).then_some(())?;
+                        let hash: [u8; 32] = f[..32].try_into().ok()?;
+                        Some((hash, FirstFlightKey::from_bytes(&f[32..]).ok()?))
+                    }),
                 })
             })
             .collect();
@@ -308,6 +364,20 @@ mod tests {
         assert_eq!(restored, bob);
         let env = alice.seal("s1", EnvelopeKind::Ratchet, b"x").unwrap();
         assert_eq!(restored.open(&env).unwrap().device, A);
+    }
+
+    #[test]
+    fn the_first_flight_key_is_found_by_its_handshake_and_survives_the_blob() {
+        let (mut alice, _) = pair(&[1; 32], "s1");
+        alice.set_first_flight("s1", [9; 32], FirstFlightKey::from_kem_secret(&[5; 32]));
+        let restored = EnvelopeBook::from_cfe(&alice.to_cfe());
+        assert_eq!(restored, alice);
+        assert_eq!(
+            restored.first_flight_by_handshake(&[9; 32]),
+            Some(&FirstFlightKey::from_kem_secret(&[5; 32]))
+        );
+        alice.clear_first_flight("s1");
+        assert!(alice.first_flight_by_handshake(&[9; 32]).is_none());
     }
 
     #[test]

@@ -91,6 +91,13 @@ fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError
 // Note: We use UDL definition, not derive macro
 pub use crate::pow::{PowChallenge, PowProgressCallback, PowSolution};
 
+/// A first flight opened by `OrchestratorCore::open_first_flight`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstFlightOpened {
+    pub certificate: Vec<u8>,
+    pub wire_payload: Vec<u8>,
+}
+
 /// A session envelope opened by `OrchestratorCore::open_envelope`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvelopeOpened {
@@ -3451,6 +3458,35 @@ impl OrchestratorCore {
             body: o.body,
             retired: o.retired,
         })
+    }
+
+    /// See `Orchestrator::seal_first_flight`.
+    pub fn seal_first_flight(
+        &self,
+        contact_id: String,
+        recipient_identity: Vec<u8>,
+        wire_payload: Vec<u8>,
+        certificate: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.seal_first_flight(
+            &contact_id,
+            &recipient_identity,
+            &wire_payload,
+            &certificate,
+        )
+        .map_err(|message| CryptoError::EncryptionFailed { message })
+    }
+
+    /// See `Orchestrator::open_first_flight`.
+    pub fn open_first_flight(&self, sealed: Vec<u8>) -> Result<FirstFlightOpened, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.open_first_flight(&sealed)
+            .map(|o| FirstFlightOpened {
+                certificate: o.certificate,
+                wire_payload: o.wire_payload,
+            })
+            .map_err(|message| CryptoError::DecryptionFailed { message })
     }
 
     /// How late messages have arrived since the process started (PQR-4).

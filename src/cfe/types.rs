@@ -666,6 +666,10 @@ pub struct CfeEnvelopeEntryV1 {
     pub keys: SecretBytes,
     #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<u64>,
+    /// The handshake's first-flight key while its first flights last: SHA-256 of the ML-KEM
+    /// ciphertext ‖ key (64 bytes). Absent before construct-core 0.27.
+    #[serde(rename = "ff", default, skip_serializing_if = "Option::is_none")]
+    pub first_flight: Option<SecretBytes>,
 }
 
 /// A pinned hybrid identity key.

@@ -247,6 +247,14 @@ dictionary EnvelopeOpened {
     boolean retired;     // its ratchet state is gone here; a ratchet body will not decrypt
 };
 
+/// A session's first flight opened by `OrchestratorCore.open_first_flight`
+/// (construct-docs decisions/first-flight-sealed-whole.md): handled as before — the
+/// certificate names the writer, the wire payload goes to MessageReceived.
+dictionary FirstFlightOpened {
+    bytes certificate;
+    bytes wire_payload;
+};
+
 /// How late messages arrive, for this process (PQR-4, construct-docs TODO 64.3). Local
 /// diagnostics for the platform's log: never sent anywhere.
 dictionary ReorderStats {
@@ -945,6 +953,19 @@ interface OrchestratorCore {
 
     /// Who wrote `envelope`, by its tag, and its opened body; null when no pair matches.
     EnvelopeOpened? open_envelope(bytes envelope);
+
+    /// Seal a first flight — a wire payload written on a session the peer has not answered yet —
+    /// with the sender certificate, to `recipient_identity` (the X25519 key the session was opened
+    /// to; it must derive to `contact_id`). Goes in `SealedInner.first_flight`. Null when the
+    /// payload carries no handshake — not a first flight; it goes with a certificate. Throws for a
+    /// first flight that cannot be sealed: never send that one any other way.
+    [Throws=CryptoError]
+    bytes? seal_first_flight(string contact_id, bytes recipient_identity, bytes wire_payload, bytes certificate);
+
+    /// Open a `SealedInner.first_flight` sealed to this device. Throws when it does not open — a
+    /// Kyber prekey no longer held (`FIRST_FLIGHT_KEY_UNAVAILABLE`), or not ours.
+    [Throws=CryptoError]
+    FirstFlightOpened open_first_flight(bytes sealed);
 
     /// How late messages have arrived since the process started (PQR-4).
     ReorderStats reorder_stats();

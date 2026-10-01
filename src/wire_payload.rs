@@ -58,6 +58,11 @@ pub const HEADER_SIZE: usize = MSG_NUM_SIZE
     + PREV_CHAIN_LEN_SIZE
     + SUITE_ID_SIZE;
 
+/// Where the Kyber prekey id and the KEM ciphertext length sit in the fixed header — read by the
+/// first-flight box (`crypto::sealed_sender::first_flight`), which lifts the ciphertext out.
+pub(crate) const KYBER_PREKEY_ID_OFFSET: usize = MSG_NUM_SIZE + DH_KEY_SIZE + OTPK_ID_SIZE;
+pub(crate) const KEM_LEN_OFFSET: usize = KYBER_PREKEY_ID_OFFSET + KYBER_OTPK_ID_SIZE;
+
 #[derive(Debug, Clone)]
 pub struct DecodedWirePayload {
     pub message_number: u32,
