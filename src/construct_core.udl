@@ -237,6 +237,17 @@ dictionary SessionHealthReport {
     PqHandshake pq_handshake;
 };
 
+/// How late messages arrive, for this process (PQR-4, construct-docs TODO 64.3). Local
+/// diagnostics for the platform's log: never sent anywhere.
+dictionary ReorderStats {
+    u64 decrypted;               // messages decrypted
+    u64 previous_epoch;          // …tagged with the epoch before the decrypting state's current one
+    u64 older_epoch;             // …tagged two or more epochs back: opened only by a skipped key
+    u32 max_epoch_lag;           // the largest such lag
+    u32 max_skip_depth;          // the most messages one message overtook
+    u64 evicted_epoch_failures;  // undecryptable, tagged older than every chain held: lost
+};
+
 dictionary DecryptedMessageResult {
     bytes plaintext;
     bytes storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
@@ -912,6 +923,9 @@ interface OrchestratorCore {
     boolean has_session(string contact_id);
 
     SessionHealthReport? get_session_health(string contact_id);
+
+    /// How late messages have arrived since the process started (PQR-4).
+    ReorderStats reorder_stats();
 
     [Throws=CryptoError]
     string init_session(string contact_id, BinaryKeyBundle recipient_bundle);

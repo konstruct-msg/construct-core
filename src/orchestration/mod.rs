@@ -31,6 +31,7 @@ pub mod platform_bridge;
 pub mod pq_prekey_plan;
 pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
+pub mod reorder_stats;
 pub mod send_plan;
 pub mod session_lifecycle;
 pub mod session_machine;
@@ -48,6 +49,7 @@ pub use pq_prekey_plan::{
 };
 pub use receiving_decrypt_plan::plan_receiving_decrypt;
 pub use receiving_init_plan::{ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind};
+pub use reorder_stats::ReorderStats;
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
 pub use session_lifecycle::{DecryptResult, SessionLifecycleManager};
 pub use session_machine::{

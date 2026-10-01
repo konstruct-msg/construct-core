@@ -1320,6 +1320,11 @@ impl Orchestrator {
             .unwrap_or(0)
     }
 
+    /// How late messages have arrived since the process started (PQR-4).
+    pub fn reorder_stats(&self) -> super::ReorderStats {
+        self.lifecycle.reorder_stats()
+    }
+
     /// Return a health snapshot for the session with `contact_id`, or `None` if absent.
     pub fn get_session_health(
         &self,

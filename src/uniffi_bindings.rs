@@ -91,6 +91,31 @@ fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError
 // Note: We use UDL definition, not derive macro
 pub use crate::pow::{PowChallenge, PowProgressCallback, PowSolution};
 
+/// How late messages arrive, for this process — the measurement PQR-4 waits on. See
+/// `orchestration::reorder_stats`. Local diagnostics: never sent anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReorderStats {
+    pub decrypted: u64,
+    pub previous_epoch: u64,
+    pub older_epoch: u64,
+    pub max_epoch_lag: u32,
+    pub max_skip_depth: u32,
+    pub evicted_epoch_failures: u64,
+}
+
+impl From<crate::orchestration::ReorderStats> for ReorderStats {
+    fn from(s: crate::orchestration::ReorderStats) -> Self {
+        Self {
+            decrypted: s.decrypted,
+            previous_epoch: s.previous_epoch,
+            older_epoch: s.older_epoch,
+            max_epoch_lag: s.max_epoch_lag,
+            max_skip_depth: s.max_skip_depth,
+            evicted_epoch_failures: s.evicted_epoch_failures,
+        }
+    }
+}
+
 /// Read-only health snapshot of a Double Ratchet session.
 ///
 /// Returned by `ClassicCryptoCore::get_session_health` and
@@ -3394,6 +3419,12 @@ impl OrchestratorCore {
     ///
     /// Returns `None` if no session exists for that contact.
     /// Does **not** mutate any session state.
+    /// How late messages have arrived since the process started (PQR-4).
+    pub fn reorder_stats(&self) -> ReorderStats {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.reorder_stats().into()
+    }
+
     pub fn get_session_health(&self, contact_id: String) -> Option<SessionHealthReport> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.get_session_health(&contact_id)

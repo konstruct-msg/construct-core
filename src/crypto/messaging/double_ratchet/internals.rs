@@ -23,6 +23,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
             session_id: self.session_id.clone(),
+            pq_epoch: self.current_pq_epoch,
+            pq_oldest_chain_epoch: self.pq_chains.first().map(|c| c.epoch),
+            pq_skipped_keys_count: self.pq_skipped_keys.len(),
         }
     }
 

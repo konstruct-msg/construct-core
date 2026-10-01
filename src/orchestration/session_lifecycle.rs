@@ -93,6 +93,8 @@ pub struct SessionLifecycleManager {
     kem_identity_pins: std::collections::BTreeMap<String, [u8; 32]>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
+    /// How late messages arrive, for this process (PQR-4). Diagnostics only.
+    reorder_stats: super::ReorderStats,
 }
 
 impl SessionLifecycleManager {
@@ -120,6 +122,7 @@ impl SessionLifecycleManager {
             prekey_tracker: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
             kem_identity_pins: std::collections::BTreeMap::new(),
+            reorder_stats: super::ReorderStats::default(),
             my_user_id,
             clock,
         }
@@ -274,12 +277,19 @@ impl SessionLifecycleManager {
         let identity_secret = identity_secret.as_ref().map(|s| s.expose());
 
         let mut current_error = None;
-        if self.client.has_session(contact_id) {
+        let current_before = self.client.get_session_health(contact_id);
+        if let Some(before) = &current_before {
             match self
                 .client
                 .decrypt_message_with_identity_secret(contact_id, msg, identity_secret)
             {
-                Ok(plaintext) => return Ok(plaintext),
+                Ok(plaintext) => {
+                    if let Some(after) = self.client.get_session_health(contact_id) {
+                        self.reorder_stats
+                            .record_decrypted(before, &after, msg.pq_message_epoch);
+                    }
+                    return Ok(plaintext);
+                }
                 Err(e) if e.starts_with(MESSAGE_KEY_CONSUMED) => return Err(e),
                 Err(e) => current_error = Some(e),
             }
@@ -290,11 +300,17 @@ impl SessionLifecycleManager {
         let mut decrypted = None;
         if let Some(states) = states {
             for (index, state) in states.iter_mut().enumerate() {
+                let before = state.session.health_snapshot();
                 match state
                     .session
                     .decrypt_with_identity_secret(msg, identity_secret)
                 {
                     Ok(plaintext) => {
+                        self.reorder_stats.record_decrypted(
+                            &before,
+                            &state.session.health_snapshot(),
+                            msg.pq_message_epoch,
+                        );
                         decrypted = Some((index, plaintext));
                         break;
                     }
@@ -305,6 +321,8 @@ impl SessionLifecycleManager {
         }
 
         let Some((index, plaintext)) = decrypted else {
+            self.reorder_stats
+                .record_failed(current_before.as_ref(), msg.pq_message_epoch);
             return Err(
                 current_error.unwrap_or_else(|| format!("No active session for {}", contact_id))
             );
@@ -326,6 +344,11 @@ impl SessionLifecycleManager {
         );
         self.install_current(contact_id, promoted.session);
         Ok(plaintext)
+    }
+
+    /// How late messages have arrived since the process started (PQR-4).
+    pub fn reorder_stats(&self) -> super::ReorderStats {
+        self.reorder_stats
     }
 
     #[cfg(feature = "post-quantum")]
@@ -911,6 +934,64 @@ mod tests {
             1,
             "the state it displaced is kept in turn"
         );
+    }
+
+    /// PQR-4's measurement on real ratchets: Alice writes and Bob answers until Bob has moved
+    /// two epochs past the one Alice held two messages back on. The one followed by later
+    /// messages of its epoch left a skipped key and opens late, counted as an older epoch; the
+    /// last of its epoch left nothing and is counted as lost to eviction.
+    ///
+    /// Mutation: drop either `record_*` call in `decrypt_ratchet_message` — this reddens.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn reorder_stats_count_late_epochs_and_evictions() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let epoch_of = |m: &EncryptedRatchetMessage| m.pq_message_epoch;
+
+        let mut mid_epoch = None; // (epoch, message) with later messages of its epoch delivered
+        let mut last_of_epoch = None; // the last message Alice sent on its epoch
+        let mut pending: Option<EncryptedRatchetMessage> = None;
+        for round in 0..400 {
+            let next = alice.client.encrypt_message(&bob_id, b"a").unwrap();
+            if let Some(held) = pending.take() {
+                let target = mid_epoch.as_ref().map(|(e, _)| *e);
+                if mid_epoch.is_none() && epoch_of(&held) >= 1 && epoch_of(&next) == epoch_of(&held)
+                {
+                    mid_epoch = Some((epoch_of(&held), held));
+                } else if last_of_epoch.is_none()
+                    && target.is_some_and(|e| epoch_of(&held) == e)
+                    && epoch_of(&next) > epoch_of(&held)
+                {
+                    last_of_epoch = Some(held);
+                } else {
+                    bob.decrypt_ratchet_message(&alice_id, &held).unwrap();
+                }
+            }
+            pending = Some(next);
+
+            let oldest = bob
+                .client
+                .get_session_health(&alice_id)
+                .and_then(|s| s.pq_oldest_chain_epoch);
+            let target = mid_epoch.as_ref().map(|(e, _)| *e);
+            if last_of_epoch.is_some() && oldest.zip(target).is_some_and(|(o, e)| o > e) {
+                break;
+            }
+            let reply = bob.client.encrypt_message(&alice_id, b"b").unwrap();
+            alice.decrypt_ratchet_message(&bob_id, &reply).unwrap();
+            assert!(round < 399, "Bob never moved two epochs past the held ones");
+        }
+
+        let before = bob.reorder_stats();
+        let (_, late) = mid_epoch.expect("a mid-epoch message was held");
+        assert_eq!(bob.decrypt_ratchet_message(&alice_id, &late).unwrap(), b"a");
+        let after_late = bob.reorder_stats();
+        assert_eq!(after_late.older_epoch, before.older_epoch + 1);
+        assert!(after_late.max_epoch_lag >= 2);
+
+        let lost = last_of_epoch.expect("the last message of the epoch was held");
+        assert!(bob.decrypt_ratchet_message(&alice_id, &lost).is_err());
+        assert_eq!(bob.reorder_stats().evicted_epoch_failures, 1);
     }
 
     /// A key already used in a previous state is a duplicate, and a duplicate promotes nothing —

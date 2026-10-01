@@ -113,6 +113,13 @@ pub struct DrHealthSnapshot {
     pub last_ratchet_at: u64,
     /// Shared session identifier (hex).
     pub session_id: String,
+    /// The PQ epoch this state sends on; 0 before the first exchange completes.
+    pub pq_epoch: u32,
+    /// The oldest epoch whose chains are still held. A message tagged with an earlier epoch
+    /// opens only by a skipped key (PQR-4).
+    pub pq_oldest_chain_epoch: Option<u32>,
+    /// Number of skipped PQ chain keys currently buffered.
+    pub pq_skipped_keys_count: usize,
 }
 
 /// A locally-generated ML-KEM-768 keypair pending completion of a sparse
