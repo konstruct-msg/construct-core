@@ -17,7 +17,8 @@ per platform. It provides:
   initial key, so every message, the first included, depends on both (see
   [Cryptography](#cryptography)). Post-quantum is mandatory for new sessions.
 - **Double Ratchet** for forward secrecy & post-compromise security, with a sparse continuous
-  **ML-KEM-768 ratchet** (suite 3, mandatory with `post-quantum`)
+  **ML-KEM-768 ratchet** that gives every message its own post-quantum key (suite 4, mandatory
+  with `post-quantum`)
 - **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204) primitives
 - **MLS (RFC 9420)** group primitives via `openmls` (`ios` / `mac` / `android` features)
 - **Account recovery** — BIP39 mnemonic, and social recovery by Shamir secret sharing over
@@ -30,6 +31,13 @@ per platform. It provides:
   into actions for the platform; the core does no I/O itself
 - **Binary persistence** — CFE envelopes (16-byte header with length and CRC32, MessagePack payload)
 
+**What is not post-quantum.** The above protects the *content* of one-to-one messages. The
+sealed-sender box (who sent a message) and the other sealed boxes are X25519 only; sender
+certificates, Key Transparency tree heads, device and recovery signatures are Ed25519 only; MLS
+uses a classical ciphersuite; Privacy Pass is Ristretto255. Calls (DTLS-SRTP) live outside the
+core and are classical too. The full table, with the open items `PQC-1`…`PQC-6`, is in the
+protocol book: [Threat Model — Post-quantum coverage](https://konstruct-msg.github.io/construct-protocol/01-threat-model.html#post-quantum-coverage).
+
 Platforms: **iOS / macOS** (UniFFI Swift) and **Android** (UniFFI Kotlin). No WASM/Web
 target — a cryptographically secure messenger can't be done as a PWA, so that path was
 dropped long ago.
@@ -41,10 +49,10 @@ construct-core/
 ├── src/
 │   ├── crypto/                    # cryptographic primitives
 │   │   ├── handshake/             # X3DH key agreement
-│   │   ├── messaging/             # Double Ratchet (+ sparse PQ ratchet, suite 3)
+│   │   ├── messaging/             # Double Ratchet (+ sparse PQ ratchet, suite 4)
 │   │   ├── suites/                # classic and hybrid CryptoProvider implementations
 │   │   ├── provider.rs            # CryptoProvider trait
-│   │   ├── suite_id.rs            # suite ids 1 / 2 / 3
+│   │   ├── suite_id.rs            # suite ids 1 / 2 / 4 (3 retired)
 │   │   ├── pq_x3dh.rs             # ML-KEM-768 and ML-KEM-1024 keygen / encapsulate / decapsulate
 │   │   ├── kyber_prekeys.rs       # the core's ML-KEM-1024 prekeys: SPK rotation, one-time pool
 │   │   ├── kyber_prekey_auth.rs   # Kyber prekey signature check + PQ-authentication label
@@ -142,7 +150,8 @@ Names follow NIST FIPS; informal names in parens.
 |---|---|---|
 | 1 | `CLASSIC` | The table above. |
 | 2 | `PQ_HYBRID` | **Reserved.** No session negotiates it; the hybrid-signature primitives below live under this name. |
-| 3 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages and its secret is mixed into message keys, epoch by epoch. **Every session a `post-quantum` build opens** — there is no capability flag to read or strip (the unsigned `supports_pq_ratchet` was the downgrade). A responder refuses a first message on another suite. |
+| 3 | — | **Retired** in 0.24.0: the epoch-granular PQ ratchet, one ML-KEM-768 epoch secret mixed into every message of its epoch. Refused on the wire and on restore; the next send opens a suite-4 session. |
+| 4 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages, and each completed epoch's secret seeds one symmetric chain per direction, stepped **per message** — the post-quantum half has per-message forward secrecy like the classical one. New epochs every `pq_ratchet_interval` DH turns or 7 days. **Every session a `post-quantum` build opens** — there is no capability flag to read or strip (the unsigned `supports_pq_ratchet` was the downgrade). A responder refuses a first message on another suite. |
 
 ### PQXDH v2 — ML-KEM-1024 in the initial key
 
@@ -221,7 +230,7 @@ server can drop them — they hide patterns from a network observer, not from th
 | `ios`           | iOS/macOS bindings via UniFFI (+ VEIL transport, MLS)          |
 | `mac`           | Native macOS build (same surface as `ios`)                     |
 | `android`       | Android JNI/Kotlin bindings via UniFFI                         |
-| `post-quantum`  | ML-KEM-1024 (PQXDH v2), ML-KEM-768 (suite-3 ratchet), ML-DSA-65 |
+| `post-quantum`  | ML-KEM-1024 (PQXDH v2), ML-KEM-768 (suite-4 ratchet), ML-DSA-65 |
 
 `default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
 features pull in `post-quantum`, `construct-veil` and `openmls`: a platform library always has
