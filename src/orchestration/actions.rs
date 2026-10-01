@@ -122,9 +122,11 @@ pub enum Action {
     /// open, and there is no state in it a DECRYPTION_ERROR could name. Terminal: record it as
     /// processed, advance past it. Nothing is sent.
     ///
-    /// Before this the only answer was a `NotifyError`, which is no routing decision: the
-    /// platform neither acknowledged nor recorded the message, and the server redelivered it
-    /// until its queue expired (2026-10-01, a suite-3 message from a device on an old build).
+    /// Before this the only answer was a `NotifyError`, which is no routing decision: the iOS
+    /// router logged "no routing decision … NOT acked" as an ERROR and wrote no processed record
+    /// (2026-10-01, a suite-3 message from a device on an old build). It did not come back — the
+    /// stream cursor had moved past it — so the cost was a false alarm and a missing record, not
+    /// a redelivery loop.
     MalformedDropped {
         message_id: String,
     },

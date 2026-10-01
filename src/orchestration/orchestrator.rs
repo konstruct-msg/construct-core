@@ -2933,10 +2933,9 @@ mod tests {
         }
     }
 
-    /// A message in a suite this build no longer reads can never open either, and must not stay
-    /// in the server's queue to be redelivered on every reconnect: the verdict drops it and names
-    /// it, so the platform records it and moves past it (2026-10-01, a suite-3 message from a
-    /// device on an old build, held unacknowledged).
+    /// A message in a suite this build no longer reads can never open either. The verdict drops
+    /// it and names it, so the platform records it and moves past it instead of logging that the
+    /// core decided nothing (2026-10-01, a suite-3 message from a device on an old build).
     ///
     /// Mutation: `malformed` returns only the `NotifyError` — this reddens.
     #[test]
