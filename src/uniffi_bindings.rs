@@ -91,6 +91,21 @@ fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError
 // Note: We use UDL definition, not derive macro
 pub use crate::pow::{PowChallenge, PowProgressCallback, PowSolution};
 
+/// A session envelope opened by `OrchestratorCore::open_envelope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeOpened {
+    /// The device whose pair matched — who wrote it.
+    pub contact_id: String,
+    /// The session of that pair; pass it on as `MessageReceived::envelope_session`.
+    pub session_id: String,
+    /// 1 = a ratchet wire payload, 2 = a DECRYPTION_ERROR.
+    pub kind: u8,
+    pub body: Vec<u8>,
+    /// The pair's ratchet state is gone here: a ratchet body will not decrypt, and is answered
+    /// with a DECRYPTION_ERROR along the same pair.
+    pub retired: bool,
+}
+
 /// How late messages arrive, for this process — the measurement PQR-4 waits on. See
 /// `orchestration::reorder_stats`. Local diagnostics: never sent anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2101,6 +2116,7 @@ mod tests {
             .unwrap(),
             content_type: 0,
             sender_certificate: None,
+            envelope_session: None,
         }
     }
 
@@ -3419,6 +3435,24 @@ impl OrchestratorCore {
     ///
     /// Returns `None` if no session exists for that contact.
     /// Does **not** mutate any session state.
+    /// See `Orchestrator::seal_envelope`.
+    pub fn seal_envelope(&self, contact_id: String, wire_payload: Vec<u8>) -> Option<Vec<u8>> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.seal_envelope(&contact_id, &wire_payload)
+    }
+
+    /// See `Orchestrator::open_envelope`.
+    pub fn open_envelope(&self, envelope: Vec<u8>) -> Option<EnvelopeOpened> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.open_envelope(&envelope).map(|o| EnvelopeOpened {
+            contact_id: o.device,
+            session_id: o.session_id,
+            kind: o.kind as u8,
+            body: o.body,
+            retired: o.retired,
+        })
+    }
+
     /// How late messages have arrived since the process started (PQR-4).
     pub fn reorder_stats(&self) -> ReorderStats {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -4058,6 +4092,7 @@ pub enum CfeIncomingEvent {
         data: Vec<u8>,
         content_type: u8,
         sender_certificate: Option<SenderCertificate>,
+        envelope_session: Option<String>,
     },
     OutgoingMessage {
         contact_id: String,
@@ -4105,6 +4140,7 @@ pub enum CfeIncomingEvent {
     DecryptionErrorReceived {
         contact_id: String,
         payload: Vec<u8>,
+        opened: bool,
     },
 }
 
@@ -4118,12 +4154,14 @@ impl CfeIncomingEvent {
                 data,
                 content_type,
                 sender_certificate,
+                envelope_session,
             } => MessageReceived {
                 message_id,
                 from,
                 data,
                 content_type,
                 sender_certificate,
+                envelope_session,
             },
             Self::OutgoingMessage {
                 contact_id,
@@ -4183,9 +4221,11 @@ impl CfeIncomingEvent {
             Self::DecryptionErrorReceived {
                 contact_id,
                 payload,
+                opened,
             } => DecryptionErrorReceived {
                 contact_id,
                 payload,
+                opened,
             },
         }
     }
@@ -4303,6 +4343,7 @@ pub enum CfeAction {
         contact_id: String,
         message_id: String,
         payload: Vec<u8>,
+        enveloped: bool,
     },
     /// See `Action::SessionRetired`.
     SessionRetired {
@@ -4385,10 +4426,12 @@ impl CfeAction {
                 contact_id,
                 message_id,
                 payload,
+                enveloped,
             } => Self::SendDecryptionError {
                 contact_id,
                 message_id,
                 payload,
+                enveloped,
             },
             SessionRetired {
                 contact_id,

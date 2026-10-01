@@ -239,6 +239,14 @@ pub const PQ_UPGRADE_BATCH: usize = 8;
 /// The pause between two batches of the upgrade sweep (ms).
 pub const PQ_UPGRADE_BATCH_INTERVAL_MS: u64 = 30_000;
 
+/// Where a DECRYPTION_ERROR goes (`Orchestrator::reply_route`).
+enum ReplyRoute {
+    /// Back along the session envelope pair with this session id.
+    Envelope(String),
+    /// Sealed to this X25519 identity key, which the writer's certificate vouched for.
+    Identity(Vec<u8>),
+}
+
 impl Orchestrator {
     /// Create a new orchestrator for the given local user.
     ///
@@ -284,12 +292,14 @@ impl Orchestrator {
                 data,
                 content_type,
                 sender_certificate,
+                envelope_session,
             } => self.handle_message_received(
                 message_id,
                 from,
                 data,
                 content_type,
                 sender_certificate,
+                envelope_session,
             ),
             IncomingEvent::OutgoingMessage {
                 contact_id,
@@ -329,7 +339,8 @@ impl Orchestrator {
             IncomingEvent::DecryptionErrorReceived {
                 contact_id,
                 payload,
-            } => self.handle_decryption_error_received(contact_id, payload),
+                opened,
+            } => self.handle_decryption_error_received(contact_id, payload, opened),
         }
     }
 
@@ -351,7 +362,36 @@ impl Orchestrator {
         &mut self,
         contact_id: String,
         payload: Vec<u8>,
+        opened: bool,
     ) -> Vec<Action> {
+        // From a session envelope it is the error itself: the envelope's pair already named the
+        // writer and opened it (`open_envelope`).
+        let error = if opened {
+            match DecryptionError::decode(&payload) {
+                Ok(error) => error,
+                Err(e) => {
+                    return vec![Action::NotifyError {
+                        code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
+                        message: format!("{e} (from {contact_id})"),
+                    }];
+                }
+            }
+        } else {
+            match self.open_boxed_decryption_error(&contact_id, &payload) {
+                Ok(error) => error,
+                Err(actions) => return actions,
+            }
+        };
+        self.answer_decryption_error(contact_id, error)
+    }
+
+    /// The X25519 box a DECRYPTION_ERROR arrives in when the message it is about came with a
+    /// certificate rather than an envelope.
+    fn open_boxed_decryption_error(
+        &self,
+        contact_id: &str,
+        payload: &[u8],
+    ) -> Result<DecryptionError, Vec<Action>> {
         let secret = match self
             .lifecycle
             .client
@@ -360,21 +400,25 @@ impl Orchestrator {
         {
             Ok(secret) => secret,
             Err(e) => {
-                return vec![Action::NotifyError {
+                return Err(vec![Action::NotifyError {
                     code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
                     message: format!("no identity key to open it with: {e:?}"),
-                }];
+                }]);
             }
         };
-        let error = match DecryptionError::open(&payload, &secret) {
-            Ok(error) => error,
-            Err(e) => {
-                return vec![Action::NotifyError {
-                    code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
-                    message: format!("{e} (from {contact_id})"),
-                }];
-            }
-        };
+        DecryptionError::open(payload, &secret).map_err(|e| {
+            vec![Action::NotifyError {
+                code: "DECRYPTION_ERROR_UNREADABLE".to_string(),
+                message: format!("{e} (from {contact_id})"),
+            }]
+        })
+    }
+
+    fn answer_decryption_error(
+        &mut self,
+        contact_id: String,
+        error: DecryptionError,
+    ) -> Vec<Action> {
         let owner = self
             .lifecycle
             .ratchet_key_owner(&contact_id, &error.ratchet_key);
@@ -430,6 +474,23 @@ impl Orchestrator {
     /// whatever key the certificate named, signed or not (construct-protocol `DE-1`). Anyone who
     /// knows our public identity key can seal an envelope to us, so an unchecked certificate made
     /// us answer a stranger's claim, to a device the stranger chose.
+    /// How a DECRYPTION_ERROR reaches the writer of an unread message: back along the session
+    /// envelope it came in, or — for a message that came with a certificate — sealed to the
+    /// identity key the server vouches for.
+    fn reply_route(
+        &self,
+        envelope_session: Option<&str>,
+        certificate: Option<&crate::crypto::sealed_sender::SenderCertificate>,
+        device: &str,
+    ) -> Option<ReplyRoute> {
+        match envelope_session {
+            Some(session_id) => Some(ReplyRoute::Envelope(session_id.to_string())),
+            None => self
+                .vouched_writer(certificate, device)
+                .map(ReplyRoute::Identity),
+        }
+    }
+
     fn vouched_writer(
         &self,
         certificate: Option<&crate::crypto::sealed_sender::SenderCertificate>,
@@ -447,15 +508,15 @@ impl Orchestrator {
         contact_id: &str,
         message_id: &str,
         ratchet_key: Option<Vec<u8>>,
-        writer_identity: Option<Vec<u8>>,
+        route: Option<ReplyRoute>,
         hint: DecryptionErrorHint,
     ) -> Option<Action> {
-        let (Some(ratchet_key), Some(writer_identity)) = (ratchet_key, writer_identity) else {
+        let (Some(ratchet_key), Some(route)) = (ratchet_key, route) else {
             tracing::warn!(
                 target: "orchestration",
                 contact_id = %contact_id,
                 message_id = %message_id,
-                "unreadable message carries no ratchet key or no certificate — no error can be sent"
+                "unreadable message carries no ratchet key, no envelope and no certificate — no error can be sent"
             );
             return None;
         };
@@ -464,11 +525,24 @@ impl Orchestrator {
             message_id: message_id.to_string(),
             hint,
         };
-        match error.seal(&writer_identity) {
+        let sealed = match &route {
+            // Back along the pair the message came by — post-quantum, and still possible when the
+            // state it was written on is gone here (the pair is kept, retired).
+            ReplyRoute::Envelope(session_id) => error.encode().and_then(|plain| {
+                self.lifecycle
+                    .client
+                    .envelopes()
+                    .seal_reply(session_id, &plain)
+                    .map_err(|e| e.to_string())
+            }),
+            ReplyRoute::Identity(writer_identity) => error.seal(writer_identity),
+        };
+        match sealed {
             Ok(payload) => Some(Action::SendDecryptionError {
                 contact_id: contact_id.to_string(),
                 message_id: message_id.to_string(),
                 payload,
+                enveloped: matches!(route, ReplyRoute::Envelope(_)),
             }),
             Err(e) => {
                 tracing::warn!(target: "orchestration", contact_id = %contact_id, "{e}");
@@ -919,7 +993,11 @@ impl Orchestrator {
             } else {
                 DecryptionErrorHint::None
             };
-            let writer_identity = self.vouched_writer(message.sender_certificate.as_ref(), device);
+            let route = self.reply_route(
+                message.envelope_session.as_deref(),
+                message.sender_certificate.as_ref(),
+                device,
+            );
             let ratchet_key = crate::wire_payload::unpack(&message.wire_payload)
                 .ok()
                 .map(|header| header.dh_public_key);
@@ -927,7 +1005,7 @@ impl Orchestrator {
                 device,
                 &message.message_id,
                 ratchet_key,
-                writer_identity,
+                route,
                 hint,
             ));
             // Given up is answered: a redelivery is a duplicate, not a second open or error.
@@ -1323,6 +1401,40 @@ impl Orchestrator {
     /// How late messages have arrived since the process started (PQR-4).
     pub fn reorder_stats(&self) -> super::ReorderStats {
         self.lifecycle.reorder_stats()
+    }
+
+    /// Seal `wire_payload` — just encrypted for `contact_id` — as a session envelope, or `None`
+    /// when it must go with a certificate instead (construct-docs
+    /// `decisions/sealed-envelope-keyed-by-the-session.md`):
+    ///
+    /// - the current state is still in its first flight (the handshake header rides on it): the
+    ///   peer has no session yet, so no tag of ours can find it;
+    /// - there is no current state, or its pair is not in the book (made before the envelope).
+    pub fn seal_envelope(&self, contact_id: &str, wire_payload: &[u8]) -> Option<Vec<u8>> {
+        let session = self.lifecycle.client.get_session(contact_id)?;
+        if session.messaging_session().prekey_header().is_some() {
+            return None;
+        }
+        self.lifecycle
+            .client
+            .envelopes()
+            .seal(
+                session.session_id(),
+                crate::crypto::sealed_sender::envelope::EnvelopeKind::Ratchet,
+                wire_payload,
+            )
+            .ok()
+    }
+
+    /// Find who wrote `envelope` by its tag and open it. `None` when no pair this device holds
+    /// matches. Changes nothing: the platform restores the named device's session, then hands
+    /// the body over as `MessageReceived` (with `envelope_session`) or `DecryptionErrorReceived`
+    /// (`opened`).
+    pub fn open_envelope(
+        &self,
+        envelope: &[u8],
+    ) -> Option<crate::crypto::sealed_sender::book::OpenedEnvelope> {
+        self.lifecycle.client.envelopes().open(envelope)
     }
 
     /// Return a health snapshot for the session with `contact_id`, or `None` if absent.
@@ -1956,6 +2068,7 @@ impl Orchestrator {
         data: Vec<u8>,
         content_type: u8,
         sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+        envelope_session: Option<String>,
     ) -> Vec<Action> {
         // A KEM ciphertext on the wire is the initiator's handshake header (PQXDH v2); the core
         // decapsulates it itself, when this message opens a session.
@@ -1968,6 +2081,7 @@ impl Orchestrator {
         // routing pipeline (ACK dedup, session check, receiving open, teardown).
         let incoming = IncomingMessage {
             sender_certificate,
+            envelope_session,
             contact_id: from.clone(),
             wire_payload: data,
             message_id,
@@ -2329,6 +2443,8 @@ impl Orchestrator {
         // A content_type we treat as "heartbeat" — content type 13.
         let msg = crate::orchestration::message_router::IncomingMessage {
             sender_certificate: None,
+            // A heartbeat's envelope is not carried here: an unreadable one is not answered.
+            envelope_session: None,
             message_id,
             contact_id: contact_id.clone(),
             wire_payload: data,
@@ -2429,6 +2545,7 @@ impl Orchestrator {
                 message_id,
                 ratchet_key,
                 writer_certificate,
+                envelope_session,
                 // Reported by `decision_to_actions`, which wraps this for every refusal.
                 reason: _,
             } => {
@@ -2439,12 +2556,16 @@ impl Orchestrator {
                 // unread message. With no error to send (an unsealed message names no writer to
                 // seal to) nothing is recorded: the platform may still try the sessions of the
                 // sender's other devices, and a recorded message would read as a duplicate there.
-                let writer_identity = self.vouched_writer(writer_certificate.as_ref(), &cid);
+                let route = self.reply_route(
+                    envelope_session.as_deref(),
+                    writer_certificate.as_ref(),
+                    &cid,
+                );
                 match self.decryption_error_for(
                     &cid,
                     &message_id,
                     ratchet_key,
-                    writer_identity,
+                    route,
                     DecryptionErrorHint::None,
                 ) {
                     Some(error) => {
@@ -2569,6 +2690,7 @@ mod tests {
             from: "bob".to_string(),
             data: packed_wire(0, Some(&[5; 1568])),
             content_type: 0,
+            envelope_session: None,
         });
         // A handshake with no session: open from it (no active session → NeedSessionInit).
         let fetches: Vec<_> = actions
@@ -2596,6 +2718,7 @@ mod tests {
                 from: "bob".to_string(),
                 data: garbage.clone(),
                 content_type: 0,
+                envelope_session: None,
             }),
             o.handle_event(IncomingEvent::HeartbeatReceived {
                 contact_id: "bob".to_string(),
@@ -2624,6 +2747,7 @@ mod tests {
             from: "bob".to_string(),
             data: packed_wire(0, Some(&[5; 1568])),
             content_type: 0,
+            envelope_session: None,
         });
         assert!(
             actions
@@ -2654,6 +2778,7 @@ mod tests {
             from: "bob".to_string(),
             data: packed_wire(0, Some(&kem)),
             content_type: 0,
+            envelope_session: None,
         });
         let printed = format!("{actions:?}");
         assert!(
@@ -2671,6 +2796,7 @@ mod tests {
             from: "bob".to_string(),
             data: vec![0u8; 4], // not a wire payload
             content_type: 0,
+            envelope_session: None,
         });
         assert!(
             matches!(actions.as_slice(), [Action::NotifyError { code, .. }] if code == "MALFORMED_WIRE_PAYLOAD"),
@@ -2750,6 +2876,7 @@ mod tests {
             ratchet_key: None,
             writer_certificate: None,
             reason: "AEAD decryption failed".to_string(),
+            envelope_session: None,
         }
     }
 
@@ -2809,8 +2936,12 @@ mod tests {
         assert!(o.lifecycle.retire_current(&device));
         let saved = o.export_session_cfe(&device).unwrap();
 
-        // A fresh core under the same local user stands in for the restart.
+        // A fresh core under the same local user stands in for the restart; the orchestrator
+        // state (with the envelope book) loads first, as on the platform.
         let mut restored = make_orchestrator("alice");
+        restored
+            .import_orchestrator_state_cfe(&o.export_orchestrator_state_cfe().unwrap())
+            .unwrap();
         let id = restored.import_session_cfe(&device, &saved).unwrap();
 
         assert!(id.is_empty(), "a retired top is not a current state");
@@ -3525,6 +3656,10 @@ mod pqxdh_v2_tests {
             .unwrap();
 
         let mut relaunched = device("zed");
+        // The envelope book loads with the orchestrator state before any session. Only the book
+        // is carried here: the state's open locks would make the sweep this test is about skip
+        // devices still marked as opening.
+        *relaunched.lifecycle.client.envelopes_mut() = zed.lifecycle.client.envelopes().clone();
         for contact_id in ["amy", "bob"] {
             let saved = zed.lifecycle.export_session_bytes_for(contact_id).unwrap();
             relaunched
@@ -3792,6 +3927,7 @@ mod pqxdh_v2_tests {
             from: from.to_string(),
             data: wire,
             content_type: ct,
+            envelope_session: None,
         })
     }
 
@@ -3846,6 +3982,7 @@ mod pqxdh_v2_tests {
             from: from.to_string(),
             data: wire,
             content_type: 0,
+            envelope_session: None,
         })
     }
 
@@ -4229,6 +4366,130 @@ mod pqxdh_v2_tests {
             .unwrap_or_else(|| panic!("no decryption error about {about}: {actions:?}"))
     }
 
+    // ── Session envelope (decisions/sealed-envelope-keyed-by-the-session.md) ──────────────
+
+    fn deliver_envelope(
+        reader: &mut Orchestrator,
+        message_id: &str,
+        envelope: &[u8],
+    ) -> (
+        crate::crypto::sealed_sender::book::OpenedEnvelope,
+        Vec<Action>,
+    ) {
+        let opened = reader
+            .open_envelope(envelope)
+            .expect("the reader finds the writer by the envelope's tag");
+        let actions = reader.handle_event(IncomingEvent::MessageReceived {
+            message_id: message_id.to_string(),
+            from: opened.device.clone(),
+            data: opened.body.clone(),
+            content_type: 0,
+            sender_certificate: None,
+            envelope_session: Some(opened.session_id.clone()),
+        });
+        (opened, actions)
+    }
+
+    /// Once both sides hold the state, a message goes in an envelope with no certificate: the tag
+    /// names the writer and the body is the wire payload.
+    #[test]
+    fn an_established_session_writes_envelopes_the_reader_finds_by_tag() {
+        use crate::crypto::sealed_sender::envelope::EnvelopeKind;
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let wire = alice.encrypt_bytes_for(&bob_id, b"m1").unwrap();
+        let envelope = alice
+            .seal_envelope(&bob_id, &wire)
+            .expect("an established session seals envelopes");
+        let (opened, actions) = deliver_envelope(&mut bob, "m1", &envelope);
+        assert_eq!(opened.device, alice_id);
+        assert_eq!(opened.kind, EnvelopeKind::Ratchet);
+        assert!(!opened.retired);
+        assert_eq!(
+            decrypted(&actions),
+            vec![("m1".to_string(), b"m1".to_vec())]
+        );
+        assert!(
+            alice.open_envelope(&envelope).is_none(),
+            "not the writer's own to open"
+        );
+    }
+
+    /// Until the peer answers, the handshake header rides on every message and the peer has no
+    /// session to find a tag in: the first flight goes with a certificate.
+    ///
+    /// Mutation: drop the `prekey_header` check in `seal_envelope` — this reddens.
+    #[test]
+    fn the_first_flight_is_not_an_envelope() {
+        let ((mut alice, _), (mut bob, bob_id)) = named_pair();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        assert!(alice.seal_envelope(&bob_id, &m0).is_none());
+    }
+
+    /// A reset is local and sends nothing, so the writer goes on writing on the state the reader
+    /// dropped. The pair outlives the ratchet: the reader still names the writer and answers it
+    /// along the same pair, and the writer retires the state and resends.
+    ///
+    /// Mutation: make `EnvelopeBook::retire_device` remove the pairs — this reddens.
+    #[test]
+    fn a_reader_that_reset_still_answers_an_envelope_along_its_pair() {
+        use crate::crypto::sealed_sender::envelope::EnvelopeKind;
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.forget_contact_state(&alice_id);
+
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let envelope = alice.seal_envelope(&bob_id, &lost).unwrap();
+        let (opened, actions) = deliver_envelope(&mut bob, "lost", &envelope);
+        assert!(opened.retired);
+        let (reply, enveloped) = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendDecryptionError {
+                    message_id,
+                    payload,
+                    enveloped,
+                    ..
+                } if message_id == "lost" => Some((payload.clone(), *enveloped)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no decryption error: {actions:?}"));
+        assert!(
+            enveloped,
+            "the answer goes back along the pair, not to an identity key"
+        );
+
+        let back = alice
+            .open_envelope(&reply)
+            .expect("the writer finds the answer by tag");
+        assert_eq!(back.kind, EnvelopeKind::DecryptionError);
+        assert_eq!(back.device, bob_id);
+        let answer = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: back.device,
+            payload: back.body,
+            opened: true,
+        });
+        assert!(
+            answer
+                .iter()
+                .any(|a| matches!(a, Action::SessionRetired { .. })),
+            "{answer:?}"
+        );
+        assert!(
+            answer.iter().any(
+                |a| matches!(a, Action::ResendMessage { message_id, .. } if message_id == "lost")
+            ),
+            "{answer:?}"
+        );
+    }
+
     /// A message no held state reads is answered only to a writer the server vouches for — the
     /// check the failed-open path already made. Until 2026-09-28 this path sealed the error to
     /// whatever key the certificate named (construct-protocol `DE-1`): an envelope with a
@@ -4294,6 +4555,7 @@ mod pqxdh_v2_tests {
         let retired = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
             contact_id: bob_id.clone(),
             payload,
+            opened: false,
         });
         assert!(retired.iter().any(|a| matches!(
             a,
@@ -4342,6 +4604,7 @@ mod pqxdh_v2_tests {
         alice.handle_event(IncomingEvent::DecryptionErrorReceived {
             contact_id: bob_id.clone(),
             payload: payload.clone(),
+            opened: false,
         });
         let (x3dh, kyber) = bundle_of(&mut bob, true);
         alice
@@ -4352,6 +4615,7 @@ mod pqxdh_v2_tests {
         let again = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
             contact_id: bob_id.clone(),
             payload,
+            opened: false,
         });
         assert!(again.is_empty(), "a stale error acted: {again:?}");
         assert_eq!(alice.lifecycle.active_session_id(&bob_id), fresh);
@@ -4379,6 +4643,7 @@ mod pqxdh_v2_tests {
         let answer = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
             contact_id: bob_id.clone(),
             payload: forged,
+            opened: false,
         });
         assert!(answer.is_empty(), "{answer:?}");
         assert!(alice.has_active_session(&bob_id));
@@ -4430,6 +4695,7 @@ mod pqxdh_v2_tests {
         let retired = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
             contact_id: bob_id.clone(),
             payload,
+            opened: false,
         });
         assert!(
             retired.iter().any(|a| matches!(

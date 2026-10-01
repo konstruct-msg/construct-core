@@ -151,6 +151,9 @@ pub enum Action {
         contact_id: String,
         message_id: String,
         payload: Vec<u8>,
+        /// `payload` is a session envelope (the unread message came in one): send it as the
+        /// sealed inner's envelope, with no certificate. Otherwise it is the X25519 box.
+        enveloped: bool,
     },
 
     /// The peer could not read what we sent on the current state with `contact_id`, and the state
@@ -234,6 +237,11 @@ pub enum IncomingEvent {
         /// session from — see `SenderCertificate::identity_for_opening`.
         #[serde(default)]
         sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+        /// The session envelope the message arrived in: the session its tag matched
+        /// (`OrchestratorCore::open_envelope`). Set instead of a certificate — the pair names the
+        /// writer — and what a DECRYPTION_ERROR is sealed back along.
+        #[serde(default)]
+        envelope_session: Option<String>,
     },
     /// Platform-side outgoing regular message.
     /// Rust orchestrator encrypts `plaintext` bytes with the Double Ratchet session,
@@ -309,6 +317,9 @@ pub enum IncomingEvent {
     DecryptionErrorReceived {
         contact_id: String,
         payload: Vec<u8>,
+        /// `payload` came out of a session envelope and is the error itself, not a box to open.
+        #[serde(default)]
+        opened: bool,
     },
     /// The platform received a heartbeat message from `contact_id`.
     /// The orchestrator should attempt to decrypt it — if nothing held decrypts it,

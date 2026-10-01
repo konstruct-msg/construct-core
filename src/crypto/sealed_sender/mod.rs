@@ -20,6 +20,9 @@
 /// separators, issued_at/expires_at as big-endian i64:
 ///
 ///   user_id ‖ domain ‖ identity_key ‖ device_id ‖ BE64(issued_at) ‖ BE64(expires_at)
+pub mod book;
+pub mod envelope;
+
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};

@@ -58,6 +58,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use storage::id_prefix;
 pub use storage::{SerializableSession, SkippedKeyEntry};
 
 /// Prefix of the error for a message whose position on the **current** receiving chain has no

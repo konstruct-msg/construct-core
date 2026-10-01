@@ -97,6 +97,10 @@ pub struct SessionLifecycleManager {
     reorder_stats: super::ReorderStats,
 }
 
+/// The error prefix for a stored session made by a core older than the session envelope
+/// (construct-core 0.26). The platform treats the session as absent.
+pub const SESSION_PREDATES_ENVELOPE: &str = "SESSION_PREDATES_ENVELOPE";
+
 impl SessionLifecycleManager {
     /// Create a manager from an existing `ClassicClient`.
     ///
@@ -153,6 +157,12 @@ impl SessionLifecycleManager {
     pub fn forget_contact_state(&mut self, contact_id: &str) {
         self.client.remove_session(contact_id);
         self.previous.remove(contact_id);
+        // The pairs stay, retired: the peer may still be writing on what we just forgot, and they
+        // are how it is named and answered (`crypto::sealed_sender::book`).
+        let now = self.clock.now_secs();
+        let envelopes = self.client.envelopes_mut();
+        envelopes.retire_device(contact_id, now);
+        envelopes.prune(now);
         self.prekey_tracker.remove(contact_id);
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
@@ -458,9 +468,20 @@ impl SessionLifecycleManager {
         };
         states.retain(|s| now.saturating_sub(s.retired_at) < PREVIOUS_STATE_TTL_SECONDS);
         states.truncate(MAX_PREVIOUS_STATES);
+        let mut held: Vec<String> = states
+            .iter()
+            .map(|s| s.session.session_id().to_string())
+            .collect();
         if states.is_empty() {
             self.previous.remove(contact_id);
         }
+        // A state pruned here takes its ratchet; its envelope pair is retired, not removed.
+        if let Some(current) = self.client.get_session(contact_id) {
+            held.push(current.session_id().to_string());
+        }
+        let envelopes = self.client.envelopes_mut();
+        envelopes.retire_device_except(contact_id, &held, now);
+        envelopes.prune(now);
     }
 
     /// How many previous states the record with `contact_id` holds.
@@ -536,6 +557,7 @@ impl SessionLifecycleManager {
                     fingerprint: serde_bytes::ByteBuf::from(fp.to_vec()),
                 })
                 .collect(),
+            envelope_book: self.client.envelopes().to_cfe(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -581,6 +603,10 @@ impl SessionLifecycleManager {
         };
         self.hybrid_identity_pins = pins(state.hybrid_identity_pins);
         self.kem_identity_pins = pins(state.kem_identity_pins);
+        let mut envelopes =
+            crate::crypto::sealed_sender::book::EnvelopeBook::from_cfe(&state.envelope_book);
+        envelopes.prune(self.clock.now_secs());
+        *self.client.envelopes_mut() = envelopes;
 
         // Return init_locks for the caller to restore.
         Ok(state.init_locks.into_iter().collect())
@@ -642,6 +668,7 @@ impl SessionLifecycleManager {
     /// Import a session from CFE binary bytes.
     pub fn import_session_bytes(&mut self, contact_id: &str, data: &[u8]) -> Result<(), String> {
         use crate::cfe::{CfeError, CfeMessageType, decode_as};
+        use crate::crypto::messaging::SecureMessaging;
         use crate::crypto::messaging::double_ratchet::{DoubleRatchetSession, SerializableSession};
 
         let (serializable, previous, retired) =
@@ -683,6 +710,16 @@ impl SessionLifecycleManager {
             state.verify_identity(contact_id, self.client.local_user_id())?;
             let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(state)
                 .map_err(|e| format!("from_serializable (previous): {}", e))?;
+            // Made by a core older than the envelope: nothing can be sealed on it, and what the
+            // peer writes on it arrives as an envelope it cannot be found by. Dropped, as a
+            // retired suite's states are.
+            if !self.client.envelopes().has_session(ratchet.session_id()) {
+                tracing::info!(
+                    target: "crypto::session",
+                    "dropping a previous state with no envelope keys (predates the envelope)"
+                );
+                continue;
+            }
             states.push(PreviousState {
                 session: HeldSession::from_messaging_session(contact_id.to_string(), ratchet),
                 retired_at: entry.retired_at,
@@ -692,6 +729,15 @@ impl SessionLifecycleManager {
 
         let ratchet = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(serializable)
             .map_err(|e| format!("from_serializable: {}", e))?;
+        // A state made before the envelope has no keys in the book — they derive from the
+        // handshake root, which is not kept — so nothing could be sealed on it. Refused like a
+        // retired suite: the platform treats the session as absent, and the next send opens one.
+        if !self.client.envelopes().has_session(ratchet.session_id()) {
+            return Err(format!(
+                "{SESSION_PREDATES_ENVELOPE}: session {} has no envelope keys",
+                crate::crypto::messaging::double_ratchet::id_prefix(ratchet.session_id())
+            ));
+        }
         match retired {
             // The top of the record is a retired state, not a current one.
             Some(mark) => {
@@ -739,6 +785,16 @@ mod tests {
         let alice = SessionLifecycleManager::new(alice_client, "alice".to_string());
         let bob = SessionLifecycleManager::new(bob_client, "bob".to_string());
         (alice, bob)
+    }
+
+    /// What the platform does before restoring any session: load the orchestrator state, which
+    /// carries the envelope book. A session restored without it is refused
+    /// (`SESSION_PREDATES_ENVELOPE`), as one made before the envelope is.
+    fn carry_orchestrator_state(from: &SessionLifecycleManager, to: &mut SessionLifecycleManager) {
+        let blob = from
+            .export_orchestrator_state_cfe(&std::collections::HashSet::new())
+            .unwrap();
+        to.import_orchestrator_state_cfe(&blob).unwrap();
     }
 
     #[test]
@@ -1027,6 +1083,7 @@ mod tests {
         let saved = bob.export_session_bytes_for(&alice_id).unwrap();
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut restored = SessionLifecycleManager::new(client, bob_id.clone());
+        carry_orchestrator_state(&bob, &mut restored);
         restored.import_session_bytes(&alice_id, &saved).unwrap();
 
         assert_eq!(restored.previous_state_count(&alice_id), 1);
@@ -1176,10 +1233,29 @@ mod tests {
 
         let alice_client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut restored = SessionLifecycleManager::new(alice_client, alice_id);
+        carry_orchestrator_state(&alice, &mut restored);
         restored
             .import_session_bytes(&bob_device_id, &bytes)
             .unwrap();
         assert!(restored.has_active_session(&bob_device_id));
+    }
+
+    /// A session whose envelope keys are not in the book — made by a core older than the
+    /// envelope, or restored without the orchestrator state — is refused: nothing can be sealed
+    /// on it, and the platform treats it as absent so the next send opens one.
+    ///
+    /// Mutation: drop the `has_session` check on the current state in `import_session_bytes`.
+    #[test]
+    fn a_session_with_no_envelope_keys_is_refused() {
+        let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
+        let bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, alice_id);
+        let err = restored
+            .import_session_bytes(&bob_device_id, &bytes)
+            .unwrap_err();
+        assert!(err.starts_with(SESSION_PREDATES_ENVELOPE), "{err}");
+        assert!(!restored.has_active_session(&bob_device_id));
     }
 
     // ── Import verifies the record's own identity ────────────────────────────
@@ -1267,6 +1343,7 @@ mod tests {
 
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut restored = SessionLifecycleManager::new(client, String::new());
+        carry_orchestrator_state(&alice, &mut restored);
 
         restored
             .import_session_bytes(&bob_device_id, &bytes)
@@ -1294,6 +1371,7 @@ mod tests {
 
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut restored = SessionLifecycleManager::new(client, alice_id);
+        carry_orchestrator_state(&alice, &mut restored);
         restored
             .import_session_bytes(&bob_device_id, &legacy)
             .expect("a pre-field record must still load");
@@ -1422,6 +1500,7 @@ mod tests {
             prekey_tracker: vec![],
             hybrid_identity_pins: vec![],
             kem_identity_pins: vec![],
+            envelope_book: vec![],
         };
         let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &legacy).unwrap();
 

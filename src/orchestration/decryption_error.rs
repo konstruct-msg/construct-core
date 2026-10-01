@@ -64,7 +64,7 @@ pub struct DecryptionError {
 }
 
 impl DecryptionError {
-    fn encode(&self) -> Result<Vec<u8>, String> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         if self.ratchet_key.len() != RATCHET_KEY_LEN {
             return Err(format!(
                 "DECRYPTION_ERROR: ratchet key must be {RATCHET_KEY_LEN} bytes, got {}",
@@ -88,7 +88,7 @@ impl DecryptionError {
         Ok(out)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() != PLAINTEXT_LEN {
             return Err(format!(
                 "DECRYPTION_ERROR: plaintext is {} bytes, expected {PLAINTEXT_LEN}",

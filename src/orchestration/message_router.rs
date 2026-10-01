@@ -62,6 +62,8 @@ pub enum RoutingDecision {
         message_id: String,
         ratchet_key: Option<Vec<u8>>,
         writer_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+        /// The session envelope the message came in — the pair to answer along, when set.
+        envelope_session: Option<String>,
         reason: String,
     },
     /// Message already processed — discard.
@@ -106,6 +108,9 @@ pub struct IncomingMessage {
     /// in `Orchestrator::open_receiving`, against the server keys held then — a message that
     /// arrived before the platform had a key is not spoiled by the order of events.
     pub sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+    /// The session whose envelope this arrived in, when it came in one (see
+    /// `IncomingEvent::MessageReceived::envelope_session`).
+    pub envelope_session: Option<String>,
 }
 
 // ── MessageRouter ─────────────────────────────────────────────────────────────
@@ -391,6 +396,7 @@ impl MessageRouter {
                     .ok()
                     .map(|header| header.dh_public_key),
                 writer_certificate: msg.sender_certificate.clone(),
+                envelope_session: msg.envelope_session.clone(),
                 reason: e,
             },
         }
@@ -481,6 +487,7 @@ mod tests {
             message_id: msg_id.to_string(),
             msg_number: msg_num,
             content_type: 0,
+            envelope_session: None,
         }
     }
 
@@ -563,6 +570,7 @@ mod tests {
             message_id: "dup-msg".to_string(),
             msg_number: 1,
             content_type: 0,
+            envelope_session: None,
         };
         let decision = router.route_message(&mut lifecycle, &m);
         assert!(matches!(decision, RoutingDecision::Duplicate { .. }));
@@ -588,6 +596,7 @@ mod tests {
             message_id: "dup-across-restart".to_string(),
             msg_number: 1,
             content_type: 0,
+            envelope_session: None,
         };
 
         // L1 misses → the platform is asked instead of assuming "new".
@@ -617,6 +626,7 @@ mod tests {
             message_id: "fresh-after-restart".to_string(),
             msg_number: 1,
             content_type: 0,
+            envelope_session: None,
         };
         router.route_message(&mut lifecycle, &m);
 
@@ -659,6 +669,7 @@ mod tests {
             message_id: "bad-msg".to_string(),
             msg_number: 5,
             content_type: 0,
+            envelope_session: None,
         };
         let decision = router.route_message(&mut lifecycle, &m);
         assert!(matches!(
@@ -696,6 +707,7 @@ mod tests {
             message_id: "unread".to_string(),
             msg_number: 5,
             content_type: 0,
+            envelope_session: None,
         };
         match router.route_message(&mut lifecycle, &m) {
             RoutingDecision::DecryptionErrorNeeded {

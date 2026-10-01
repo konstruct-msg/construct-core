@@ -148,6 +148,11 @@ pub struct Client<P: CryptoProvider, H: KeyAgreement<P>, M: SecureMessaging<P>> 
     /// Идентификатор локального пользователя (UUID от сервера)
     local_user_id: String,
 
+    /// Every session envelope key pair, by peer device and session — filed here when a session
+    /// is made, the one moment the root that derives them exists
+    /// (`crypto::sealed_sender::book`).
+    envelopes: crate::crypto::sealed_sender::book::EnvelopeBook,
+
     /// PhantomData для generic types
     _phantom: PhantomData<(P, H, M)>,
 }
@@ -189,6 +194,7 @@ where
             key_manager,
             sessions: HashMap::new(),
             pending_otpk_ids: HashMap::new(),
+            envelopes: Default::default(),
             local_user_id: String::new(),
             _phantom: PhantomData,
         })
@@ -264,6 +270,7 @@ where
             key_manager,
             sessions: HashMap::new(),
             pending_otpk_ids: HashMap::new(),
+            envelopes: Default::default(),
             local_user_id: String::new(),
             _phantom: PhantomData,
         })
@@ -439,7 +446,11 @@ where
             pq,
         )?;
 
+        let mut session = session;
         let session_id = session.session_id().to_string();
+        if let Some(keys) = session.take_envelope_keys() {
+            self.envelopes.register(contact_id, &session_id, keys);
+        }
 
         // Store session
         self.sessions.insert(contact_id.to_string(), session);
@@ -700,8 +711,11 @@ where
                 consumed_otpk.as_ref(),
                 pq,
             ) {
-                Ok((session, plaintext)) => {
+                Ok((mut session, plaintext)) => {
                     let session_id = session.session_id().to_string();
+                    if let Some(keys) = session.take_envelope_keys() {
+                        self.envelopes.register(contact_id, &session_id, keys);
+                    }
                     self.sessions.insert(contact_id.to_string(), session);
 
                     // Burn it here and nowhere else: the handshake closed, so the key has now
@@ -850,8 +864,30 @@ where
     }
 
     /// Удалить сессию с контактом
+    /// The envelope book (`crypto::sealed_sender::book`).
+    pub fn envelopes(&self) -> &crate::crypto::sealed_sender::book::EnvelopeBook {
+        &self.envelopes
+    }
+
+    pub(crate) fn envelopes_mut(
+        &mut self,
+    ) -> &mut crate::crypto::sealed_sender::book::EnvelopeBook {
+        &mut self.envelopes
+    }
+
+    /// Remove the current session with `contact_id`. Its envelope pair is retired, not removed:
+    /// the peer may still be writing on it, and the pair is how it is named and answered
+    /// (`crypto::sealed_sender::book`).
     pub fn remove_session(&mut self, contact_id: &str) -> bool {
-        self.sessions.remove(contact_id).is_some()
+        let Some(session) = self.sessions.remove(contact_id) else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.envelopes.retire_session(session.session_id(), now);
+        true
     }
 
     /// Take the session with `contact_id` out of the map without dropping it.

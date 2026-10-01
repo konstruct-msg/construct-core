@@ -93,6 +93,11 @@ pub struct Session<P: CryptoProvider, H: KeyAgreement<P>, M: SecureMessaging<P>>
     /// Активная messaging session (Double Ratchet)
     messaging_session: M,
 
+    /// The session envelope keys, derived from the handshake root when this session was made and
+    /// held only until the client files them in its envelope book (`Client::envelopes`). The root
+    /// is not kept, so this is the one moment they can be derived; a restored session has none.
+    envelope_keys: Option<crate::crypto::sealed_sender::envelope::EnvelopePair>,
+
     /// PhantomData для generic types
     _phantom: PhantomData<(P, H)>,
 }
@@ -189,6 +194,11 @@ where
             suite_id = %suite_id.as_u16(),
             "Suite negotiated for new session"
         );
+        let envelope_keys = crate::crypto::sealed_sender::envelope::EnvelopePair::derive(
+            root_key.as_ref(),
+            &local_user_id,
+            &contact_id,
+        );
         let messaging_session = M::new_initiator_session(
             root_key.as_ref(),
             initiator_state,
@@ -215,6 +225,7 @@ where
         Ok(Self {
             contact_id,
             messaging_session,
+            envelope_keys: Some(envelope_keys),
             _phantom: PhantomData,
         })
     }
@@ -305,6 +316,11 @@ where
         // 2. Create messaging session (Double Ratchet) from first message
         // Convert root_key to &[u8] - X3DH returns Vec<u8>
         // ⚠️ ВАЖНО: new_responder_session теперь возвращает (session, plaintext)
+        let envelope_keys = crate::crypto::sealed_sender::envelope::EnvelopePair::derive(
+            root_key.as_ref(),
+            &local_user_id,
+            &contact_id,
+        );
         let (messaging_session, plaintext) = M::new_responder_session(
             root_key.as_ref(),
             local_identity,
@@ -323,6 +339,7 @@ where
         let session = Self {
             contact_id,
             messaging_session,
+            envelope_keys: Some(envelope_keys),
             _phantom: PhantomData,
         };
 
@@ -415,8 +432,18 @@ where
         Self {
             contact_id,
             messaging_session,
+            // Restored: the root that would derive them is gone. The envelope book has them.
+            envelope_keys: None,
             _phantom: PhantomData,
         }
+    }
+
+    /// The envelope keys derived when this session was made, once. `None` after the first call
+    /// and for a restored session.
+    pub fn take_envelope_keys(
+        &mut self,
+    ) -> Option<crate::crypto::sealed_sender::envelope::EnvelopePair> {
+        self.envelope_keys.take()
     }
 }
 

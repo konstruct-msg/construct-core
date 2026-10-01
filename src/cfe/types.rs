@@ -649,6 +649,23 @@ pub struct CfeOrchestratorStateV1 {
     /// Same shape as a hybrid pin.
     #[serde(rename = "kip", default, skip_serializing_if = "Vec::is_empty")]
     pub kem_identity_pins: Vec<CfeHybridPinV1>,
+    /// The envelope book: every session envelope key pair, newest first
+    /// (`crypto::sealed_sender::book`). Absent in blobs older than construct-core 0.26.
+    #[serde(rename = "env", default, skip_serializing_if = "Vec::is_empty")]
+    pub envelope_book: Vec<CfeEnvelopeEntryV1>,
+}
+
+/// One envelope book entry. `keys` = send `env ‖ tag` ‖ recv `env ‖ tag` (128 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeEnvelopeEntryV1 {
+    #[serde(rename = "d")]
+    pub device_id: String,
+    #[serde(rename = "s")]
+    pub session_id: String,
+    #[serde(rename = "k")]
+    pub keys: SecretBytes,
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<u64>,
 }
 
 /// A pinned hybrid identity key.

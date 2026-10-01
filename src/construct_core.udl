@@ -237,6 +237,16 @@ dictionary SessionHealthReport {
     PqHandshake pq_handshake;
 };
 
+/// A session envelope opened by `OrchestratorCore.open_envelope`
+/// (construct-docs decisions/sealed-envelope-keyed-by-the-session.md).
+dictionary EnvelopeOpened {
+    string contact_id;   // the device whose pair matched: who wrote it
+    string session_id;   // pass on as MessageReceived.envelope_session
+    u8 kind;             // 1 = ratchet wire payload, 2 = DECRYPTION_ERROR
+    bytes body;
+    boolean retired;     // its ratchet state is gone here; a ratchet body will not decrypt
+};
+
 /// How late messages arrive, for this process (PQR-4, construct-docs TODO 64.3). Local
 /// diagnostics for the platform's log: never sent anywhere.
 dictionary ReorderStats {
@@ -702,7 +712,9 @@ interface RustAckStore {
 /// Platform creates one of these variants and passes to `handle_event()`.
 [Enum]
 interface CfeIncomingEvent {
-    MessageReceived(string message_id, string from, bytes data, u8 content_type, SenderCertificate? sender_certificate);
+    /// `envelope_session`: the session whose envelope the message came in (`open_envelope`),
+    /// set instead of `sender_certificate`.
+    MessageReceived(string message_id, string from, bytes data, u8 content_type, SenderCertificate? sender_certificate, string? envelope_session);
     OutgoingMessage(string contact_id, string message_id, bytes plaintext, u8 content_type);
     OutgoingCallSignal(string contact_id, string message_id, bytes proto_bytes);
     SessionInitCompleted(string contact_id, bytes session_data);
@@ -723,7 +735,8 @@ interface CfeIncomingEvent {
     /// A DECRYPTION_ERROR (content type 28) arrived from `contact_id` — the device its sender
     /// certificate names; `payload` is the envelope's sealed box. Answered with `SessionRetired` +
     /// `ResendMessage`, `ResendMessage` alone, or nothing when the error is stale.
-    DecryptionErrorReceived(string contact_id, bytes payload);
+    /// `opened`: `payload` came out of a session envelope and is the error itself.
+    DecryptionErrorReceived(string contact_id, bytes payload, boolean opened);
 };
 
 /// Which durable slot a `SaveToSecureStore` payload belongs in.
@@ -771,7 +784,9 @@ interface CfeAction {
     /// We could not read `message_id` from `contact_id`: send `payload` to that device as a
     /// DECRYPTION_ERROR (content type 28) envelope, sealed-sender, and acknowledge the message.
     /// The core built and sealed `payload`; one per unread message.
-    SendDecryptionError(string contact_id, string message_id, bytes payload);
+    /// `enveloped`: `payload` is a session envelope — send it as the sealed inner's envelope with
+    /// no certificate; otherwise it is the X25519 box, sent as before.
+    SendDecryptionError(string contact_id, string message_id, bytes payload, boolean enveloped);
     /// The peer could not read our current state with `contact_id`; it is retired and the next
     /// send opens a new one — without a one-time prekey when `without_one_time_prekey`.
     SessionRetired(string contact_id, boolean without_one_time_prekey);
@@ -923,6 +938,13 @@ interface OrchestratorCore {
     boolean has_session(string contact_id);
 
     SessionHealthReport? get_session_health(string contact_id);
+
+    /// Seal a wire payload just encrypted for `contact_id` as a session envelope; null when it
+    /// must go with a certificate (first flight, or a session made before the envelope).
+    bytes? seal_envelope(string contact_id, bytes wire_payload);
+
+    /// Who wrote `envelope`, by its tag, and its opened body; null when no pair matches.
+    EnvelopeOpened? open_envelope(bytes envelope);
 
     /// How late messages have arrived since the process started (PQR-4).
     ReorderStats reorder_stats();

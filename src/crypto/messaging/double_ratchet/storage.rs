@@ -660,7 +660,7 @@ impl Drop for SerializableSession {
 ///
 /// Shared across the module rather than re-written per call site: a second truncation helper is a
 /// second answer to "how much of an identifier may a log carry", and the two would drift.
-pub(super) fn id_prefix(id: &str) -> &str {
+pub(crate) fn id_prefix(id: &str) -> &str {
     let end = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
     &id[..end]
 }
