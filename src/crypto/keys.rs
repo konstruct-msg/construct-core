@@ -17,6 +17,27 @@ use zeroize::{Zeroize, Zeroizing};
 /// life still has its full window.
 pub const SPK_RETENTION_AFTER_ROTATION_SECS: u64 = 14 * 24 * 3600;
 
+/// How long the server keeps an undelivered message: construct-server `MESSAGE_TTL_DAYS` (7, the
+/// default and the production value, checked 2026-10-01). Changing it there means re-checking the
+/// inequality below.
+pub const QUEUE_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// The oldest unanswered handshake an initiator still writes first flights on. Past it the session
+/// is retired and the next send opens a new one from a fresh bundle
+/// (construct-docs `decisions/first-flight-sealed-whole.md`).
+///
+/// Since construct-core 0.27 a first flight is sealed under its handshake's ML-KEM secret, so a
+/// recipient that no longer holds the prekey cannot tell who wrote it and cannot answer. The prekey
+/// a handshake used is held at least `SPK_RETENTION_AFTER_ROTATION_SECS` from the moment its bundle
+/// was served; a first flight written at the handshake's age `a` may wait `QUEUE_TTL_SECS` in the
+/// queue. Every first flight opens while `a + queue ≤ retention`.
+pub const MAX_UNANSWERED_HANDSHAKE_AGE_SECS: u64 = 7 * 24 * 3600;
+
+const _: () = assert!(
+    MAX_UNANSWERED_HANDSHAKE_AGE_SECS + QUEUE_TTL_SECS <= SPK_RETENTION_AFTER_ROTATION_SECS,
+    "a first flight could outlive the prekey it was sealed to"
+);
+
 /// HKDF info of the KEM identity seed (`KeyManager::kem_identity_seed`).
 #[cfg(feature = "post-quantum")]
 const KEM_IDENTITY_SEED_INFO: &[u8] = b"Construct-KEM-identity-v1";

@@ -19,8 +19,9 @@ use super::envelope::{EnvelopeKind, EnvelopePair};
 use super::first_flight::{FiledFirstFlightKey, FirstFlightKey};
 use crate::error::CryptoError;
 
-/// How long a retired pair still names its writer: the server's queue window (30 days).
-pub const RETIRED_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+/// How long a retired pair still names its writer: the server's queue window — after it nothing
+/// written on the pair can still arrive.
+pub const RETIRED_RETENTION_SECS: u64 = crate::crypto::keys::QUEUE_TTL_SECS;
 
 /// One session's pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,9 +91,14 @@ impl EnvelopeBook {
         session_id: &str,
         ciphertext_hash: [u8; 32],
         key: FirstFlightKey,
+        handshake_at: u64,
     ) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.session_id == session_id) {
-            e.first_flight = Some((ciphertext_hash, key));
+            e.first_flight = Some(FiledFirstFlightKey {
+                ciphertext_hash,
+                key,
+                handshake_at,
+            });
         }
     }
 
@@ -115,7 +121,7 @@ impl EnvelopeBook {
     /// flight of a session the first one opened.
     pub fn first_flight_by_handshake(&self, ciphertext_hash: &[u8; 32]) -> Option<&FirstFlightKey> {
         self.entries.iter().find_map(|e| match &e.first_flight {
-            Some((hash, key)) if hash == ciphertext_hash => Some(key),
+            Some(f) if &f.ciphertext_hash == ciphertext_hash => Some(&f.key),
             _ => None,
         })
     }
@@ -216,9 +222,10 @@ impl EnvelopeBook {
             .map(|e| {
                 let mut keys = e.keys.send.to_bytes();
                 keys.extend_from_slice(&e.keys.recv.to_bytes());
-                let first_flight = e.first_flight.as_ref().map(|(hash, key)| {
-                    let mut bytes = hash.to_vec();
-                    bytes.extend_from_slice(&key.to_bytes());
+                let first_flight = e.first_flight.as_ref().map(|f| {
+                    let mut bytes = f.ciphertext_hash.to_vec();
+                    bytes.extend_from_slice(&f.key.to_bytes());
+                    bytes.extend_from_slice(&f.handshake_at.to_be_bytes());
                     crate::crypto::SecretBytes::new(bytes)
                 });
                 crate::cfe::CfeEnvelopeEntryV1 {
@@ -253,9 +260,12 @@ impl EnvelopeBook {
                     // A malformed first-flight record costs only the later first flights.
                     first_flight: e.first_flight.as_ref().and_then(|f| {
                         let f = f.expose();
-                        (f.len() == 64).then_some(())?;
-                        let hash: [u8; 32] = f[..32].try_into().ok()?;
-                        Some((hash, FirstFlightKey::from_bytes(&f[32..]).ok()?))
+                        (f.len() == 72).then_some(())?;
+                        Some(FiledFirstFlightKey {
+                            ciphertext_hash: f[..32].try_into().ok()?,
+                            key: FirstFlightKey::from_bytes(&f[32..64]).ok()?,
+                            handshake_at: u64::from_be_bytes(f[64..].try_into().ok()?),
+                        })
                     }),
                 })
             })
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn the_first_flight_key_is_found_by_its_handshake_and_survives_the_blob() {
         let (mut alice, _) = pair(&[1; 32], "s1");
-        alice.set_first_flight("s1", [9; 32], FirstFlightKey::from_kem_secret(&[5; 32]));
+        alice.set_first_flight("s1", [9; 32], FirstFlightKey::from_kem_secret(&[5; 32]), 77);
         let restored = EnvelopeBook::from_cfe(&alice.to_cfe());
         assert_eq!(restored, alice);
         assert_eq!(

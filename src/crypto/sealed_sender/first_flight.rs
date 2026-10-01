@@ -84,8 +84,14 @@ impl FirstFlightKey {
     }
 }
 
-/// A handshake's first-flight key filed under the hash of its ML-KEM ciphertext.
-pub type FiledFirstFlightKey = ([u8; 32], FirstFlightKey);
+/// A handshake's first-flight key, filed under the hash of its ML-KEM ciphertext, with when the
+/// handshake was made (`keys::MAX_UNANSWERED_HANDSHAKE_AGE_SECS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiledFirstFlightKey {
+    pub ciphertext_hash: [u8; 32],
+    pub key: FirstFlightKey,
+    pub handshake_at: u64,
+}
 
 /// What a recipient reads before it can open the box: which of its Kyber prekeys the handshake
 /// was made to, and the ciphertext to decapsulate.

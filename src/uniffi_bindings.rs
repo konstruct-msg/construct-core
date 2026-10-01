@@ -3746,9 +3746,11 @@ impl OrchestratorCore {
         orch.get_all_session_contact_ids()
     }
 
+    /// Asked before every send: an unanswered handshake past its age is retired first
+    /// (`Orchestrator::has_session_for_sending`), so the platform opens a new state.
     pub fn has_session(&self, contact_id: String) -> bool {
-        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        orch.has_active_session(&contact_id)
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.has_session_for_sending(&contact_id)
     }
 
     pub fn init_session(

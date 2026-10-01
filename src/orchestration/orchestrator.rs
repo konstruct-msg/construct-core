@@ -561,6 +561,55 @@ impl Orchestrator {
         self.lifecycle.has_active_session(contact_id)
     }
 
+    /// Whether a message to `contact_id` can be written on the current state — what the platform
+    /// asks before every send. A handshake the peer has not answered within
+    /// `MAX_UNANSWERED_HANDSHAKE_AGE_SECS` is retired first: a first flight written on it could
+    /// reach the peer after the prekey it was sealed to is gone, and nobody could tell who wrote
+    /// it. The platform then opens a new state from a fresh bundle, as for any missing session;
+    /// the retired one still reads a late answer.
+    pub fn has_session_for_sending(&mut self, contact_id: &str) -> bool {
+        self.retire_stale_handshake(contact_id);
+        self.lifecycle.has_active_session(contact_id)
+    }
+
+    /// Retire the current state with `contact_id` if it is an unanswered handshake older than
+    /// `MAX_UNANSWERED_HANDSHAKE_AGE_SECS`. True when it did.
+    fn retire_stale_handshake(&mut self, contact_id: &str) -> bool {
+        use crate::crypto::keys::MAX_UNANSWERED_HANDSHAKE_AGE_SECS;
+        let now = self.lifecycle.now_secs();
+        let stale = self
+            .lifecycle
+            .client
+            .get_session(contact_id)
+            .is_some_and(|session| {
+                session.messaging_session().prekey_header().is_some()
+                    && self
+                        .lifecycle
+                        .client
+                        .envelopes()
+                        .first_flight_of_session(session.session_id())
+                        .is_some_and(|f| {
+                            now.saturating_sub(f.handshake_at) >= MAX_UNANSWERED_HANDSHAKE_AGE_SECS
+                        })
+            });
+        if !stale {
+            return false;
+        }
+        tracing::info!(
+            target: "crypto::lifecycle",
+            contact_id = %contact_id,
+            "unanswered handshake past its age — retired; the next send opens a new state"
+        );
+        self.lifecycle.retire_current(contact_id)
+    }
+
+    /// `retire_stale_handshake` for every device with a current state (the GC sweep).
+    fn retire_stale_handshakes(&mut self) {
+        for contact_id in self.lifecycle.client.active_contacts() {
+            self.retire_stale_handshake(&contact_id);
+        }
+    }
+
     pub fn pending_message_count(&self, contact_id: &str) -> usize {
         self.router.pending_count(contact_id)
     }
@@ -754,12 +803,15 @@ impl Orchestrator {
                     Some(&pq),
                 )
                 .map_err(|e| e.to_string())?;
-            let first_flight = (
-                crate::crypto::sealed_sender::first_flight::ciphertext_hash(&enc.ciphertext),
-                crate::crypto::sealed_sender::first_flight::FirstFlightKey::from_kem_secret(
+            let first_flight = crate::crypto::sealed_sender::first_flight::FiledFirstFlightKey {
+                ciphertext_hash: crate::crypto::sealed_sender::first_flight::ciphertext_hash(
+                    &enc.ciphertext,
+                ),
+                key: crate::crypto::sealed_sender::first_flight::FirstFlightKey::from_kem_secret(
                     enc.shared_secret.expose(),
                 ),
-            );
+                handshake_at: self.lifecycle.now_secs(),
+            };
             let header = PrekeyHeader {
                 one_time_prekey_id,
                 kyber_prekey_id: choice.kyber_prekey_id,
@@ -817,17 +869,19 @@ impl Orchestrator {
             ratchet.set_prekey_header(header);
         }
         // The key every first flight of this session is sealed with, until the peer answers.
-        if let Some((hash, key)) = first_flight
+        if let Some(filed) = first_flight
             && let Some(session_id) = self
                 .lifecycle
                 .client
                 .get_session(contact_id)
                 .map(|s| s.session_id().to_string())
         {
-            self.lifecycle
-                .client
-                .envelopes_mut()
-                .set_first_flight(&session_id, hash, key);
+            self.lifecycle.client.envelopes_mut().set_first_flight(
+                &session_id,
+                filed.ciphertext_hash,
+                filed.key,
+                filed.handshake_at,
+            );
         }
         tracing::info!(
             target: "crypto::orchestrator",
@@ -1315,10 +1369,12 @@ impl Orchestrator {
                 .map(|s| s.session_id().to_string())
             {
                 use crate::crypto::sealed_sender::first_flight::{FirstFlightKey, ciphertext_hash};
+                let now = self.lifecycle.now_secs();
                 self.lifecycle.client.envelopes_mut().set_first_flight(
                     &session_id,
                     ciphertext_hash(kem.kem_ciphertext),
                     FirstFlightKey::from_kem_secret(shared.expose()),
+                    now,
                 );
             }
         }
@@ -1499,7 +1555,7 @@ impl Orchestrator {
             .client
             .get_session(contact_id)
             .ok_or_else(|| format!("FIRST_FLIGHT_NO_SESSION: {}", contact_id))?;
-        let (hash, key) = self
+        let filed = self
             .lifecycle
             .client
             .envelopes()
@@ -1509,12 +1565,12 @@ impl Orchestrator {
                  a core older than 0.27"
                     .to_string()
             })?;
-        if &handshake.ciphertext_hash() != hash {
+        if handshake.ciphertext_hash() != filed.ciphertext_hash {
             return Err(
                 "FIRST_FLIGHT_OTHER_HANDSHAKE: the payload was written on another state".into(),
             );
         }
-        first_flight::seal(key, recipient_identity, wire_payload, certificate)
+        first_flight::seal(&filed.key, recipient_identity, wire_payload, certificate)
             .map(Some)
             .map_err(|e| e.to_string())
     }
@@ -2555,6 +2611,7 @@ impl Orchestrator {
             "gc_sweep" => {
                 let actions = self.lifecycle.ack_store.prune_expired();
                 self.sessions.prune_expired();
+                self.retire_stale_handshakes();
                 actions
             }
             "pq_upgrade_sweep" if cfg!(feature = "post-quantum") => self.pq_upgrade_sweep(),
@@ -4618,6 +4675,86 @@ mod pqxdh_v2_tests {
                 .first_flight_by_handshake(&hash)
                 .is_none()
         );
+    }
+
+    /// A device on a clock the test moves, named by its key.
+    fn clocked_device(
+        clock: Arc<crate::orchestration::clock::MockClock>,
+    ) -> (Orchestrator, String) {
+        let mut o = Orchestrator::new_with_clock(
+            ClassicClient::<ClassicSuiteProvider>::new().unwrap(),
+            "pending".to_string(),
+            clock,
+        );
+        o.lifecycle
+            .client
+            .key_manager_mut()
+            .ensure_hybrid_signature_key()
+            .unwrap();
+        o.begin_kyber_spk_rotation().unwrap();
+        assert!(o.commit_kyber_spk_rotation());
+        let id = crate::device_id::derive_device_id(
+            &o.get_registration_bundle_fields().unwrap().identity_public,
+        );
+        o.set_my_user_id(id.clone());
+        (o, id)
+    }
+
+    /// An unanswered handshake past `MAX_UNANSWERED_HANDSHAKE_AGE_SECS` is not written on: its
+    /// first flights could outlive the prekey they are sealed to. The platform's pre-send question
+    /// retires it, and a new state is opened as for any missing session.
+    ///
+    /// Mutation: drop the `retire_stale_handshake` call in `has_session_for_sending` — this
+    /// reddens.
+    #[test]
+    fn an_unanswered_handshake_past_its_age_is_not_written_on() {
+        use crate::crypto::keys::MAX_UNANSWERED_HANDSHAKE_AGE_SECS;
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000));
+        let (mut alice, _) = clocked_device(clock.clone());
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+
+        clock.advance_ms((MAX_UNANSWERED_HANDSHAKE_AGE_SECS - 1) * 1000);
+        assert!(
+            alice.has_session_for_sending(&bob_id),
+            "a day short of the limit"
+        );
+
+        clock.advance_ms(1000);
+        assert!(
+            !alice.has_session_for_sending(&bob_id),
+            "written on past its age"
+        );
+        assert!(
+            alice.lifecycle.previous_state_count(&bob_id) >= 1,
+            "kept to read a late answer"
+        );
+
+        // The sweep does the same without being asked.
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        clock.advance_ms(MAX_UNANSWERED_HANDSHAKE_AGE_SECS * 1000);
+        alice.handle_event(IncomingEvent::TimerFired {
+            timer_id: "gc_sweep".to_string(),
+        });
+        assert!(!alice.has_active_session(&bob_id));
+    }
+
+    /// An answered session has no handshake to age: it is never retired for it.
+    #[test]
+    fn an_answered_session_is_never_retired_for_its_age() {
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000));
+        let (mut alice, alice_id) = clocked_device(clock.clone());
+        let (mut bob, bob_id) = named_device();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        clock.advance_ms(365 * 24 * 3600 * 1000);
+        assert!(alice.has_session_for_sending(&bob_id));
     }
 
     /// A first flight whose handshake this device cannot reconstruct — a Kyber prekey no longer
