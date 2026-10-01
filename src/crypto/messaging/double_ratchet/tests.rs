@@ -2755,6 +2755,45 @@ fn test_pqr1_the_responder_does_not_propose() {
     assert!(bob.pending_pq_exchange.is_none());
 }
 
+/// The case the remaining PQR-1 gap was stated for: only the responder writes. The initiator
+/// still answers every delivery with a receipt, and a receipt is an ordinary `encrypt` — so the
+/// age check runs on it, the proposal rides on it, and the epoch the responder then writes on
+/// is new. Alternating roles would add nothing here: any exchange needs both sides to send once,
+/// whoever proposes.
+///
+/// Mutation: `pq_epoch_is_old` always false — this reddens. (Dropping only the call in
+/// `maybe_start_pq_exchange_by_age` does not: receipts also turn the DH ratchet, and the
+/// turn-counted path checks the same age.)
+#[cfg(feature = "post-quantum")]
+#[test]
+fn test_pqr1_a_responder_only_conversation_rekeys_through_the_initiators_receipts() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000001b7",
+        "bbbbbbbb-0000-4000-8000-0000000001b8",
+    );
+    let max_age = crate::config::Config::global().pq_ratchet_max_age_seconds;
+    alice.pq_epoch_since = super::unix_now().saturating_sub(max_age + 1);
+
+    // Bob writes; Alice only acknowledges. Three rounds: proposal, ciphertext, promotion.
+    for round in 0..3 {
+        let m = bob.encrypt(format!("bob {round}").as_bytes()).unwrap();
+        alice.decrypt(&m).unwrap();
+        let receipt = alice.encrypt(b"receipt").unwrap();
+        bob.decrypt(&receipt).unwrap();
+    }
+
+    assert_eq!(
+        alice.current_pq_epoch, 1,
+        "the initiator activated a new epoch"
+    );
+    let m = bob.encrypt(b"bob writes on").unwrap();
+    assert_eq!(
+        m.pq_message_epoch, 1,
+        "the responder writes on the new epoch without ever proposing"
+    );
+    alice.decrypt(&m).unwrap();
+}
+
 /// The epoch's start survives a restore, so a restart neither resets the clock nor fires early.
 #[cfg(feature = "post-quantum")]
 #[test]
