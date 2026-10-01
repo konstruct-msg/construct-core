@@ -784,6 +784,9 @@ interface CfeAction {
     /// A message already handled (ACK cache, platform DB, or its ratchet key already used).
     /// Terminal: record it as processed and advance the stream cursor past it.
     DuplicateDropped(string message_id);
+    /// A message whose payload does not parse (garbage, or a retired suite): it can never open.
+    /// Terminal: record it as processed and advance the stream cursor past it. Nothing is sent.
+    MalformedDropped(string message_id);
     // A message waits for a session with `contact_id` and can open one: call
     // `open_receiving(contact_id)`. Nothing is fetched — the key comes from the sender certificate.
     OpenReceiving(string contact_id);

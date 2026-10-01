@@ -2243,11 +2243,17 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
+    /// The verdict, then the reason for the log. The verdict is what the platform acts on.
     fn malformed(message_id: &str, from: &str, reason: String) -> Vec<Action> {
-        vec![Action::NotifyError {
-            code: "MALFORMED_WIRE_PAYLOAD".to_string(),
-            message: format!("{reason} (message {message_id} from {from})"),
-        }]
+        vec![
+            Action::MalformedDropped {
+                message_id: message_id.to_string(),
+            },
+            Action::NotifyError {
+                code: "MALFORMED_WIRE_PAYLOAD".to_string(),
+                message: format!("{reason} (message {message_id} from {from})"),
+            },
+        ]
     }
 
     fn handle_message_received(
@@ -2916,16 +2922,66 @@ mod tests {
                 data: garbage.clone(),
             }),
         ] {
-            assert_eq!(
-                actions.len(),
-                1,
-                "one refusal and nothing else: {actions:?}"
-            );
             assert!(
-                matches!(&actions[0], Action::NotifyError { code, .. } if code == "MALFORMED_WIRE_PAYLOAD"),
-                "{actions:?}"
+                matches!(
+                    actions.as_slice(),
+                    [Action::MalformedDropped { .. }, Action::NotifyError { code, .. }]
+                        if code == "MALFORMED_WIRE_PAYLOAD"
+                ),
+                "the drop verdict and its reason, nothing routed: {actions:?}"
             );
         }
+    }
+
+    /// A message in a suite this build no longer reads can never open either, and must not stay
+    /// in the server's queue to be redelivered on every reconnect: the verdict drops it and names
+    /// it, so the platform records it and moves past it (2026-10-01, a suite-3 message from a
+    /// device on an old build, held unacknowledged).
+    ///
+    /// Mutation: `malformed` returns only the `NotifyError` — this reddens.
+    #[test]
+    fn a_message_in_a_retired_suite_is_dropped_by_name() {
+        let mut o = make_orchestrator("alice");
+        let mut suite_3 = crate::wire_payload::pack(
+            &[0x11; 32],
+            3,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            None,
+            &[0x44; 60],
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+        let at = crate::wire_payload::HEADER_SIZE;
+        suite_3[at - 2..at].copy_from_slice(&3u16.to_le_bytes());
+
+        let actions = o.handle_event(IncomingEvent::MessageReceived {
+            sender_certificate: None,
+            message_id: "m-suite-3".to_string(),
+            from: "bob".to_string(),
+            data: suite_3,
+            content_type: 0,
+            envelope_session: None,
+        });
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, Action::MalformedDropped { message_id } if message_id == "m-suite-3")
+            ),
+            "{actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::OpenReceiving { .. } | Action::SendDecryptionError { .. }
+            )),
+            "nothing is opened and nothing is sent: {actions:?}"
+        );
     }
 
     #[test]
@@ -2989,8 +3045,12 @@ mod tests {
             envelope_session: None,
         });
         assert!(
-            matches!(actions.as_slice(), [Action::NotifyError { code, .. }] if code == "MALFORMED_WIRE_PAYLOAD"),
-            "expected single MALFORMED_WIRE_PAYLOAD NotifyError, got {actions:?}"
+            matches!(
+                actions.as_slice(),
+                [Action::MalformedDropped { message_id }, Action::NotifyError { code, .. }]
+                    if message_id == "msg-003" && code == "MALFORMED_WIRE_PAYLOAD"
+            ),
+            "expected the drop verdict and its reason, got {actions:?}"
         );
     }
 

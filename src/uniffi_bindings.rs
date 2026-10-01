@@ -4323,6 +4323,9 @@ pub enum CfeAction {
     DuplicateDropped {
         message_id: String,
     },
+    MalformedDropped {
+        message_id: String,
+    },
     OpenReceiving {
         contact_id: String,
     },
@@ -4438,6 +4441,7 @@ impl CfeAction {
             PruneAckStore { cutoff_ts } => Self::PruneAckStore { cutoff_ts },
             MarkMessageDelivered { message_id } => Self::MarkMessageDelivered { message_id },
             DuplicateDropped { message_id } => Self::DuplicateDropped { message_id },
+            MalformedDropped { message_id } => Self::MalformedDropped { message_id },
             OpenReceiving { contact_id } => Self::OpenReceiving { contact_id },
             SendEncryptedMessage {
                 to,

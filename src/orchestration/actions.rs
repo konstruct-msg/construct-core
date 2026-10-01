@@ -117,6 +117,17 @@ pub enum Action {
     DuplicateDropped {
         message_id: String,
     },
+    /// The routing verdict for a message whose payload does not parse — garbage, or a suite this
+    /// build no longer reads (suite 3 since 0.24). Decrypt uses the same parser, so it can never
+    /// open, and there is no state in it a DECRYPTION_ERROR could name. Terminal: record it as
+    /// processed, advance past it. Nothing is sent.
+    ///
+    /// Before this the only answer was a `NotifyError`, which is no routing decision: the
+    /// platform neither acknowledged nor recorded the message, and the server redelivered it
+    /// until its queue expired (2026-10-01, a suite-3 message from a device on an old build).
+    MalformedDropped {
+        message_id: String,
+    },
 
     // ── Network ───────────────────────────────────────────────────────────────
     /// A message waits for a session with `contact_id` and can open one: the platform calls
