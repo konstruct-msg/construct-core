@@ -4362,6 +4362,12 @@ pub enum CfeAction {
         message_id: String,
         proto_bytes: Vec<u8>,
     },
+    ControlFrameDecrypted {
+        contact_id: String,
+        message_id: String,
+        content_type: u8,
+        body: Vec<u8>,
+    },
     /// Platform must query its persistent ACK store for `message_id`.
     CheckAckInDb {
         message_id: String,
@@ -4502,6 +4508,17 @@ impl CfeAction {
                 contact_id,
                 message_id,
                 proto_bytes,
+            },
+            ControlFrameDecrypted {
+                contact_id,
+                message_id,
+                content_type,
+                body,
+            } => Self::ControlFrameDecrypted {
+                contact_id,
+                message_id,
+                content_type,
+                body,
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
             OpenSession { contact_id } => Self::OpenSession { contact_id },

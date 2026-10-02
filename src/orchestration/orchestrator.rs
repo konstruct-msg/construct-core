@@ -2849,6 +2849,17 @@ fn decrypted_actions(
             proto_bytes,
         }];
     }
+
+    if let Some((content_type, body)) = crate::knst::control_frame(&plaintext)
+        .filter(|(framed, _)| crate::knst::is_silent_control(*framed))
+    {
+        return vec![Action::ControlFrameDecrypted {
+            contact_id,
+            message_id,
+            content_type,
+            body: body.to_vec(),
+        }];
+    }
     if content_type == crate::knst::CONTENT_TYPE_CALL_SIGNAL {
         // An identified envelope whose body is the signal itself, unframed.
         return vec![Action::CallSignalDecrypted {
@@ -2938,6 +2949,47 @@ mod tests {
             actions.first(),
             Some(Action::NotifyNewMessage { .. })
         ));
+        assert_eq!(
+            actions.last(),
+            Some(&Action::MessageDecrypted {
+                contact_id: "dev".into(),
+                message_id: "m".into(),
+                plaintext: frame
+            })
+        );
+    }
+
+    /// Every other silent control frame is named too — a receipt, a card, a profile — with its
+    /// body and type, and nothing that notifies or reaches the transcript. Before 0.30 each left
+    /// sealed as MessageDecrypted with a NotifyNewMessage. Mutation: drop the branch — this reddens.
+    #[test]
+    fn a_sealed_control_frame_is_named_by_its_frame() {
+        for content_type in [13u8, 14, 25, 26, 27, 29] {
+            let actions = decrypted_actions(
+                "dev".into(),
+                "m".into(),
+                control_frame(content_type, b"body"),
+                SEALED,
+            );
+            assert_eq!(
+                actions,
+                vec![Action::ControlFrameDecrypted {
+                    contact_id: "dev".into(),
+                    message_id: "m".into(),
+                    content_type,
+                    body: b"body".to_vec(),
+                }],
+                "type {content_type}"
+            );
+        }
+    }
+
+    /// A type the table does not call silent stays a message, framed whole: the transcript
+    /// pipeline reassembles it.
+    #[test]
+    fn sender_sync_stays_a_message() {
+        let frame = control_frame(23, b"copy");
+        let actions = decrypted_actions("dev".into(), "m".into(), frame.clone(), SEALED);
         assert_eq!(
             actions.last(),
             Some(&Action::MessageDecrypted {

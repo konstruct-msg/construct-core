@@ -25,6 +25,17 @@ pub const HEADER_LEN: usize = 30;
 /// `ContentType::CALL_SIGNAL` in `construct-protos/core/envelope.proto`.
 pub const CONTENT_TYPE_CALL_SIGNAL: u8 = 12;
 
+/// The content types a KNST control frame carries silently: never a chat message, so never a
+/// notification or a transcript row — the rows of `knst_content_types.json` with
+/// `knst_byte5: true` and `disposition: silent_control` (12 is among them, and has its own
+/// action). Pinned against that file by a test, so a type added there and not here reddens.
+pub const SILENT_CONTROL_TYPES: [u8; 7] = [12, 13, 14, 25, 26, 27, 29];
+
+/// Whether `content_type` in byte 5 makes a control frame silent.
+pub fn is_silent_control(content_type: u8) -> bool {
+    SILENT_CONTROL_TYPES.contains(&content_type)
+}
+
 /// A parsed frame. The payload is borrowed from the plaintext.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame<'a> {
@@ -127,6 +138,27 @@ mod tests {
             );
             assert_eq!(body.as_deref(), case["body"].as_str(), "{name}: body");
         }
+    }
+
+    /// The silent set is exactly what the cross-client table says: framed in byte 5 and
+    /// `silent_control`. Mutation: drop 29 from the set, or add 1 — this reddens.
+    #[test]
+    fn the_silent_set_is_the_tables() {
+        let text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/conformance/knst_content_types.json"
+        ));
+        let root: serde_json::Value = serde_json::from_str(text).expect("table parses");
+        let mut table: Vec<u8> = root["types"]
+            .as_array()
+            .expect("types")
+            .iter()
+            .filter(|row| row["knst_byte5"] == true && row["disposition"] == "silent_control")
+            .map(|row| row["value"].as_u64().unwrap() as u8)
+            .collect();
+        table.sort_unstable();
+        assert!(table.len() >= 5, "table looks truncated");
+        assert_eq!(table, SILENT_CONTROL_TYPES.to_vec());
     }
 
     fn uuid_string(b: &[u8; 16]) -> String {

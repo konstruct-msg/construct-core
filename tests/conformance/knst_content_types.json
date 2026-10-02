@@ -1,0 +1,226 @@
+{
+  "$schema_version": 1,
+  "$authority": "core/envelope.proto :: shared.proto.core.v1.ContentType",
+  "$spec": "construct-docs/architecture/WIRE_FORMAT.md",
+  "$decision": "construct-docs/decisions/wire-format-one-authority.md",
+  "$purpose": [
+    "Every client that speaks this protocol classifies a content type before it does anything",
+    "with the payload: transcript or control, which handler, whether a sealed envelope may name",
+    "it out loud. Until 2026-08-23 each client carried that classification in its own switch, and",
+    "the two had already drifted — iOS treated {12,14,21,23,24,25,26} as control while the TUI",
+    "treated {12,13,14,25,26} as silent, because the two lists were answering different questions",
+    "nobody had written down. Divergence here does not fail loudly: a message renders as a bubble",
+    "on one client and vanishes on the other, and it surfaces weeks later as 'the phone shows",
+    "something the terminal does not'.",
+    "This file is the answer, and every client must have a test that reads it. A new content type",
+    "is added here in the same change as the proto; the client that has not learned it goes red."
+  ],
+  "$fields": {
+    "value": "the enum number; the authority for it is envelope.proto, this file must not disagree",
+    "name": "the enum name in envelope.proto",
+    "knst_byte5": "may this value appear in KNST frame byte 5 (i.e. inside the ciphertext)",
+    "disposition": "transcript_incoming | transcript_own_device | silent_control | not_carried",
+    "routing_kind": "what a client's contentType -> routing-kind mapping must return",
+    "session_control_op": "PING | READY | RESET_INIT | END | null — the SessionControl op it denotes",
+    "framed_side_channel": "call_signal | delivery_receipt | contact_card | profile | null — handler for a framed payload",
+    "sealed_inner_content_type": "may SealedInner.content_type carry this value (0 means absent)"
+  },
+  "$notes": {
+    "disposition": [
+      "silent_control — must NEVER reach the transcript. A bubble here is a user-visible defect;",
+      "  __session_reset_notify__ spent four months writing itself into transcripts this way.",
+      "transcript_own_device — belongs in the transcript as a SENT bubble, not an incoming one.",
+      "not_carried — never framed by any current producer. A client that receives one has met a",
+      "  peer it does not understand; it must not guess, and it must not crash."
+    ],
+    "sealed_inner_content_type": [
+      "Only 0, 21 and 24 may appear. 0 is proto3 absence — the generic baseline. 21 is sent when",
+      "the ratchet may be unusable, so it cannot ride inside it; 24 says 'archive the session you",
+      "hold', and reading that from inside the ciphertext would require establishing the session",
+      "that is being archived. Everything else moved into byte 5 precisely so the server stopped",
+      "seeing it — putting one back on SealedInner undoes that, silently."
+    ]
+  },
+  "types": [
+    {
+      "value": 0,
+      "name": "CONTENT_TYPE_UNSPECIFIED",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": true
+    },
+    {
+      "value": 1,
+      "name": "CONTENT_TYPE_E2EE_SIGNAL",
+      "knst_byte5": true,
+      "disposition": "transcript_incoming",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 2,
+      "name": "CONTENT_TYPE_E2EE_MLS",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 10,
+      "name": "CONTENT_TYPE_WEBRTC_SIGNAL",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 11,
+      "name": "CONTENT_TYPE_PRESENCE",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 12,
+      "name": "CONTENT_TYPE_CALL_SIGNAL",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": "call_signal",
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 13,
+      "name": "CONTENT_TYPE_HEARTBEAT",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 14,
+      "name": "CONTENT_TYPE_DELIVERY_RECEIPT",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": "delivery_receipt",
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 20,
+      "name": "CONTENT_TYPE_KEY_EXCHANGE",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 21,
+      "name": "CONTENT_TYPE_SESSION_RESET",
+      "knst_byte5": false,
+      "disposition": "silent_control",
+      "routing_kind": "CONTROL_MESSAGE",
+      "session_control_op": "END",
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 22,
+      "name": "CONTENT_TYPE_KEY_SYNC",
+      "knst_byte5": false,
+      "disposition": "not_carried",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 23,
+      "name": "CONTENT_TYPE_SENDER_SYNC",
+      "knst_byte5": true,
+      "disposition": "transcript_own_device",
+      "routing_kind": "SENDER_SYNC",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 24,
+      "name": "CONTENT_TYPE_SESSION_RESET_INIT",
+      "knst_byte5": false,
+      "disposition": "silent_control",
+      "routing_kind": "SESSION_RESET_INIT",
+      "session_control_op": "RESET_INIT",
+      "framed_side_channel": null,
+      "sealed_inner_content_type": true
+    },
+    {
+      "value": 25,
+      "name": "CONTENT_TYPE_SESSION_PING",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": "PING",
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 26,
+      "name": "CONTENT_TYPE_SESSION_READY",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": "READY",
+      "framed_side_channel": null,
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 27,
+      "name": "CONTENT_TYPE_CONTACT_CARD",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": "contact_card",
+      "sealed_inner_content_type": false
+    },
+    {
+      "value": 28,
+      "name": "CONTENT_TYPE_DECRYPTION_ERROR",
+      "knst_byte5": false,
+      "disposition": "silent_control",
+      "routing_kind": "CONTROL_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": null,
+      "sealed_inner_content_type": true
+    },
+    {
+      "value": 29,
+      "name": "CONTENT_TYPE_PROFILE",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "DIRECT_MESSAGE",
+      "session_control_op": null,
+      "framed_side_channel": "profile",
+      "sealed_inner_content_type": false
+    }
+  ]
+}
