@@ -809,6 +809,10 @@ interface CfeAction {
     ScheduleTimer(string timer_id, u64 delay_ms);
     CancelTimer(string timer_id);
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
+    /// A silent control frame other than a call signal (13, 14, 25, 26, 27, 29), named by byte 5
+    /// of its KNST frame; `body` is without the header. Never a chat message: handle by
+    /// `content_type` and record the message processed.
+    ControlFrameDecrypted(string contact_id, string message_id, u8 content_type, bytes body);
     /// Platform must query its persistent ACK store for `message_id` and reply with `AckDbResult`.
     CheckAckInDb(string message_id);
 };

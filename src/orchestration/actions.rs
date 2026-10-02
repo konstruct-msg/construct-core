@@ -60,6 +60,18 @@ pub enum Action {
         proto_bytes: Vec<u8>,
     },
 
+    /// A silent control frame other than a call signal — delivery receipt (14), heartbeat (13),
+    /// contact card (27), profile (29), and the retired ping/ready (25/26) — named by byte 5 of
+    /// its KNST frame. `body` is the frame's body, without the header. Never a chat message:
+    /// nothing to notify and nothing for the transcript; the platform handles the body by
+    /// `content_type` and records the message processed.
+    ControlFrameDecrypted {
+        contact_id: String,
+        message_id: String,
+        content_type: u8,
+        body: Vec<u8>,
+    },
+
     /// Open a new session with `contact_id` — a device — as INITIATOR, over the one held: fetch
     /// that device's bundle and answer with `IncomingEvent::SessionBundleFetched` (or
     /// `SessionBundleUnavailable`). The core reopens inside the event, keeps the held state as a
