@@ -2891,17 +2891,9 @@ mod tests {
 
     // ── What a decrypted message becomes (TODO 94) ─────────────────────────────
 
-    /// A KNST control frame as the clients write it (`knst_frame.json` layout).
+    /// A KNST control frame, as `knst::frame_whole` writes it.
     fn control_frame(content_type: u8, body: &[u8]) -> Vec<u8> {
-        let mut frame = crate::knst::MAGIC.to_vec();
-        frame.push(crate::knst::VERSION);
-        frame.push(content_type);
-        frame.extend_from_slice(&[0x5a; 16]);
-        frame.extend_from_slice(&0u16.to_be_bytes());
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        frame.extend_from_slice(body);
-        frame
+        crate::knst::frame_whole(body, content_type, &[0x5a; 16]).unwrap()
     }
 
     const SIGNAL: &[u8] = b"\x0a\x06call-1";

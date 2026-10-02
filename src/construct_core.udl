@@ -34,6 +34,18 @@ namespace construct_core {
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
+    // KNST plaintext frame — the header every message body is framed with before encryption.
+    // The core's, since 0.31; vectors: construct-protos/conformance/knst_frame.json.
+    /// `payload` split into frames of at most 3770 bytes, each carrying the whole body's length;
+    /// an empty body is one frame. Null when it needs more than 256 frames, or `message_id` is not
+    /// a UUID.
+    sequence<bytes>? knst_encode_chunks(bytes payload, u8 content_type, string message_id);
+    /// One frame holding the whole payload — a control carrier, never split. Null when
+    /// `message_id` is not a UUID.
+    bytes? knst_frame_whole(bytes payload, u8 content_type, string message_id);
+    /// The header and payload of a frame; null when `frame` is not one (magic, version, length).
+    KnstFrame? knst_parse(bytes frame);
+
     /// Whether to open a session with a device now.
     ///
     /// Called at the moment a client wants a session and has none it can use. Answering this
@@ -75,6 +87,18 @@ namespace construct_core {
 // Mirrors wire_payload::DecodedWirePayload. `pq_ratchet_field` is the opaque
 // serialized suite-3 field (empty = none); the core translates it to/from the
 // canonical wire encoding so platform SDKs never touch the byte layout.
+/// A parsed KNST frame. `message_id` is the dashed lowercase UUID; `payload` is everything after
+/// the header — for a control frame (`total_chunks == 1`) the body is its first
+/// `plaintext_length` bytes.
+dictionary KnstFrame {
+    u8 content_type;
+    string message_id;
+    u16 chunk_index;
+    u16 total_chunks;
+    u32 plaintext_length;
+    bytes payload;
+};
+
 dictionary WirePayload {
     bytes dh_public_key;        // 32-byte X25519 ephemeral public key
     u32 message_number;
