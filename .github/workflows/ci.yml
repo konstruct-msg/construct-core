@@ -294,7 +294,9 @@ jobs:
 
           ## Which build is this
           The rolling `latest` release republishes one fixed filename on every
-          push to main, so the name tells you nothing. The library says:
+          push to main, so the name tells you nothing. Every push to main is
+          also published once, for good, under the tag `v<stamp>` — that is
+          the one to pin. The library says:
 
           ```
           strings -a libconstruct_core.so | grep -o 'CONSTRUCT_CORE_VERSION=.*'
@@ -318,8 +320,11 @@ jobs:
           retention-days: 7
 
   # ── 4. Release ────────────────────────────────────────────────────────────
-  # Publishes two kinds of releases:
+  # Publishes three kinds of releases:
   #   * Tagged release (`release` event)   — versioned (e.g. `v0.9.1`), full release.
+  #   * Pinned pre-release (`push` to main or `workflow_dispatch`) — tag `v<stamp>`
+  #     (`v0.28.0+<12-char commit>`), created once per build and never moved: what a
+  #     client lock names. See "Pinned release" below.
   #   * Rolling pre-release (`push` to main or `workflow_dispatch`) — single fixed
   #     tag `latest`, force-updated on every run. Gives integrators a stable URL:
   #       https://github.com/<owner>/construct-core/releases/download/latest/construct-core-android.tar.gz
@@ -409,6 +414,55 @@ jobs:
           # softprops/action-gh-release@v2 supports this via `files:` replacement
           # when the release already exists; combined with the fixed tag, this
           # gives integrators a never-changing download URL for the latest build.
+          files: |
+            release/construct-core-ios-bindings.tar.gz
+            release/construct-core-android.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Pinned release: one per build, never moved ──────────────────────────
+      # `latest` is republished on every push to main — a docs commit included —
+      # so it names no particular build, and Android's `construct-core.lock`
+      # names exactly one (`<version>+<commit>`, the library's own stamp). A
+      # build that cannot fetch the core its lock names cannot run in CI. This
+      # release is that core, under a tag that *is* the stamp: `v` + the stamp,
+      # read from the arm64 library about to ship, not recomputed — so the tag
+      # cannot say something the library does not.
+      #
+      # Created once and never touched again: a rerun on the same commit finds
+      # the tag and leaves it, so what a lock pointed at stays what it fetches.
+      - name: Resolve pinned tag
+        if: github.event_name != 'release'
+        id: pinned
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          stamp=$(strings -a release/android/jniLibs/arm64-v8a/libconstruct_core.so \
+                  | grep -o -m1 'CONSTRUCT_CORE_VERSION=.*' | cut -d= -f2)
+          if [ -z "$stamp" ]; then
+            echo "::error::arm64 library carries no stamp — no pinned release"
+            exit 1
+          fi
+          tag="v${stamp}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$tag already published — left as it is"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          sed "s|/download/latest/|/download/${tag}/|g; s|\`latest\`|\`${tag}\`|" release/notes.md > release/pinned-notes.md
+
+      - name: Publish pinned release
+        if: github.event_name != 'release' && steps.pinned.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pinned.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.pinned.outputs.tag }}
+          body_path: release/pinned-notes.md
+          prerelease: true
+          make_latest: false
           files: |
             release/construct-core-ios-bindings.tar.gz
             release/construct-core-android.tar.gz

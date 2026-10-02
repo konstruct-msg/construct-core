@@ -110,6 +110,16 @@ curl -L -o construct-core-android.tar.gz \
 tar -xzf construct-core-android.tar.gz
 ```
 
+`latest` moves with every push, a docs commit included, so it is for trying the
+newest core, not for a build that must be reproducible. Each push to `main` is
+also published once, never moved, under the tag `v` + the library's own stamp —
+the value in construct-android's `construct-core.lock`. Encode the `+` as `%2B`:
+
+```bash
+curl -L -o construct-core-android.tar.gz \
+  https://github.com/konstruct-msg/construct-core/releases/download/v0.28.0%2B<12-char commit>/construct-core-android.tar.gz
+```
+
 What's inside:
 
 ```
