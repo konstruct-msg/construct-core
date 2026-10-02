@@ -1,0 +1,92 @@
+{
+  "_doc": "KNST plaintext frame (30-byte header, big-endian). is_frame: magic KNST, version 1, at least 30 bytes. control: total_chunks == 1 and plaintext_length <= payload length; body = the first plaintext_length bytes of the payload. Checked by check_knst_frame.py.",
+  "cases": [
+    {
+      "name": "call_signal",
+      "frame": "4b4e5354010c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000080a0663616c6c2d31",
+      "is_frame": true,
+      "content_type": 12,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "plaintext_length": 8,
+      "control": true,
+      "body": "0a0663616c6c2d31"
+    },
+    {
+      "name": "profile",
+      "frame": "4b4e5354011d0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000070a05416c696365",
+      "is_frame": true,
+      "content_type": 29,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "plaintext_length": 7,
+      "control": true,
+      "body": "0a05416c696365"
+    },
+    {
+      "name": "empty_body",
+      "frame": "4b4e5354010e0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f0000000100000000",
+      "is_frame": true,
+      "content_type": 14,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "plaintext_length": 0,
+      "control": true,
+      "body": ""
+    },
+    {
+      "name": "padded_body_is_cut_to_length",
+      "frame": "4b4e5354010c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000080a0663616c6c2d31000000",
+      "is_frame": true,
+      "content_type": 12,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "plaintext_length": 8,
+      "control": true,
+      "body": "0a0663616c6c2d31"
+    },
+    {
+      "name": "chunk_of_two_is_not_control",
+      "frame": "4b4e535401010b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f000000020000000870617274206f6e65",
+      "is_frame": true,
+      "content_type": 1,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 2,
+      "plaintext_length": 8,
+      "control": false,
+      "body": null
+    },
+    {
+      "name": "length_past_payload_is_not_control",
+      "frame": "4b4e5354010c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000090a0663616c6c2d31",
+      "is_frame": true,
+      "content_type": 12,
+      "message_id": "0b8e2f5c-6a1d-4e7b-9c3f-1a2b3c4d5e6f",
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "plaintext_length": 9,
+      "control": false,
+      "body": null
+    },
+    {
+      "name": "wrong_magic",
+      "frame": "4b4e5355010c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000080a0663616c6c2d31",
+      "is_frame": false
+    },
+    {
+      "name": "wrong_version",
+      "frame": "4b4e5354020c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000080a0663616c6c2d31",
+      "is_frame": false
+    },
+    {
+      "name": "truncated_header",
+      "frame": "4b4e5354010c0b8e2f5c6a1d4e7b9c3f1a2b3c4d5e6f00000001000000",
+      "is_frame": false
+    }
+  ]
+}

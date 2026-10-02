@@ -2689,34 +2689,7 @@ impl Orchestrator {
                 content_type,
             } => {
                 let mut all = actions;
-                if content_type == 12 {
-                    // CALL_SIGNAL: return raw proto bytes, no chat notification.
-                    all.push(Action::CallSignalDecrypted {
-                        contact_id: cid,
-                        message_id: mid,
-                        proto_bytes: plaintext,
-                    });
-                } else {
-                    // content_type 13 (HEARTBEAT) and 14 (DELIVERY_RECEIPT) are silent
-                    // control payloads — no push notification, just decrypt and let Swift handle.
-                    //
-                    // Privacy note: decrypting ct=13/14 DOES advance the Double Ratchet chain
-                    // (receiving_chain_length, possibly last_ratchet_at on a DH ratchet step).
-                    // This is intentional — heartbeats must exercise the real DR path so session
-                    // health is accurately reflected.  last_ratchet_at is local-only and is never
-                    // transmitted to the server, so these decrypts do not leak timing metadata.
-                    if content_type != 13 && content_type != 14 {
-                        all.push(Action::NotifyNewMessage {
-                            chat_id: cid.clone(),
-                            preview: preview(&plaintext),
-                        });
-                    }
-                    all.push(Action::MessageDecrypted {
-                        contact_id: cid,
-                        message_id: mid,
-                        plaintext,
-                    });
-                }
+                all.extend(decrypted_actions(cid, mid, plaintext, content_type));
                 all
             }
             RoutingDecision::NeedSessionInit {
@@ -2847,11 +2820,146 @@ fn decrypt_failed(reason: String) -> Action {
     }
 }
 
+/// What a decrypted message becomes.
+///
+/// A call signal is recognised by its type in the KNST frame as well as by the envelope's: a
+/// sealed envelope says GENERIC, and the real type is only in byte 5 of the decrypted frame.
+/// Until 0.29 only the envelope's was read, so every sealed call signal — and iOS seals them all —
+/// left here as `MessageDecrypted`, and each client looked inside the frame itself (iOS
+/// `handleFramedSideChannel`, Android `onDecrypted`; without that branch Android lost every call
+/// from iOS). The body handed over is the frame's, not the frame. TODO 94.
+///
+/// Content types 13 and 14 are silent control payloads — no notification. Decrypting them does
+/// advance the Double Ratchet chain (receiving_chain_length, possibly last_ratchet_at on a DH
+/// step): heartbeats must exercise the real path so session health is accurate, and
+/// last_ratchet_at is local-only, never sent to the server.
+fn decrypted_actions(
+    contact_id: String,
+    message_id: String,
+    plaintext: Vec<u8>,
+    content_type: u8,
+) -> Vec<Action> {
+    let framed_call_signal = crate::knst::control_frame(&plaintext)
+        .filter(|(framed, _)| *framed == crate::knst::CONTENT_TYPE_CALL_SIGNAL)
+        .map(|(_, body)| body.to_vec());
+    if let Some(proto_bytes) = framed_call_signal {
+        return vec![Action::CallSignalDecrypted {
+            contact_id,
+            message_id,
+            proto_bytes,
+        }];
+    }
+    if content_type == crate::knst::CONTENT_TYPE_CALL_SIGNAL {
+        // An identified envelope whose body is the signal itself, unframed.
+        return vec![Action::CallSignalDecrypted {
+            contact_id,
+            message_id,
+            proto_bytes: plaintext,
+        }];
+    }
+    let mut actions = Vec::new();
+    if content_type != 13 && content_type != 14 {
+        actions.push(Action::NotifyNewMessage {
+            chat_id: contact_id.clone(),
+            preview: preview(&plaintext),
+        });
+    }
+    actions.push(Action::MessageDecrypted {
+        contact_id,
+        message_id,
+        plaintext,
+    });
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
+
+    // ── What a decrypted message becomes (TODO 94) ─────────────────────────────
+
+    /// A KNST control frame as the clients write it (`knst_frame.json` layout).
+    fn control_frame(content_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut frame = crate::knst::MAGIC.to_vec();
+        frame.push(crate::knst::VERSION);
+        frame.push(content_type);
+        frame.extend_from_slice(&[0x5a; 16]);
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    const SIGNAL: &[u8] = b"\x0a\x06call-1";
+    /// The content type a sealed envelope carries: absent, the generic baseline.
+    const SEALED: u8 = 0;
+
+    /// The defect: a sealed call signal (every one iOS sends) said GENERIC on the envelope and
+    /// left as `MessageDecrypted`, with a notification. Mutation: read only `content_type` again
+    /// — this reddens.
+    #[test]
+    fn a_sealed_call_signal_is_named_by_its_frame() {
+        let actions =
+            decrypted_actions("dev".into(), "m".into(), control_frame(12, SIGNAL), SEALED);
+        assert_eq!(
+            actions,
+            vec![Action::CallSignalDecrypted {
+                contact_id: "dev".into(),
+                message_id: "m".into(),
+                proto_bytes: SIGNAL.to_vec(),
+            }],
+            "the frame's body alone, and nothing that would notify or reach the transcript"
+        );
+    }
+
+    /// An identified envelope of type 12 whose body is the signal itself still reads as one.
+    #[test]
+    fn an_identified_unframed_call_signal_is_still_one() {
+        let actions = decrypted_actions("dev".into(), "m".into(), SIGNAL.to_vec(), 12);
+        assert_eq!(
+            actions,
+            vec![Action::CallSignalDecrypted {
+                contact_id: "dev".into(),
+                message_id: "m".into(),
+                proto_bytes: SIGNAL.to_vec(),
+            }]
+        );
+    }
+
+    /// Anything else framed is a message as before — the frame is handed over whole.
+    #[test]
+    fn a_framed_message_is_still_a_message() {
+        let frame = control_frame(1, b"hello");
+        let actions = decrypted_actions("dev".into(), "m".into(), frame.clone(), SEALED);
+        assert!(matches!(
+            actions.first(),
+            Some(Action::NotifyNewMessage { .. })
+        ));
+        assert_eq!(
+            actions.last(),
+            Some(&Action::MessageDecrypted {
+                contact_id: "dev".into(),
+                message_id: "m".into(),
+                plaintext: frame
+            })
+        );
+    }
+
+    /// A chunk of a split message is not a control frame, whatever its byte 5 says.
+    #[test]
+    fn a_chunk_naming_call_signal_is_not_taken_for_one() {
+        let mut frame = control_frame(12, SIGNAL);
+        frame[24..26].copy_from_slice(&2u16.to_be_bytes());
+        let actions = decrypted_actions("dev".into(), "m".into(), frame, SEALED);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, Action::CallSignalDecrypted { .. }))
+        );
+    }
 
     fn make_orchestrator(user_id: &str) -> Orchestrator {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
