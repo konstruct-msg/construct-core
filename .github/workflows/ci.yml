@@ -256,6 +256,32 @@ jobs:
             echo "$abi: $stamp"
           done
 
+      # The same library for the machine running the client's JVM unit tests:
+      # Android's tests load it through JNA, so the code they check is this
+      # build's, not a Kotlin stand-in. Same features as the .so it ships with.
+      # Laid out under JNA's own resource prefix (`linux-x86-64/`), so a test
+      # classpath that includes `host/` finds it with no path set.
+      - name: Build host library (linux-x86-64) for JVM tests
+        working-directory: construct-core
+        run: |
+          cargo build --release --features android
+          mkdir -p ../android-out/host/linux-x86-64
+          cp target/release/libconstruct_core.so ../android-out/host/linux-x86-64/
+
+      - name: The host library carries the same stamp
+        run: |
+          version=$(grep -m1 '^version' construct-core/Cargo.toml | cut -d'"' -f2)
+          expected="CONSTRUCT_CORE_VERSION=${version}+$(echo "$GITHUB_SHA" | cut -c1-12)"
+          stamp=$(strings -a android-out/host/linux-x86-64/libconstruct_core.so \
+                  | grep -o -m1 'CONSTRUCT_CORE_VERSION=.*') || true
+          if [ "$stamp" != "$expected" ]; then
+            echo "::error::linux-x86-64 host library stamp is not the build that produced it"
+            echo "  expected: $expected"
+            echo "  got:      $stamp"
+            exit 1
+          fi
+          echo "linux-x86-64: $stamp"
+
       # UniFFI library-mode binding generation — the arm64 .so is the
       # canonical artifact (all ABIs share one UDL, so bindings are identical).
       - name: Generate Kotlin bindings
@@ -288,6 +314,13 @@ jobs:
              crypto package (e.g. `app/src/main/java/.../crypto/`).
           3. Build the app — no other Gradle changes required.
 
+          ## Host libraries (JVM unit tests)
+          `host/darwin-aarch64/libconstruct_core.dylib` and
+          `host/linux-x86-64/libconstruct_core.so` are the same build for the
+          machine running `./gradlew test`, under JNA's resource prefixes: put
+          `host/` on the test classpath and the bindings load them by name.
+          Never packaged into the app.
+
           ## Features compiled in
           - `android` (UniFFI Kotlin bindings, construct-veil transport)
           - `post-quantum` (Kyber-768 OTPK, ML-DSA signing)
@@ -319,6 +352,64 @@ jobs:
           path: android-out/
           retention-days: 7
 
+  # ── 3b. Host library for macOS (Apple Silicon) JVM unit tests ─────────────
+  # The Android archive's `host/darwin-aarch64/` — what Android's unit tests
+  # load on a developer's Mac. Built with the Android features, so it is the
+  # library the app ships for another CPU, not the iOS/mac flavour.
+  build-host-mac:
+    name: Host library (darwin-aarch64)
+    runs-on: macos-14
+    needs: test
+    steps:
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          path: construct-core
+
+      - name: Install pinned Rust toolchain
+        working-directory: construct-core
+        run: rustup show
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            construct-core/target/
+          key: macos-cargo-host-${{ hashFiles('construct-core/Cargo.lock') }}
+          restore-keys: macos-cargo-host-
+
+      - name: Build host library
+        working-directory: construct-core
+        run: |
+          cargo build --release --features android --target aarch64-apple-darwin
+          mkdir -p ../host-out/darwin-aarch64
+          cp target/aarch64-apple-darwin/release/libconstruct_core.dylib ../host-out/darwin-aarch64/
+
+      - name: The host library carries the same stamp
+        run: |
+          version=$(grep -m1 '^version' construct-core/Cargo.toml | cut -d'"' -f2)
+          expected="CONSTRUCT_CORE_VERSION=${version}+$(echo "$GITHUB_SHA" | cut -c1-12)"
+          stamp=$(strings -a host-out/darwin-aarch64/libconstruct_core.dylib \
+                  | grep -o -m1 'CONSTRUCT_CORE_VERSION=.*') || true
+          if [ "$stamp" != "$expected" ]; then
+            echo "::error::darwin-aarch64 host library stamp is not the build that produced it"
+            echo "  expected: $expected"
+            echo "  got:      $stamp"
+            exit 1
+          fi
+          echo "darwin-aarch64: $stamp"
+
+      - name: Upload host library
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-darwin-${{ github.sha }}
+          path: host-out/
+          retention-days: 7
+
   # ── 4. Release ────────────────────────────────────────────────────────────
   # Publishes three kinds of releases:
   #   * Tagged release (`release` event)   — versioned (e.g. `v0.9.1`), full release.
@@ -332,7 +423,7 @@ jobs:
   release:
     name: Upload Release Assets
     runs-on: ubuntu-latest
-    needs: [build-ios, build-android]
+    needs: [build-ios, build-android, build-host-mac]
     if: |
       github.event_name == 'release' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -350,6 +441,13 @@ jobs:
         with:
           name: android-${{ github.sha }}
           path: release/android/
+
+      # Into the Android archive, beside the linux host library: one download,
+      # one stamp, everything an Android checkout needs to build and test.
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-darwin-${{ github.sha }}
+          path: release/android/host/
 
       - name: Create archives
         run: |
@@ -397,8 +495,9 @@ jobs:
           \`\`\`
 
           The Android archive contains \`libconstruct_core.so\` for
-          \`arm64-v8a\`, \`armeabi-v7a\`, and \`x86_64\` plus auto-generated
-          Kotlin UniFFI bindings.
+          \`arm64-v8a\`, \`armeabi-v7a\`, and \`x86_64\`, auto-generated
+          Kotlin UniFFI bindings, and the same build for the host running JVM
+          unit tests (\`host/darwin-aarch64\`, \`host/linux-x86-64\`).
 
           Related repository: [construct-veil](https://github.com/${{ github.repository_owner }}/construct-veil)
           EOF
