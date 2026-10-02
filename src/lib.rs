@@ -54,6 +54,7 @@ pub mod device_id;
 pub mod error;
 pub mod history;
 pub mod intake;
+pub mod knst;
 pub mod orchestration;
 pub mod pow;
 pub mod storage;
