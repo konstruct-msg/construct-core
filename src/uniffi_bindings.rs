@@ -2962,6 +2962,45 @@ pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> O
     crate::crypto::recovery::compute_safety_number(&my_device_id, &their_device_id)
 }
 
+// ── KNST frame ────────────────────────────────────────────────────────────────
+
+/// See the UDL `KnstFrame`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnstFrame {
+    pub content_type: u8,
+    pub message_id: String,
+    pub chunk_index: u16,
+    pub total_chunks: u16,
+    pub plaintext_length: u32,
+    pub payload: Vec<u8>,
+}
+
+pub fn knst_encode_chunks(
+    payload: Vec<u8>,
+    content_type: u8,
+    message_id: String,
+) -> Option<Vec<Vec<u8>>> {
+    let id = crate::knst::message_id_bytes(&message_id)?;
+    crate::knst::encode_chunks(&payload, content_type, &id)
+}
+
+pub fn knst_frame_whole(payload: Vec<u8>, content_type: u8, message_id: String) -> Option<Vec<u8>> {
+    let id = crate::knst::message_id_bytes(&message_id)?;
+    crate::knst::frame_whole(&payload, content_type, &id)
+}
+
+pub fn knst_parse(frame: Vec<u8>) -> Option<KnstFrame> {
+    let f = crate::knst::Frame::parse(&frame)?;
+    Some(KnstFrame {
+        content_type: f.content_type,
+        message_id: crate::knst::message_id_string(&f.message_id),
+        chunk_index: f.chunk_index,
+        total_chunks: f.total_chunks,
+        plaintext_length: f.plaintext_length,
+        payload: f.payload.to_vec(),
+    })
+}
+
 // ── Post-Quantum KEM Namespace Functions ─────────────────────────────────────
 
 /// Encapsulate to an ML-KEM-1024 public key — history transfer to a peer's Kyber SPK. The
