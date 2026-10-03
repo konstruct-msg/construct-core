@@ -34,7 +34,7 @@ jobs:
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/konstruct-root
           file "$BIN"
-          file "$BIN" | grep -q "statically linked"
+          file "$BIN" | grep -Eq "statically linked|static-pie linked"
           "$BIN" --version
           cp "$BIN" konstruct-root
           sha256sum konstruct-root | tee konstruct-root.sha256
