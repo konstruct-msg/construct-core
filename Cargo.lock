@@ -533,7 +533,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "construct-core"
-version = "0.31.0"
+version = "0.31.1"
 dependencies = [
  "argon2",
  "base64",
@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "construct-veil"
 version = "3.5.0"
-source = "git+https://github.com/konstruct-msg/construct-veil?rev=21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b#21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b"
+source = "git+https://github.com/konstruct-msg/construct-veil?rev=40127fa937d8e43fd39c48639848d9527159adad#40127fa937d8e43fd39c48639848d9527159adad"
 dependencies = [
  "async-trait",
  "base64",
@@ -620,7 +620,7 @@ dependencies = [
 [[package]]
 name = "construct-veil-protocol"
 version = "3.5.0"
-source = "git+https://github.com/konstruct-msg/construct-veil?rev=21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b#21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b"
+source = "git+https://github.com/konstruct-msg/construct-veil?rev=40127fa937d8e43fd39c48639848d9527159adad#40127fa937d8e43fd39c48639848d9527159adad"
 dependencies = [
  "bytes",
  "ed25519-dalek",
