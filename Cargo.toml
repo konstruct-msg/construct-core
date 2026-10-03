@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.31.0"
+version = "0.31.1"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -106,7 +106,7 @@ uniffi = { version = "0.30", features = ["build"], optional = true }
 # The local store every client keeps — exported through this library's UDL on the platform
 # features; the Tauri desktops and the TUI depend on it directly.
 construct-store = { path = "store", optional = true }
-construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "21c06bd80e3d12b6b02b0290ebf84a9fb3b1460b", features = ["ffi"], optional = true }
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "40127fa937d8e43fd39c48639848d9527159adad", features = ["ffi"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
