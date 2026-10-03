@@ -239,6 +239,151 @@ fn consistency_reconstruct(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// A bundle's proofs, judged — what a client asks (decisions/server-keys-rooted-offline-and-hybrid.md)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Leaf domain of a device's X25519 identity key.
+pub const LEAF_IDENTITY: u8 = 0x00;
+/// Leaf domain of a device's hybrid (Ed25519 ‖ ML-DSA-65) identity key.
+pub const LEAF_HYBRID: u8 = 0x02;
+
+/// `SHA-256(domain ‖ device_id ‖ key)` — the leaf key-service appends.
+pub fn leaf_hash(domain: u8, device_id: &str, key: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([domain]);
+    h.update(device_id.as_bytes());
+    h.update(key);
+    h.finalize().into()
+}
+
+/// What the Ed25519 tree-head signature covers: `"ConstructKT-v1" ‖ BE64(size) ‖ root`.
+pub fn tree_head_signable(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
+    let mut buf = b"ConstructKT-v1".to_vec();
+    buf.extend_from_slice(&tree_size.to_be_bytes());
+    buf.extend_from_slice(root);
+    buf
+}
+
+/// An inclusion proof as a bundle carries it. UDL `dictionary KtInclusionProof`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KtInclusionProof {
+    pub leaf_index: u64,
+    pub tree_size: u64,
+    pub root_hash: Vec<u8>,
+    pub proof_hashes: Vec<Vec<u8>>,
+    /// Ed25519 over `tree_head_signable` — the head before delegated keys.
+    pub tree_head_signature: Vec<u8>,
+}
+
+/// The tree head a bundle's proofs are relative to, signed by a delegated key. UDL
+/// `dictionary KtSignedTreeHead`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KtSignedTreeHead {
+    pub tree_size: u64,
+    pub root_hash: Vec<u8>,
+    pub kid: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// What a client concludes from one proof. UDL `enum KtVerdict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KtVerdict {
+    Verified,
+    /// No key to check the head with yet — not evidence of anything.
+    Unavailable,
+    MalformedProof,
+    /// The key is not where the proof says, or the proof is not of the signed head.
+    InclusionProofInvalid,
+    SignatureInvalid,
+}
+
+/// Judge one proof of `key` under `device_id` (leaf `domain`), and the head it is relative to.
+///
+/// The head is judged as a certificate is (`SenderCertificate::check_signature`): with roots
+/// pinned, a delegated `head` decides alone and must name this proof's size and root; without
+/// one the Ed25519 head signature decides until `HYBRID_REQUIRED`; without roots, Ed25519.
+pub fn verify_proof(
+    domain: u8,
+    device_id: &str,
+    key: &[u8],
+    proof: &KtInclusionProof,
+    head: Option<&KtSignedTreeHead>,
+    trust: &crate::crypto::sealed_sender::ServerTrust,
+    now_secs: i64,
+) -> KtVerdict {
+    let Ok(root) = <[u8; 32]>::try_from(proof.root_hash.as_slice()) else {
+        return KtVerdict::MalformedProof;
+    };
+    let Ok(hashes) = proof
+        .proof_hashes
+        .iter()
+        .map(|h| <[u8; 32]>::try_from(h.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return KtVerdict::MalformedProof;
+    };
+    if proof.tree_size == 0 || proof.leaf_index >= proof.tree_size {
+        return KtVerdict::MalformedProof;
+    }
+    let leaf = leaf_hash(domain, device_id, key);
+    if !verify_inclusion_inner(&leaf, &hashes, proof.leaf_index, proof.tree_size, &root) {
+        return KtVerdict::InclusionProofInvalid;
+    }
+
+    #[cfg(feature = "post-quantum")]
+    if trust.ring.has_roots() {
+        use crate::crypto::server_trust::{
+            HYBRID_REQUIRED, Kid, Purpose, TrustError, kt_head_body,
+        };
+        if let Some(head) = head {
+            if head.tree_size != proof.tree_size || head.root_hash != proof.root_hash {
+                return KtVerdict::InclusionProofInvalid;
+            }
+            let Ok(kid) = Kid::try_from(head.kid.as_slice()) else {
+                return KtVerdict::MalformedProof;
+            };
+            let body = kt_head_body(head.tree_size, &root);
+            return match trust.ring.verify(
+                Purpose::KtHead,
+                &kid,
+                &body,
+                &head.signature,
+                now_secs,
+                now_secs,
+            ) {
+                Ok(()) => KtVerdict::Verified,
+                Err(TrustError::UnknownKey) => KtVerdict::Unavailable,
+                Err(_) => KtVerdict::SignatureInvalid,
+            };
+        }
+        if HYBRID_REQUIRED {
+            return KtVerdict::SignatureInvalid;
+        }
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    let _ = (head, now_secs);
+
+    if trust.legacy_keys.is_empty() {
+        return KtVerdict::Unavailable;
+    }
+    let signable = tree_head_signable(proof.tree_size, &root);
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&proof.tree_head_signature) else {
+        return KtVerdict::SignatureInvalid;
+    };
+    let signed = trust.legacy_keys.iter().any(|k| {
+        <[u8; 32]>::try_from(k.as_slice())
+            .ok()
+            .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+            .is_some_and(|vk| ed25519_dalek::Verifier::verify(&vk, &signable, &sig).is_ok())
+    });
+    if signed {
+        KtVerdict::Verified
+    } else {
+        KtVerdict::SignatureInvalid
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Public API (called from UniFFI bindings and server-side code)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -569,5 +714,209 @@ mod tests {
         // "ConstructKT-v1" (14) + 8 + 32 = 54
         assert_eq!(bytes.len(), 54);
         assert!(bytes.starts_with(b"ConstructKT-v1"));
+    }
+
+    // ── verify_proof: a bundle's proofs, judged (decisions/server-keys-rooted-offline-and-hybrid.md) ──
+
+    mod bundle_proofs {
+        use super::super::*;
+        use crate::crypto::sealed_sender::ServerTrust;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const NOW: i64 = 1_800_000_000;
+        const DEVICE: &str = "6f5e37ac00000000000000000000000a";
+        const KEY: [u8; 32] = [7; 32];
+        const HYBRID_KEY: [u8; 4] = [8; 4];
+
+        /// A tree of 6 leaves with the device's identity leaf at 2 and its hybrid leaf at 5, the
+        /// Ed25519 head signed by `ed`.
+        fn tree(ed: &SigningKey) -> (KtInclusionProof, KtInclusionProof, [u8; 32]) {
+            let mut leaves: Vec<[u8; 32]> = (0..6u8).map(|i| sha256(&[i])).collect();
+            leaves[2] = leaf_hash(LEAF_IDENTITY, DEVICE, &KEY);
+            leaves[5] = leaf_hash(LEAF_HYBRID, DEVICE, &HYBRID_KEY);
+            let root = merkle_tree_hash(&leaves);
+            let sig = ed.sign(&tree_head_signable(6, &root)).to_bytes().to_vec();
+            let proof = |i: usize| KtInclusionProof {
+                leaf_index: i as u64,
+                tree_size: 6,
+                root_hash: root.to_vec(),
+                proof_hashes: generate_inclusion_proof_inner(&leaves, i)
+                    .into_iter()
+                    .map(|h| h.to_vec())
+                    .collect(),
+                tree_head_signature: sig.clone(),
+            };
+            (proof(2), proof(5), root)
+        }
+
+        fn legacy(ed: &SigningKey) -> ServerTrust {
+            ServerTrust::with_legacy_keys(vec![ed.verifying_key().to_bytes().to_vec()])
+        }
+
+        #[test]
+        fn a_leaf_under_a_signed_head_is_verified() {
+            let ed = SigningKey::from_bytes(&[9; 32]);
+            let (id, hy, _) = tree(&ed);
+            let t = legacy(&ed);
+            assert_eq!(
+                verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, None, &t, NOW),
+                KtVerdict::Verified
+            );
+            assert_eq!(
+                verify_proof(LEAF_HYBRID, DEVICE, &HYBRID_KEY, &hy, None, &t, NOW),
+                KtVerdict::Verified
+            );
+        }
+
+        /// Mutation: hash the leaf without its domain byte, or skip the reconstruction — a line reddens.
+        #[test]
+        fn another_key_or_the_wrong_leaf_kind_is_not_in_the_tree() {
+            let ed = SigningKey::from_bytes(&[9; 32]);
+            let (id, hy, _) = tree(&ed);
+            let t = legacy(&ed);
+            assert_eq!(
+                verify_proof(LEAF_IDENTITY, DEVICE, &[6; 32], &id, None, &t, NOW),
+                KtVerdict::InclusionProofInvalid
+            );
+            assert_eq!(
+                verify_proof(LEAF_IDENTITY, DEVICE, &HYBRID_KEY, &hy, None, &t, NOW),
+                KtVerdict::InclusionProofInvalid
+            );
+        }
+
+        #[test]
+        fn a_head_signed_by_another_key_or_no_key_at_all() {
+            let ed = SigningKey::from_bytes(&[9; 32]);
+            let (id, _, _) = tree(&ed);
+            let other = legacy(&SigningKey::from_bytes(&[10; 32]));
+            assert_eq!(
+                verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, None, &other, NOW),
+                KtVerdict::SignatureInvalid
+            );
+            assert_eq!(
+                verify_proof(
+                    LEAF_IDENTITY,
+                    DEVICE,
+                    &KEY,
+                    &id,
+                    None,
+                    &ServerTrust::default(),
+                    NOW
+                ),
+                KtVerdict::Unavailable
+            );
+            let mut short = id.clone();
+            short.root_hash.pop();
+            assert_eq!(
+                verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &short, None, &legacy(&ed), NOW),
+                KtVerdict::MalformedProof
+            );
+        }
+
+        #[cfg(feature = "post-quantum")]
+        mod delegated_head {
+            use super::*;
+            use crate::crypto::server_trust::{
+                Purpose, ServerKeyRing, issue_delegation, kid_of, kt_head_body, sign_as_server,
+            };
+            use crate::crypto::suites::hybrid::hybrid_signature_keypair_from_seeds;
+
+            fn rooted(ed: &SigningKey) -> (ServerTrust, (crate::crypto::SecretBytes, Vec<u8>)) {
+                let (root_sk, root_pk) = hybrid_signature_keypair_from_seeds(&[1; 32], &[2; 32]);
+                let key = hybrid_signature_keypair_from_seeds(&[3; 32], &[4; 32]);
+                let d = issue_delegation(&root_sk, Purpose::KtHead, NOW - 10, NOW + 10, &key.1)
+                    .unwrap();
+                let mut ring = ServerKeyRing::new(vec![root_pk]);
+                ring.admit(&d.encode()).unwrap();
+                (
+                    ServerTrust {
+                        legacy_keys: vec![ed.verifying_key().to_bytes().to_vec()],
+                        ring,
+                    },
+                    key,
+                )
+            }
+
+            fn head(
+                key: &(crate::crypto::SecretBytes, Vec<u8>),
+                size: u64,
+                root: &[u8; 32],
+            ) -> KtSignedTreeHead {
+                KtSignedTreeHead {
+                    tree_size: size,
+                    root_hash: root.to_vec(),
+                    kid: kid_of(&key.1).to_vec(),
+                    signature: sign_as_server(
+                        Purpose::KtHead,
+                        &key.0,
+                        &key.1,
+                        &kt_head_body(size, root),
+                    )
+                    .unwrap(),
+                }
+            }
+
+            #[test]
+            fn a_delegated_head_verifies_the_proof() {
+                let ed = SigningKey::from_bytes(&[9; 32]);
+                let (id, _, root) = tree(&ed);
+                let (t, key) = rooted(&ed);
+                let h = head(&key, 6, &root);
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW),
+                    KtVerdict::Verified
+                );
+            }
+
+            /// A delegated head that fails is not rescued by a good Ed25519 head beside it.
+            #[test]
+            fn a_spoiled_delegated_head_does_not_fall_back() {
+                let ed = SigningKey::from_bytes(&[9; 32]);
+                let (id, _, root) = tree(&ed);
+                let (t, key) = rooted(&ed);
+                let mut h = head(&key, 6, &root);
+                h.signature[70] ^= 1;
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW),
+                    KtVerdict::SignatureInvalid
+                );
+            }
+
+            /// The head must be the one the proof is relative to.
+            #[test]
+            fn a_head_of_another_tree_does_not_vouch_for_this_proof() {
+                let ed = SigningKey::from_bytes(&[9; 32]);
+                let (id, _, root) = tree(&ed);
+                let (t, key) = rooted(&ed);
+                let h = head(&key, 7, &root);
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW),
+                    KtVerdict::InclusionProofInvalid
+                );
+                let h = head(&key, 6, &[0; 32]);
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW),
+                    KtVerdict::InclusionProofInvalid
+                );
+            }
+
+            #[test]
+            fn an_unknown_head_key_or_a_lapsed_one() {
+                let ed = SigningKey::from_bytes(&[9; 32]);
+                let (id, _, root) = tree(&ed);
+                let (t, key) = rooted(&ed);
+                let mut h = head(&key, 6, &root);
+                h.kid = vec![0; 16];
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW),
+                    KtVerdict::Unavailable
+                );
+                let h = head(&key, 6, &root);
+                assert_eq!(
+                    verify_proof(LEAF_IDENTITY, DEVICE, &KEY, &id, Some(&h), &t, NOW + 11),
+                    KtVerdict::SignatureInvalid
+                );
+            }
+        }
     }
 }

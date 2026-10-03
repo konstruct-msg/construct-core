@@ -162,9 +162,20 @@ pub struct SessionHealthReport {
     pub pq_handshake: PqHandshake,
 }
 
+/// UDL `KtInclusionProof`, `KtSignedTreeHead`, `KtVerdict`.
+pub use crate::crypto::key_transparency::{KtInclusionProof, KtSignedTreeHead, KtVerdict};
 pub use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
+/// UDL `enum CertificateVerdict`.
+pub use crate::crypto::sealed_sender::CertificateVerdict;
 /// The sender certificate as a platform unsealed it. UDL `dictionary SenderCertificate`.
 pub use crate::crypto::sealed_sender::SenderCertificate;
+
+/// The verdicts on a bundle's proofs. UDL `dictionary KtVerdicts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KtVerdicts {
+    pub identity: KtVerdict,
+    pub hybrid: Option<KtVerdict>,
+}
 
 // Registration bundle fields exposed across the UniFFI boundary as raw bytes.
 // Mirrors the UDL `RegistrationBundleFields` dictionary — no base64, no JSON.
@@ -3897,6 +3908,41 @@ impl OrchestratorCore {
         orch.set_trusted_server_keys(keys);
     }
 
+    /// Delegations of the server's hybrid keys. See `Orchestrator::admit_server_delegations`.
+    pub fn admit_server_delegations(&self, delegations: Vec<Vec<u8>>) -> u32 {
+        let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.admit_server_delegations(delegations)
+    }
+
+    /// The label for a sender certificate. See `SenderCertificate::verdict`.
+    pub fn certificate_verdict(&self, certificate: SenderCertificate) -> CertificateVerdict {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.certificate_verdict(&certificate)
+    }
+
+    /// Judge a bundle's KT proofs. See `Orchestrator::verify_kt_proofs`. A hybrid key without its
+    /// proof, or the reverse, judges the identity proof alone.
+    pub fn verify_kt_proofs(
+        &self,
+        device_id: String,
+        identity_key: Vec<u8>,
+        identity_proof: KtInclusionProof,
+        hybrid_identity_key: Option<Vec<u8>>,
+        hybrid_proof: Option<KtInclusionProof>,
+        tree_head: Option<KtSignedTreeHead>,
+    ) -> KtVerdicts {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let hybrid = hybrid_identity_key.as_deref().zip(hybrid_proof.as_ref());
+        let (identity, hybrid) = orch.verify_kt_proofs(
+            &device_id,
+            &identity_key,
+            &identity_proof,
+            hybrid,
+            tree_head.as_ref(),
+        );
+        KtVerdicts { identity, hybrid }
+    }
+
     /// Open a receiving session from what the core holds under `device`. See
     /// `Orchestrator::open_receiving`.
     pub fn open_receiving(&self, device: String) -> ReceivingOpenResult {
@@ -4237,7 +4283,7 @@ impl CfeIncomingEvent {
                 from,
                 data,
                 content_type,
-                sender_certificate,
+                sender_certificate: sender_certificate.map(Box::new),
                 envelope_session,
             },
             Self::OutgoingMessage {

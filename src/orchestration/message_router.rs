@@ -61,7 +61,7 @@ pub enum RoutingDecision {
         contact_id: String,
         message_id: String,
         ratchet_key: Option<Vec<u8>>,
-        writer_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+        writer_certificate: Option<Box<crate::crypto::sealed_sender::SenderCertificate>>,
         /// The session envelope the message came in — the pair to answer along, when set.
         envelope_session: Option<String>,
         reason: String,
@@ -395,7 +395,7 @@ impl MessageRouter {
                 ratchet_key: crate::wire_payload::unpack(&msg.wire_payload)
                     .ok()
                     .map(|header| header.dh_public_key),
-                writer_certificate: msg.sender_certificate.clone(),
+                writer_certificate: msg.sender_certificate.clone().map(Box::new),
                 envelope_session: msg.envelope_session.clone(),
                 reason: e,
             },
@@ -699,6 +699,8 @@ mod tests {
             issued_at: 0,
             expires_at: 0,
             signature: vec![],
+            server_kid: vec![],
+            server_signature_hybrid: vec![],
         };
         let m = IncomingMessage {
             sender_certificate: Some(certificate),

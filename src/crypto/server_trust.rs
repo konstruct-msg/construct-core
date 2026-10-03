@@ -49,6 +49,12 @@ const _: () = assert!(construct_server_trust::HYBRID_SIGNATURE_LEN == HYBRID_SIG
 /// admitted and nothing verifies, which is why no caller depends on this module yet.
 pub const PINNED_ROOTS: &[&str] = &[];
 
+/// Whether a certificate or tree head without the hybrid signature is refused once roots are
+/// pinned. `false` while servers that sign with Ed25519 alone are still answering; set when every
+/// server signs hybrid. Until then stripping the hybrid signature falls back to Ed25519 — the
+/// classical guarantee, not less — and a hybrid signature that is present is never bypassed.
+pub const HYBRID_REQUIRED: bool = false;
+
 /// Why a server signature or delegation is not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
@@ -151,6 +157,12 @@ impl ServerKeyRing {
                 .filter_map(|h| hex::decode(h).ok())
                 .collect(),
         )
+    }
+
+    /// Whether any root is pinned. Without one nothing can be admitted, and the hybrid signature
+    /// cannot decide anything.
+    pub fn has_roots(&self) -> bool {
+        !self.roots.is_empty()
     }
 
     /// Admit a delegation if a pinned root signed it. A delegation already admitted is kept once.

@@ -197,7 +197,7 @@ pub struct Orchestrator {
     resent_after_error: HashSet<String>,
     /// The server keys a sender certificate is checked against before it opens a session
     /// (`set_trusted_server_keys`). In memory: the platform sets them at every launch.
-    trusted_server_keys: Vec<Vec<u8>>,
+    server_trust: crate::crypto::sealed_sender::ServerTrust,
     /// Read for a certificate's age; the same clock as the router's and the machine's.
     clock: Arc<dyn Clock>,
 }
@@ -268,7 +268,7 @@ impl Orchestrator {
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
             resent_after_error: HashSet::new(),
-            trusted_server_keys: Vec::new(),
+            server_trust: crate::crypto::sealed_sender::ServerTrust::pinned(),
             clock,
         }
     }
@@ -298,7 +298,7 @@ impl Orchestrator {
                 from,
                 data,
                 content_type,
-                sender_certificate,
+                sender_certificate.map(|c| *c),
                 envelope_session,
             ),
             IncomingEvent::OutgoingMessage {
@@ -498,7 +498,7 @@ impl Orchestrator {
     ) -> Option<Vec<u8>> {
         let now = self.clock.now_secs() as i64;
         certificate
-            .and_then(|c| c.identity_for_opening(&self.trusted_server_keys, now).ok())
+            .and_then(|c| c.identity_for_opening(&self.server_trust, now).ok())
             .map(|key| key.to_vec())
             .filter(|key| crate::device_id::derive_device_id(key) == device)
     }
@@ -951,7 +951,69 @@ impl Orchestrator {
     /// The server's certificate-signing keys, as the platform holds them: the well-known key and
     /// its pins. Replaced whole; nothing opens a receiving session before the first call.
     pub fn set_trusted_server_keys(&mut self, keys: Vec<Vec<u8>>) {
-        self.trusted_server_keys = keys;
+        self.server_trust.legacy_keys = keys;
+    }
+
+    /// Admit delegations of the server's hybrid keys — as `/.well-known` serves them, or as the
+    /// platform cached them. Each is kept only if a root this build pins signed it; the rest are
+    /// ignored, so a server cannot add a key by serving one. Returns how many were admitted.
+    /// In memory, like the Ed25519 keys: the platform hands them over at every launch.
+    #[cfg(feature = "post-quantum")]
+    pub fn admit_server_delegations(&mut self, delegations: Vec<Vec<u8>>) -> u32 {
+        let mut admitted = 0;
+        for d in delegations {
+            match self.server_trust.ring.admit(&d) {
+                Ok(_) => admitted += 1,
+                Err(e) => tracing::warn!(error = %e, "server delegation not admitted"),
+            }
+        }
+        admitted
+    }
+
+    /// What may be said about `certificate`: the checks a session opens on, as a label.
+    pub fn certificate_verdict(
+        &self,
+        certificate: &crate::crypto::sealed_sender::SenderCertificate,
+    ) -> crate::crypto::sealed_sender::CertificateVerdict {
+        certificate.verdict(&self.server_trust, self.clock.now_secs() as i64)
+    }
+
+    /// Judge a bundle's KT proofs: the X25519 identity key's, the hybrid key's when the device has
+    /// one, against the head they share. `crypto::key_transparency::verify_proof`.
+    pub fn verify_kt_proofs(
+        &self,
+        device_id: &str,
+        identity_key: &[u8],
+        identity_proof: &crate::crypto::key_transparency::KtInclusionProof,
+        hybrid: Option<(&[u8], &crate::crypto::key_transparency::KtInclusionProof)>,
+        head: Option<&crate::crypto::key_transparency::KtSignedTreeHead>,
+    ) -> (
+        crate::crypto::key_transparency::KtVerdict,
+        Option<crate::crypto::key_transparency::KtVerdict>,
+    ) {
+        use crate::crypto::key_transparency::{LEAF_HYBRID, LEAF_IDENTITY, verify_proof};
+        let now = self.clock.now_secs() as i64;
+        let identity = verify_proof(
+            LEAF_IDENTITY,
+            device_id,
+            identity_key,
+            identity_proof,
+            head,
+            &self.server_trust,
+            now,
+        );
+        let hybrid = hybrid.map(|(key, proof)| {
+            verify_proof(
+                LEAF_HYBRID,
+                device_id,
+                key,
+                proof,
+                head,
+                &self.server_trust,
+                now,
+            )
+        });
+        (identity, hybrid)
     }
 
     /// Open a receiving session from what waits under `device`.
@@ -998,7 +1060,7 @@ impl Orchestrator {
             let checked = carrier
                 .sender_certificate
                 .as_ref()
-                .map(|c| c.identity_for_opening(&self.trusted_server_keys, now));
+                .map(|c| c.identity_for_opening(&self.server_trust, now));
             let identity = match checked {
                 Some(Ok(key)) => key.to_vec(),
                 Some(Err(SenderRefusal::NoTrustedKey)) => {
@@ -1427,7 +1489,7 @@ impl Orchestrator {
         wire_payload: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
         let identity = certificate
-            .identity_for_opening(&self.trusted_server_keys, self.clock.now_secs() as i64)
+            .identity_for_opening(&self.server_trust, self.clock.now_secs() as i64)
             .map_err(|refusal| format!("SENDER_CERTIFICATE_REFUSED: {refusal:?}"))?
             .to_vec();
         let first = IncomingFirstMessage::from_wire_payload(wire_payload)?;
@@ -2727,7 +2789,7 @@ impl Orchestrator {
                 // sender's other devices, and a recorded message would read as a duplicate there.
                 let route = self.reply_route(
                     envelope_session.as_deref(),
-                    writer_certificate.as_ref(),
+                    writer_certificate.as_deref(),
                     &cid,
                 );
                 match self.decryption_error_for(
@@ -4378,7 +4440,7 @@ mod pqxdh_v2_tests {
         wire: Vec<u8>,
     ) -> Vec<Action> {
         bob.handle_event(IncomingEvent::MessageReceived {
-            sender_certificate: Some(certificate),
+            sender_certificate: Some(Box::new(certificate)),
             message_id: id.to_string(),
             from: from.to_string(),
             data: wire,
