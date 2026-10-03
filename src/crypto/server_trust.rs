@@ -476,4 +476,200 @@ mod tests {
         assert!(root_words::decode(&list.join(" ")).is_err());
         assert!(root_words::decode("abandon").is_err());
     }
+
+    // ── Conformance vectors: construct-protos conformance/knst_server_trust.json ───────────────
+
+    const V_ROOT: ([u8; 32], [u8; 32]) = ([0x11; 32], [0x12; 32]);
+    const V_SERVER: ([u8; 32], [u8; 32]) = ([0x21; 32], [0x22; 32]);
+    const V_NOT_BEFORE: i64 = 1_800_000_000;
+    const V_NOT_AFTER: i64 = V_NOT_BEFORE + 90 * DAY;
+
+    fn v_cert_body() -> Vec<u8> {
+        sender_cert_body(
+            "14f28d31-0000-4000-8000-000000000001",
+            "konstruct.cc",
+            &[0x07; 32],
+            "6f5e37ac00000000000000000000000a",
+            V_NOT_BEFORE + DAY,
+            V_NOT_BEFORE + 2 * DAY,
+        )
+        .unwrap()
+    }
+
+    fn v_head_body() -> Vec<u8> {
+        kt_head_body(1234, &[0x5a; 32])
+    }
+
+    /// Writes the vector file. Run by hand after a deliberate format change:
+    /// `KNST_SERVER_TRUST_OUT=/path cargo test --features mac --lib write_server_trust_vectors -- --ignored`
+    #[test]
+    #[ignore]
+    fn write_server_trust_vectors() {
+        let out = std::env::var("KNST_SERVER_TRUST_OUT").expect("KNST_SERVER_TRUST_OUT");
+        let (root_sk, root_pk) = hybrid_signature_keypair_from_seeds(&V_ROOT.0, &V_ROOT.1);
+        let (server_sk, server_pk) = hybrid_signature_keypair_from_seeds(&V_SERVER.0, &V_SERVER.1);
+        let d = issue_delegation(
+            &root_sk,
+            Purpose::SenderCert,
+            V_NOT_BEFORE,
+            V_NOT_AFTER,
+            &server_pk,
+        )
+        .unwrap();
+        let kid = kid_of(&server_pk);
+        let cert_sig =
+            sign_as_server(Purpose::SenderCert, &server_sk, &server_pk, &v_cert_body()).unwrap();
+        let head_d = issue_delegation(
+            &root_sk,
+            Purpose::KtHead,
+            V_NOT_BEFORE,
+            V_NOT_AFTER,
+            &server_pk,
+        )
+        .unwrap();
+        let head_sig =
+            sign_as_server(Purpose::KtHead, &server_sk, &server_pk, &v_head_body()).unwrap();
+        let j = serde_json::json!({
+            "$schema_version": 1,
+            "$authority": "construct-core :: server-trust (construct-server-trust crate) + crypto::server_trust",
+            "$spec": "construct-docs/decisions/server-keys-rooted-offline-and-hybrid.md",
+            "$purpose": [
+                "What the offline root signs (a delegation), what a delegated server key signs",
+                "(label ‖ kid ‖ body), and the bodies of a sender certificate and a KT tree head.",
+                "Every party that signs or checks a server signature — construct-core, construct-server,",
+                "the root tool — must reproduce these bytes and accept these signatures. Hybrid =",
+                "Ed25519 ‖ ML-DSA-65, both halves must verify. Keys come from fixed seeds so any",
+                "implementation can rebuild them; signatures are given, not recomputed."
+            ],
+            "root": {
+                "ed25519_seed": hex::encode(V_ROOT.0),
+                "mldsa65_seed": hex::encode(V_ROOT.1),
+                "public_key": hex::encode(&root_pk),
+            },
+            "server_key": {
+                "ed25519_seed": hex::encode(V_SERVER.0),
+                "mldsa65_seed": hex::encode(V_SERVER.1),
+                "public_key": hex::encode(&server_pk),
+                "kid": hex::encode(kid),
+            },
+            "delegations": [
+                {
+                    "purpose": "sender-cert",
+                    "not_before": V_NOT_BEFORE,
+                    "not_after": V_NOT_AFTER,
+                    "signable": hex::encode(d.signable()),
+                    "encoded": hex::encode(d.encode()),
+                },
+                {
+                    "purpose": "kt-head",
+                    "not_before": V_NOT_BEFORE,
+                    "not_after": V_NOT_AFTER,
+                    "signable": hex::encode(head_d.signable()),
+                    "encoded": hex::encode(head_d.encode()),
+                }
+            ],
+            "signatures": [
+                {
+                    "purpose": "sender-cert",
+                    "fields": {
+                        "user_id": "14f28d31-0000-4000-8000-000000000001",
+                        "domain": "konstruct.cc",
+                        "identity_key": hex::encode([0x07; 32]),
+                        "device_id": "6f5e37ac00000000000000000000000a",
+                        "issued_at": V_NOT_BEFORE + DAY,
+                        "expires_at": V_NOT_BEFORE + 2 * DAY,
+                    },
+                    "body": hex::encode(v_cert_body()),
+                    "signable": hex::encode(server_signable(Purpose::SenderCert, &kid, &v_cert_body())),
+                    "signature": hex::encode(&cert_sig),
+                },
+                {
+                    "purpose": "kt-head",
+                    "fields": { "tree_size": 1234, "root_hash": hex::encode([0x5a; 32]) },
+                    "body": hex::encode(v_head_body()),
+                    "signable": hex::encode(server_signable(Purpose::KtHead, &kid, &v_head_body())),
+                    "signature": hex::encode(&head_sig),
+                }
+            ]
+        });
+        std::fs::write(out, serde_json::to_string_pretty(&j).unwrap() + "\n").unwrap();
+    }
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/conformance/knst_server_trust.json"
+        )))
+        .expect("vectors parse")
+    }
+
+    fn unhex(v: &serde_json::Value) -> Vec<u8> {
+        hex::decode(v.as_str().expect("hex string")).expect("hex")
+    }
+
+    /// The keys rebuild from their seeds, and every byte string the file states is what this
+    /// crate builds. Mutation: drop a label, a length prefix, or a field — a line reddens.
+    #[test]
+    fn the_vectors_bytes_are_rebuilt_exactly() {
+        let v = vectors();
+        let (_, root_pk) = hybrid_signature_keypair_from_seeds(&V_ROOT.0, &V_ROOT.1);
+        let (_, server_pk) = hybrid_signature_keypair_from_seeds(&V_SERVER.0, &V_SERVER.1);
+        assert_eq!(unhex(&v["root"]["public_key"]), root_pk);
+        assert_eq!(unhex(&v["server_key"]["public_key"]), server_pk);
+        assert_eq!(unhex(&v["server_key"]["kid"]), kid_of(&server_pk));
+
+        let delegations = v["delegations"].as_array().unwrap();
+        assert_eq!(delegations.len(), 2, "vectors look truncated");
+        for d in delegations {
+            let purpose = Purpose::from_name(d["purpose"].as_str().unwrap()).unwrap();
+            let decoded = Delegation::decode(&unhex(&d["encoded"])).unwrap();
+            assert_eq!(decoded.purpose, purpose);
+            assert_eq!(decoded.not_before, d["not_before"].as_i64().unwrap());
+            assert_eq!(decoded.not_after, d["not_after"].as_i64().unwrap());
+            assert_eq!(decoded.public_key, server_pk);
+            assert_eq!(decoded.signable(), unhex(&d["signable"]));
+        }
+
+        let sigs = v["signatures"].as_array().unwrap();
+        assert_eq!(sigs.len(), 2, "vectors look truncated");
+        assert_eq!(unhex(&sigs[0]["body"]), v_cert_body());
+        assert_eq!(unhex(&sigs[1]["body"]), v_head_body());
+        let kid = kid_of(&server_pk);
+        for s in sigs {
+            let purpose = Purpose::from_name(s["purpose"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                unhex(&s["signable"]),
+                server_signable(purpose, &kid, &unhex(&s["body"]))
+            );
+        }
+    }
+
+    /// The stated signatures are accepted through the stated delegations, and refused when a
+    /// delegation or a signature is altered.
+    #[test]
+    fn the_vectors_signatures_verify_through_their_root() {
+        let v = vectors();
+        let mut ring = ServerKeyRing::new(vec![unhex(&v["root"]["public_key"])]);
+        for d in v["delegations"].as_array().unwrap() {
+            ring.admit(&unhex(&d["encoded"])).unwrap();
+        }
+        let kid: Kid = unhex(&v["server_key"]["kid"]).try_into().unwrap();
+        let at = V_NOT_BEFORE + DAY;
+        for s in v["signatures"].as_array().unwrap() {
+            let purpose = Purpose::from_name(s["purpose"].as_str().unwrap()).unwrap();
+            let body = unhex(&s["body"]);
+            let sig = unhex(&s["signature"]);
+            assert_eq!(ring.verify(purpose, &kid, &body, &sig, at, at), Ok(()));
+            let mut bad = sig.clone();
+            bad[100] ^= 1;
+            assert_eq!(
+                ring.verify(purpose, &kid, &body, &bad, at, at),
+                Err(TrustError::BadSignature)
+            );
+        }
+        let mut tampered = unhex(&v["delegations"][0]["encoded"]);
+        tampered[20] ^= 1; // inside the delegated key
+        let mut fresh = ServerKeyRing::new(vec![unhex(&v["root"]["public_key"])]);
+        assert_eq!(fresh.admit(&tampered), Err(TrustError::NotRooted));
+    }
 }
