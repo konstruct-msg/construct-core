@@ -1,0 +1,47 @@
+name: konstruct-root
+
+# The offline root tool, as a static Linux x86_64 binary for the ceremony machine (Tails), with its
+# SHA-256. The owner compares that hash by eye on the offline machine before running it —
+# construct-docs manuals&instructions/server-root-key-ceremony.md §2.4. Manual trigger only: the
+# tool is rebuilt when the ceremony needs it, not on every commit.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: konstruct-root (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honors rust-toolchain.toml (pinned channel), then adds the one target this job needs.
+      - name: Install pinned Rust toolchain + musl target
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: >
+          cargo build --release --locked --features post-quantum --bin konstruct-root
+          --target x86_64-unknown-linux-musl
+
+      - name: Static, runs, hash
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/konstruct-root
+          file "$BIN"
+          file "$BIN" | grep -q "statically linked"
+          "$BIN" --version
+          cp "$BIN" konstruct-root
+          sha256sum konstruct-root | tee konstruct-root.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: konstruct-root-${{ github.sha }}
+          path: |
+            konstruct-root
+            konstruct-root.sha256

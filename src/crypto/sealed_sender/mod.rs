@@ -208,7 +208,8 @@ pub fn verify_sender_cert(
 /// holds an undelivered message (`MESSAGE_TTL_DAYS=7` in construct-server). A certificate lives 24 h
 /// and a recipient who was offline longer receives a genuine first message with an expired one; the
 /// sender authenticated to the relay when it sent, so refusing on age alone would protect nothing.
-pub const MAX_DELIVERY_AGE_SECS: i64 = 7 * 86_400;
+/// Defined with the server-signature format, whose sender-certificate grace is built on it.
+pub use construct_server_trust::MAX_DELIVERY_AGE_SECS;
 
 /// A sender certificate as the recipient unsealed it — the fields the server signed, and the
 /// signature. The platform parses the protobuf; every decision about it is made here.

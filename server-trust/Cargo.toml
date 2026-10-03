@@ -1,0 +1,14 @@
+[package]
+name = "construct-server-trust"
+version = "0.1.0"
+authors = ["Construct Team"]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/konstruct-msg/construct-core"
+description = "The bytes of a Konstruct server signature: delegations from the offline root, labels, key ids — one format for clients, servers and the root tool"
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"

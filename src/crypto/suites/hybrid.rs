@@ -189,6 +189,34 @@ fn split_hybrid_signature(
     Ok((ed25519_sig, mldsa_sig))
 }
 
+/// The hybrid signature keypair two 32-byte seeds determine: `(private, public)`.
+///
+/// The seeds are the whole secret — the ML-DSA-65 key is re-derived from its seed at sign time —
+/// so a key written down as its seeds (the offline server root, `crypto::server_trust`) is
+/// restored exactly. Private: `[ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]`;
+/// public: `[ed25519_pk (32)] [mldsa65_pk (1952)]`. Formats are FIPS 204 standard.
+pub fn hybrid_signature_keypair_from_seeds(
+    ed25519_seed: &[u8; ED25519_SECRET_KEY_SIZE],
+    mldsa_seed: &[u8; ML_DSA_65_SECRET_KEY_SIZE],
+) -> (SecretBytes, Vec<u8>) {
+    let ed25519_pk = SigningKey::from_bytes(ed25519_seed).verifying_key();
+    let mldsa_pk_enc = MlDsaSigningKey::<MlDsa65>::from_seed(&B32::from(*mldsa_seed))
+        .verifying_key()
+        .encode(); // 1952 bytes
+
+    // Built at its final capacity so no reallocation leaves a copy of the seeds behind.
+    let mut hybrid_sk = Vec::with_capacity(HYBRID_SIG_SECRET_KEY_SIZE);
+    hybrid_sk.extend_from_slice(ed25519_seed);
+    hybrid_sk.extend_from_slice(mldsa_seed);
+    hybrid_sk.extend_from_slice(mldsa_pk_enc.as_slice());
+
+    let mut hybrid_pk = Vec::with_capacity(HYBRID_SIG_PUBLIC_KEY_SIZE);
+    hybrid_pk.extend_from_slice(&ed25519_pk.to_bytes());
+    hybrid_pk.extend_from_slice(mldsa_pk_enc.as_slice());
+
+    (SecretBytes::new(hybrid_sk), hybrid_pk)
+}
+
 /// Concrete implementation of `CryptoProvider` for the PQ Hybrid suite.
 ///
 /// Suite ID: 2
@@ -250,32 +278,13 @@ impl CryptoProvider for HybridSuiteProvider {
 
     fn generate_signature_keys()
     -> Result<(Self::SignaturePrivateKey, Self::SignaturePublicKey), CryptoError> {
-        // Ed25519
-        let ed25519_sk = SigningKey::generate(&mut OsRng);
-        let ed25519_pk = ed25519_sk.verifying_key();
-
-        // ML-DSA-65 — store the 32-byte signing seed; the expanded 4032-byte key is
-        // re-derived on demand at sign time. The public key (1952) is embedded for
-        // convenience. pk and signature wire formats are FIPS 204 standard.
-        let mut rng = OsRng;
-        let mut mldsa_seed = [0u8; ML_DSA_65_SECRET_KEY_SIZE];
-        rng.fill_bytes(&mut mldsa_seed);
-        let mldsa_sk = MlDsaSigningKey::<MlDsa65>::from_seed(&B32::from(mldsa_seed));
-        let mldsa_pk_enc = mldsa_sk.verifying_key().encode(); // 1952 bytes
-
-        // Private key: [ed25519_seed (32)] [mldsa65_seed (32)] [mldsa65_pk (1952)]
-        // Built at its final capacity so no reallocation leaves a copy of the seeds behind.
-        let mut hybrid_sk = Vec::with_capacity(HYBRID_SIG_SECRET_KEY_SIZE);
-        hybrid_sk.extend_from_slice(&ed25519_sk.to_bytes());
-        hybrid_sk.extend_from_slice(&mldsa_seed);
-        hybrid_sk.extend_from_slice(mldsa_pk_enc.as_slice());
-
-        // Public key: [ed25519_pk (32)] [mldsa65_pk (1952)]
-        let mut hybrid_pk = Vec::with_capacity(HYBRID_SIG_PUBLIC_KEY_SIZE);
-        hybrid_pk.extend_from_slice(&ed25519_pk.to_bytes());
-        hybrid_pk.extend_from_slice(mldsa_pk_enc.as_slice());
-
-        Ok((SecretBytes::new(hybrid_sk), hybrid_pk))
+        let mut seeds = Zeroizing::new([0u8; ED25519_SECRET_KEY_SIZE + ML_DSA_65_SECRET_KEY_SIZE]);
+        OsRng.fill_bytes(seeds.as_mut());
+        let (ed25519_seed, mldsa_seed) = seeds.split_at(ED25519_SECRET_KEY_SIZE);
+        Ok(hybrid_signature_keypair_from_seeds(
+            ed25519_seed.try_into().expect("split at 32"),
+            mldsa_seed.try_into().expect("32 remain"),
+        ))
     }
 
     fn from_signature_private_to_public(
