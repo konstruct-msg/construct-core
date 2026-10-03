@@ -261,7 +261,7 @@ pub enum IncomingEvent {
         /// `None` for a message that was not sealed. The only thing a first message can open a
         /// session from — see `SenderCertificate::identity_for_opening`.
         #[serde(default)]
-        sender_certificate: Option<crate::crypto::sealed_sender::SenderCertificate>,
+        sender_certificate: Option<Box<crate::crypto::sealed_sender::SenderCertificate>>,
         /// The session envelope the message arrived in: the session its tag matched
         /// (`OrchestratorCore::open_envelope`). Set instead of a certificate — the pair names the
         /// writer — and what a DECRYPTION_ERROR is sealed back along.

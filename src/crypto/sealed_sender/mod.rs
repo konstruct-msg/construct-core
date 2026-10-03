@@ -223,6 +223,54 @@ pub struct SenderCertificate {
     pub issued_at: i64,
     pub expires_at: i64,
     pub signature: Vec<u8>,
+    /// Id of the delegated server key that made `server_signature_hybrid`; empty from a server
+    /// that does not sign with one yet.
+    #[serde(default)]
+    pub server_kid: Vec<u8>,
+    /// Hybrid Ed25519 ‖ ML-DSA-65 signature by that key (`crypto::server_trust`); empty likewise.
+    #[serde(default)]
+    pub server_signature_hybrid: Vec<u8>,
+}
+
+/// The server keys a certificate is checked against.
+///
+/// - `legacy_keys`: the Ed25519 keys the platform hands over — the well-known key and its pins.
+///   Whoever holds the server chooses the well-known key; that is what the delegated keys end.
+/// - `ring` (post-quantum builds): the roots pinned in this build and the delegations admitted
+///   under them (`crypto::server_trust`, decisions/server-keys-rooted-offline-and-hybrid.md).
+#[derive(Debug, Clone, Default)]
+pub struct ServerTrust {
+    pub legacy_keys: Vec<Vec<u8>>,
+    #[cfg(feature = "post-quantum")]
+    pub ring: crate::crypto::server_trust::ServerKeyRing,
+}
+
+impl ServerTrust {
+    /// The trust a client starts with: the roots this build pins, nothing admitted yet.
+    pub fn pinned() -> Self {
+        Self {
+            legacy_keys: Vec::new(),
+            #[cfg(feature = "post-quantum")]
+            ring: crate::crypto::server_trust::ServerKeyRing::pinned(),
+        }
+    }
+
+    /// Only the Ed25519 keys — a client before it has admitted any delegation.
+    pub fn with_legacy_keys(keys: Vec<Vec<u8>>) -> Self {
+        let mut trust = Self::pinned();
+        trust.legacy_keys = keys;
+        trust
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn has_roots(&self) -> bool {
+        self.ring.has_roots()
+    }
+
+    #[cfg(not(feature = "post-quantum"))]
+    fn has_roots(&self) -> bool {
+        false
+    }
 }
 
 /// Why a certificate may not open a session.
@@ -249,13 +297,46 @@ impl SenderCertificate {
     /// existing session does not ask this: the ratchet authenticates those.
     pub fn identity_for_opening(
         &self,
-        trusted_server_keys: &[Vec<u8>],
+        trust: &ServerTrust,
         now_secs: i64,
     ) -> Result<&[u8], SenderRefusal> {
-        if trusted_server_keys.is_empty() {
+        self.check_signature(trust, now_secs)?;
+        if self.identity_key.len() != 32
+            || crate::device_id::derive_device_id(&self.identity_key) != self.device_id
+        {
+            return Err(SenderRefusal::DeviceMismatch);
+        }
+        if self.expires_at.saturating_add(MAX_DELIVERY_AGE_SECS) <= now_secs {
+            return Err(SenderRefusal::Expired);
+        }
+        Ok(&self.identity_key)
+    }
+
+    /// Which signature decides, and whether it holds.
+    ///
+    /// With roots pinned, a certificate carrying the hybrid signature is judged by it alone:
+    /// falling back to the Ed25519 one when it fails would let anyone who can forge Ed25519 strip
+    /// or spoil it. One without it is judged by Ed25519 until `HYBRID_REQUIRED` — the servers
+    /// that do not sign hybrid yet. Without roots (a build before the ceremony) the hybrid
+    /// signature cannot be checked and Ed25519 decides.
+    fn check_signature(&self, trust: &ServerTrust, now_secs: i64) -> Result<(), SenderRefusal> {
+        #[cfg(not(feature = "post-quantum"))]
+        let _ = now_secs;
+        if trust.has_roots() {
+            #[cfg(feature = "post-quantum")]
+            {
+                if !self.server_signature_hybrid.is_empty() {
+                    return self.check_hybrid(&trust.ring, now_secs);
+                }
+                if crate::crypto::server_trust::HYBRID_REQUIRED {
+                    return Err(SenderRefusal::BadSignature);
+                }
+            }
+        }
+        if trust.legacy_keys.is_empty() {
             return Err(SenderRefusal::NoTrustedKey);
         }
-        let signed = trusted_server_keys.iter().any(|key| {
+        let signed = trust.legacy_keys.iter().any(|key| {
             verify_sender_cert(
                 &self.user_id,
                 &self.domain,
@@ -267,19 +348,82 @@ impl SenderCertificate {
                 key,
             )
         });
-        if !signed {
+        if signed {
+            Ok(())
+        } else {
+            Err(SenderRefusal::BadSignature)
+        }
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn check_hybrid(
+        &self,
+        ring: &crate::crypto::server_trust::ServerKeyRing,
+        now_secs: i64,
+    ) -> Result<(), SenderRefusal> {
+        use crate::crypto::server_trust::{
+            Kid, Purpose, SENDER_CERT_MAX_LIFETIME_SECS, TrustError, sender_cert_body,
+        };
+        let kid: Kid = self
+            .server_kid
+            .as_slice()
+            .try_into()
+            .map_err(|_| SenderRefusal::BadSignature)?;
+        // The key's grace assumes a certificate lives at most a day; a longer claim would stretch
+        // a leaked key past it.
+        let lifetime = self.expires_at.saturating_sub(self.issued_at);
+        if !(0..=SENDER_CERT_MAX_LIFETIME_SECS).contains(&lifetime) {
             return Err(SenderRefusal::BadSignature);
         }
-        if self.identity_key.len() != 32
-            || crate::device_id::derive_device_id(&self.identity_key) != self.device_id
-        {
-            return Err(SenderRefusal::DeviceMismatch);
+        let body = sender_cert_body(
+            &self.user_id,
+            &self.domain,
+            &self.identity_key,
+            &self.device_id,
+            self.issued_at,
+            self.expires_at,
+        )
+        .map_err(|_| SenderRefusal::BadSignature)?;
+        match ring.verify(
+            Purpose::SenderCert,
+            &kid,
+            &body,
+            &self.server_signature_hybrid,
+            self.issued_at,
+            now_secs,
+        ) {
+            Ok(()) => Ok(()),
+            // The delegation has not reached us yet: the same open may pass once it has.
+            Err(TrustError::UnknownKey) => Err(SenderRefusal::NoTrustedKey),
+            Err(TrustError::Expired) => Err(SenderRefusal::Expired),
+            Err(_) => Err(SenderRefusal::BadSignature),
         }
-        if self.expires_at.saturating_add(MAX_DELIVERY_AGE_SECS) <= now_secs {
-            return Err(SenderRefusal::Expired);
-        }
-        Ok(&self.identity_key)
     }
+
+    /// What the platform may say about this certificate: the same checks a session opens on,
+    /// answered as a label. `Expired` is only ever reached after the signature and the device
+    /// have passed, so a platform may pin the key of an expired-but-signed certificate.
+    pub fn verdict(&self, trust: &ServerTrust, now_secs: i64) -> CertificateVerdict {
+        match self.identity_for_opening(trust, now_secs) {
+            Ok(_) => CertificateVerdict::Vouched,
+            Err(SenderRefusal::NoTrustedKey) => CertificateVerdict::NoKey,
+            Err(SenderRefusal::Expired) => CertificateVerdict::Expired,
+            Err(SenderRefusal::BadSignature | SenderRefusal::DeviceMismatch) => {
+                CertificateVerdict::BadSignature
+            }
+        }
+    }
+}
+
+/// `SenderCertificate::verdict`. UDL `enum CertificateVerdict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateVerdict {
+    Vouched,
+    /// No key to check with yet — transient.
+    NoKey,
+    BadSignature,
+    /// Signed and naming its device, but older than a message can wait at the relay.
+    Expired,
 }
 
 #[cfg(test)]
@@ -334,6 +478,8 @@ pub(crate) mod test_support {
                 issued_at,
                 expires_at,
                 signature: self.key.sign(&payload).to_bytes().to_vec(),
+                server_kid: Vec::new(),
+                server_signature_hybrid: Vec::new(),
             }
         }
     }
@@ -347,12 +493,16 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
+    fn legacy(keys: &[Vec<u8>]) -> ServerTrust {
+        ServerTrust::with_legacy_keys(keys.to_vec())
+    }
+
     #[test]
     fn a_signed_certificate_opens_with_its_key() {
         let server = TestServer::new();
         let cert = server.certify(&[7u8; 32], NOW);
         assert_eq!(
-            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            cert.identity_for_opening(&legacy(&[server.verifying_key()]), NOW),
             Ok(&[7u8; 32][..])
         );
     }
@@ -364,7 +514,7 @@ mod tests {
         let other = TestServer::new();
         let cert = server.certify(&[7u8; 32], NOW);
         let keys = [other.verifying_key(), server.verifying_key()];
-        assert!(cert.identity_for_opening(&keys, NOW).is_ok());
+        assert!(cert.identity_for_opening(&legacy(&keys), NOW).is_ok());
     }
 
     #[test]
@@ -373,7 +523,7 @@ mod tests {
         let stranger = TestServer::new();
         let cert = stranger.certify(&[7u8; 32], NOW);
         assert_eq!(
-            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            cert.identity_for_opening(&legacy(&[server.verifying_key()]), NOW),
             Err(SenderRefusal::BadSignature)
         );
     }
@@ -383,7 +533,7 @@ mod tests {
         let server = TestServer::new();
         let cert = server.certify(&[7u8; 32], NOW);
         assert_eq!(
-            cert.identity_for_opening(&[], NOW),
+            cert.identity_for_opening(&legacy(&[]), NOW),
             Err(SenderRefusal::NoTrustedKey)
         );
     }
@@ -395,7 +545,7 @@ mod tests {
         let server = TestServer::new();
         let cert = server.certify_as(&[7u8; 32], "someone-else", NOW, NOW + 86_400);
         assert_eq!(
-            cert.identity_for_opening(&[server.verifying_key()], NOW),
+            cert.identity_for_opening(&legacy(&[server.verifying_key()]), NOW),
             Err(SenderRefusal::DeviceMismatch)
         );
     }
@@ -407,15 +557,15 @@ mod tests {
         let keys = [server.verifying_key()];
         let expiry = cert.expires_at;
         assert!(
-            cert.identity_for_opening(&keys, expiry + 3 * 86_400)
+            cert.identity_for_opening(&legacy(&keys), expiry + 3 * 86_400)
                 .is_ok()
         );
         assert!(
-            cert.identity_for_opening(&keys, expiry + MAX_DELIVERY_AGE_SECS - 1)
+            cert.identity_for_opening(&legacy(&keys), expiry + MAX_DELIVERY_AGE_SECS - 1)
                 .is_ok()
         );
         assert_eq!(
-            cert.identity_for_opening(&keys, expiry + MAX_DELIVERY_AGE_SECS),
+            cert.identity_for_opening(&legacy(&keys), expiry + MAX_DELIVERY_AGE_SECS),
             Err(SenderRefusal::Expired)
         );
     }
@@ -647,5 +797,164 @@ mod tests {
         let a = seal_to_x25519_public(b"name=iPhone", pubk.as_bytes()).unwrap();
         let b = seal_to_x25519_public(b"name=iPhone", pubk.as_bytes()).unwrap();
         assert_ne!(a, b);
+    }
+
+    // ── The delegated hybrid signature (decisions/server-keys-rooted-offline-and-hybrid.md) ──
+
+    #[cfg(feature = "post-quantum")]
+    mod hybrid {
+        use super::*;
+        use crate::crypto::server_trust::{
+            Purpose, ServerKeyRing, issue_delegation, kid_of, sender_cert_body, sign_as_server,
+        };
+        use crate::crypto::suites::hybrid::hybrid_signature_keypair_from_seeds;
+
+        const DAY: i64 = 86_400;
+
+        /// A ring rooted in a test root with one admitted sender-cert key, the legacy server, and
+        /// a signer for the delegated key.
+        struct Fixture {
+            trust: ServerTrust,
+            legacy: TestServer,
+            key: (crate::crypto::SecretBytes, Vec<u8>),
+        }
+
+        fn fixture() -> Fixture {
+            let (root_sk, root_pk) = hybrid_signature_keypair_from_seeds(&[1; 32], &[2; 32]);
+            let key = hybrid_signature_keypair_from_seeds(&[3; 32], &[4; 32]);
+            let d = issue_delegation(
+                &root_sk,
+                Purpose::SenderCert,
+                NOW - DAY,
+                NOW + 89 * DAY,
+                &key.1,
+            )
+            .unwrap();
+            let mut ring = ServerKeyRing::new(vec![root_pk]);
+            ring.admit(&d.encode()).unwrap();
+            let legacy = TestServer::new();
+            Fixture {
+                trust: ServerTrust {
+                    legacy_keys: vec![legacy.verifying_key()],
+                    ring,
+                },
+                legacy,
+                key,
+            }
+        }
+
+        /// The legacy-signed certificate, also signed by the delegated key.
+        fn hybrid_cert(f: &Fixture) -> SenderCertificate {
+            let mut c = f.legacy.certify(&[7u8; 32], NOW);
+            let body = sender_cert_body(
+                &c.user_id,
+                &c.domain,
+                &c.identity_key,
+                &c.device_id,
+                c.issued_at,
+                c.expires_at,
+            )
+            .unwrap();
+            c.server_kid = kid_of(&f.key.1).to_vec();
+            c.server_signature_hybrid =
+                sign_as_server(Purpose::SenderCert, &f.key.0, &f.key.1, &body).unwrap();
+            c
+        }
+
+        #[test]
+        fn a_certificate_signed_by_a_delegated_key_opens() {
+            let f = fixture();
+            let mut cert = hybrid_cert(&f);
+            cert.signature.clear(); // the Ed25519 one is not needed
+            assert_eq!(cert.identity_for_opening(&f.trust, NOW), Ok(&[7u8; 32][..]));
+        }
+
+        /// The hybrid signature, when present, is never bypassed: a spoiled one with a good
+        /// Ed25519 signature beside it is refused. Mutation: fall back to Ed25519 — this reddens.
+        #[test]
+        fn a_spoiled_hybrid_signature_does_not_fall_back_to_ed25519() {
+            let f = fixture();
+            let mut cert = hybrid_cert(&f);
+            cert.server_signature_hybrid[70] ^= 1;
+            assert_eq!(
+                cert.identity_for_opening(&f.trust, NOW),
+                Err(SenderRefusal::BadSignature)
+            );
+        }
+
+        #[test]
+        fn a_certificate_without_the_hybrid_signature_is_judged_by_ed25519_meanwhile() {
+            let f = fixture();
+            let cert = f.legacy.certify(&[7u8; 32], NOW);
+            assert!(cert.identity_for_opening(&f.trust, NOW).is_ok());
+        }
+
+        #[test]
+        fn a_key_whose_delegation_has_not_arrived_waits() {
+            let f = fixture();
+            let mut cert = hybrid_cert(&f);
+            cert.server_kid = vec![0; 16];
+            assert_eq!(
+                cert.identity_for_opening(&f.trust, NOW),
+                Err(SenderRefusal::NoTrustedKey)
+            );
+        }
+
+        #[test]
+        fn a_certificate_claiming_more_than_a_day_is_refused() {
+            let f = fixture();
+            let mut c = f.legacy.certify_as(
+                &[7u8; 32],
+                &crate::device_id::derive_device_id(&[7u8; 32]),
+                NOW,
+                NOW + 2 * DAY,
+            );
+            let body = sender_cert_body(
+                &c.user_id,
+                &c.domain,
+                &c.identity_key,
+                &c.device_id,
+                c.issued_at,
+                c.expires_at,
+            )
+            .unwrap();
+            c.server_kid = kid_of(&f.key.1).to_vec();
+            c.server_signature_hybrid =
+                sign_as_server(Purpose::SenderCert, &f.key.0, &f.key.1, &body).unwrap();
+            assert_eq!(
+                c.identity_for_opening(&f.trust, NOW),
+                Err(SenderRefusal::BadSignature)
+            );
+        }
+
+        /// A build without roots cannot check the hybrid signature: Ed25519 decides, and garbage
+        /// in the hybrid fields changes nothing.
+        #[test]
+        fn without_roots_ed25519_decides() {
+            let f = fixture();
+            let mut cert = hybrid_cert(&f);
+            cert.server_signature_hybrid = vec![0; 10];
+            let trust = ServerTrust {
+                legacy_keys: vec![f.legacy.verifying_key()],
+                ring: ServerKeyRing::new(vec![]),
+            };
+            assert!(cert.identity_for_opening(&trust, NOW).is_ok());
+        }
+
+        #[test]
+        fn the_verdict_labels_what_an_open_would_do() {
+            let f = fixture();
+            let cert = hybrid_cert(&f);
+            assert_eq!(cert.verdict(&f.trust, NOW), CertificateVerdict::Vouched);
+            let late = cert.expires_at + MAX_DELIVERY_AGE_SECS;
+            assert_eq!(cert.verdict(&f.trust, late), CertificateVerdict::Expired);
+            let mut bad = cert.clone();
+            bad.server_signature_hybrid[70] ^= 1;
+            assert_eq!(bad.verdict(&f.trust, NOW), CertificateVerdict::BadSignature);
+            assert_eq!(
+                cert.verdict(&ServerTrust::default(), NOW),
+                CertificateVerdict::NoKey
+            );
+        }
     }
 }
