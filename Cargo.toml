@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "store"]
+members = [".", "store", "server-trust"]
 resolver = "2"
 
 [package]
@@ -106,6 +106,8 @@ uniffi = { version = "0.30", features = ["build"], optional = true }
 # The local store every client keeps — exported through this library's UDL on the platform
 # features; the Tauri desktops and the TUI depend on it directly.
 construct-store = { path = "store", optional = true }
+# The bytes of a server signature, shared with construct-server and the root tool.
+construct-server-trust = { path = "server-trust" }
 construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "c3330a45927fbe39c4661d0cfa45aecfff984eb8", features = ["ffi"], optional = true }
 
 [dev-dependencies]

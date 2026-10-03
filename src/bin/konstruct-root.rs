@@ -22,7 +22,9 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use construct_core::crypto::server_trust::{Delegation, Purpose, fingerprint, kid_of, root_words};
+use construct_core::crypto::server_trust::{
+    Delegation, Purpose, fingerprint, issue_delegation, kid_of, root_words, verify_rooted,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
@@ -230,7 +232,7 @@ fn delegate(args: &[String]) -> Result<(), String> {
         return Err("not signed".into());
     }
 
-    let d = Delegation::issue(
+    let d = issue_delegation(
         &root_private,
         purpose,
         not_before,
@@ -252,7 +254,7 @@ fn verify(args: &[String]) -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let d = Delegation::decode(&read_hex(Path::new(a.required("--delegation")?))?)
         .map_err(|e| e.to_string())?;
-    d.verify_rooted(&roots).map_err(|e| e.to_string())?;
+    verify_rooted(&d, &roots).map_err(|e| e.to_string())?;
     println!("OK — signed by a given root");
     println!("Purpose:       {}", d.purpose.name());
     println!("Server key:    {}", fingerprint(&d.public_key));

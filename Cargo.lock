@@ -540,6 +540,7 @@ dependencies = [
  "bip39",
  "bytes",
  "chacha20poly1305",
+ "construct-server-trust",
  "construct-store",
  "construct-veil",
  "crc32fast",
@@ -569,6 +570,15 @@ dependencies = [
  "uniffi",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "construct-server-trust"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -24,114 +24,30 @@
 //! signed, only for the purpose the delegation names, and only for signatures made inside its
 //! window. A server that serves a delegation cannot have made it.
 //!
-//! The key id is derived from the key (`kid_of`), so the id a signature names and the key that
-//! verifies it cannot disagree — there is no second carrier to keep in step.
-//!
-//! ## Wire
-//!
-//! ```text
-//! delegation = 0x01 ‖ purpose(1) ‖ BE64(not_before) ‖ BE64(not_after)
-//!              ‖ public_key(1984) ‖ root_signature(3373)                     — 5 375 bytes
-//! signed by the root:   "konstruct/v1/delegation" ‖ 0x01 ‖ purpose ‖ BE64 ‖ BE64 ‖ public_key
-//! kid       = SHA-256("konstruct/v1/kid" ‖ public_key)[0..16]
-//! signed by the key:    label(purpose) ‖ kid ‖ body
-//! ```
-//!
-//! Every variable-length field inside a body is length-prefixed (`BE16(len) ‖ bytes`), and every
-//! signed message starts with a label naming what it is — the Ed25519 certificate signature before
-//! this had neither, so a key signing two kinds of message could not tell them apart.
-
-use sha2::{Digest, Sha256};
+//! The bytes — what a root and a server key sign, the delegation encoding, key ids — are the
+//! `construct-server-trust` crate, shared with the server and the root tool so that no side
+//! rebuilds them. This module adds the signature (this crate's hybrid suite) and the decisions.
 
 use crate::crypto::SecretBytes;
 use crate::crypto::provider::CryptoProvider;
-use crate::crypto::sealed_sender::MAX_DELIVERY_AGE_SECS;
 use crate::crypto::suites::hybrid::{
     HYBRID_SIG_PUBLIC_KEY_SIZE, HYBRID_SIGNATURE_SIZE, HybridSuiteProvider,
 };
+
+pub use construct_server_trust::{
+    DELEGATION_LEN, Delegation, KID_LEN, Kid, MAX_DELIVERY_AGE_SECS, Purpose,
+    SENDER_CERT_MAX_LIFETIME_SECS, fingerprint, kid_of, kt_head_body, sender_cert_body,
+    server_signable, sticker_manifest_body,
+};
+
+// The format crate states the hybrid sizes for its encoding; the suite is what produces them.
+const _: () = assert!(construct_server_trust::HYBRID_PUBLIC_KEY_LEN == HYBRID_SIG_PUBLIC_KEY_SIZE);
+const _: () = assert!(construct_server_trust::HYBRID_SIGNATURE_LEN == HYBRID_SIGNATURE_SIZE);
 
 /// The roots this build trusts, as hex of the 1984-byte hybrid public key: the primary first,
 /// then the backup. Empty until the root ceremony (manual §3.1) — with no root, no delegation is
 /// admitted and nothing verifies, which is why no caller depends on this module yet.
 pub const PINNED_ROOTS: &[&str] = &[];
-
-/// Format version of a delegation.
-pub const DELEGATION_VERSION: u8 = 1;
-/// Length of a key id.
-pub const KID_LEN: usize = 16;
-/// Length of an encoded delegation.
-pub const DELEGATION_LEN: usize =
-    1 + 1 + 8 + 8 + HYBRID_SIG_PUBLIC_KEY_SIZE + HYBRID_SIGNATURE_SIZE;
-
-const DELEGATION_LABEL: &[u8] = b"konstruct/v1/delegation";
-const KID_LABEL: &[u8] = b"konstruct/v1/kid";
-
-/// A sender certificate lives a day (identity-service); the most it may claim.
-pub const SENDER_CERT_MAX_LIFETIME_SECS: i64 = 86_400;
-
-/// A server key id: the first 16 bytes of a labelled hash of the key.
-pub type Kid = [u8; KID_LEN];
-
-/// What a server key may sign. One key per purpose: a leaked sticker key signs no certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Purpose {
-    SenderCert = 1,
-    KtHead = 2,
-    StickerManifest = 3,
-}
-
-impl Purpose {
-    pub fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            1 => Some(Self::SenderCert),
-            2 => Some(Self::KtHead),
-            3 => Some(Self::StickerManifest),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::SenderCert => "sender-cert",
-            Self::KtHead => "kt-head",
-            Self::StickerManifest => "sticker-manifest",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        [Self::SenderCert, Self::KtHead, Self::StickerManifest]
-            .into_iter()
-            .find(|p| p.name() == name)
-    }
-
-    /// The label every message signed for this purpose starts with.
-    fn label(self) -> &'static [u8] {
-        match self {
-            Self::SenderCert => b"konstruct/v1/sender-cert",
-            Self::KtHead => b"konstruct/v1/kt-head",
-            Self::StickerManifest => b"konstruct/v1/sticker-manifest",
-        }
-    }
-
-    /// How long after its key's window closes a signature of this purpose is still accepted.
-    ///
-    /// The holder of a leaked key writes whatever `signed_at` it likes, so this — measured against
-    /// the verifier's clock — is what ends a leak, not the window.
-    /// - A sender certificate signed on the window's last second lives a day and then rides a
-    ///   message the relay holds up to `MAX_DELIVERY_AGE_SECS`; refusing earlier would drop
-    ///   genuine first messages sent in a key's last days.
-    /// - A tree head is checked when it is fetched: no grace.
-    /// - A sticker manifest is signed once and read for as long as the pack is installed, so it is
-    ///   not bounded; a leaked sticker key forges sticker packs and nothing else (open question in
-    ///   the decision: re-sign packs on rotation instead).
-    fn grace_secs(self) -> Option<i64> {
-        match self {
-            Self::SenderCert => Some(SENDER_CERT_MAX_LIFETIME_SECS + MAX_DELIVERY_AGE_SECS),
-            Self::KtHead => Some(0),
-            Self::StickerManifest => None,
-        }
-    }
-}
 
 /// Why a server signature or delegation is not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -154,132 +70,54 @@ pub enum TrustError {
     BadSignature,
 }
 
-/// The id of a server key.
-pub fn kid_of(public_key: &[u8]) -> Kid {
-    let digest = Sha256::new()
-        .chain_update(KID_LABEL)
-        .chain_update(public_key)
-        .finalize();
-    digest[..KID_LEN].try_into().expect("SHA-256 is 32 bytes")
-}
-
-/// A root-signed statement: this key may sign for `purpose` between the two instants.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Delegation {
-    pub purpose: Purpose,
-    pub not_before: i64,
-    pub not_after: i64,
-    pub public_key: Vec<u8>,
-    pub root_signature: Vec<u8>,
-}
-
-impl Delegation {
-    pub fn kid(&self) -> Kid {
-        kid_of(&self.public_key)
-    }
-
-    /// What a root signs.
-    fn signable(purpose: Purpose, not_before: i64, not_after: i64, public_key: &[u8]) -> Vec<u8> {
-        let mut m = Vec::with_capacity(DELEGATION_LABEL.len() + 18 + public_key.len());
-        m.extend_from_slice(DELEGATION_LABEL);
-        m.push(DELEGATION_VERSION);
-        m.push(purpose as u8);
-        m.extend_from_slice(&not_before.to_be_bytes());
-        m.extend_from_slice(&not_after.to_be_bytes());
-        m.extend_from_slice(public_key);
-        m
-    }
-
-    /// Delegate `public_key` with `root_private_key` (the 2016-byte hybrid private key). Used by
-    /// the offline tool, never by a client or a server.
-    pub fn issue(
-        root_private_key: &SecretBytes,
-        purpose: Purpose,
-        not_before: i64,
-        not_after: i64,
-        public_key: &[u8],
-    ) -> Result<Self, TrustError> {
-        if public_key.len() != HYBRID_SIG_PUBLIC_KEY_SIZE || not_before >= not_after {
-            return Err(TrustError::Malformed);
-        }
-        let message = Self::signable(purpose, not_before, not_after, public_key);
-        let root_signature = HybridSuiteProvider::sign(root_private_key, &message)
-            .map_err(|_| TrustError::Malformed)?;
-        Ok(Self {
-            purpose,
-            not_before,
-            not_after,
-            public_key: public_key.to_vec(),
-            root_signature,
-        })
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(DELEGATION_LEN);
-        out.push(DELEGATION_VERSION);
-        out.push(self.purpose as u8);
-        out.extend_from_slice(&self.not_before.to_be_bytes());
-        out.extend_from_slice(&self.not_after.to_be_bytes());
-        out.extend_from_slice(&self.public_key);
-        out.extend_from_slice(&self.root_signature);
-        out
-    }
-
-    /// Parse only; `ServerKeyRing::admit` is what checks it.
-    pub fn decode(bytes: &[u8]) -> Result<Self, TrustError> {
-        if bytes.len() != DELEGATION_LEN || bytes[0] != DELEGATION_VERSION {
-            return Err(TrustError::Malformed);
-        }
-        let purpose = Purpose::from_byte(bytes[1]).ok_or(TrustError::Malformed)?;
-        let be64 = |at: usize| i64::from_be_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-        let key_at = 18;
-        let sig_at = key_at + HYBRID_SIG_PUBLIC_KEY_SIZE;
-        Ok(Self {
-            purpose,
-            not_before: be64(2),
-            not_after: be64(10),
-            public_key: bytes[key_at..sig_at].to_vec(),
-            root_signature: bytes[sig_at..].to_vec(),
-        })
-    }
-
-    /// Whether one of `roots` signed this delegation.
-    pub fn verify_rooted(&self, roots: &[Vec<u8>]) -> Result<(), TrustError> {
-        if roots.is_empty() {
-            return Err(TrustError::NoRoot);
-        }
-        if self.not_before >= self.not_after {
-            return Err(TrustError::Malformed);
-        }
-        let message = Self::signable(
-            self.purpose,
-            self.not_before,
-            self.not_after,
-            &self.public_key,
-        );
-        if roots
-            .iter()
-            .any(|root| HybridSuiteProvider::verify(root, &message, &self.root_signature).is_ok())
-        {
-            Ok(())
-        } else {
-            Err(TrustError::NotRooted)
-        }
+impl From<construct_server_trust::Malformed> for TrustError {
+    fn from(_: construct_server_trust::Malformed) -> Self {
+        Self::Malformed
     }
 }
 
-/// The message a server key signs: `label(purpose) ‖ kid ‖ body`.
-fn server_signable(purpose: Purpose, kid: &Kid, body: &[u8]) -> Vec<u8> {
-    let label = purpose.label();
-    let mut m = Vec::with_capacity(label.len() + KID_LEN + body.len());
-    m.extend_from_slice(label);
-    m.extend_from_slice(kid);
-    m.extend_from_slice(body);
-    m
+/// Delegate `public_key` with `root_private_key` (the 2016-byte hybrid private key). Used by the
+/// offline tool, never by a client or a server.
+pub fn issue_delegation(
+    root_private_key: &SecretBytes,
+    purpose: Purpose,
+    not_before: i64,
+    not_after: i64,
+    public_key: &[u8],
+) -> Result<Delegation, TrustError> {
+    if public_key.len() != HYBRID_SIG_PUBLIC_KEY_SIZE || not_before >= not_after {
+        return Err(TrustError::Malformed);
+    }
+    let mut d = Delegation {
+        purpose,
+        not_before,
+        not_after,
+        public_key: public_key.to_vec(),
+        root_signature: Vec::new(),
+    };
+    d.root_signature = HybridSuiteProvider::sign(root_private_key, &d.signable())
+        .map_err(|_| TrustError::Malformed)?;
+    Ok(d)
 }
 
-/// Sign `body` for `purpose` with a delegated server key. The server's half of the format; the
-/// conformance vectors keep a server that does not link this crate byte-identical to it.
+/// Whether one of `roots` signed `delegation`.
+pub fn verify_rooted(delegation: &Delegation, roots: &[Vec<u8>]) -> Result<(), TrustError> {
+    if roots.is_empty() {
+        return Err(TrustError::NoRoot);
+    }
+    let message = delegation.signable();
+    if roots
+        .iter()
+        .any(|root| HybridSuiteProvider::verify(root, &message, &delegation.root_signature).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(TrustError::NotRooted)
+    }
+}
+
+/// Sign `body` for `purpose` with a delegated server key. Tests and tools only: the server signs
+/// with its own crypto over the same `server_signable` bytes.
 pub fn sign_as_server(
     purpose: Purpose,
     private_key: &SecretBytes,
@@ -288,50 +126,6 @@ pub fn sign_as_server(
 ) -> Result<Vec<u8>, TrustError> {
     let message = server_signable(purpose, &kid_of(public_key), body);
     HybridSuiteProvider::sign(private_key, &message).map_err(|_| TrustError::Malformed)
-}
-
-fn put_lp(out: &mut Vec<u8>, field: &[u8]) -> Result<(), TrustError> {
-    let len = u16::try_from(field.len()).map_err(|_| TrustError::Malformed)?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(field);
-    Ok(())
-}
-
-/// The body of a sender certificate signature.
-pub fn sender_cert_body(
-    user_id: &str,
-    domain: &str,
-    identity_key: &[u8],
-    device_id: &str,
-    issued_at: i64,
-    expires_at: i64,
-) -> Result<Vec<u8>, TrustError> {
-    let mut b = Vec::with_capacity(
-        8 + user_id.len() + domain.len() + identity_key.len() + device_id.len() + 16,
-    );
-    put_lp(&mut b, user_id.as_bytes())?;
-    put_lp(&mut b, domain.as_bytes())?;
-    put_lp(&mut b, identity_key)?;
-    put_lp(&mut b, device_id.as_bytes())?;
-    b.extend_from_slice(&issued_at.to_be_bytes());
-    b.extend_from_slice(&expires_at.to_be_bytes());
-    Ok(b)
-}
-
-/// The body of a tree head signature.
-pub fn kt_head_body(tree_size: u64, root_hash: &[u8; 32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(40);
-    b.extend_from_slice(&tree_size.to_be_bytes());
-    b.extend_from_slice(root_hash);
-    b
-}
-
-/// The body of a sticker manifest signature: its canonical bytes, length-prefixed.
-pub fn sticker_manifest_body(canonical: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(4 + canonical.len());
-    b.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
-    b.extend_from_slice(canonical);
-    b
 }
 
 /// The server keys this client accepts: the pinned roots and the delegations admitted under them.
@@ -362,7 +156,7 @@ impl ServerKeyRing {
     /// Admit a delegation if a pinned root signed it. A delegation already admitted is kept once.
     pub fn admit(&mut self, encoded: &[u8]) -> Result<Kid, TrustError> {
         let delegation = Delegation::decode(encoded)?;
-        delegation.verify_rooted(&self.roots)?;
+        verify_rooted(&delegation, &self.roots)?;
         let kid = delegation.kid();
         if !self
             .keys
@@ -403,16 +197,6 @@ impl ServerKeyRing {
         HybridSuiteProvider::verify(&key.public_key, &message, signature)
             .map_err(|_| TrustError::BadSignature)
     }
-}
-
-/// Fingerprint of a public key for a person to compare: SHA-256 as 16 groups of 4 hex digits.
-pub fn fingerprint(public_key: &[u8]) -> String {
-    let h = hex::encode(Sha256::digest(public_key));
-    h.as_bytes()
-        .chunks(4)
-        .map(|c| std::str::from_utf8(c).expect("hex is ascii"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// A root's private half as words: its two 32-byte seeds (Ed25519, then ML-DSA-65), each as a
@@ -487,7 +271,7 @@ mod tests {
     fn setup(purpose: Purpose) -> Setup {
         let (root_sk, root_pk) = key(1);
         let (server_sk, server_pk) = key(10);
-        let d = Delegation::issue(&root_sk, purpose, T0, T0 + 90 * DAY, &server_pk).unwrap();
+        let d = issue_delegation(&root_sk, purpose, T0, T0 + 90 * DAY, &server_pk).unwrap();
         let mut ring = ServerKeyRing::new(vec![root_pk]);
         let kid = ring.admit(&d.encode()).unwrap();
         Setup {
@@ -520,7 +304,7 @@ mod tests {
         let (_, root_pk) = key(1);
         let (_, server_pk) = key(10);
         let d =
-            Delegation::issue(&other_root_sk, Purpose::KtHead, T0, T0 + DAY, &server_pk).unwrap();
+            issue_delegation(&other_root_sk, Purpose::KtHead, T0, T0 + DAY, &server_pk).unwrap();
         let mut ring = ServerKeyRing::new(vec![root_pk]);
         assert_eq!(ring.admit(&d.encode()), Err(TrustError::NotRooted));
         assert_eq!(
@@ -534,7 +318,7 @@ mod tests {
         let (_, primary_pk) = key(1);
         let (backup_sk, backup_pk) = key(3);
         let (_, server_pk) = key(10);
-        let d = Delegation::issue(&backup_sk, Purpose::KtHead, T0, T0 + DAY, &server_pk).unwrap();
+        let d = issue_delegation(&backup_sk, Purpose::KtHead, T0, T0 + DAY, &server_pk).unwrap();
         let mut ring = ServerKeyRing::new(vec![primary_pk, backup_pk]);
         assert!(ring.admit(&d.encode()).is_ok());
     }
@@ -543,7 +327,7 @@ mod tests {
     fn every_delegated_field_is_covered_by_the_root_signature() {
         let (root_sk, root_pk) = key(1);
         let (_, server_pk) = key(10);
-        let good = Delegation::issue(&root_sk, Purpose::SenderCert, T0, T0 + DAY, &server_pk)
+        let good = issue_delegation(&root_sk, Purpose::SenderCert, T0, T0 + DAY, &server_pk)
             .unwrap()
             .encode();
         // purpose, not_before, not_after, a key byte, a signature byte in each half
@@ -573,7 +357,7 @@ mod tests {
         let (server_sk, server_pk) = key(10);
         let mut ring = ServerKeyRing::new(vec![root_pk]);
         for p in [Purpose::SenderCert, Purpose::StickerManifest] {
-            let d = Delegation::issue(&root_sk, p, T0, T0 + DAY, &server_pk).unwrap();
+            let d = issue_delegation(&root_sk, p, T0, T0 + DAY, &server_pk).unwrap();
             ring.admit(&d.encode()).unwrap();
         }
         let body = b"same bytes".to_vec();
@@ -665,14 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn certificate_fields_cannot_slide_into_each_other() {
-        // Without length prefixes "ab"+"c" and "a"+"bc" signed the same bytes.
-        let a = sender_cert_body("ab", "c", &[1; 32], "d", 1, 2).unwrap();
-        let b = sender_cert_body("a", "bc", &[1; 32], "d", 1, 2).unwrap();
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn the_kid_is_the_key() {
         let (_, a) = key(10);
         let (_, b) = key(11);
@@ -699,20 +475,5 @@ mod tests {
         list.swap(3, 4);
         assert!(root_words::decode(&list.join(" ")).is_err());
         assert!(root_words::decode("abandon").is_err());
-    }
-
-    #[test]
-    fn the_root_signed_message_is_fixed() {
-        // Conformance anchor: the bytes a root signs for a fixed delegation. A change here is a
-        // format change — every server and offline tool must change with it.
-        let m = Delegation::signable(Purpose::KtHead, 1, 2, &[0xAB; 4]);
-        assert_eq!(
-            hex::encode(m),
-            "6b6f6e7374727563742f76312f64656c65676174696f6e010200000000000000010000000000000002abababab"
-        );
-        assert_eq!(
-            hex::encode(kid_of(&[0xAB; 4])),
-            hex::encode(&Sha256::digest(b"konstruct/v1/kid\xab\xab\xab\xab")[..16])
-        );
     }
 }
