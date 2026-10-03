@@ -120,6 +120,11 @@ openmls_basic_credential = { version = "0.5", features = ["test-utils"] }
 hex = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# The offline root of the server keys — construct-docs manuals&instructions/server-root-key-ceremony.md
+[[bin]]
+name = "konstruct-root"
+required-features = ["post-quantum"]
+
 [[bench]]
 name = "crypto_bench"
 harness = false

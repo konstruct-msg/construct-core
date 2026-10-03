@@ -125,6 +125,10 @@ pub mod sealed_sender;
 /// Per-message tag naming which device a copy is for, readable only by the two devices
 pub mod device_copy_tag;
 
+/// Server keys rooted offline: delegations from a pinned hybrid root, labelled server signatures
+#[cfg(feature = "post-quantum")]
+pub mod server_trust;
+
 /// Kyber prekey signature check and the PQ-authentication label of a session
 pub mod kyber_prekey_auth;
 
