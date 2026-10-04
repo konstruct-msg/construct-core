@@ -31,6 +31,21 @@ namespace construct_core {
     [Throws=CryptoError]
     WireSummary wire_summary(bytes wire_payload);
 
+    // Media blobs — the encrypted file a media message points to (media.rs). Sealed here, in
+    // one format for every client, and padded to a Padmé bucket so the server sees a size class
+    // rather than the size. `open_media` opens this format and the pre-0.33 one.
+    /// A fresh key, the blob to upload, and the blob's SHA-256 for the message.
+    /// Throws `EncryptionFailed` when `plaintext` is longer than `media_max_plaintext_len()`.
+    [Throws=CryptoError]
+    SealedMedia seal_media(bytes plaintext);
+    /// The file in `blob`. Throws `InvalidKeyData` for a key that is not 32 bytes,
+    /// `DecryptionFailed` when the blob does not open with it, `InvalidCiphertext` when it opens
+    /// but is not well formed.
+    [Throws=CryptoError]
+    bytes open_media(bytes key, bytes blob);
+    /// The largest file `seal_media` takes — check before encoding or uploading anything.
+    u64 media_max_plaintext_len();
+
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
@@ -90,6 +105,13 @@ namespace construct_core {
 /// A parsed KNST frame. `message_id` is the dashed lowercase UUID; `payload` is everything after
 /// the header — for a control frame (`total_chunks == 1`) the body is its first
 /// `plaintext_length` bytes.
+/// See `seal_media`.
+dictionary SealedMedia {
+    bytes key;
+    bytes blob;
+    bytes sha256;
+};
+
 dictionary KnstFrame {
     u8 content_type;
     string message_id;
