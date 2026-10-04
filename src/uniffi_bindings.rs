@@ -2973,6 +2973,47 @@ pub fn compute_safety_number(my_device_id: String, their_device_id: String) -> O
     crate::crypto::recovery::compute_safety_number(&my_device_id, &their_device_id)
 }
 
+// ── Media blobs ───────────────────────────────────────────────────────────────
+
+/// See the UDL `SealedMedia`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealedMedia {
+    pub key: Vec<u8>,
+    pub blob: Vec<u8>,
+    pub sha256: Vec<u8>,
+}
+
+pub fn seal_media(plaintext: Vec<u8>) -> Result<SealedMedia, CryptoError> {
+    let sealed = crate::media::seal_media(&plaintext).map_err(media_error)?;
+    Ok(SealedMedia {
+        key: sealed.key,
+        blob: sealed.blob,
+        sha256: sealed.sha256,
+    })
+}
+
+pub fn open_media(key: Vec<u8>, blob: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+    crate::media::open_media(&key, &blob).map_err(media_error)
+}
+
+pub fn media_max_plaintext_len() -> u64 {
+    crate::media::max_plaintext_len()
+}
+
+fn media_error(e: crate::media::MediaError) -> CryptoError {
+    use crate::media::MediaError;
+    match e {
+        MediaError::TooLarge(_) => CryptoError::EncryptionFailed {
+            message: e.to_string(),
+        },
+        MediaError::InvalidKey(_) => CryptoError::InvalidKeyData,
+        MediaError::Unauthenticated => CryptoError::DecryptionFailed {
+            message: e.to_string(),
+        },
+        MediaError::MalformedPadding => CryptoError::InvalidCiphertext,
+    }
+}
+
 // ── KNST frame ────────────────────────────────────────────────────────────────
 
 /// See the UDL `KnstFrame`.
