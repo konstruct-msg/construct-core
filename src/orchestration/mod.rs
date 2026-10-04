@@ -15,7 +15,6 @@
 ///   initiation_plan  — Whether to open a session with a device now
 ///   receiving_init_plan — Which message can open a session
 ///   send_plan        — Who gets a copy of an outgoing message
-///   receiving_decrypt_plan — Which device session an incoming message is tried against
 ///   pq_prekey_plan   — Which Kyber prekey an initiator encapsulates to, or why no session opens
 ///   orchestrator     — handle_event: every event in, every Action out
 /// ```
@@ -29,7 +28,6 @@ pub mod orchestrator;
 pub mod platform_bridge;
 #[cfg(feature = "post-quantum")]
 pub mod pq_prekey_plan;
-pub mod receiving_decrypt_plan;
 pub mod receiving_init_plan;
 pub mod reorder_stats;
 pub mod send_plan;
@@ -47,7 +45,6 @@ pub use platform_bridge::PlatformBridge;
 pub use pq_prekey_plan::{
     KyberPrekeyOffer, PqxdhChoice, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,
 };
-pub use receiving_decrypt_plan::plan_receiving_decrypt;
 pub use receiving_init_plan::{ReceivingInitCarrier, ReceivingInitKind, receiving_init_kind};
 pub use reorder_stats::ReorderStats;
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
