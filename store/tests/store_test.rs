@@ -751,3 +751,130 @@ fn our_profile_is_one_row_and_not_a_contact() {
         })
     );
 }
+
+// MARK: - Chat writes (schema 3)
+
+fn store_with_peer(peer: &str) -> Store {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&contact(peer, peer)).unwrap();
+    store
+}
+
+/// One chat per peer, however it is asked for. Mutation: make `chats_by_peer` not unique — the
+/// second insert adds a chat and `chat_for_peer` answers with either.
+#[test]
+fn a_peer_has_one_chat() {
+    let store = store_with_peer("p");
+    assert_eq!(
+        store.insert_chat(&chat("c1", "p", None, false)).unwrap(),
+        Insert::Inserted
+    );
+    assert_eq!(
+        store.insert_chat(&chat("c2", "p", Some(5), false)).unwrap(),
+        Insert::AlreadyPresent
+    );
+    assert_eq!(
+        store.insert_chat(&chat("c1", "p", Some(5), false)).unwrap(),
+        Insert::AlreadyPresent,
+        "an insert never replaces"
+    );
+    assert_eq!(
+        store.chat_for_peer("p").unwrap(),
+        Some(chat("c1", "p", None, false))
+    );
+    assert!(store.upsert_chat(&chat("c3", "p", None, false)).is_err());
+    assert_eq!(store.chats().unwrap().len(), 1);
+    assert_eq!(store.chat_for_peer("nobody").unwrap(), None);
+}
+
+/// Messages arrive out of order; the preview only moves forward. Mutation: drop the time
+/// condition from `advance_chat_preview` — the late older message replaces the newer preview.
+#[test]
+fn the_preview_moves_forward_unless_set() {
+    let store = store_with_peer("p");
+    store.upsert_chat(&chat("c", "p", None, false)).unwrap();
+    let preview = |s: &Store| {
+        let c = s.chat("c").unwrap().unwrap();
+        (c.last_message_text, c.last_message_time)
+    };
+
+    assert!(store.advance_chat_preview("c", "first", 10).unwrap());
+    assert!(store.advance_chat_preview("c", "newer", 20).unwrap());
+    assert!(!store.advance_chat_preview("c", "late", 15).unwrap());
+    assert_eq!(preview(&store), (Some("newer".into()), Some(20)));
+    assert!(store.advance_chat_preview("c", "edited", 20).unwrap());
+    assert_eq!(preview(&store), (Some("edited".into()), Some(20)));
+
+    assert!(store.set_chat_preview("c", Some("left"), Some(3)).unwrap());
+    assert_eq!(preview(&store), (Some("left".into()), Some(3)));
+    assert!(store.set_chat_preview("c", None, None).unwrap());
+    assert_eq!(preview(&store), (None, None));
+}
+
+/// Every arriving message counts, from whichever thread. Mutation: implement the increment as a
+/// read and a write back — increments are lost and the total falls short.
+#[test]
+fn unread_counts_every_increment() {
+    let store = Arc::new(store_with_peer("p"));
+    store.upsert_chat(&chat("c", "p", None, false)).unwrap();
+    let threads = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    assert!(store.increment_unread("c").unwrap());
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(store.chat("c").unwrap().unwrap().unread_count, 400);
+    assert!(store.set_unread("c", 0).unwrap());
+    assert_eq!(store.chat("c").unwrap().unwrap().unread_count, 0);
+}
+
+/// Each chat write changes its fields and nothing else, announces its chat, and reports a missing
+/// one without announcing it. Mutation: write `is_pinned` from `set_unread`, or notify
+/// unconditionally in `update_chat`.
+#[test]
+fn each_chat_write_changes_only_its_fields() {
+    let store = store_with_peer("p");
+    let mut expected = Chat {
+        id: "c".into(),
+        peer_id: "p".into(),
+        last_message_text: Some("hi".into()),
+        last_message_time: Some(7),
+        is_pinned: false,
+        unread_count: 3,
+    };
+    store.upsert_chat(&expected).unwrap();
+    assert_eq!(store.chat("c").unwrap(), Some(expected.clone()));
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    assert!(store.set_chat_pinned("c", true).unwrap());
+    expected.is_pinned = true;
+    assert!(store.set_unread("c", 5).unwrap());
+    expected.unread_count = 5;
+    assert!(store.increment_unread("c").unwrap());
+    expected.unread_count = 6;
+    assert_eq!(store.chat("c").unwrap(), Some(expected));
+
+    for missing in [
+        store.set_chat_pinned("nobody", true).unwrap(),
+        store.increment_unread("nobody").unwrap(),
+        store.advance_chat_preview("nobody", "x", 1).unwrap(),
+        store.set_chat_preview("nobody", None, None).unwrap(),
+    ] {
+        assert!(!missing);
+    }
+    let changes = seen.changes.lock().unwrap();
+    assert_eq!(changes.len(), 3);
+    assert!(
+        changes
+            .iter()
+            .all(|c| c.table == Table::Chats && c.ids == ["c"])
+    );
+}

@@ -166,6 +166,20 @@ const STEPS: &[&str] = &[
         profile_edited_at_ms INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // 3 — one chat per peer, and the chat columns no client reads or writes.
+    //
+    // iOS keeps one chat per person by convention only: `Chat.findOrCreate` looks up by peer and
+    // merges duplicates when it meets them. Here the index says it. No store with rows exists
+    // outside tests yet, so nothing is merged; the iOS import merges duplicates before writing.
+    //
+    // `session_id` was never written by any client; `is_muted` had a setter nobody called and no
+    // reader. A mute comes back with the feature that reads it.
+    r#"
+    DROP INDEX chats_by_peer;
+    CREATE UNIQUE INDEX chats_by_peer ON chats(peer_id);
+    ALTER TABLE chats DROP COLUMN session_id;
+    ALTER TABLE chats DROP COLUMN is_muted;
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;

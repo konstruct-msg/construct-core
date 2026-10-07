@@ -45,12 +45,13 @@ pub struct IdentityKeyPin {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Chat {
     pub id: String,
+    /// One chat per peer.
     pub peer_id: String,
+    /// The list's preview, as the client formatted it.
     pub last_message_text: Option<String>,
+    /// Milliseconds since the Unix epoch.
     pub last_message_time: Option<i64>,
-    pub session_id: Option<String>,
     pub is_pinned: bool,
-    pub is_muted: bool,
     pub unread_count: i32,
 }
 

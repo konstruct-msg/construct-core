@@ -1660,12 +1660,13 @@ dictionary LocalIdentityKeyPin {
 
 dictionary LocalChat {
     string id;
+    /// One chat per peer.
     string peer_id;
+    /// The list's preview, as the client formatted it.
     string? last_message_text;
+    /// Milliseconds since the Unix epoch.
     i64? last_message_time;
-    string? session_id;
     boolean is_pinned;
-    boolean is_muted;
     i32 unread_count;
 };
 
@@ -1794,10 +1795,29 @@ interface LocalStore {
     [Throws=LocalStoreError]
     void set_own_profile(LocalOwnProfile profile);
 
+    /// The whole row; a second chat for a peer that has one is an error.
     [Throws=LocalStoreError]
     void upsert_chat(LocalChat chat);
+    /// `AlreadyPresent` when the id or the peer has a chat — then use `chat_for_peer`.
+    [Throws=LocalStoreError]
+    LocalInsert insert_chat(LocalChat chat);
     [Throws=LocalStoreError]
     LocalChat? chat(string id);
+    [Throws=LocalStoreError]
+    LocalChat? chat_for_peer(string peer_id);
+    /// Each write below changes its named fields of one chat in one statement; false: no such chat.
+    /// Moves the preview unless the one shown is newer; false also when it is.
+    [Throws=LocalStoreError]
+    boolean advance_chat_preview(string id, string text, i64 time);
+    /// Sets the preview whatever it was — after a deletion; both null when no message is left.
+    [Throws=LocalStoreError]
+    boolean set_chat_preview(string id, string? text, i64? time);
+    [Throws=LocalStoreError]
+    boolean increment_unread(string id);
+    [Throws=LocalStoreError]
+    boolean set_unread(string id, i32 count);
+    [Throws=LocalStoreError]
+    boolean set_chat_pinned(string id, boolean pinned);
     /// Pinned first, then most recent, chats with no message last.
     [Throws=LocalStoreError]
     sequence<LocalChat> chats();
