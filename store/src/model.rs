@@ -7,7 +7,6 @@ pub struct Contact {
     pub display_name: String,
     pub local_alias: Option<String>,
     pub avatar: Option<Vec<u8>>,
-    pub public_key: Option<String>,
     pub known_identity_key: Option<Vec<u8>>,
     pub account_address: Option<Vec<u8>>,
     pub is_contact: bool,
@@ -17,8 +16,30 @@ pub struct Contact {
     pub shared_with_me_at: Option<i64>,
     pub added_at: Option<i64>,
     pub kt_status: i16,
-    pub hybrid_capable: bool,
     pub security_notice: i16,
+    /// When the peer last edited the profile they share; 0 when never told. A profile that is not
+    /// newer than this is not applied.
+    pub profile_edited_at_ms: i64,
+    /// An avatar the peer announced that has not been downloaded yet, and since when.
+    pub pending_avatar_ref: Option<Vec<u8>>,
+    pub pending_avatar_since: Option<i64>,
+}
+
+/// Our own profile — what we share with the people we share it with. One row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OwnProfile {
+    pub account_id: String,
+    pub username: String,
+    pub display_name: String,
+    pub avatar: Option<Vec<u8>>,
+    pub profile_edited_at_ms: i64,
+}
+
+/// A contact's pinned identity key, without the rest of the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityKeyPin {
+    pub contact_id: String,
+    pub key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

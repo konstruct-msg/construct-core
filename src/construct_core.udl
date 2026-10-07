@@ -1603,6 +1603,7 @@ enum LocalStoreTable {
     "Reactions",
     "Calls",
     "PeerDevices",
+    "OwnProfile",
 };
 
 enum LocalInsert {
@@ -1626,7 +1627,6 @@ dictionary LocalContact {
     string display_name;
     string? local_alias;
     bytes? avatar;
-    string? public_key;
     bytes? known_identity_key;
     bytes? account_address;
     boolean is_contact;
@@ -1636,8 +1636,26 @@ dictionary LocalContact {
     i64? shared_with_me_at;
     i64? added_at;
     i16 kt_status;
-    boolean hybrid_capable;
     i16 security_notice;
+    /// When the peer last edited the profile they share; 0 when never told.
+    i64 profile_edited_at_ms;
+    /// An announced avatar not yet downloaded, and since when.
+    bytes? pending_avatar_ref;
+    i64? pending_avatar_since;
+};
+
+/// Our own profile — one row, not a contact.
+dictionary LocalOwnProfile {
+    string account_id;
+    string username;
+    string display_name;
+    bytes? avatar;
+    i64 profile_edited_at_ms;
+};
+
+dictionary LocalIdentityKeyPin {
+    string contact_id;
+    bytes key;
 };
 
 dictionary LocalChat {
@@ -1732,6 +1750,49 @@ interface LocalStore {
     /// Takes the contact's chats and their messages with it.
     [Throws=LocalStoreError]
     void delete_contact(string id);
+    /// Every row, contacts or not, by id.
+    [Throws=LocalStoreError]
+    sequence<LocalContact> every_contact();
+    /// The ids we share our profile with.
+    [Throws=LocalStoreError]
+    sequence<string> sharing_with();
+    [Throws=LocalStoreError]
+    sequence<LocalContact> contacts_with_pending_avatar();
+    [Throws=LocalStoreError]
+    sequence<LocalIdentityKeyPin> identity_key_pins();
+
+    /// Each write below changes its named fields of one row in one statement; false: no such row.
+    /// A contact from now on; `added_at` is kept if it was set.
+    [Throws=LocalStoreError]
+    boolean mark_contact(string id, i64 added_at);
+    [Throws=LocalStoreError]
+    boolean set_contact_blocked(string id, boolean blocked);
+    [Throws=LocalStoreError]
+    boolean set_contact_alias(string id, string? alias);
+    [Throws=LocalStoreError]
+    boolean set_sharing_with(string id, boolean sharing);
+    [Throws=LocalStoreError]
+    boolean set_identity_key(string id, bytes? key);
+    [Throws=LocalStoreError]
+    boolean set_kt_status(string id, i16 status);
+    [Throws=LocalStoreError]
+    boolean set_account_address(string id, bytes? address);
+    [Throws=LocalStoreError]
+    boolean set_security_notice(string id, i16 notice);
+    [Throws=LocalStoreError]
+    boolean set_contact_names(string id, string username, string display_name);
+    /// Sharing on, with the name and both times the client chose.
+    [Throws=LocalStoreError]
+    boolean apply_shared_profile(string id, string display_name, i64 shared_with_me_at, i64 profile_edited_at_ms);
+    /// The avatar and the one still to download, set together.
+    [Throws=LocalStoreError]
+    boolean set_contact_avatar(string id, bytes? avatar, bytes? pending_ref, i64? pending_since);
+
+    [Throws=LocalStoreError]
+    LocalOwnProfile? own_profile();
+    /// Replaces our profile — there is one.
+    [Throws=LocalStoreError]
+    void set_own_profile(LocalOwnProfile profile);
 
     [Throws=LocalStoreError]
     void upsert_chat(LocalChat chat);

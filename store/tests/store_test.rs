@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use construct_store::{
-    Change, Chat, Contact, Insert, Message, PeerDevice, Reaction, Store, StoreError, StoreObserver,
-    Table,
+    Change, Chat, Contact, IdentityKeyPin, Insert, Message, OwnProfile, PeerDevice, Reaction,
+    Store, StoreError, StoreObserver, Table,
 };
 
 const KEY: [u8; 32] = [7; 32];
@@ -532,4 +532,222 @@ fn a_server_id_maps_back_to_our_message_until_it_is_forgotten() {
     assert_eq!(store.forget_server_message_ids_before(150).unwrap(), 1);
     assert_eq!(store.local_message_id("e474825e-aaaa").unwrap(), None);
     assert!(store.local_message_id("f00d-0001").unwrap().is_some());
+}
+
+// MARK: - Contact writes and our own profile (schema 2)
+
+#[derive(Default)]
+struct Changes {
+    changes: Mutex<Vec<Change>>,
+}
+
+impl StoreObserver for Changes {
+    fn on_change(&self, change: Change) {
+        self.changes.lock().unwrap().push(change);
+    }
+}
+
+fn full_contact(id: &str) -> Contact {
+    Contact {
+        id: id.into(),
+        username: "ada".into(),
+        display_name: "Ada".into(),
+        local_alias: Some("A".into()),
+        avatar: Some(vec![1, 2, 3]),
+        known_identity_key: Some(vec![9; 32]),
+        account_address: Some(vec![8; 32]),
+        is_contact: true,
+        is_blocked: false,
+        is_sharing_with_me: true,
+        am_i_sharing_with: true,
+        shared_with_me_at: Some(10),
+        added_at: Some(20),
+        kt_status: 1,
+        security_notice: 0,
+        profile_edited_at_ms: 30,
+        pending_avatar_ref: Some(vec![7]),
+        pending_avatar_since: Some(40),
+    }
+}
+
+/// Every field round-trips, the three schema-2 ones included. Mutation: drop one from
+/// `CONTACT_COLUMNS`/`contact_row` or from the upsert — the row reads back different.
+#[test]
+fn a_contact_reads_back_as_written() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&full_contact("a")).unwrap();
+    assert_eq!(store.contact("a").unwrap(), Some(full_contact("a")));
+}
+
+/// A write names its fields and leaves the rest. Mutation: implement a setter as read, change,
+/// `upsert_contact` — a concurrent writer of another field is undone; here, a setter that
+/// rewrites more than its fields changes the row beyond the one field.
+#[test]
+fn each_contact_write_changes_only_its_fields() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&full_contact("a")).unwrap();
+    let mut expected = full_contact("a");
+
+    assert!(store.set_contact_blocked("a", true).unwrap());
+    expected.is_blocked = true;
+    assert!(store.set_contact_alias("a", None).unwrap());
+    expected.local_alias = None;
+    assert!(store.set_sharing_with("a", false).unwrap());
+    expected.am_i_sharing_with = false;
+    assert!(store.set_identity_key("a", Some(&[5; 32])).unwrap());
+    expected.known_identity_key = Some(vec![5; 32]);
+    assert!(store.set_kt_status("a", 2).unwrap());
+    expected.kt_status = 2;
+    assert!(store.set_account_address("a", None).unwrap());
+    expected.account_address = None;
+    assert!(store.set_security_notice("a", 1).unwrap());
+    expected.security_notice = 1;
+    assert!(store.set_contact_names("a", "ada2", "Ada Two").unwrap());
+    expected.username = "ada2".into();
+    expected.display_name = "Ada Two".into();
+    assert!(
+        store
+            .set_contact_avatar("a", Some(&[4]), None, None)
+            .unwrap()
+    );
+    expected.avatar = Some(vec![4]);
+    expected.pending_avatar_ref = None;
+    expected.pending_avatar_since = None;
+
+    assert_eq!(store.contact("a").unwrap(), Some(expected));
+}
+
+/// A shared profile turns sharing on and writes the name and both times.
+#[test]
+fn a_shared_profile_is_applied_whole() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let mut c = contact("a", "");
+    c.is_sharing_with_me = false;
+    store.upsert_contact(&c).unwrap();
+    assert!(store.apply_shared_profile("a", "Ada", 100, 200).unwrap());
+    let read = store.contact("a").unwrap().unwrap();
+    assert!(read.is_sharing_with_me);
+    assert_eq!(read.display_name, "Ada");
+    assert_eq!(read.shared_with_me_at, Some(100));
+    assert_eq!(read.profile_edited_at_ms, 200);
+}
+
+/// Marking a contact keeps the date it was first added. Mutation: drop the `COALESCE`.
+#[test]
+fn marking_a_contact_keeps_when_it_was_added() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let mut c = contact("a", "Ada");
+    c.is_contact = false;
+    c.added_at = Some(5);
+    store.upsert_contact(&c).unwrap();
+    store
+        .upsert_contact(&Contact {
+            id: "b".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(store.mark_contact("a", 99).unwrap());
+    assert!(store.mark_contact("b", 99).unwrap());
+    let a = store.contact("a").unwrap().unwrap();
+    assert!(a.is_contact);
+    assert_eq!(a.added_at, Some(5));
+    assert_eq!(store.contact("b").unwrap().unwrap().added_at, Some(99));
+}
+
+/// A write to a row that does not exist reports it, creates nothing and announces nothing.
+/// Mutation: notify unconditionally — observers rebuild for a row that is not there.
+#[test]
+fn a_write_to_no_row_is_reported_and_silent() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+    assert!(!store.set_contact_blocked("nobody", true).unwrap());
+    assert_eq!(store.contact("nobody").unwrap(), None);
+    assert!(seen.changes.lock().unwrap().is_empty());
+}
+
+/// Every write names its table and row. Mutation: drop the notify in `update_contact`.
+#[test]
+fn contact_writes_are_announced() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&full_contact("a")).unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+    store.set_contact_alias("a", Some("B")).unwrap();
+    assert_eq!(
+        *seen.changes.lock().unwrap(),
+        vec![Change {
+            table: Table::Contacts,
+            ids: vec!["a".into()]
+        }]
+    );
+}
+
+/// The list of contacts is people marked as contacts; every row is everyone we hold a row for.
+#[test]
+fn every_row_includes_people_who_are_not_contacts() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&contact("b", "Bea")).unwrap();
+    let mut stranger = contact("a", "Al");
+    stranger.is_contact = false;
+    store.upsert_contact(&stranger).unwrap();
+
+    let ids = |rows: Vec<Contact>| rows.into_iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.contacts().unwrap()), vec!["b"]);
+    assert_eq!(ids(store.every_contact().unwrap()), vec!["a", "b"]);
+}
+
+/// The narrow reads answer from the field they are named for.
+#[test]
+fn pins_pending_avatars_and_sharing_are_found_by_their_field() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&full_contact("a")).unwrap();
+    store.upsert_contact(&contact("b", "Bea")).unwrap();
+
+    assert_eq!(
+        store.identity_key_pins().unwrap(),
+        vec![IdentityKeyPin {
+            contact_id: "a".into(),
+            key: vec![9; 32]
+        }]
+    );
+    let pending = store.contacts_with_pending_avatar().unwrap();
+    assert_eq!(
+        pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
+    assert_eq!(store.sharing_with().unwrap(), vec!["a"]);
+}
+
+/// Our profile is one row, not a contact. Mutation: drop the `one = 1` key — a second set adds a
+/// row and the read takes either.
+#[test]
+fn our_profile_is_one_row_and_not_a_contact() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert_eq!(store.own_profile().unwrap(), None);
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    let mut me = OwnProfile {
+        account_id: "me".into(),
+        username: "max".into(),
+        display_name: "Max".into(),
+        avatar: None,
+        profile_edited_at_ms: 1,
+    };
+    store.set_own_profile(&me).unwrap();
+    me.display_name = "Maxim".into();
+    me.profile_edited_at_ms = 2;
+    store.set_own_profile(&me).unwrap();
+
+    assert_eq!(store.own_profile().unwrap(), Some(me));
+    assert!(store.every_contact().unwrap().is_empty());
+    assert_eq!(
+        seen.changes.lock().unwrap().last(),
+        Some(&Change {
+            table: Table::OwnProfile,
+            ids: vec!["me".into()]
+        })
+    );
 }
