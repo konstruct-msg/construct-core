@@ -86,9 +86,7 @@ fn a_client_writes_reads_pages_and_hears_about_it() {
             peer_id: "peer".into(),
             last_message_text: None,
             last_message_time: Some(1),
-            session_id: None,
             is_pinned: false,
-            is_muted: false,
             unread_count: 0,
         })
         .unwrap();

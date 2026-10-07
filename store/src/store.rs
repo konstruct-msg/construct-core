@@ -397,29 +397,64 @@ impl Store {
 
     // MARK: - Chats
 
+    /// The whole row, replacing one with the same id. A second chat for a peer that has one is
+    /// refused (`Sqlite` constraint error): one chat per peer.
     pub fn upsert_chat(&self, c: &Chat) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO chats (id, peer_id, last_message_text, last_message_time, session_id,
-                 is_pinned, is_muted, unread_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO chats (id, peer_id, last_message_text, last_message_time, is_pinned,
+                 unread_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                  peer_id = excluded.peer_id, last_message_text = excluded.last_message_text,
-                 last_message_time = excluded.last_message_time, session_id = excluded.session_id,
-                 is_pinned = excluded.is_pinned, is_muted = excluded.is_muted,
+                 last_message_time = excluded.last_message_time, is_pinned = excluded.is_pinned,
                  unread_count = excluded.unread_count",
             params![
                 c.id,
                 c.peer_id,
                 c.last_message_text,
                 c.last_message_time,
-                c.session_id,
                 c.is_pinned,
-                c.is_muted,
                 c.unread_count
             ],
         )?;
         self.notify(Table::Chats, vec![c.id.clone()]);
         Ok(())
+    }
+
+    /// Adds the chat unless its id or its peer already has one; the chat to use then is
+    /// `chat_for_peer`. Two writers opening a chat with the same person at once get one chat.
+    pub fn insert_chat(&self, c: &Chat) -> Result<Insert> {
+        let added = self.lock().execute(
+            "INSERT INTO chats (id, peer_id, last_message_text, last_message_time, is_pinned,
+                 unread_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT DO NOTHING",
+            params![
+                c.id,
+                c.peer_id,
+                c.last_message_text,
+                c.last_message_time,
+                c.is_pinned,
+                c.unread_count
+            ],
+        )?;
+        if added > 0 {
+            self.notify(Table::Chats, vec![c.id.clone()]);
+            Ok(Insert::Inserted)
+        } else {
+            Ok(Insert::AlreadyPresent)
+        }
+    }
+
+    pub fn chat_for_peer(&self, peer_id: &str) -> Result<Option<Chat>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!("SELECT {CHAT_COLUMNS} FROM chats WHERE peer_id = ?1"),
+                [peer_id],
+                chat_row,
+            )
+            .optional()?)
     }
 
     pub fn chat(&self, id: &str) -> Result<Option<Chat>> {
@@ -455,6 +490,63 @@ impl Store {
             self.notify(Table::Chats, vec![id.to_string()]);
         }
         Ok(())
+    }
+
+    // Each write below changes the named fields of one existing chat in one statement, like the
+    // contact writes. The preview and the unread count are written by every arriving message, from
+    // whichever thread received it: a read, a change and a write back would lose one of two.
+
+    /// Moves the preview to a message unless the one shown is newer — messages arrive out of
+    /// order, and an older one must not replace a newer preview. An equal time moves it (a
+    /// message edited in place). `false`: no such chat, or the preview shown is newer.
+    pub fn advance_chat_preview(&self, id: &str, text: &str, time: i64) -> Result<bool> {
+        self.update_chat(
+            id,
+            "last_message_text = ?1, last_message_time = ?2",
+            "AND (last_message_time IS NULL OR last_message_time <= ?2)",
+            &[&text, &time],
+        )
+    }
+
+    /// Sets the preview whatever it was: recomputed from the messages left after a deletion,
+    /// which moves it back; both `None` when none are left.
+    pub fn set_chat_preview(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        time: Option<i64>,
+    ) -> Result<bool> {
+        self.update_chat(
+            id,
+            "last_message_text = ?1, last_message_time = ?2",
+            "",
+            &[&text, &time],
+        )
+    }
+
+    /// One more unread message.
+    pub fn increment_unread(&self, id: &str) -> Result<bool> {
+        self.update_chat(id, "unread_count = unread_count + 1", "", &[])
+    }
+
+    /// Zero when the chat is read.
+    pub fn set_unread(&self, id: &str, count: i32) -> Result<bool> {
+        self.update_chat(id, "unread_count = ?1", "", &[&count])
+    }
+
+    pub fn set_chat_pinned(&self, id: &str, pinned: bool) -> Result<bool> {
+        self.update_chat(id, "is_pinned = ?1", "", &[&pinned])
+    }
+
+    fn update_chat(&self, id: &str, set: &str, and: &str, values: &[&dyn ToSql]) -> Result<bool> {
+        let mut args = values.to_vec();
+        args.push(&id);
+        let sql = format!("UPDATE chats SET {set} WHERE id = ?{} {and}", args.len());
+        let changed = self.lock().execute(&sql, args.as_slice())? > 0;
+        if changed {
+            self.notify(Table::Chats, vec![id.to_string()]);
+        }
+        Ok(changed)
     }
 
     // MARK: - Messages
@@ -896,7 +988,8 @@ fn contact_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
     })
 }
 
-const CHAT_COLUMNS: &str = "id, peer_id, last_message_text, last_message_time, session_id, is_pinned, is_muted, unread_count";
+const CHAT_COLUMNS: &str =
+    "id, peer_id, last_message_text, last_message_time, is_pinned, unread_count";
 
 fn chat_row(row: &Row<'_>) -> rusqlite::Result<Chat> {
     Ok(Chat {
@@ -904,10 +997,8 @@ fn chat_row(row: &Row<'_>) -> rusqlite::Result<Chat> {
         peer_id: row.get(1)?,
         last_message_text: row.get(2)?,
         last_message_time: row.get(3)?,
-        session_id: row.get(4)?,
-        is_pinned: row.get(5)?,
-        is_muted: row.get(6)?,
-        unread_count: row.get(7)?,
+        is_pinned: row.get(4)?,
+        unread_count: row.get(5)?,
     })
 }
 

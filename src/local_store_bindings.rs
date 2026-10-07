@@ -127,8 +127,7 @@ mirror!(LocalIdentityKeyPin <=> store::IdentityKeyPin {
 
 mirror!(LocalChat <=> store::Chat {
     id: String, peer_id: String, last_message_text: Option<String>,
-    last_message_time: Option<i64>, session_id: Option<String>, is_pinned: bool,
-    is_muted: bool, unread_count: i32,
+    last_message_time: Option<i64>, is_pinned: bool, unread_count: i32,
 });
 
 mirror!(LocalMessage <=> store::Message {
@@ -300,8 +299,34 @@ impl LocalStore {
     pub fn upsert_chat(&self, chat: LocalChat) -> Result<()> {
         self.with(|s| s.upsert_chat(&chat.into()))
     }
+    pub fn insert_chat(&self, chat: LocalChat) -> Result<LocalInsert> {
+        Ok(self.with(|s| s.insert_chat(&chat.into()))?.into())
+    }
     pub fn chat(&self, id: String) -> Result<Option<LocalChat>> {
         Ok(self.with(|s| s.chat(&id))?.map(Into::into))
+    }
+    pub fn chat_for_peer(&self, peer_id: String) -> Result<Option<LocalChat>> {
+        Ok(self.with(|s| s.chat_for_peer(&peer_id))?.map(Into::into))
+    }
+    pub fn advance_chat_preview(&self, id: String, text: String, time: i64) -> Result<bool> {
+        self.with(|s| s.advance_chat_preview(&id, &text, time))
+    }
+    pub fn set_chat_preview(
+        &self,
+        id: String,
+        text: Option<String>,
+        time: Option<i64>,
+    ) -> Result<bool> {
+        self.with(|s| s.set_chat_preview(&id, text.as_deref(), time))
+    }
+    pub fn increment_unread(&self, id: String) -> Result<bool> {
+        self.with(|s| s.increment_unread(&id))
+    }
+    pub fn set_unread(&self, id: String, count: i32) -> Result<bool> {
+        self.with(|s| s.set_unread(&id, count))
+    }
+    pub fn set_chat_pinned(&self, id: String, pinned: bool) -> Result<bool> {
+        self.with(|s| s.set_chat_pinned(&id, pinned))
     }
     pub fn chats(&self) -> Result<Vec<LocalChat>> {
         Ok(all(self.with(|s| s.chats())?))
