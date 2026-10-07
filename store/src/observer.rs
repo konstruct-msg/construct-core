@@ -9,6 +9,8 @@ pub enum Table {
     Reactions,
     Calls,
     PeerDevices,
+    /// Our own profile; the id is our account id.
+    OwnProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, ToSql, params};
 use zeroize::Zeroizing;
 
 use crate::KEY_LEN;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    CallRecord, Chat, Contact, DeliveryStatus, Message, PeerDevice, Reaction, SearchHit,
+    CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, Message, OwnProfile, PeerDevice,
+    Reaction, SearchHit,
 };
 use crate::observer::{Change, StoreObserver, Table};
 
@@ -127,28 +128,29 @@ impl Store {
 
     pub fn upsert_contact(&self, c: &Contact) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO contacts (id, username, display_name, local_alias, avatar, public_key,
+            "INSERT INTO contacts (id, username, display_name, local_alias, avatar,
                  known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
-                 am_i_sharing_with, shared_with_me_at, added_at, kt_status, hybrid_capable,
-                 security_notice)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
+                 profile_edited_at_ms, pending_avatar_ref, pending_avatar_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                  username = excluded.username, display_name = excluded.display_name,
                  local_alias = excluded.local_alias, avatar = excluded.avatar,
-                 public_key = excluded.public_key, known_identity_key = excluded.known_identity_key,
+                 known_identity_key = excluded.known_identity_key,
                  account_address = excluded.account_address, is_contact = excluded.is_contact,
                  is_blocked = excluded.is_blocked, is_sharing_with_me = excluded.is_sharing_with_me,
                  am_i_sharing_with = excluded.am_i_sharing_with,
                  shared_with_me_at = excluded.shared_with_me_at, added_at = excluded.added_at,
-                 kt_status = excluded.kt_status, hybrid_capable = excluded.hybrid_capable,
-                 security_notice = excluded.security_notice",
+                 kt_status = excluded.kt_status, security_notice = excluded.security_notice,
+                 profile_edited_at_ms = excluded.profile_edited_at_ms,
+                 pending_avatar_ref = excluded.pending_avatar_ref,
+                 pending_avatar_since = excluded.pending_avatar_since",
             params![
                 c.id,
                 c.username,
                 c.display_name,
                 c.local_alias,
                 c.avatar,
-                c.public_key,
                 c.known_identity_key,
                 c.account_address,
                 c.is_contact,
@@ -158,8 +160,10 @@ impl Store {
                 c.shared_with_me_at,
                 c.added_at,
                 c.kt_status,
-                c.hybrid_capable,
-                c.security_notice
+                c.security_notice,
+                c.profile_edited_at_ms,
+                c.pending_avatar_ref,
+                c.pending_avatar_since
             ],
         )?;
         self.notify(Table::Contacts, vec![c.id.clone()]);
@@ -198,6 +202,196 @@ impl Store {
         if removed > 0 {
             self.notify(Table::Contacts, vec![id.to_string()]);
         }
+        Ok(())
+    }
+
+    /// Every row, contacts or not (a peer we hold a key for, a blocked stranger), by id.
+    pub fn every_contact(&self) -> Result<Vec<Contact>> {
+        self.contacts_where("1", [])
+    }
+
+    /// The people we share our profile with, by id.
+    pub fn sharing_with(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id FROM contacts WHERE am_i_sharing_with = 1 ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Rows with an avatar announced and not yet downloaded, by id.
+    pub fn contacts_with_pending_avatar(&self) -> Result<Vec<Contact>> {
+        self.contacts_where("pending_avatar_ref IS NOT NULL", [])
+    }
+
+    /// Every pinned identity key, by contact id.
+    pub fn identity_key_pins(&self) -> Result<Vec<IdentityKeyPin>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, known_identity_key FROM contacts
+             WHERE known_identity_key IS NOT NULL ORDER BY id",
+        )?;
+        let pins = stmt
+            .query_map([], |row| {
+                Ok(IdentityKeyPin {
+                    contact_id: row.get(0)?,
+                    key: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(pins)
+    }
+
+    // Each write below changes the named fields of one existing row and nothing else, in one
+    // statement, so two writers of different fields never undo each other — which a read, a
+    // change and an `upsert_contact` of the whole row would. `false`: no such row.
+
+    /// A contact from now on; `added_at` is kept if it was set.
+    pub fn mark_contact(&self, id: &str, added_at: i64) -> Result<bool> {
+        self.update_contact(
+            id,
+            "is_contact = 1, added_at = COALESCE(added_at, ?1)",
+            &[&added_at],
+        )
+    }
+
+    pub fn set_contact_blocked(&self, id: &str, blocked: bool) -> Result<bool> {
+        self.update_contact(id, "is_blocked = ?1", &[&blocked])
+    }
+
+    /// The name we gave them; `None` shows theirs again.
+    pub fn set_contact_alias(&self, id: &str, alias: Option<&str>) -> Result<bool> {
+        self.update_contact(id, "local_alias = ?1", &[&alias])
+    }
+
+    /// Whether we share our profile with them.
+    pub fn set_sharing_with(&self, id: &str, sharing: bool) -> Result<bool> {
+        self.update_contact(id, "am_i_sharing_with = ?1", &[&sharing])
+    }
+
+    pub fn set_identity_key(&self, id: &str, key: Option<&[u8]>) -> Result<bool> {
+        self.update_contact(id, "known_identity_key = ?1", &[&key])
+    }
+
+    pub fn set_kt_status(&self, id: &str, status: i16) -> Result<bool> {
+        self.update_contact(id, "kt_status = ?1", &[&status])
+    }
+
+    pub fn set_account_address(&self, id: &str, address: Option<&[u8]>) -> Result<bool> {
+        self.update_contact(id, "account_address = ?1", &[&address])
+    }
+
+    pub fn set_security_notice(&self, id: &str, notice: i16) -> Result<bool> {
+        self.update_contact(id, "security_notice = ?1", &[&notice])
+    }
+
+    /// The names the server knows them by, as the client resolved them.
+    pub fn set_contact_names(&self, id: &str, username: &str, display_name: &str) -> Result<bool> {
+        self.update_contact(
+            id,
+            "username = ?1, display_name = ?2",
+            &[&username, &display_name],
+        )
+    }
+
+    /// A profile they shared with us. Which name and times to write is the client's decision —
+    /// whether this edit is newer, whether the name is a generated one.
+    pub fn apply_shared_profile(
+        &self,
+        id: &str,
+        display_name: &str,
+        shared_with_me_at: i64,
+        profile_edited_at_ms: i64,
+    ) -> Result<bool> {
+        self.update_contact(
+            id,
+            "is_sharing_with_me = 1, display_name = ?1, shared_with_me_at = ?2,
+             profile_edited_at_ms = ?3",
+            &[&display_name, &shared_with_me_at, &profile_edited_at_ms],
+        )
+    }
+
+    /// The avatar, and the one still to download — set together, since a downloaded avatar ends
+    /// the wait for it and an announced one replaces what was shown.
+    pub fn set_contact_avatar(
+        &self,
+        id: &str,
+        avatar: Option<&[u8]>,
+        pending_ref: Option<&[u8]>,
+        pending_since: Option<i64>,
+    ) -> Result<bool> {
+        self.update_contact(
+            id,
+            "avatar = ?1, pending_avatar_ref = ?2, pending_avatar_since = ?3",
+            &[&avatar, &pending_ref, &pending_since],
+        )
+    }
+
+    fn update_contact(&self, id: &str, set: &str, values: &[&dyn ToSql]) -> Result<bool> {
+        let mut args = values.to_vec();
+        args.push(&id);
+        let sql = format!("UPDATE contacts SET {set} WHERE id = ?{}", args.len());
+        let changed = self.lock().execute(&sql, args.as_slice())? > 0;
+        if changed {
+            self.notify(Table::Contacts, vec![id.to_string()]);
+        }
+        Ok(changed)
+    }
+
+    fn contacts_where<P: rusqlite::Params>(&self, filter: &str, args: P) -> Result<Vec<Contact>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CONTACT_COLUMNS} FROM contacts WHERE {filter} ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(args, contact_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // MARK: - Own profile
+
+    pub fn own_profile(&self) -> Result<Option<OwnProfile>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT account_id, username, display_name, avatar, profile_edited_at_ms
+                 FROM own_profile WHERE one = 1",
+                [],
+                |row| {
+                    Ok(OwnProfile {
+                        account_id: row.get(0)?,
+                        username: row.get(1)?,
+                        display_name: row.get(2)?,
+                        avatar: row.get(3)?,
+                        profile_edited_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Replaces our profile — there is one.
+    pub fn set_own_profile(&self, p: &OwnProfile) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO own_profile (one, account_id, username, display_name, avatar,
+                 profile_edited_at_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(one) DO UPDATE SET
+                 account_id = excluded.account_id, username = excluded.username,
+                 display_name = excluded.display_name, avatar = excluded.avatar,
+                 profile_edited_at_ms = excluded.profile_edited_at_ms",
+            params![
+                p.account_id,
+                p.username,
+                p.display_name,
+                p.avatar,
+                p.profile_edited_at_ms
+            ],
+        )?;
+        self.notify(Table::OwnProfile, vec![p.account_id.clone()]);
         Ok(())
     }
 
@@ -674,9 +868,10 @@ impl Store {
 
 // MARK: - Rows
 
-const CONTACT_COLUMNS: &str = "id, username, display_name, local_alias, avatar, public_key,
+const CONTACT_COLUMNS: &str = "id, username, display_name, local_alias, avatar,
     known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
-    am_i_sharing_with, shared_with_me_at, added_at, kt_status, hybrid_capable, security_notice";
+    am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
+    profile_edited_at_ms, pending_avatar_ref, pending_avatar_since";
 
 fn contact_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
     Ok(Contact {
@@ -685,18 +880,19 @@ fn contact_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
         display_name: row.get(2)?,
         local_alias: row.get(3)?,
         avatar: row.get(4)?,
-        public_key: row.get(5)?,
-        known_identity_key: row.get(6)?,
-        account_address: row.get(7)?,
-        is_contact: row.get(8)?,
-        is_blocked: row.get(9)?,
-        is_sharing_with_me: row.get(10)?,
-        am_i_sharing_with: row.get(11)?,
-        shared_with_me_at: row.get(12)?,
-        added_at: row.get(13)?,
-        kt_status: row.get(14)?,
-        hybrid_capable: row.get(15)?,
-        security_notice: row.get(16)?,
+        known_identity_key: row.get(5)?,
+        account_address: row.get(6)?,
+        is_contact: row.get(7)?,
+        is_blocked: row.get(8)?,
+        is_sharing_with_me: row.get(9)?,
+        am_i_sharing_with: row.get(10)?,
+        shared_with_me_at: row.get(11)?,
+        added_at: row.get(12)?,
+        kt_status: row.get(13)?,
+        security_notice: row.get(14)?,
+        profile_edited_at_ms: row.get(15)?,
+        pending_avatar_ref: row.get(16)?,
+        pending_avatar_since: row.get(17)?,
     })
 }
 

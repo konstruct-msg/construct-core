@@ -141,6 +141,31 @@ const STEPS: &[&str] = &[
         value BLOB NOT NULL
     );
     "#,
+    // 2 — iOS Core Data model 15, and our own profile out of the contacts table.
+    //
+    // A contact gains what model 15 added for profiles: when the peer last edited theirs (a newer
+    // edit wins), and an avatar announced but not yet downloaded. `public_key` and
+    // `hybrid_capable` go: nothing on any client writes them (the core pins the hybrid key per
+    // device since PQXDH v2).
+    //
+    // Our own profile was a row of `contacts` on iOS, told apart by `id != me` in two places. It
+    // is not a contact — no chat, no pin, no block — so it is a table of one row.
+    r#"
+    ALTER TABLE contacts ADD COLUMN profile_edited_at_ms INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE contacts ADD COLUMN pending_avatar_ref   BLOB;
+    ALTER TABLE contacts ADD COLUMN pending_avatar_since INTEGER;
+    ALTER TABLE contacts DROP COLUMN public_key;
+    ALTER TABLE contacts DROP COLUMN hybrid_capable;
+
+    CREATE TABLE own_profile (
+        one                  INTEGER PRIMARY KEY NOT NULL CHECK (one = 1),
+        account_id           TEXT NOT NULL,
+        username             TEXT NOT NULL DEFAULT '',
+        display_name         TEXT NOT NULL DEFAULT '',
+        avatar               BLOB,
+        profile_edited_at_ms INTEGER NOT NULL DEFAULT 0
+    );
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;

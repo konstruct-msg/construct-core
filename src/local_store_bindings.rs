@@ -43,6 +43,7 @@ pub enum LocalStoreTable {
     Reactions,
     Calls,
     PeerDevices,
+    OwnProfile,
 }
 
 impl From<store::Table> for LocalStoreTable {
@@ -54,6 +55,7 @@ impl From<store::Table> for LocalStoreTable {
             store::Table::Reactions => Self::Reactions,
             store::Table::Calls => Self::Calls,
             store::Table::PeerDevices => Self::PeerDevices,
+            store::Table::OwnProfile => Self::OwnProfile,
         }
     }
 }
@@ -107,10 +109,20 @@ macro_rules! mirror {
 
 mirror!(LocalContact <=> store::Contact {
     id: String, username: String, display_name: String, local_alias: Option<String>,
-    avatar: Option<Vec<u8>>, public_key: Option<String>, known_identity_key: Option<Vec<u8>>,
+    avatar: Option<Vec<u8>>, known_identity_key: Option<Vec<u8>>,
     account_address: Option<Vec<u8>>, is_contact: bool, is_blocked: bool,
     is_sharing_with_me: bool, am_i_sharing_with: bool, shared_with_me_at: Option<i64>,
-    added_at: Option<i64>, kt_status: i16, hybrid_capable: bool, security_notice: i16,
+    added_at: Option<i64>, kt_status: i16, security_notice: i16, profile_edited_at_ms: i64,
+    pending_avatar_ref: Option<Vec<u8>>, pending_avatar_since: Option<i64>,
+});
+
+mirror!(LocalOwnProfile <=> store::OwnProfile {
+    account_id: String, username: String, display_name: String, avatar: Option<Vec<u8>>,
+    profile_edited_at_ms: i64,
+});
+
+mirror!(LocalIdentityKeyPin <=> store::IdentityKeyPin {
+    contact_id: String, key: Vec<u8>,
 });
 
 mirror!(LocalChat <=> store::Chat {
@@ -205,6 +217,84 @@ impl LocalStore {
     }
     pub fn delete_contact(&self, id: String) -> Result<()> {
         self.with(|s| s.delete_contact(&id))
+    }
+    pub fn every_contact(&self) -> Result<Vec<LocalContact>> {
+        Ok(all(self.with(|s| s.every_contact())?))
+    }
+    pub fn sharing_with(&self) -> Result<Vec<String>> {
+        self.with(|s| s.sharing_with())
+    }
+    pub fn contacts_with_pending_avatar(&self) -> Result<Vec<LocalContact>> {
+        Ok(all(self.with(|s| s.contacts_with_pending_avatar())?))
+    }
+    pub fn identity_key_pins(&self) -> Result<Vec<LocalIdentityKeyPin>> {
+        Ok(all(self.with(|s| s.identity_key_pins())?))
+    }
+    pub fn mark_contact(&self, id: String, added_at: i64) -> Result<bool> {
+        self.with(|s| s.mark_contact(&id, added_at))
+    }
+    pub fn set_contact_blocked(&self, id: String, blocked: bool) -> Result<bool> {
+        self.with(|s| s.set_contact_blocked(&id, blocked))
+    }
+    pub fn set_contact_alias(&self, id: String, alias: Option<String>) -> Result<bool> {
+        self.with(|s| s.set_contact_alias(&id, alias.as_deref()))
+    }
+    pub fn set_sharing_with(&self, id: String, sharing: bool) -> Result<bool> {
+        self.with(|s| s.set_sharing_with(&id, sharing))
+    }
+    pub fn set_identity_key(&self, id: String, key: Option<Vec<u8>>) -> Result<bool> {
+        self.with(|s| s.set_identity_key(&id, key.as_deref()))
+    }
+    pub fn set_kt_status(&self, id: String, status: i16) -> Result<bool> {
+        self.with(|s| s.set_kt_status(&id, status))
+    }
+    pub fn set_account_address(&self, id: String, address: Option<Vec<u8>>) -> Result<bool> {
+        self.with(|s| s.set_account_address(&id, address.as_deref()))
+    }
+    pub fn set_security_notice(&self, id: String, notice: i16) -> Result<bool> {
+        self.with(|s| s.set_security_notice(&id, notice))
+    }
+    pub fn set_contact_names(
+        &self,
+        id: String,
+        username: String,
+        display_name: String,
+    ) -> Result<bool> {
+        self.with(|s| s.set_contact_names(&id, &username, &display_name))
+    }
+    pub fn apply_shared_profile(
+        &self,
+        id: String,
+        display_name: String,
+        shared_with_me_at: i64,
+        profile_edited_at_ms: i64,
+    ) -> Result<bool> {
+        self.with(|s| {
+            s.apply_shared_profile(&id, &display_name, shared_with_me_at, profile_edited_at_ms)
+        })
+    }
+    pub fn set_contact_avatar(
+        &self,
+        id: String,
+        avatar: Option<Vec<u8>>,
+        pending_ref: Option<Vec<u8>>,
+        pending_since: Option<i64>,
+    ) -> Result<bool> {
+        self.with(|s| {
+            s.set_contact_avatar(
+                &id,
+                avatar.as_deref(),
+                pending_ref.as_deref(),
+                pending_since,
+            )
+        })
+    }
+
+    pub fn own_profile(&self) -> Result<Option<LocalOwnProfile>> {
+        Ok(self.with(|s| s.own_profile())?.map(Into::into))
+    }
+    pub fn set_own_profile(&self, profile: LocalOwnProfile) -> Result<()> {
+        self.with(|s| s.set_own_profile(&profile.into()))
     }
 
     pub fn upsert_chat(&self, chat: LocalChat) -> Result<()> {
