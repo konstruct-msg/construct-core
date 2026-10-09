@@ -55,9 +55,67 @@ pub struct Chat {
     pub unread_count: i32,
 }
 
-/// Values are the clients' `deliveryStatusRaw`; the store keeps and compares them, it does not
-/// interpret them.
+/// A message's delivery status. The values are the iOS `deliveryStatusRaw`, which every client
+/// stores. The store interprets them in one place: `delivery`, the rule for which writer
+/// outranks which.
 pub type DeliveryStatus = i16;
+
+/// The delivery statuses, and the rule that decides between two writers who disagree.
+///
+/// Written from many places that run in no defined order — the send outcome, the peer's receipt,
+/// the retry path, a timeout, a session archive. Until 0.37.0 the rule lived in the iOS app
+/// (`DeliveryStatusTransition`), so a second client would have kept a copy of it.
+pub mod delivery {
+    use super::DeliveryStatus;
+
+    pub const SENDING: DeliveryStatus = 0;
+    /// The server took it.
+    pub const SENT: DeliveryStatus = 1;
+    /// The peer's end-to-end receipt.
+    pub const DELIVERED: DeliveryStatus = 2;
+    /// Not sent yet, and something will try again.
+    pub const QUEUED: DeliveryStatus = 3;
+    /// Not sent; nothing retries on its own unless the retry budget allows.
+    pub const FAILED: DeliveryStatus = 4;
+
+    /// How much a status proves about the message having reached someone else. A transport
+    /// failure is ignorance, not a negative result: the statuses about our own attempt rank 0,
+    /// interchangeable among themselves, and none of them may overwrite evidence.
+    pub fn evidence_rank(status: DeliveryStatus) -> u8 {
+        match status {
+            DELIVERED => 2,
+            SENT => 1,
+            _ => 0,
+        }
+    }
+
+    /// What a session archive does to an outgoing message encrypted under it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ArchiveOutcome {
+        /// The peer confirmed it; no session change unsays that.
+        Keep,
+        /// Send again: it becomes queued.
+        Resend,
+        /// Attempts exhausted: it becomes failed, so the person sees it did not arrive.
+        GiveUp,
+    }
+
+    /// `SENT` was evidence of arrival only while the peer could decrypt — and the archive ends
+    /// exactly that, so a sent message the peer never confirmed goes back to being an attempt.
+    pub fn after_session_archive(
+        status: DeliveryStatus,
+        retry_count: i16,
+        max_retries: i16,
+    ) -> ArchiveOutcome {
+        if evidence_rank(status) >= evidence_rank(DELIVERED) {
+            ArchiveOutcome::Keep
+        } else if retry_count < max_retries {
+            ArchiveOutcome::Resend
+        } else {
+            ArchiveOutcome::GiveUp
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Message {

@@ -26,7 +26,7 @@ mod store;
 pub use error::StoreError;
 pub use model::{
     CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, Message, OwnProfile, PeerDevice,
-    Reaction, SearchHit,
+    Reaction, SearchHit, delivery,
 };
 pub use observer::{Change, StoreObserver, Table};
 pub use store::{Insert, Store};

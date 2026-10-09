@@ -1611,6 +1611,16 @@ enum LocalInsert {
     "AlreadyPresent",
 };
 
+/// What a session archive did to an outgoing message encrypted under it.
+enum LocalArchiveOutcome {
+    /// The peer confirmed it; it stays delivered.
+    "Keep",
+    /// Queued to be sent again.
+    "Resend",
+    /// Attempts spent; failed.
+    "GiveUp",
+};
+
 dictionary LocalStoreChange {
     LocalStoreTable table;
     sequence<string> ids;
@@ -1829,14 +1839,44 @@ interface LocalStore {
     LocalInsert insert_message(LocalMessage message, string? search_text);
     [Throws=LocalStoreError]
     boolean edit_message(string id, bytes body, string? search_text, i64 edited_at);
+    /// Statuses: 0 sending, 1 sent, 2 delivered, 3 queued, 4 failed. A write that would replace
+    /// stronger evidence of arrival (delivered > sent > the rest) is refused: false, as for no
+    /// change and no message.
     [Throws=LocalStoreError]
     boolean set_delivery_status(string id, i16 status);
+    /// The session the message was encrypted under was archived: keep, queue again, or fail
+    /// once `max_retries` is spent — the one write that may lower `sent`. Null: no message.
+    [Throws=LocalStoreError]
+    LocalArchiveOutcome? apply_session_archive(string id, i16 max_retries);
+    /// Each write below changes its named fields of one message; false: no message or no change.
+    [Throws=LocalStoreError]
+    boolean set_retry_count(string id, i16 count);
+    /// One more attempt, counted in the store; the new count, null for no message.
+    [Throws=LocalStoreError]
+    i16? increment_retry_count(string id);
+    [Throws=LocalStoreError]
+    boolean set_order_key(string id, string order_key);
+    /// All null clears the transcript.
+    [Throws=LocalStoreError]
+    boolean set_transcript(string id, string? text, string? language, i64? generated_at);
     [Throws=LocalStoreError]
     LocalMessage? message(string id);
     /// Up to `limit` messages just before (`before_order_key`, `before_id`) — both null for the
     /// newest page — oldest first.
     [Throws=LocalStoreError]
     sequence<LocalMessage> messages_before(string chat_id, string? before_order_key, string? before_id, u32 limit);
+    /// Up to `limit` messages from (`from_order_key`, `from_id`), that one included, oldest first.
+    [Throws=LocalStoreError]
+    sequence<LocalMessage> messages_from(string chat_id, string from_order_key, string from_id, u32 limit);
+    /// Ours, queued or failed with `retry_count < retry_ceiling`; one chat, or every chat for null.
+    [Throws=LocalStoreError]
+    sequence<LocalMessage> pending_sends(string? chat_id, i16 retry_ceiling, u32 limit);
+    [Throws=LocalStoreError]
+    u64 message_count();
+    /// Every chat's messages after (`after_order_key`, `after_id`) — both null from the start — a
+    /// page at a time, in that order: a history snapshot.
+    [Throws=LocalStoreError]
+    sequence<LocalMessage> all_messages_after(string? after_order_key, string? after_id, u32 limit);
     [Throws=LocalStoreError]
     void delete_message(string id);
     /// Messages whose text contains `query` (one phrase, three characters at least), newest first.
@@ -1849,6 +1889,12 @@ interface LocalStore {
     sequence<LocalReaction> reactions(string target_message_id);
     [Throws=LocalStoreError]
     void delete_reaction(string target_message_id, string reactor_user_id);
+    /// Every reaction, oldest first: a history snapshot.
+    [Throws=LocalStoreError]
+    sequence<LocalReaction> all_reactions();
+    /// Forget reactions received at or before `cutoff` (ms); one with no receipt time stays.
+    [Throws=LocalStoreError]
+    u32 expire_reactions(i64 cutoff);
 
     [Throws=LocalStoreError]
     void upsert_call(LocalCall call);

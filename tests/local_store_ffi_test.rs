@@ -5,8 +5,9 @@
 use std::sync::{Arc, Mutex};
 
 use construct_core::{
-    LocalChat, LocalContact, LocalInsert, LocalMessage, LocalOwnProfile, LocalPeerDevice,
-    LocalStore, LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable,
+    LocalArchiveOutcome, LocalChat, LocalContact, LocalInsert, LocalMessage, LocalOwnProfile,
+    LocalPeerDevice, LocalStore, LocalStoreChange, LocalStoreError, LocalStoreObserver,
+    LocalStoreTable,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -58,7 +59,10 @@ fn message(id: &str, order_key: &str) -> LocalMessage {
     }
 }
 
-struct Seen(Arc<Mutex<Vec<(String, Vec<String>)>>>);
+/// Each announced change, as (table, ids).
+type ChangeLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+struct Seen(ChangeLog);
 
 impl LocalStoreObserver for Seen {
     fn on_change(&self, change: LocalStoreChange) {
@@ -255,4 +259,89 @@ fn contact_writes_and_our_profile_cross_the_boundary() {
         &("own_profile".to_string(), vec!["me".to_string()])
     );
     assert_eq!(seen.iter().filter(|(t, _)| t == "contacts").count(), 3);
+}
+
+/// The messages domain of 0.37.0 across the boundary: the status rule, the archive outcome, field
+/// writes, the pending sends, the forward window and the export pages.
+#[test]
+fn message_writes_and_the_status_rule_cross_the_boundary() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    store.upsert_contact(contact("peer")).unwrap();
+    store
+        .upsert_chat(LocalChat {
+            id: "c1".into(),
+            peer_id: "peer".into(),
+            last_message_text: None,
+            last_message_time: None,
+            is_pinned: false,
+            unread_count: 0,
+        })
+        .unwrap();
+    for (id, key) in [("m1", "k1"), ("m2", "k2"), ("m3", "k3")] {
+        store.insert_message(message(id, key), None).unwrap();
+    }
+
+    assert!(store.set_delivery_status("m1".into(), 2).unwrap());
+    assert!(
+        !store.set_delivery_status("m1".into(), 3).unwrap(),
+        "evidence stays"
+    );
+    assert!(matches!(
+        store.apply_session_archive("m1".into(), 3).unwrap(),
+        Some(LocalArchiveOutcome::Keep)
+    ));
+    assert!(store.set_delivery_status("m2".into(), 1).unwrap());
+    assert!(matches!(
+        store.apply_session_archive("m2".into(), 3).unwrap(),
+        Some(LocalArchiveOutcome::Resend)
+    ));
+    assert_eq!(store.increment_retry_count("m2".into()).unwrap(), Some(1));
+    assert!(store.set_order_key("m2".into(), "k2s".into()).unwrap());
+    assert!(
+        store
+            .set_transcript("m3".into(), Some("hi".into()), Some("en".into()), Some(4))
+            .unwrap()
+    );
+
+    let m2 = store.message("m2".into()).unwrap().unwrap();
+    assert_eq!(
+        (m2.delivery_status, m2.retry_count, m2.order_key.as_str()),
+        (3, 1, "k2s")
+    );
+    assert_eq!(
+        store
+            .message("m3".into())
+            .unwrap()
+            .unwrap()
+            .transcript_text
+            .as_deref(),
+        Some("hi")
+    );
+    let pending = store.pending_sends(Some("c1".into()), 3, 10).unwrap();
+    assert_eq!(
+        pending.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m2"]
+    );
+    let window = store
+        .messages_from("c1".into(), "k2s".into(), "m2".into(), 10)
+        .unwrap();
+    assert_eq!(
+        window.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m2", "m3"]
+    );
+    let first = store.all_messages_after(None, None, 2).unwrap();
+    assert_eq!(
+        first.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m1", "m2"]
+    );
+    let rest = store
+        .all_messages_after(Some("k2s".into()), Some("m2".into()), 2)
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m3"]
+    );
+    assert_eq!(store.message_count().unwrap(), 3);
+    assert!(store.all_reactions().unwrap().is_empty());
+    assert_eq!(store.expire_reactions(10).unwrap(), 0);
 }
