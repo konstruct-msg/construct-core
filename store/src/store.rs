@@ -9,7 +9,7 @@ use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
     CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, Message, OwnProfile, PeerDevice,
-    Reaction, SearchHit,
+    Reaction, SearchHit, delivery,
 };
 use crate::observer::{Change, StoreObserver, Table};
 
@@ -538,6 +538,23 @@ impl Store {
         self.update_chat(id, "is_pinned = ?1", "", &[&pinned])
     }
 
+    fn update_message(
+        &self,
+        id: &str,
+        set: &str,
+        and: &str,
+        values: &[&dyn ToSql],
+    ) -> Result<bool> {
+        let mut args = values.to_vec();
+        args.push(&id);
+        let sql = format!("UPDATE messages SET {set} WHERE id = ?{} {and}", args.len());
+        let changed = self.lock().execute(&sql, args.as_slice())? > 0;
+        if changed {
+            self.notify(Table::Messages, vec![id.to_string()]);
+        }
+        Ok(changed)
+    }
+
     fn update_chat(&self, id: &str, set: &str, and: &str, values: &[&dyn ToSql]) -> Result<bool> {
         let mut args = values.to_vec();
         args.push(&id);
@@ -628,15 +645,113 @@ impl Store {
         Ok(changed)
     }
 
+    /// Write `status` unless the stored one is stronger evidence (`delivery::evidence_rank`): a
+    /// slower writer arriving with a weaker fact is refused, and that is the normal outcome, not
+    /// an error. False also when nothing changed or there is no such message. Until 0.37.0 this
+    /// wrote any status; the rule was the iOS app's.
     pub fn set_delivery_status(&self, id: &str, status: DeliveryStatus) -> Result<bool> {
-        let changed = self.lock().execute(
-            "UPDATE messages SET delivery_status = ?2 WHERE id = ?1 AND delivery_status != ?2",
-            params![id, status],
-        )? > 0;
+        self.update_message(
+            id,
+            "delivery_status = ?1",
+            &format!(
+                "AND delivery_status != ?1 AND {} <= ?2",
+                RANK_OF_STORED_STATUS
+            ),
+            &[&status, &delivery::evidence_rank(status)],
+        )
+    }
+
+    /// The session an outgoing message was encrypted under was archived: keep it (the peer
+    /// confirmed), queue it again, or give up when `max_retries` is spent. This is the one write
+    /// that may lower the evidence — `SENT` stops meaning anything once the peer can no longer
+    /// decrypt — and `Keep` is the branch that protects `DELIVERED`. `None` when there is no
+    /// such message.
+    pub fn apply_session_archive(
+        &self,
+        id: &str,
+        max_retries: i16,
+    ) -> Result<Option<delivery::ArchiveOutcome>> {
+        let (outcome, changed) = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let Some((status, retry_count)) = tx
+                .query_row(
+                    "SELECT delivery_status, retry_count FROM messages WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get::<_, DeliveryStatus>(0)?, row.get::<_, i16>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let outcome = delivery::after_session_archive(status, retry_count, max_retries);
+            let target = match outcome {
+                delivery::ArchiveOutcome::Keep => None,
+                delivery::ArchiveOutcome::Resend => Some(delivery::QUEUED),
+                delivery::ArchiveOutcome::GiveUp => Some(delivery::FAILED),
+            };
+            let changed = match target {
+                Some(t) if t != status => {
+                    tx.execute(
+                        "UPDATE messages SET delivery_status = ?2 WHERE id = ?1",
+                        params![id, t],
+                    )? > 0
+                }
+                _ => false,
+            };
+            tx.commit()?;
+            (outcome, changed)
+        };
         if changed {
             self.notify(Table::Messages, vec![id.to_string()]);
         }
-        Ok(changed)
+        Ok(Some(outcome))
+    }
+
+    /// Each write below changes its named fields of one message in one statement, is announced
+    /// after it commits, and reports false when there is no such message or nothing changed.
+    pub fn set_retry_count(&self, id: &str, count: i16) -> Result<bool> {
+        self.update_message(id, "retry_count = ?1", "AND retry_count != ?1", &[&count])
+    }
+
+    /// One more attempt, counted in the store rather than read, changed and written back — two
+    /// retries at once would otherwise count as one. The new count, or `None` for no message.
+    pub fn increment_retry_count(&self, id: &str) -> Result<Option<i16>> {
+        let count = self
+            .lock()
+            .query_row(
+                "UPDATE messages SET retry_count = retry_count + 1 WHERE id = ?1
+                 RETURNING retry_count",
+                [id],
+                |row| row.get::<_, i16>(0),
+            )
+            .optional()?;
+        if count.is_some() {
+            self.notify(Table::Messages, vec![id.to_string()]);
+        }
+        Ok(count)
+    }
+
+    /// The server's order for a message we placed optimistically.
+    pub fn set_order_key(&self, id: &str, order_key: &str) -> Result<bool> {
+        self.update_message(id, "order_key = ?1", "AND order_key != ?1", &[&order_key])
+    }
+
+    /// A voice or video note's transcript; all `None` clears it.
+    pub fn set_transcript(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        language: Option<&str>,
+        generated_at: Option<i64>,
+    ) -> Result<bool> {
+        self.update_message(
+            id,
+            "transcript_text = ?1, transcript_language = ?2, transcript_generated_at = ?3",
+            "AND (transcript_text IS NOT ?1 OR transcript_language IS NOT ?2
+                  OR transcript_generated_at IS NOT ?3)",
+            &[&text, &language, &generated_at],
+        )
     }
 
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
@@ -669,6 +784,82 @@ impl Store {
             .query_map(params![chat_id, key, id, limit], message_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.reverse();
+        Ok(rows)
+    }
+
+    /// Up to `limit` messages of a chat from `from` — `(order_key, id)`, included — onwards,
+    /// oldest first: the window a transcript already holds, read again forwards.
+    pub fn messages_from(
+        &self,
+        chat_id: &str,
+        from: (&str, &str),
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE chat_id = ?1 AND (order_key, id) >= (?2, ?3)
+             ORDER BY order_key, id LIMIT ?4"
+        ))?;
+        let rows = stmt
+            .query_map(params![chat_id, from.0, from.1, limit], message_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Our messages waiting to be sent: queued, or failed with attempts left under
+    /// `retry_ceiling`; in one chat, or in every chat for `None`. Transcript order.
+    pub fn pending_sends(
+        &self,
+        chat_id: Option<&str>,
+        retry_ceiling: i16,
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE is_sent_by_me = 1 AND (?1 IS NULL OR chat_id = ?1)
+               AND (delivery_status = ?2 OR (delivery_status = ?3 AND retry_count < ?4))
+             ORDER BY order_key, id LIMIT ?5"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    chat_id,
+                    delivery::QUEUED,
+                    delivery::FAILED,
+                    retry_ceiling,
+                    limit
+                ],
+                message_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn message_count(&self) -> Result<u64> {
+        Ok(self
+            .lock()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?)
+    }
+
+    /// Every message of every chat after `after` — `(order_key, id)`, `None` for the start — in
+    /// `(order_key, id)` order, a page at a time: what a history snapshot reads.
+    pub fn all_messages_after(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE ?1 IS NULL OR (order_key, id) > (?1, ?2)
+             ORDER BY order_key, id LIMIT ?3"
+        ))?;
+        let (key, id) = after.unzip();
+        let rows = stmt
+            .query_map(params![key, id, limit], message_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -751,6 +942,54 @@ impl Store {
             self.notify(Table::Reactions, vec![target_message_id.to_string()]);
         }
         Ok(())
+    }
+
+    /// Every reaction, oldest first: what a history snapshot reads.
+    pub fn all_reactions(&self) -> Result<Vec<Reaction>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT target_message_id, reactor_user_id, emoji, timestamp_ms, received_at
+             FROM reactions ORDER BY timestamp_ms, target_message_id, reactor_user_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Reaction {
+                    target_message_id: row.get(0)?,
+                    reactor_user_id: row.get(1)?,
+                    emoji: row.get(2)?,
+                    timestamp_ms: row.get(3)?,
+                    received_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget reactions received at or before `cutoff` (ms); one with no receipt time — ours, or
+    /// from a history snapshot — is kept. How many went.
+    pub fn expire_reactions(&self, cutoff: i64) -> Result<u32> {
+        let targets = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let targets = {
+                let mut stmt = tx.prepare(
+                    "DELETE FROM reactions WHERE received_at IS NOT NULL AND received_at <= ?1
+                     RETURNING target_message_id",
+                )?;
+                stmt.query_map([cutoff], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.commit()?;
+            targets
+        };
+        let removed = targets.len() as u32;
+        if !targets.is_empty() {
+            let mut ids = targets;
+            ids.sort();
+            ids.dedup();
+            self.notify(Table::Reactions, ids);
+        }
+        Ok(removed)
     }
 
     // MARK: - Calls
@@ -1001,6 +1240,10 @@ fn chat_row(row: &Row<'_>) -> rusqlite::Result<Chat> {
         unread_count: row.get(5)?,
     })
 }
+
+/// `delivery::evidence_rank` of the stored status, in SQL — kept beside the Rust one and checked
+/// against it by `the_status_rule_is_one_rule`.
+const RANK_OF_STORED_STATUS: &str = "(CASE delivery_status WHEN 2 THEN 2 WHEN 1 THEN 1 ELSE 0 END)";
 
 const MESSAGE_COLUMNS: &str = "id, chat_id, from_user_id, to_user_id, is_sent_by_me, timestamp,
     order_key, body, content_type, delivery_status, retry_count, suite_id, is_edited, edited_at,

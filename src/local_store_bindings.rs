@@ -74,6 +74,22 @@ impl From<store::Insert> for LocalInsert {
     }
 }
 
+pub enum LocalArchiveOutcome {
+    Keep,
+    Resend,
+    GiveUp,
+}
+
+impl From<store::delivery::ArchiveOutcome> for LocalArchiveOutcome {
+    fn from(o: store::delivery::ArchiveOutcome) -> Self {
+        match o {
+            store::delivery::ArchiveOutcome::Keep => Self::Keep,
+            store::delivery::ArchiveOutcome::Resend => Self::Resend,
+            store::delivery::ArchiveOutcome::GiveUp => Self::GiveUp,
+        }
+    }
+}
+
 pub struct LocalStoreChange {
     pub table: LocalStoreTable,
     pub ids: Vec<String>,
@@ -356,6 +372,33 @@ impl LocalStore {
     pub fn set_delivery_status(&self, id: String, status: i16) -> Result<bool> {
         self.with(|s| s.set_delivery_status(&id, status))
     }
+    pub fn apply_session_archive(
+        &self,
+        id: String,
+        max_retries: i16,
+    ) -> Result<Option<LocalArchiveOutcome>> {
+        Ok(self
+            .with(|s| s.apply_session_archive(&id, max_retries))?
+            .map(Into::into))
+    }
+    pub fn set_retry_count(&self, id: String, count: i16) -> Result<bool> {
+        self.with(|s| s.set_retry_count(&id, count))
+    }
+    pub fn increment_retry_count(&self, id: String) -> Result<Option<i16>> {
+        self.with(|s| s.increment_retry_count(&id))
+    }
+    pub fn set_order_key(&self, id: String, order_key: String) -> Result<bool> {
+        self.with(|s| s.set_order_key(&id, &order_key))
+    }
+    pub fn set_transcript(
+        &self,
+        id: String,
+        text: Option<String>,
+        language: Option<String>,
+        generated_at: Option<i64>,
+    ) -> Result<bool> {
+        self.with(|s| s.set_transcript(&id, text.as_deref(), language.as_deref(), generated_at))
+    }
     pub fn message(&self, id: String) -> Result<Option<LocalMessage>> {
         Ok(self.with(|s| s.message(&id))?.map(Into::into))
     }
@@ -370,6 +413,39 @@ impl LocalStore {
         Ok(all(
             self.with(|s| s.messages_before(&chat_id, before, limit))?
         ))
+    }
+    pub fn messages_from(
+        &self,
+        chat_id: String,
+        from_order_key: String,
+        from_id: String,
+        limit: u32,
+    ) -> Result<Vec<LocalMessage>> {
+        Ok(all(self.with(|s| {
+            s.messages_from(&chat_id, (&from_order_key, &from_id), limit)
+        })?))
+    }
+    pub fn pending_sends(
+        &self,
+        chat_id: Option<String>,
+        retry_ceiling: i16,
+        limit: u32,
+    ) -> Result<Vec<LocalMessage>> {
+        Ok(all(self.with(|s| {
+            s.pending_sends(chat_id.as_deref(), retry_ceiling, limit)
+        })?))
+    }
+    pub fn message_count(&self) -> Result<u64> {
+        self.with(|s| s.message_count())
+    }
+    pub fn all_messages_after(
+        &self,
+        after_order_key: Option<String>,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<LocalMessage>> {
+        let after = after_order_key.as_deref().zip(after_id.as_deref());
+        Ok(all(self.with(|s| s.all_messages_after(after, limit))?))
     }
     pub fn delete_message(&self, id: String) -> Result<()> {
         self.with(|s| s.delete_message(&id))
@@ -390,6 +466,13 @@ impl LocalStore {
         reactor_user_id: String,
     ) -> Result<()> {
         self.with(|s| s.delete_reaction(&target_message_id, &reactor_user_id))
+    }
+
+    pub fn all_reactions(&self) -> Result<Vec<LocalReaction>> {
+        Ok(all(self.with(|s| s.all_reactions())?))
+    }
+    pub fn expire_reactions(&self, cutoff: i64) -> Result<u32> {
+        self.with(|s| s.expire_reactions(cutoff))
     }
 
     pub fn upsert_call(&self, call: LocalCall) -> Result<()> {

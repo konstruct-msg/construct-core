@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use construct_store::{
     Change, Chat, Contact, IdentityKeyPin, Insert, Message, OwnProfile, PeerDevice, Reaction,
     Store, StoreError, StoreObserver, Table,
+    delivery::{self, ArchiveOutcome, DELIVERED, FAILED, QUEUED, SENDING, SENT},
 };
 
 const KEY: [u8; 32] = [7; 32];
@@ -877,4 +878,269 @@ fn each_chat_write_changes_only_its_fields() {
             .iter()
             .all(|c| c.table == Table::Chats && c.ids == ["c"])
     );
+}
+
+// MARK: - Messages domain (0.37.0)
+
+/// A store with one chat `c` and messages `m1…m{n}`, ours, keyed `k1…k{n}`.
+fn with_messages(n: usize) -> Store {
+    let store = store_with_peer("p");
+    store.upsert_chat(&chat("c", "p", None, false)).unwrap();
+    for i in 1..=n {
+        let mut m = message(&format!("m{i}"), "c", &format!("k{i}"), b"x");
+        m.is_sent_by_me = true;
+        store.insert_message(&m, None).unwrap();
+    }
+    store
+}
+
+fn status(store: &Store, id: &str) -> i16 {
+    store.message(id).unwrap().unwrap().delivery_status
+}
+
+/// A transport failure is ignorance, not a negative result: the attempt statuses move among
+/// themselves, and none overwrites evidence. Mutation: drop the rank condition in
+/// `set_delivery_status` — a queued write demotes a delivered message.
+#[test]
+fn ignorance_never_overwrites_evidence() {
+    let store = with_messages(1);
+    for (write, lands) in [
+        (QUEUED, true),
+        (FAILED, true),
+        (SENDING, true),
+        (SENT, true),
+        (QUEUED, false),
+        (FAILED, false),
+        (DELIVERED, true),
+        (SENT, false),
+        (QUEUED, false),
+        (DELIVERED, false),
+    ] {
+        assert_eq!(
+            store.set_delivery_status("m1", write).unwrap(),
+            lands,
+            "write {write}"
+        );
+    }
+    assert_eq!(status(&store, "m1"), DELIVERED);
+    assert!(!store.set_delivery_status("nothing", SENT).unwrap());
+}
+
+/// The SQL rank and the Rust rank are one rule: every pair of statuses lands exactly when the
+/// Rust rule says it may. Mutation: rank `DELIVERED` 1 in `RANK_OF_STORED_STATUS` — a sent
+/// write then replaces a delivered one.
+#[test]
+fn the_status_rule_is_one_rule() {
+    let all = [SENDING, SENT, DELIVERED, QUEUED, FAILED];
+    for from in all {
+        for to in all {
+            let store = with_messages(1);
+            // From `SENDING` every status is reachable: it ranks lowest.
+            store.set_delivery_status("m1", from).unwrap();
+            assert_eq!(status(&store, "m1"), from);
+            let lands = store.set_delivery_status("m1", to).unwrap();
+            let rule = from != to && delivery::evidence_rank(to) >= delivery::evidence_rank(from);
+            assert_eq!(lands, rule, "{from} → {to}");
+        }
+    }
+}
+
+/// A session archive keeps what the peer confirmed, queues the rest while attempts last, and
+/// gives up after — the one write allowed to lower `SENT`. Mutation: return `Resend` for
+/// `DELIVERED` in `after_session_archive`.
+#[test]
+fn a_session_archive_keeps_the_confirmed_and_requeues_the_rest() {
+    let store = with_messages(3);
+    store.set_delivery_status("m1", DELIVERED).unwrap();
+    store.set_delivery_status("m2", SENT).unwrap();
+    store.set_delivery_status("m3", SENT).unwrap();
+    store.set_retry_count("m3", 3).unwrap();
+
+    assert_eq!(
+        store.apply_session_archive("m1", 3).unwrap(),
+        Some(ArchiveOutcome::Keep)
+    );
+    assert_eq!(
+        store.apply_session_archive("m2", 3).unwrap(),
+        Some(ArchiveOutcome::Resend)
+    );
+    assert_eq!(
+        store.apply_session_archive("m3", 3).unwrap(),
+        Some(ArchiveOutcome::GiveUp)
+    );
+    assert_eq!(
+        [
+            status(&store, "m1"),
+            status(&store, "m2"),
+            status(&store, "m3")
+        ],
+        [DELIVERED, QUEUED, FAILED]
+    );
+    assert_eq!(store.apply_session_archive("nothing", 3).unwrap(), None);
+}
+
+/// Every attempt counts, from whichever thread. Mutation: read, add and write back.
+#[test]
+fn retries_count_every_attempt() {
+    let store = Arc::new(with_messages(1));
+    let threads = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    assert!(store.increment_retry_count("m1").unwrap().is_some());
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(store.message("m1").unwrap().unwrap().retry_count, 200);
+    assert_eq!(store.increment_retry_count("nothing").unwrap(), None);
+}
+
+/// Each message write changes its fields and nothing else, and announces its message once.
+/// Mutation: write `retry_count` from `set_order_key`, or announce a write that changed nothing.
+#[test]
+fn each_message_write_changes_only_its_fields() {
+    let store = with_messages(1);
+    let mut expected = store.message("m1").unwrap().unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    // The count first: a later write that touched it would show.
+    assert!(store.set_retry_count("m1", 2).unwrap());
+    expected.retry_count = 2;
+    assert!(store.set_order_key("m1", "server-7").unwrap());
+    expected.order_key = "server-7".into();
+    assert!(
+        store
+            .set_transcript("m1", Some("hello"), Some("en"), Some(9))
+            .unwrap()
+    );
+    expected.transcript_text = Some("hello".into());
+    expected.transcript_language = Some("en".into());
+    expected.transcript_generated_at = Some(9);
+    assert_eq!(store.message("m1").unwrap(), Some(expected.clone()));
+
+    // The same values again: nothing changed, nothing announced.
+    assert!(!store.set_order_key("m1", "server-7").unwrap());
+    assert!(!store.set_retry_count("m1", 2).unwrap());
+    assert!(
+        !store
+            .set_transcript("m1", Some("hello"), Some("en"), Some(9))
+            .unwrap()
+    );
+    assert!(store.set_transcript("m1", None, None, None).unwrap());
+    expected.transcript_text = None;
+    expected.transcript_language = None;
+    expected.transcript_generated_at = None;
+    assert_eq!(store.message("m1").unwrap(), Some(expected));
+
+    let changes = seen.changes.lock().unwrap();
+    assert_eq!(changes.len(), 4);
+    assert!(
+        changes
+            .iter()
+            .all(|c| c.table == Table::Messages && c.ids == ["m1"])
+    );
+}
+
+/// The window a transcript holds is read again forwards from its first row, that row included.
+/// Mutation: `>` for `>=` in `messages_from` — the first row is lost.
+#[test]
+fn a_window_reads_forward_from_its_first_row() {
+    let store = with_messages(5);
+    let page = store.messages_from("c", ("k2", "m2"), 10).unwrap();
+    assert_eq!(
+        page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m2", "m3", "m4", "m5"]
+    );
+    let short = store.messages_from("c", ("k2", "m2"), 2).unwrap();
+    assert_eq!(
+        short.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m2", "m3"]
+    );
+}
+
+/// What waits to be sent: our queued messages, and failed ones with attempts left. Mutation:
+/// drop `retry_count < ceiling` — a message out of attempts is sent forever.
+#[test]
+fn pending_sends_are_ours_queued_or_failed_with_attempts_left() {
+    let store = with_messages(5);
+    store.set_delivery_status("m1", QUEUED).unwrap();
+    store.set_delivery_status("m2", FAILED).unwrap();
+    store.set_delivery_status("m3", FAILED).unwrap();
+    store.set_retry_count("m3", 3).unwrap();
+    store.set_delivery_status("m4", SENT).unwrap();
+    let mut theirs = message("t1", "c", "k0", b"x");
+    theirs.delivery_status = QUEUED;
+    store.insert_message(&theirs, None).unwrap();
+
+    let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.pending_sends(Some("c"), 3, 50).unwrap()),
+        ["m1", "m2"]
+    );
+    assert_eq!(ids(store.pending_sends(None, 3, 50).unwrap()), ["m1", "m2"]);
+    assert!(
+        store
+            .pending_sends(Some("other"), 3, 50)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A history snapshot reads every message of every chat a page at a time, and the count agrees.
+/// Mutation: page with `>=` — every page after the first repeats a row.
+#[test]
+fn export_pages_run_through_every_chat_once() {
+    let store = with_messages(3);
+    store.upsert_contact(&contact("q", "q")).unwrap();
+    store.upsert_chat(&chat("d", "q", None, false)).unwrap();
+    store
+        .insert_message(&message("n1", "d", "k2a", b"x"), None)
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let mut after: Option<(String, String)> = None;
+    // Bounded: a page that repeats a row would otherwise loop forever instead of failing.
+    for _ in 0..10 {
+        let page = store
+            .all_messages_after(after.as_ref().map(|(k, i)| (k.as_str(), i.as_str())), 2)
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some((last.order_key.clone(), last.id.clone()));
+        seen.extend(page.into_iter().map(|m| m.id));
+    }
+    assert_eq!(seen, ["m1", "m2", "n1", "m3"]);
+    assert_eq!(store.message_count().unwrap(), 4);
+}
+
+/// Reactions received long enough ago are forgotten; one with no receipt time is kept.
+/// Mutation: drop `received_at IS NOT NULL` — our own reactions expire too.
+#[test]
+fn reactions_expire_by_when_they_were_received() {
+    let store = with_messages(1);
+    let reaction = |who: &str, received: Option<i64>| Reaction {
+        target_message_id: "m1".into(),
+        reactor_user_id: who.into(),
+        emoji: "👍".into(),
+        timestamp_ms: 1,
+        received_at: received,
+    };
+    store.upsert_reaction(&reaction("old", Some(100))).unwrap();
+    store.upsert_reaction(&reaction("new", Some(900))).unwrap();
+    store.upsert_reaction(&reaction("ours", None)).unwrap();
+
+    assert_eq!(store.expire_reactions(500).unwrap(), 1);
+    let left = store.all_reactions().unwrap();
+    let mut who = left
+        .iter()
+        .map(|r| r.reactor_user_id.as_str())
+        .collect::<Vec<_>>();
+    who.sort();
+    assert_eq!(who, ["new", "ours"]);
+    assert_eq!(store.expire_reactions(500).unwrap(), 0);
 }
