@@ -296,6 +296,12 @@ fn message_writes_and_the_status_rule_cross_the_boundary() {
         Some(LocalArchiveOutcome::Resend)
     ));
     assert_eq!(store.increment_retry_count("m2".into()).unwrap(), Some(1));
+    assert!(
+        store
+            .set_message_body("m3".into(), b"late".to_vec(), Some("late".into()))
+            .unwrap()
+    );
+    assert!(!store.message("m3".into()).unwrap().unwrap().is_edited);
     assert!(store.set_order_key("m2".into(), "k2s".into()).unwrap());
     assert!(
         store

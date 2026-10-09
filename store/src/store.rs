@@ -616,13 +616,43 @@ impl Store {
         search_text: Option<&str>,
         edited_at: i64,
     ) -> Result<bool> {
+        self.replace_body(id, body, search_text, Some(edited_at))
+    }
+
+    /// The body and its search text replaced, the message **not** marked edited: what it said all
+    /// along, read late — a message stored undecryptable whose sender sent it again under the same
+    /// id. False when there is no such message.
+    pub fn set_message_body(
+        &self,
+        id: &str,
+        body: &[u8],
+        search_text: Option<&str>,
+    ) -> Result<bool> {
+        self.replace_body(id, body, search_text, None)
+    }
+
+    /// One path for both: the body and the full-text row in one transaction, `edited_at` marking
+    /// an edit when given.
+    fn replace_body(
+        &self,
+        id: &str,
+        body: &[u8],
+        search_text: Option<&str>,
+        edited_at: Option<i64>,
+    ) -> Result<bool> {
         let changed = {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
-            let changed = tx.execute(
-                "UPDATE messages SET body = ?2, is_edited = 1, edited_at = ?3 WHERE id = ?1",
-                params![id, body, edited_at],
-            )?;
+            let changed = match edited_at {
+                Some(at) => tx.execute(
+                    "UPDATE messages SET body = ?2, is_edited = 1, edited_at = ?3 WHERE id = ?1",
+                    params![id, body, at],
+                )?,
+                None => tx.execute(
+                    "UPDATE messages SET body = ?2 WHERE id = ?1",
+                    params![id, body],
+                )?,
+            };
             if changed > 0 {
                 tx.execute(
                     "DELETE FROM message_search WHERE rowid = (SELECT rowid FROM messages WHERE id = ?1)",

@@ -1144,3 +1144,43 @@ fn reactions_expire_by_when_they_were_received() {
     assert_eq!(who, ["new", "ours"]);
     assert_eq!(store.expire_reactions(500).unwrap(), 0);
 }
+
+/// A body read late replaces what is stored and what is findable, and does not mark the message
+/// edited — it says what it said all along. Mutation: route `set_message_body` through the edit
+/// branch — the message reads as edited.
+#[test]
+fn a_body_read_late_is_not_an_edit() {
+    let store = with_messages(1);
+    store
+        .insert_message(&message("u1", "c", "k9", b""), None)
+        .unwrap();
+    assert!(
+        store
+            .set_message_body("u1", b"recovered", Some("recovered words"))
+            .unwrap()
+    );
+    let m = store.message("u1").unwrap().unwrap();
+    assert_eq!(
+        (m.body.as_slice(), m.is_edited, m.edited_at),
+        (&b"recovered"[..], false, None)
+    );
+    assert_eq!(
+        store.search("recovered", 10).unwrap().len(),
+        1,
+        "now findable"
+    );
+    assert!(!store.set_message_body("nothing", b"x", None).unwrap());
+
+    // An edit still marks the message, through the same path.
+    assert!(
+        store
+            .edit_message("u1", b"edited", Some("edited"), 7)
+            .unwrap()
+    );
+    let m = store.message("u1").unwrap().unwrap();
+    assert_eq!((m.is_edited, m.edited_at), (true, Some(7)));
+    assert!(
+        store.search("recovered", 10).unwrap().is_empty(),
+        "the old text is no longer findable"
+    );
+}
