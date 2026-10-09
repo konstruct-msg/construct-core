@@ -369,6 +369,14 @@ impl LocalStore {
     ) -> Result<bool> {
         self.with(|s| s.edit_message(&id, &body, search_text.as_deref(), edited_at))
     }
+    pub fn set_message_body(
+        &self,
+        id: String,
+        body: Vec<u8>,
+        search_text: Option<String>,
+    ) -> Result<bool> {
+        self.with(|s| s.set_message_body(&id, &body, search_text.as_deref()))
+    }
     pub fn set_delivery_status(&self, id: String, status: i16) -> Result<bool> {
         self.with(|s| s.set_delivery_status(&id, status))
     }

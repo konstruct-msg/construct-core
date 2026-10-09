@@ -1839,6 +1839,10 @@ interface LocalStore {
     LocalInsert insert_message(LocalMessage message, string? search_text);
     [Throws=LocalStoreError]
     boolean edit_message(string id, bytes body, string? search_text, i64 edited_at);
+    /// The body and its search text replaced, the message not marked edited: a body read late —
+    /// stored undecryptable, sent again under the same id. False: no message.
+    [Throws=LocalStoreError]
+    boolean set_message_body(string id, bytes body, string? search_text);
     /// Statuses: 0 sending, 1 sent, 2 delivered, 3 queued, 4 failed. A write that would replace
     /// stronger evidence of arrival (delivered > sent > the rest) is refused: false, as for no
     /// change and no message.
