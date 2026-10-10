@@ -1772,6 +1772,40 @@ dictionary LocalKvEntry {
     bytes value;
 };
 
+/// What a chat record asks of the receiver's chat with `peer_id`: that it exist, pinned if `pin`
+/// (never unpinned), its unread count cleared.
+dictionary HistoryChatImport {
+    string peer_id;
+    boolean pin;
+};
+
+[Enum]
+interface HistoryMessageImport {
+    /// The row to insert into the chat with `peer_id`; its `chat_id` is empty — open that chat
+    /// and set it. A message already held is kept: the insert does not overwrite.
+    Row(string peer_id, LocalMessage message);
+    /// A body this version does not know: skip the record.
+    UnknownBody();
+};
+
+/// A media file a body refers to.
+dictionary HistoryMediaRef {
+    string id;
+    string mime;
+};
+
+[Enum]
+interface HistoryMessageExport {
+    /// The record, and the media files its body refers to.
+    Record(bytes record, sequence<HistoryMediaRef> media);
+    /// A control row: not transcript.
+    Control();
+    /// No body: a message this device never read.
+    Empty();
+    /// A body from before CTM1: the client that wrote it converts it.
+    Legacy();
+};
+
 dictionary LocalSearchHit {
     string message_id;
     string chat_id;
@@ -2037,4 +2071,35 @@ interface LocalStore {
     /// Every entry whose key starts with `prefix`, by key; no pattern characters.
     [Throws=LocalStoreError]
     sequence<LocalKvEntry> entries_with_prefix(string prefix);
+};
+
+/// History records ↔ local store rows (`construct-docs/decisions/history-projection-in-the-core.md`).
+/// Import merges into what the receiver holds: names and avatar only fill in, sharing flags only
+/// rise, a block is never lifted, our own message lands sent, an imported message takes a local
+/// order key. Times are ms.
+namespace construct_core {
+    /// Pass a display name the client generated itself as empty.
+    [Throws=HistoryError]
+    LocalContact history_import_contact(bytes record, LocalContact? existing, i64 now_ms);
+    [Throws=HistoryError]
+    HistoryChatImport history_import_chat(bytes record);
+    [Throws=HistoryError]
+    HistoryMessageImport history_import_message(bytes record, string own_account_id);
+    /// Keep out one whose message is not held, and one the reactor already has on it.
+    [Throws=HistoryError]
+    LocalReaction history_import_reaction(bytes record, i64 received_at_ms);
+    /// Null when the device id is not the one its key derives.
+    [Throws=HistoryError]
+    LocalPeerDevice? history_import_peer_device(bytes record, i64 now_ms);
+    /// `peer_name`: the receiver's name for the peer; the record carries none.
+    [Throws=HistoryError]
+    LocalCall history_import_call(bytes record, string peer_name, i64 now_ms);
+
+    bytes history_export_contact(LocalContact contact);
+    bytes history_export_chat(string peer_id, boolean is_pinned);
+    /// `chat_peer_id` names the received side of an older row whose stored id is not an account.
+    HistoryMessageExport history_export_message(LocalMessage message, string own_account_id, string? chat_peer_id);
+    bytes history_export_reaction(LocalReaction reaction);
+    bytes history_export_peer_device(LocalPeerDevice device);
+    bytes history_export_call(LocalCall call);
 };
