@@ -44,6 +44,7 @@ pub enum LocalStoreTable {
     Calls,
     PeerDevices,
     OwnProfile,
+    IssuedInvites,
 }
 
 impl From<store::Table> for LocalStoreTable {
@@ -56,6 +57,7 @@ impl From<store::Table> for LocalStoreTable {
             store::Table::Calls => Self::Calls,
             store::Table::PeerDevices => Self::PeerDevices,
             store::Table::OwnProfile => Self::OwnProfile,
+            store::Table::IssuedInvites => Self::IssuedInvites,
         }
     }
 }
@@ -168,6 +170,27 @@ mirror!(LocalCall <=> store::CallRecord {
 mirror!(LocalPeerDevice <=> store::PeerDevice {
     device_id: String, account_id: String, identity_key: Vec<u8>, first_seen_at: i64,
 });
+
+mirror!(LocalPendingChunk <=> store::PendingChunk {
+    sender_id: String, message_id: String, chunk_index: u32, total_chunks: u32,
+    plaintext_length: u64, content_type: u8, payload: Vec<u8>, envelope_id: Option<String>,
+    received_at: i64,
+});
+
+mirror!(LocalPendingResend <=> store::PendingResend {
+    message_id: String, device_id: String, account_id: String, created_at: i64, attempts: u32,
+});
+
+mirror!(LocalIssuedInvite <=> store::IssuedInvite {
+    jti: String, kind: String, issued_at: i64, ttl_seconds: u32, sitting: Option<String>,
+});
+
+mirror!(LocalKvEntry <=> store::KvEntry { key: String, value: Vec<u8> });
+
+pub struct LocalPendingChunkMessage {
+    pub sender_id: String,
+    pub message_id: String,
+}
 
 mirror!(LocalSearchHit <=> store::SearchHit {
     message_id: String, chat_id: String, timestamp: i64,
@@ -531,6 +554,86 @@ impl LocalStore {
         self.with(|s| s.forget_server_message_ids_before(cutoff))
     }
 
+    pub fn mark_processed(
+        &self,
+        message_id: String,
+        sender_id: String,
+        processed_at: i64,
+    ) -> Result<bool> {
+        self.with(|s| s.mark_processed(&message_id, &sender_id, processed_at))
+    }
+    pub fn is_processed(&self, message_id: String) -> Result<bool> {
+        self.with(|s| s.is_processed(&message_id))
+    }
+    pub fn processed_message_ids(&self) -> Result<Vec<String>> {
+        self.with(|s| s.processed_message_ids())
+    }
+    pub fn forget_processed_before(&self, cutoff: i64) -> Result<u64> {
+        self.with(|s| s.forget_processed_before(cutoff))
+    }
+
+    pub fn add_pending_chunk(&self, chunk: LocalPendingChunk) -> Result<bool> {
+        self.with(|s| s.add_pending_chunk(&chunk.into()))
+    }
+    pub fn pending_chunks(
+        &self,
+        sender_id: String,
+        message_id: String,
+    ) -> Result<Vec<LocalPendingChunk>> {
+        Ok(all(
+            self.with(|s| s.pending_chunks(&sender_id, &message_id))?
+        ))
+    }
+    pub fn pending_chunk_count(&self, sender_id: String, message_id: String) -> Result<u32> {
+        self.with(|s| s.pending_chunk_count(&sender_id, &message_id))
+    }
+    pub fn pending_chunk_messages(&self) -> Result<Vec<LocalPendingChunkMessage>> {
+        Ok(self
+            .with(|s| s.pending_chunk_messages())?
+            .into_iter()
+            .map(|(sender_id, message_id)| LocalPendingChunkMessage {
+                sender_id,
+                message_id,
+            })
+            .collect())
+    }
+    pub fn delete_pending_chunks(&self, sender_id: String, message_id: String) -> Result<()> {
+        self.with(|s| s.delete_pending_chunks(&sender_id, &message_id))
+    }
+    pub fn forget_pending_chunks_before(&self, cutoff: i64) -> Result<u64> {
+        self.with(|s| s.forget_pending_chunks_before(cutoff))
+    }
+
+    pub fn queue_resend(&self, resend: LocalPendingResend) -> Result<bool> {
+        self.with(|s| s.queue_resend(&resend.into()))
+    }
+    pub fn pending_resends(&self) -> Result<Vec<LocalPendingResend>> {
+        Ok(all(self.with(|s| s.pending_resends())?))
+    }
+    pub fn count_resend_attempt(
+        &self,
+        message_id: String,
+        device_id: String,
+    ) -> Result<Option<u32>> {
+        self.with(|s| s.count_resend_attempt(&message_id, &device_id))
+    }
+    pub fn delete_resend(&self, message_id: String, device_id: String) -> Result<()> {
+        self.with(|s| s.delete_resend(&message_id, &device_id))
+    }
+    pub fn forget_resends_before(&self, cutoff: i64) -> Result<u64> {
+        self.with(|s| s.forget_resends_before(cutoff))
+    }
+
+    pub fn record_issued_invite(&self, invite: LocalIssuedInvite) -> Result<()> {
+        self.with(|s| s.record_issued_invite(&invite.into()))
+    }
+    pub fn issued_invites(&self) -> Result<Vec<LocalIssuedInvite>> {
+        Ok(all(self.with(|s| s.issued_invites())?))
+    }
+    pub fn delete_issued_invites(&self, jtis: Vec<String>) -> Result<()> {
+        self.with(|s| s.delete_issued_invites(&jtis))
+    }
+
     pub fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.with(|s| s.put(&key, &value))
     }
@@ -539,5 +642,8 @@ impl LocalStore {
     }
     pub fn remove(&self, key: String) -> Result<()> {
         self.with(|s| s.remove(&key))
+    }
+    pub fn entries_with_prefix(&self, prefix: String) -> Result<Vec<LocalKvEntry>> {
+        Ok(all(self.with(|s| s.entries_with_prefix(&prefix))?))
     }
 }

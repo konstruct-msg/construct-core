@@ -1604,6 +1604,7 @@ enum LocalStoreTable {
     "Calls",
     "PeerDevices",
     "OwnProfile",
+    "IssuedInvites",
 };
 
 enum LocalInsert {
@@ -1726,6 +1727,49 @@ dictionary LocalPeerDevice {
     string account_id;
     bytes identity_key;
     i64 first_seen_at;
+};
+
+/// One decrypted chunk of an incoming message not yet complete.
+dictionary LocalPendingChunk {
+    string sender_id;
+    string message_id;
+    u32 chunk_index;
+    u32 total_chunks;
+    u64 plaintext_length;
+    u8 content_type;
+    bytes payload;
+    /// The envelope that carried it.
+    string? envelope_id;
+    i64 received_at;
+};
+
+/// A message the core asked to send again to one device; `message_id` is the id the reader named.
+dictionary LocalPendingResend {
+    string message_id;
+    string device_id;
+    string account_id;
+    i64 created_at;
+    u32 attempts;
+};
+
+/// An invite capability this device minted; `sitting` groups the codes of one QR showing.
+dictionary LocalIssuedInvite {
+    string jti;
+    string kind;
+    i64 issued_at;
+    u32 ttl_seconds;
+    string? sitting;
+};
+
+/// One message with chunks held.
+dictionary LocalPendingChunkMessage {
+    string sender_id;
+    string message_id;
+};
+
+dictionary LocalKvEntry {
+    string key;
+    bytes value;
 };
 
 dictionary LocalSearchHit {
@@ -1934,10 +1978,63 @@ interface LocalStore {
     [Throws=LocalStoreError]
     u64 forget_server_message_ids_before(i64 cutoff);
 
+    /// An envelope processed, so a redelivery is not; exact ids. Returns whether it was new.
+    [Throws=LocalStoreError]
+    boolean mark_processed(string message_id, string sender_id, i64 processed_at);
+    [Throws=LocalStoreError]
+    boolean is_processed(string message_id);
+    /// Every id held: to warm an in-memory cache at launch.
+    [Throws=LocalStoreError]
+    sequence<string> processed_message_ids();
+    [Throws=LocalStoreError]
+    u64 forget_processed_before(i64 cutoff);
+
+    /// A redelivered chunk keeps the copy held. Returns whether it was new.
+    [Throws=LocalStoreError]
+    boolean add_pending_chunk(LocalPendingChunk chunk);
+    /// One sender's message, by chunk index.
+    [Throws=LocalStoreError]
+    sequence<LocalPendingChunk> pending_chunks(string sender_id, string message_id);
+    [Throws=LocalStoreError]
+    u32 pending_chunk_count(string sender_id, string message_id);
+    /// Every message with chunks held, by its first chunk's arrival.
+    [Throws=LocalStoreError]
+    sequence<LocalPendingChunkMessage> pending_chunk_messages();
+    [Throws=LocalStoreError]
+    void delete_pending_chunks(string sender_id, string message_id);
+    [Throws=LocalStoreError]
+    u64 forget_pending_chunks_before(i64 cutoff);
+
+    /// A second request for the same copy keeps the first row. Returns whether it was new.
+    [Throws=LocalStoreError]
+    boolean queue_resend(LocalPendingResend resend);
+    /// Oldest first.
+    [Throws=LocalStoreError]
+    sequence<LocalPendingResend> pending_resends();
+    /// The attempts now, or null when not queued.
+    [Throws=LocalStoreError]
+    u32? count_resend_attempt(string message_id, string device_id);
+    [Throws=LocalStoreError]
+    void delete_resend(string message_id, string device_id);
+    [Throws=LocalStoreError]
+    u64 forget_resends_before(i64 cutoff);
+
+    /// Insert, or replace the row of its jti.
+    [Throws=LocalStoreError]
+    void record_issued_invite(LocalIssuedInvite invite);
+    /// Newest first.
+    [Throws=LocalStoreError]
+    sequence<LocalIssuedInvite> issued_invites();
+    [Throws=LocalStoreError]
+    void delete_issued_invites(sequence<string> jtis);
+
     [Throws=LocalStoreError]
     void put(string key, bytes value);
     [Throws=LocalStoreError]
     bytes? get(string key);
     [Throws=LocalStoreError]
     void remove(string key);
+    /// Every entry whose key starts with `prefix`, by key; no pattern characters.
+    [Throws=LocalStoreError]
+    sequence<LocalKvEntry> entries_with_prefix(string prefix);
 };

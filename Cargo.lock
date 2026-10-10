@@ -533,7 +533,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "construct-core"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "construct-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rusqlite",
  "tempfile",

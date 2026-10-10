@@ -8,8 +8,8 @@ use crate::KEY_LEN;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, Message, OwnProfile, PeerDevice,
-    Reaction, SearchHit, delivery,
+    CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, IssuedInvite, KvEntry, Message,
+    OwnProfile, PeerDevice, PendingChunk, PendingResend, Reaction, SearchHit, delivery,
 };
 use crate::observer::{Change, StoreObserver, Table};
 
@@ -1246,6 +1246,256 @@ impl Store {
         )? as u64)
     }
 
+    // MARK: - Processed messages
+
+    /// Remember that the envelope `message_id` was processed, so a redelivery is not processed
+    /// again. Ids are the server's envelope ids, compared exactly. One already here keeps its
+    /// first time. Returns whether it was new.
+    pub fn mark_processed(
+        &self,
+        message_id: &str,
+        sender_id: &str,
+        processed_at: i64,
+    ) -> Result<bool> {
+        Ok(self.lock().execute(
+            "INSERT OR IGNORE INTO processed_messages (message_id, sender_id, processed_at)
+             VALUES (?1, ?2, ?3)",
+            params![message_id, sender_id, processed_at],
+        )? == 1)
+    }
+
+    pub fn is_processed(&self, message_id: &str) -> Result<bool> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM processed_messages WHERE message_id = ?1)",
+            [message_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Every id held — to warm an in-memory cache at launch.
+    pub fn processed_message_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT message_id FROM processed_messages")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// Forget envelopes processed before `cutoff` (ms) — past the server's redelivery window.
+    pub fn forget_processed_before(&self, cutoff: i64) -> Result<u64> {
+        Ok(self.lock().execute(
+            "DELETE FROM processed_messages WHERE processed_at < ?1",
+            [cutoff],
+        )? as u64)
+    }
+
+    // MARK: - Pending chunks
+
+    /// Keep a decrypted chunk. A redelivered chunk keeps the copy already held. Returns whether
+    /// it was new.
+    pub fn add_pending_chunk(&self, chunk: &PendingChunk) -> Result<bool> {
+        Ok(self.lock().execute(
+            "INSERT OR IGNORE INTO pending_chunks (sender_id, message_id, chunk_index,
+                total_chunks, plaintext_length, content_type, payload, envelope_id, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                chunk.sender_id,
+                chunk.message_id,
+                chunk.chunk_index,
+                chunk.total_chunks,
+                chunk.plaintext_length,
+                chunk.content_type,
+                chunk.payload,
+                chunk.envelope_id,
+                chunk.received_at
+            ],
+        )? == 1)
+    }
+
+    /// The chunks held of one sender's message, by index.
+    pub fn pending_chunks(&self, sender_id: &str, message_id: &str) -> Result<Vec<PendingChunk>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PENDING_CHUNK_COLUMNS} FROM pending_chunks
+             WHERE sender_id = ?1 AND message_id = ?2 ORDER BY chunk_index"
+        ))?;
+        let rows = stmt
+            .query_map([sender_id, message_id], pending_chunk_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// How many chunks of one sender's message are held — whether it is complete, without
+    /// reading the payloads.
+    pub fn pending_chunk_count(&self, sender_id: &str, message_id: &str) -> Result<u32> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM pending_chunks WHERE sender_id = ?1 AND message_id = ?2",
+            [sender_id, message_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Every message with chunks held, as (sender, message) — to resume or expire at launch.
+    pub fn pending_chunk_messages(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT sender_id, message_id FROM pending_chunks
+             GROUP BY sender_id, message_id ORDER BY MIN(received_at), sender_id, message_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Drop one sender's message — assembled, or given up on.
+    pub fn delete_pending_chunks(&self, sender_id: &str, message_id: &str) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM pending_chunks WHERE sender_id = ?1 AND message_id = ?2",
+            [sender_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Forget chunks received before `cutoff` (ms); returns how many.
+    pub fn forget_pending_chunks_before(&self, cutoff: i64) -> Result<u64> {
+        Ok(self.lock().execute(
+            "DELETE FROM pending_chunks WHERE received_at < ?1",
+            [cutoff],
+        )? as u64)
+    }
+
+    // MARK: - Pending resends
+
+    /// Queue a resend. A second request for the same copy keeps the first row, its age and its
+    /// attempts. Returns whether it was new.
+    pub fn queue_resend(&self, resend: &PendingResend) -> Result<bool> {
+        Ok(self.lock().execute(
+            "INSERT OR IGNORE INTO pending_resends
+                (message_id, device_id, account_id, created_at, attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                resend.message_id,
+                resend.device_id,
+                resend.account_id,
+                resend.created_at,
+                resend.attempts
+            ],
+        )? == 1)
+    }
+
+    /// Every queued resend, oldest first.
+    pub fn pending_resends(&self) -> Result<Vec<PendingResend>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, device_id, account_id, created_at, attempts FROM pending_resends
+             ORDER BY created_at, message_id, device_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingResend {
+                    message_id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    account_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                    attempts: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// One more failed try; returns the attempts now, or `None` when the resend is not queued.
+    pub fn count_resend_attempt(&self, message_id: &str, device_id: &str) -> Result<Option<u32>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "UPDATE pending_resends SET attempts = attempts + 1
+                 WHERE message_id = ?1 AND device_id = ?2 RETURNING attempts",
+                [message_id, device_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The copy was sent, or will never be.
+    pub fn delete_resend(&self, message_id: &str, device_id: &str) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM pending_resends WHERE message_id = ?1 AND device_id = ?2",
+            [message_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    /// Forget resends queued before `cutoff` (ms); returns how many.
+    pub fn forget_resends_before(&self, cutoff: i64) -> Result<u64> {
+        Ok(self.lock().execute(
+            "DELETE FROM pending_resends WHERE created_at < ?1",
+            [cutoff],
+        )? as u64)
+    }
+
+    // MARK: - Issued invites
+
+    /// Record a minted invite, or replace the row of its `jti`.
+    pub fn record_issued_invite(&self, invite: &IssuedInvite) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO issued_invites (jti, kind, issued_at, ttl_seconds, sitting)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(jti) DO UPDATE SET kind = excluded.kind, issued_at = excluded.issued_at,
+                ttl_seconds = excluded.ttl_seconds, sitting = excluded.sitting",
+            params![
+                invite.jti,
+                invite.kind,
+                invite.issued_at,
+                invite.ttl_seconds,
+                invite.sitting
+            ],
+        )?;
+        self.notify(Table::IssuedInvites, vec![invite.jti.clone()]);
+        Ok(())
+    }
+
+    /// Every invite held, newest first.
+    pub fn issued_invites(&self) -> Result<Vec<IssuedInvite>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT jti, kind, issued_at, ttl_seconds, sitting FROM issued_invites
+             ORDER BY issued_at DESC, jti",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(IssuedInvite {
+                    jti: row.get(0)?,
+                    kind: row.get(1)?,
+                    issued_at: row.get(2)?,
+                    ttl_seconds: row.get(3)?,
+                    sitting: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Forget invites — revoked, or past their life.
+    pub fn delete_issued_invites(&self, jtis: &[String]) -> Result<()> {
+        let removed = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let mut removed = Vec::new();
+            for jti in jtis {
+                if tx.execute("DELETE FROM issued_invites WHERE jti = ?1", [jti])? == 1 {
+                    removed.push(jti.clone());
+                }
+            }
+            tx.commit()?;
+            removed
+        };
+        self.notify(Table::IssuedInvites, removed);
+        Ok(())
+    }
+
     // MARK: - Small state
 
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -1270,9 +1520,44 @@ impl Store {
             .execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
     }
+
+    /// Every entry whose key starts with `prefix`, by key — a family of values kept under one
+    /// prefix (`session:<slot>`), read at launch. Compared bytewise: no pattern characters.
+    pub fn entries_with_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+        )?;
+        let rows = stmt
+            .query_map([prefix], |row| {
+                Ok(KvEntry {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
 }
 
 // MARK: - Rows
+
+const PENDING_CHUNK_COLUMNS: &str = "sender_id, message_id, chunk_index, total_chunks,
+    plaintext_length, content_type, payload, envelope_id, received_at";
+
+fn pending_chunk_row(row: &Row<'_>) -> rusqlite::Result<PendingChunk> {
+    Ok(PendingChunk {
+        sender_id: row.get(0)?,
+        message_id: row.get(1)?,
+        chunk_index: row.get(2)?,
+        total_chunks: row.get(3)?,
+        plaintext_length: row.get(4)?,
+        content_type: row.get(5)?,
+        payload: row.get(6)?,
+        envelope_id: row.get(7)?,
+        received_at: row.get(8)?,
+    })
+}
 
 const CONTACT_COLUMNS: &str = "id, username, display_name, local_alias, avatar,
     known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,

@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use construct_store::{
-    Change, Chat, Contact, IdentityKeyPin, Insert, Message, OwnProfile, PeerDevice, Reaction,
-    Store, StoreError, StoreObserver, Table,
+    Change, Chat, Contact, IdentityKeyPin, Insert, IssuedInvite, KvEntry, Message, OwnProfile,
+    PeerDevice, PendingChunk, PendingResend, Reaction, Store, StoreError, StoreObserver, Table,
     delivery::{self, ArchiveOutcome, DELIVERED, FAILED, QUEUED, SENDING, SENT},
 };
 
@@ -1261,4 +1261,221 @@ fn a_body_read_late_is_not_an_edit() {
         store.search("recovered", 10).unwrap().is_empty(),
         "the old text is no longer findable"
     );
+}
+
+// MARK: - Service tables (schema 4)
+
+/// A processed envelope is remembered once, by its exact id, and forgotten past the window.
+/// Mutation: `INSERT OR REPLACE` — the second mark moves the time and the prune keeps the row;
+/// `<=` in the prune — the row at the cutoff goes.
+#[test]
+fn a_processed_envelope_is_remembered_until_the_window_closes() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert!(store.mark_processed("Env-1", "s", 100).unwrap());
+    assert!(
+        !store.mark_processed("Env-1", "s", 900).unwrap(),
+        "already here"
+    );
+    assert!(store.mark_processed("env-2", "s", 500).unwrap());
+    assert!(store.is_processed("Env-1").unwrap());
+    assert!(
+        !store.is_processed("env-1").unwrap(),
+        "envelope ids compare exactly"
+    );
+    let mut ids = store.processed_message_ids().unwrap();
+    ids.sort();
+    assert_eq!(ids, ["Env-1", "env-2"]);
+
+    assert_eq!(
+        store.forget_processed_before(500).unwrap(),
+        1,
+        "the first time is kept"
+    );
+    assert!(!store.is_processed("Env-1").unwrap());
+    assert!(
+        store.is_processed("env-2").unwrap(),
+        "at the cutoff is kept"
+    );
+}
+
+fn chunk(sender: &str, message: &str, index: u32, at: i64) -> PendingChunk {
+    PendingChunk {
+        sender_id: sender.into(),
+        message_id: message.into(),
+        chunk_index: index,
+        total_chunks: 3,
+        plaintext_length: 70_000,
+        content_type: 4,
+        payload: vec![index as u8; 4],
+        envelope_id: Some(format!("e{index}")),
+        received_at: at,
+    }
+}
+
+/// Chunks are kept per sender and message, in order, and a redelivery keeps the first copy.
+/// Mutation: drop `sender_id` from the key or the reads — another sender's chunk joins the
+/// message; `INSERT OR REPLACE` — the redelivered payload replaces the first.
+#[test]
+fn chunks_are_kept_per_sender_and_message() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert!(store.add_pending_chunk(&chunk("a", "m", 2, 30)).unwrap());
+    assert!(store.add_pending_chunk(&chunk("a", "m", 0, 10)).unwrap());
+    let mut again = chunk("a", "m", 0, 99);
+    again.payload = vec![0xFF];
+    assert!(!store.add_pending_chunk(&again).unwrap(), "a redelivery");
+    assert!(
+        store.add_pending_chunk(&chunk("b", "m", 1, 20)).unwrap(),
+        "another sender, same id"
+    );
+
+    let held = store.pending_chunks("a", "m").unwrap();
+    assert_eq!(held, vec![chunk("a", "m", 0, 10), chunk("a", "m", 2, 30)]);
+    assert_eq!(store.pending_chunk_count("a", "m").unwrap(), 2);
+    assert_eq!(store.pending_chunk_count("b", "m").unwrap(), 1);
+    assert_eq!(
+        store.pending_chunk_messages().unwrap(),
+        vec![("a".to_string(), "m".to_string()), ("b".into(), "m".into())],
+        "by the first chunk's arrival"
+    );
+
+    store.delete_pending_chunks("a", "m").unwrap();
+    assert!(store.pending_chunks("a", "m").unwrap().is_empty());
+    assert_eq!(
+        store.pending_chunk_count("b", "m").unwrap(),
+        1,
+        "the other sender's stays"
+    );
+}
+
+/// Old chunks expire by when they arrived. Mutation: `<=` — the chunk at the cutoff goes.
+#[test]
+fn old_chunks_expire() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.add_pending_chunk(&chunk("a", "m", 0, 10)).unwrap();
+    store.add_pending_chunk(&chunk("a", "m", 1, 20)).unwrap();
+    assert_eq!(store.forget_pending_chunks_before(20).unwrap(), 1);
+    assert_eq!(
+        store.pending_chunks("a", "m").unwrap(),
+        vec![chunk("a", "m", 1, 20)]
+    );
+}
+
+fn resend(message: &str, device: &str, at: i64) -> PendingResend {
+    PendingResend {
+        message_id: message.into(),
+        device_id: device.into(),
+        account_id: "acct".into(),
+        created_at: at,
+        attempts: 0,
+    }
+}
+
+/// A resend is queued once per copy, keeps its age and attempts, and goes when sent.
+/// Mutation: `INSERT OR REPLACE` — a second request resets the attempts; drop `device_id` from
+/// the attempt's `WHERE` — both devices' copies count it.
+#[test]
+fn a_resend_waits_per_device_until_sent() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert!(store.queue_resend(&resend("m1", "d2", 20)).unwrap());
+    assert!(store.queue_resend(&resend("m1", "d1", 10)).unwrap());
+    assert_eq!(store.count_resend_attempt("m1", "d1").unwrap(), Some(1));
+    assert!(
+        !store.queue_resend(&resend("m1", "d1", 99)).unwrap(),
+        "already queued"
+    );
+    assert_eq!(store.count_resend_attempt("m1", "d1").unwrap(), Some(2));
+    assert_eq!(store.count_resend_attempt("m9", "d1").unwrap(), None);
+
+    let queued = store.pending_resends().unwrap();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|r| (r.device_id.as_str(), r.created_at, r.attempts))
+            .collect::<Vec<_>>(),
+        [("d1", 10, 2), ("d2", 20, 0)],
+        "oldest first; the first row's age kept"
+    );
+
+    store.delete_resend("m1", "d1").unwrap();
+    assert_eq!(
+        store.pending_resends().unwrap(),
+        vec![resend("m1", "d2", 20)]
+    );
+    assert_eq!(store.forget_resends_before(21).unwrap(), 1);
+    assert!(store.pending_resends().unwrap().is_empty());
+}
+
+fn invite(jti: &str, at: i64, sitting: Option<&str>) -> IssuedInvite {
+    IssuedInvite {
+        jti: jti.into(),
+        kind: "qr".into(),
+        issued_at: at,
+        ttl_seconds: 600,
+        sitting: sitting.map(Into::into),
+    }
+}
+
+/// Invites come newest first, a re-record replaces the row, and both writes are announced.
+/// Mutation: `ORDER BY issued_at` ascending; drop the `notify` in `delete_issued_invites`.
+#[test]
+fn issued_invites_are_listed_newest_first_and_announced() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let changes = Arc::new(Changes::default());
+    store.set_observer(Some(changes.clone()));
+    store
+        .record_issued_invite(&invite("j1", 10, Some("s")))
+        .unwrap();
+    store
+        .record_issued_invite(&invite("j2", 20, Some("s")))
+        .unwrap();
+    store.record_issued_invite(&invite("j1", 30, None)).unwrap();
+    assert_eq!(
+        store.issued_invites().unwrap(),
+        vec![invite("j1", 30, None), invite("j2", 20, Some("s"))]
+    );
+
+    store
+        .delete_issued_invites(&["j2".into(), "gone".into()])
+        .unwrap();
+    assert_eq!(
+        store.issued_invites().unwrap(),
+        vec![invite("j1", 30, None)]
+    );
+    let seen = changes.changes.lock().unwrap();
+    assert!(seen.iter().all(|c| c.table == Table::IssuedInvites));
+    assert_eq!(
+        seen.iter().map(|c| c.ids.clone()).collect::<Vec<_>>(),
+        [vec!["j1"], vec!["j2"], vec!["j1"], vec!["j2"]],
+        "only what was there is announced as deleted"
+    );
+}
+
+/// A prefix reads its family of keys, and only it — `%` and `_` are not patterns. Mutation:
+/// `key LIKE ?1 || '%'` — `session_x` and the `%` key answer too.
+#[test]
+fn entries_are_read_by_prefix() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.put("session:b", b"2").unwrap();
+    store.put("session:a", b"1").unwrap();
+    store.put("sessionXa", b"no").unwrap();
+    store.put("cursor", b"no").unwrap();
+    store.put("s%:a", b"no").unwrap();
+    assert_eq!(
+        store.entries_with_prefix("session:").unwrap(),
+        vec![
+            KvEntry {
+                key: "session:a".into(),
+                value: b"1".to_vec()
+            },
+            KvEntry {
+                key: "session:b".into(),
+                value: b"2".to_vec()
+            },
+        ]
+    );
+    assert!(
+        store.entries_with_prefix("s%:").unwrap().len() == 1,
+        "the literal key only"
+    );
+    assert_eq!(store.entries_with_prefix("").unwrap().len(), 5);
 }
