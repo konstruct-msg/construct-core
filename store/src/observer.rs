@@ -11,6 +11,8 @@ pub enum Table {
     PeerDevices,
     /// Our own profile; the id is our account id.
     OwnProfile,
+    /// Invites this device minted; the ids are their `jti`.
+    IssuedInvites,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -5,9 +5,9 @@
 use std::sync::{Arc, Mutex};
 
 use construct_core::{
-    LocalArchiveOutcome, LocalChat, LocalContact, LocalInsert, LocalMessage, LocalOwnProfile,
-    LocalPeerDevice, LocalStore, LocalStoreChange, LocalStoreError, LocalStoreObserver,
-    LocalStoreTable,
+    LocalArchiveOutcome, LocalChat, LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage,
+    LocalOwnProfile, LocalPeerDevice, LocalPendingChunk, LocalPendingResend, LocalStore,
+    LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -352,4 +352,89 @@ fn message_writes_and_the_status_rule_cross_the_boundary() {
     assert!(store.reactions_in_chat("c1".into()).unwrap().is_empty());
     assert!(store.all_reactions().unwrap().is_empty());
     assert_eq!(store.expire_reactions(10).unwrap(), 0);
+}
+
+/// The service tables cross the FFI: every record and both table answers come back whole.
+#[test]
+fn the_service_tables_cross() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    assert!(store.mark_processed("e1".into(), "s".into(), 5).unwrap());
+    assert!(store.is_processed("e1".into()).unwrap());
+    assert_eq!(store.processed_message_ids().unwrap(), ["e1"]);
+    assert_eq!(store.forget_processed_before(6).unwrap(), 1);
+
+    let chunk = LocalPendingChunk {
+        sender_id: "s".into(),
+        message_id: "m".into(),
+        chunk_index: 1,
+        total_chunks: 2,
+        plaintext_length: 5_000_000_000,
+        content_type: 200,
+        payload: vec![1, 2],
+        envelope_id: Some("e".into()),
+        received_at: 7,
+    };
+    assert!(store.add_pending_chunk(chunk).unwrap());
+    let held = store.pending_chunks("s".into(), "m".into()).unwrap();
+    assert_eq!(
+        (
+            held[0].plaintext_length,
+            held[0].content_type,
+            held[0].envelope_id.as_deref()
+        ),
+        (5_000_000_000, 200, Some("e"))
+    );
+    assert_eq!(
+        store.pending_chunk_count("s".into(), "m".into()).unwrap(),
+        1
+    );
+    let messages = store.pending_chunk_messages().unwrap();
+    assert_eq!(
+        (
+            messages[0].sender_id.as_str(),
+            messages[0].message_id.as_str()
+        ),
+        ("s", "m")
+    );
+    store.delete_pending_chunks("s".into(), "m".into()).unwrap();
+    assert_eq!(store.forget_pending_chunks_before(100).unwrap(), 0);
+
+    assert!(
+        store
+            .queue_resend(LocalPendingResend {
+                message_id: "m".into(),
+                device_id: "d".into(),
+                account_id: "a".into(),
+                created_at: 3,
+                attempts: 0,
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.count_resend_attempt("m".into(), "d".into()).unwrap(),
+        Some(1)
+    );
+    assert_eq!(store.pending_resends().unwrap()[0].attempts, 1);
+    store.delete_resend("m".into(), "d".into()).unwrap();
+    assert_eq!(store.forget_resends_before(100).unwrap(), 0);
+
+    store
+        .record_issued_invite(LocalIssuedInvite {
+            jti: "j".into(),
+            kind: "link".into(),
+            issued_at: 9,
+            ttl_seconds: 600,
+            sitting: None,
+        })
+        .unwrap();
+    assert_eq!(store.issued_invites().unwrap()[0].ttl_seconds, 600);
+    store.delete_issued_invites(vec!["j".into()]).unwrap();
+    assert!(store.issued_invites().unwrap().is_empty());
+
+    store.put("session:x".into(), vec![9]).unwrap();
+    let entries = store.entries_with_prefix("session:".into()).unwrap();
+    assert_eq!(
+        (entries[0].key.as_str(), entries[0].value.as_slice()),
+        ("session:x", &[9u8][..])
+    );
 }

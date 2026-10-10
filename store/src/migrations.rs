@@ -180,6 +180,56 @@ const STEPS: &[&str] = &[
     ALTER TABLE chats DROP COLUMN session_id;
     ALTER TABLE chats DROP COLUMN is_muted;
     "#,
+    // 4 — the service tables both clients keep beside the conversation.
+    //
+    // `processed_messages` gets the index its pruning reads. `healing_messages` goes: session
+    // healing was removed (a session renews by sending), and iOS only ever purges its copy.
+    //
+    // The rest are Android's Room tables, which iOS keeps elsewhere or not at all:
+    // - `pending_chunks` — decrypted chunks of a message not yet complete. A chunk's ratchet key
+    //   is spent when it is read, so a restart without these bytes loses the message. Keyed by the
+    //   sending account too, so one sender's frames never fill in another's message. A row per
+    //   chunk, not one growing blob: rewriting the message on every chunk would be quadratic.
+    //   `envelope_id` is the envelope that carried it, marked processed once the bytes are here.
+    // - `pending_resends` — a message the core asked to send again to one device, until it is
+    //   sent: a resend tried once and dropped on a network error loses the message.
+    // - `issued_invites` — invites this device minted, one row per capability; `sitting` groups
+    //   the codes of one showing of the QR screen.
+    r#"
+    CREATE INDEX processed_messages_by_age ON processed_messages(processed_at);
+    DROP TABLE healing_messages;
+
+    CREATE TABLE pending_chunks (
+        sender_id        TEXT NOT NULL,
+        message_id       TEXT NOT NULL,
+        chunk_index      INTEGER NOT NULL,
+        total_chunks     INTEGER NOT NULL,
+        plaintext_length INTEGER NOT NULL,
+        content_type     INTEGER NOT NULL,
+        payload          BLOB NOT NULL,
+        envelope_id      TEXT,
+        received_at      INTEGER NOT NULL,
+        PRIMARY KEY (sender_id, message_id, chunk_index)
+    );
+    CREATE INDEX pending_chunks_by_age ON pending_chunks(received_at);
+
+    CREATE TABLE pending_resends (
+        message_id TEXT NOT NULL,
+        device_id  TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (message_id, device_id)
+    );
+
+    CREATE TABLE issued_invites (
+        jti         TEXT PRIMARY KEY NOT NULL,
+        kind        TEXT NOT NULL,
+        issued_at   INTEGER NOT NULL,
+        ttl_seconds INTEGER NOT NULL,
+        sitting     TEXT
+    );
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;

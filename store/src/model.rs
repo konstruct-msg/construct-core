@@ -172,6 +172,51 @@ pub struct PeerDevice {
     pub first_seen_at: i64,
 }
 
+/// One decrypted chunk of an incoming message not yet complete.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingChunk {
+    pub sender_id: String,
+    pub message_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub plaintext_length: u64,
+    pub content_type: u8,
+    pub payload: Vec<u8>,
+    /// The envelope that carried it.
+    pub envelope_id: Option<String>,
+    pub received_at: i64,
+}
+
+/// A message the core asked to send again to one device, not sent yet. `message_id` is the id
+/// the reader named — for a sealed copy, the server's.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingResend {
+    pub message_id: String,
+    pub device_id: String,
+    /// The device's account.
+    pub account_id: String,
+    pub created_at: i64,
+    pub attempts: u32,
+}
+
+/// An invite capability this device minted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssuedInvite {
+    pub jti: String,
+    /// What the client calls the way it was handed out (a copied link, a QR code).
+    pub kind: String,
+    pub issued_at: i64,
+    pub ttl_seconds: u32,
+    /// The showing of the QR screen that minted it; its codes are one row to the user.
+    pub sitting: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub message_id: String,
