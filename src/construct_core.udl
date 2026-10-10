@@ -1877,6 +1877,9 @@ interface LocalStore {
     sequence<LocalMessage> pending_sends(string? chat_id, i16 retry_ceiling, u32 limit);
     [Throws=LocalStoreError]
     u64 message_count();
+    /// How many messages a chat holds.
+    [Throws=LocalStoreError]
+    u64 chat_message_count(string chat_id);
     /// Every chat's messages after (`after_order_key`, `after_id`) — both null from the start — a
     /// page at a time, in that order: a history snapshot.
     [Throws=LocalStoreError]
@@ -1896,9 +1899,13 @@ interface LocalStore {
     /// Every reaction, oldest first: a history snapshot.
     [Throws=LocalStoreError]
     sequence<LocalReaction> all_reactions();
-    /// Forget reactions received at or before `cutoff` (ms); one with no receipt time stays.
+    /// Forget reactions whose message is not here, received at or before `cutoff` (ms). A reaction
+    /// on a held message is never expired; one with no receipt time stays.
     [Throws=LocalStoreError]
     u32 expire_reactions(i64 cutoff);
+    /// Every reaction on a chat's messages, by message then time — one read per transcript.
+    [Throws=LocalStoreError]
+    sequence<LocalReaction> reactions_in_chat(string chat_id);
 
     [Throws=LocalStoreError]
     void upsert_call(LocalCall call);

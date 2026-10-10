@@ -1118,31 +1118,109 @@ fn export_pages_run_through_every_chat_once() {
     assert_eq!(store.message_count().unwrap(), 4);
 }
 
-/// Reactions received long enough ago are forgotten; one with no receipt time is kept.
-/// Mutation: drop `received_at IS NOT NULL` — our own reactions expire too.
+/// Only a reaction whose message never came is forgotten — and only once it has waited past the
+/// cutoff; a reaction on a message the store holds is kept however old, as is one with no receipt
+/// time. Mutation: drop the case-insensitive `NOT EXISTS` — the reaction on `M2-UPPER` expires; drop
+/// both — every old reaction expires. (The exact one is for the index, not for the answer.)
 #[test]
-fn reactions_expire_by_when_they_were_received() {
-    let store = with_messages(1);
-    let reaction = |who: &str, received: Option<i64>| Reaction {
-        target_message_id: "m1".into(),
+fn only_reactions_whose_message_never_came_expire() {
+    let store = with_messages(1); // holds "m1"
+    let mut upper = message("M2-UPPER", "c", "k2", b"x");
+    upper.is_sent_by_me = true;
+    store.insert_message(&upper, None).unwrap();
+    let reaction = |target: &str, who: &str, received: Option<i64>| Reaction {
+        target_message_id: target.into(),
         reactor_user_id: who.into(),
         emoji: "👍".into(),
         timestamp_ms: 1,
         received_at: received,
     };
-    store.upsert_reaction(&reaction("old", Some(100))).unwrap();
-    store.upsert_reaction(&reaction("new", Some(900))).unwrap();
-    store.upsert_reaction(&reaction("ours", None)).unwrap();
+    store
+        .upsert_reaction(&reaction("m1", "old-on-held", Some(100)))
+        .unwrap();
+    store
+        .upsert_reaction(&reaction("m2-upper", "old-on-held-other-case", Some(100)))
+        .unwrap();
+    store
+        .upsert_reaction(&reaction("gone", "old-orphan", Some(100)))
+        .unwrap();
+    store
+        .upsert_reaction(&reaction("gone", "new-orphan", Some(900)))
+        .unwrap();
+    store
+        .upsert_reaction(&reaction("gone", "ours", None))
+        .unwrap();
 
     assert_eq!(store.expire_reactions(500).unwrap(), 1);
-    let left = store.all_reactions().unwrap();
-    let mut who = left
-        .iter()
-        .map(|r| r.reactor_user_id.as_str())
+    let mut who = store
+        .all_reactions()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.reactor_user_id)
         .collect::<Vec<_>>();
     who.sort();
-    assert_eq!(who, ["new", "ours"]);
+    assert_eq!(
+        who,
+        [
+            "new-orphan",
+            "old-on-held",
+            "old-on-held-other-case",
+            "ours"
+        ]
+    );
     assert_eq!(store.expire_reactions(500).unwrap(), 0);
+}
+
+/// A chat's reactions in one read, its messages only. Mutation: drop `m.chat_id = ?1` — another
+/// chat's reaction comes along.
+#[test]
+fn a_chats_reactions_come_in_one_read() {
+    let store = with_messages(2); // chat "c": m1, m2
+    store.upsert_contact(&contact("q", "q")).unwrap();
+    store.upsert_chat(&chat("d", "q", None, false)).unwrap();
+    store
+        .insert_message(&message("n1", "d", "k1", b"x"), None)
+        .unwrap();
+    let reaction = |target: &str, who: &str, at: i64| Reaction {
+        target_message_id: target.into(),
+        reactor_user_id: who.into(),
+        emoji: "🔥".into(),
+        timestamp_ms: at,
+        received_at: None,
+    };
+    store.upsert_reaction(&reaction("m2", "b", 2)).unwrap();
+    store.upsert_reaction(&reaction("m1", "a", 5)).unwrap();
+    store.upsert_reaction(&reaction("m1", "z", 1)).unwrap();
+    store
+        .upsert_reaction(&reaction("n1", "other-chat", 1))
+        .unwrap();
+
+    let got = store
+        .reactions_in_chat("c")
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.target_message_id, r.reactor_user_id))
+        .collect::<Vec<_>>();
+    let pairs = |v: &[(&str, &str)]| {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(got, pairs(&[("m1", "z"), ("m1", "a"), ("m2", "b")]));
+}
+
+/// Counted per chat. Mutation: count every message.
+#[test]
+fn messages_are_counted_per_chat() {
+    let store = with_messages(3);
+    store.upsert_contact(&contact("q", "q")).unwrap();
+    store.upsert_chat(&chat("d", "q", None, false)).unwrap();
+    store
+        .insert_message(&message("n1", "d", "k1", b"x"), None)
+        .unwrap();
+    assert_eq!(store.chat_message_count("c").unwrap(), 3);
+    assert_eq!(store.chat_message_count("d").unwrap(), 1);
+    assert_eq!(store.chat_message_count("none").unwrap(), 0);
 }
 
 /// A body read late replaces what is stored and what is findable, and does not mark the message

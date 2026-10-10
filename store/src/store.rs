@@ -867,6 +867,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// How many messages a chat holds — the activity a contact is ranked by.
+    pub fn chat_message_count(&self, chat_id: &str) -> Result<u64> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ?1",
+            [chat_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn message_count(&self) -> Result<u64> {
         Ok(self
             .lock()
@@ -995,15 +1004,26 @@ impl Store {
         Ok(rows)
     }
 
-    /// Forget reactions received at or before `cutoff` (ms); one with no receipt time — ours, or
-    /// from a history snapshot — is kept. How many went.
+    /// Forget reactions whose message is not here and that were received at or before `cutoff`
+    /// (ms) — a reaction that arrived before its message waits for it that long, then goes. A
+    /// reaction on a message the store holds is never expired, however old; one with no receipt
+    /// time (ours, or from a history snapshot) is kept. How many went.
+    ///
+    /// Until 0.39.0 this dropped every reaction older than the cutoff, message or not — on a
+    /// client calling it, all reactions would have gone after the window. The rule is the clients'
+    /// own (iOS `ReactionReducer.shouldEvictOrphan`); the message is matched without case, as
+    /// theirs is.
     pub fn expire_reactions(&self, cutoff: i64) -> Result<u32> {
         let targets = {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
             let targets = {
                 let mut stmt = tx.prepare(
-                    "DELETE FROM reactions WHERE received_at IS NOT NULL AND received_at <= ?1
+                    "DELETE FROM reactions
+                     WHERE received_at IS NOT NULL AND received_at <= ?1
+                       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = reactions.target_message_id)
+                       AND NOT EXISTS (SELECT 1 FROM messages m
+                                       WHERE m.id = reactions.target_message_id COLLATE NOCASE)
                      RETURNING target_message_id",
                 )?;
                 stmt.query_map([cutoff], |row| row.get::<_, String>(0))?
@@ -1020,6 +1040,31 @@ impl Store {
             self.notify(Table::Reactions, ids);
         }
         Ok(removed)
+    }
+
+    /// Every reaction on the messages of a chat, by message then time — one query for a
+    /// transcript instead of one per message. A reaction is matched to its message by the
+    /// message's id lowercased, the form clients store reaction targets in.
+    pub fn reactions_in_chat(&self, chat_id: &str) -> Result<Vec<Reaction>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT r.target_message_id, r.reactor_user_id, r.emoji, r.timestamp_ms, r.received_at
+             FROM messages m JOIN reactions r ON r.target_message_id = lower(m.id)
+             WHERE m.chat_id = ?1
+             ORDER BY r.target_message_id, r.timestamp_ms, r.reactor_user_id",
+        )?;
+        let rows = stmt
+            .query_map([chat_id], |row| {
+                Ok(Reaction {
+                    target_message_id: row.get(0)?,
+                    reactor_user_id: row.get(1)?,
+                    emoji: row.get(2)?,
+                    timestamp_ms: row.get(3)?,
+                    received_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // MARK: - Calls
