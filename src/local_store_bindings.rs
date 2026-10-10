@@ -446,6 +446,9 @@ impl LocalStore {
     pub fn message_count(&self) -> Result<u64> {
         self.with(|s| s.message_count())
     }
+    pub fn chat_message_count(&self, chat_id: String) -> Result<u64> {
+        self.with(|s| s.chat_message_count(&chat_id))
+    }
     pub fn all_messages_after(
         &self,
         after_order_key: Option<String>,
@@ -481,6 +484,9 @@ impl LocalStore {
     }
     pub fn expire_reactions(&self, cutoff: i64) -> Result<u32> {
         self.with(|s| s.expire_reactions(cutoff))
+    }
+    pub fn reactions_in_chat(&self, chat_id: String) -> Result<Vec<LocalReaction>> {
+        Ok(all(self.with(|s| s.reactions_in_chat(&chat_id))?))
     }
 
     pub fn upsert_call(&self, call: LocalCall) -> Result<()> {

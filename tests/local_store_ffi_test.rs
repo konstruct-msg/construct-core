@@ -348,6 +348,8 @@ fn message_writes_and_the_status_rule_cross_the_boundary() {
         ["m3"]
     );
     assert_eq!(store.message_count().unwrap(), 3);
+    assert_eq!(store.chat_message_count("c1".into()).unwrap(), 3);
+    assert!(store.reactions_in_chat("c1".into()).unwrap().is_empty());
     assert!(store.all_reactions().unwrap().is_empty());
     assert_eq!(store.expire_reactions(10).unwrap(), 0);
 }
