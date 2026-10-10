@@ -647,3 +647,133 @@ impl LocalStore {
         Ok(all(self.with(|s| s.entries_with_prefix(&prefix))?))
     }
 }
+
+// MARK: - History projection
+
+use crate::history::project;
+use crate::uniffi_bindings::HistoryError;
+
+type HistoryResult<T> = std::result::Result<T, HistoryError>;
+
+pub struct HistoryChatImport {
+    pub peer_id: String,
+    pub pin: bool,
+}
+
+// A value UniFFI copies across field by field, once per record; boxing the row buys nothing there.
+#[allow(clippy::large_enum_variant)]
+pub enum HistoryMessageImport {
+    Row {
+        peer_id: String,
+        message: LocalMessage,
+    },
+    UnknownBody,
+}
+
+pub struct HistoryMediaRef {
+    pub id: String,
+    pub mime: String,
+}
+
+pub enum HistoryMessageExport {
+    Record {
+        record: Vec<u8>,
+        media: Vec<HistoryMediaRef>,
+    },
+    Control,
+    Empty,
+    Legacy,
+}
+
+pub fn history_import_contact(
+    record: Vec<u8>,
+    existing: Option<LocalContact>,
+    now_ms: i64,
+) -> HistoryResult<LocalContact> {
+    Ok(project::import_contact(&record, existing.map(Into::into), now_ms)?.into())
+}
+
+pub fn history_import_chat(record: Vec<u8>) -> HistoryResult<HistoryChatImport> {
+    let chat = project::import_chat(&record)?;
+    Ok(HistoryChatImport {
+        peer_id: chat.peer_id,
+        pin: chat.pin,
+    })
+}
+
+pub fn history_import_message(
+    record: Vec<u8>,
+    own_account_id: String,
+) -> HistoryResult<HistoryMessageImport> {
+    Ok(match project::import_message(&record, &own_account_id)? {
+        project::MessageImport::Row { peer_id, message } => HistoryMessageImport::Row {
+            peer_id,
+            message: (*message).into(),
+        },
+        project::MessageImport::UnknownBody => HistoryMessageImport::UnknownBody,
+    })
+}
+
+pub fn history_import_reaction(
+    record: Vec<u8>,
+    received_at_ms: i64,
+) -> HistoryResult<LocalReaction> {
+    Ok(project::import_reaction(&record, received_at_ms)?.into())
+}
+
+pub fn history_import_peer_device(
+    record: Vec<u8>,
+    now_ms: i64,
+) -> HistoryResult<Option<LocalPeerDevice>> {
+    Ok(project::import_peer_device(&record, now_ms)?.map(Into::into))
+}
+
+pub fn history_import_call(
+    record: Vec<u8>,
+    peer_name: String,
+    now_ms: i64,
+) -> HistoryResult<LocalCall> {
+    Ok(project::import_call(&record, &peer_name, now_ms)?.into())
+}
+
+pub fn history_export_contact(contact: LocalContact) -> Vec<u8> {
+    project::export_contact(&contact.into())
+}
+
+pub fn history_export_chat(peer_id: String, is_pinned: bool) -> Vec<u8> {
+    project::export_chat(&peer_id, is_pinned)
+}
+
+pub fn history_export_message(
+    message: LocalMessage,
+    own_account_id: String,
+    chat_peer_id: Option<String>,
+) -> HistoryMessageExport {
+    match project::export_message(&message.into(), &own_account_id, chat_peer_id.as_deref()) {
+        project::MessageExport::Record { record, media } => HistoryMessageExport::Record {
+            record,
+            media: media
+                .into_iter()
+                .map(|m| HistoryMediaRef {
+                    id: m.id,
+                    mime: m.mime,
+                })
+                .collect(),
+        },
+        project::MessageExport::Control => HistoryMessageExport::Control,
+        project::MessageExport::Empty => HistoryMessageExport::Empty,
+        project::MessageExport::Legacy => HistoryMessageExport::Legacy,
+    }
+}
+
+pub fn history_export_reaction(reaction: LocalReaction) -> Vec<u8> {
+    project::export_reaction(&reaction.into())
+}
+
+pub fn history_export_peer_device(device: LocalPeerDevice) -> Vec<u8> {
+    project::export_peer_device(&device.into())
+}
+
+pub fn history_export_call(call: LocalCall) -> Vec<u8> {
+    project::export_call(&call.into())
+}

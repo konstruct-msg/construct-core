@@ -21,6 +21,7 @@ mod error;
 mod migrations;
 mod model;
 mod observer;
+pub mod payload;
 mod store;
 
 pub use error::StoreError;

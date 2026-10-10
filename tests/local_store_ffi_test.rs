@@ -5,9 +5,11 @@
 use std::sync::{Arc, Mutex};
 
 use construct_core::{
-    LocalArchiveOutcome, LocalChat, LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage,
-    LocalOwnProfile, LocalPeerDevice, LocalPendingChunk, LocalPendingResend, LocalStore,
-    LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable,
+    HistoryError, HistoryMessageExport, HistoryMessageImport, LocalArchiveOutcome, LocalChat,
+    LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalOwnProfile, LocalPeerDevice,
+    LocalPendingChunk, LocalPendingResend, LocalStore, LocalStoreChange, LocalStoreError,
+    LocalStoreObserver, LocalStoreTable, history_export_chat, history_export_message,
+    history_import_chat, history_import_message,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -437,4 +439,57 @@ fn the_service_tables_cross() {
         (entries[0].key.as_str(), entries[0].value.as_slice()),
         ("session:x", &[9u8][..])
     );
+}
+
+/// The history projection crosses the FFI: a row exported and imported back is the same row,
+/// and a malformed record is the history error.
+#[test]
+fn the_history_projection_crosses() {
+    let own = "00000000-0000-4000-8000-000000000001";
+    let peer = "00000000-0000-4000-8000-000000000002";
+    let row = LocalMessage {
+        id: "m1".into(),
+        chat_id: "c1".into(),
+        from_user_id: own.into(),
+        to_user_id: peer.into(),
+        is_sent_by_me: true,
+        timestamp: 1_700_000_000_000,
+        order_key: "00000001700000000000-00000000000000000000-m1".into(),
+        body: b"CTM1\x01hello".to_vec(),
+        content_type: 0,
+        delivery_status: 1,
+        retry_count: 0,
+        suite_id: 2,
+        is_edited: false,
+        edited_at: None,
+        reply_to_message_id: None,
+        reply_to_content: None,
+        transcript_text: None,
+        transcript_language: None,
+        transcript_generated_at: None,
+    };
+    let HistoryMessageExport::Record { record, media } =
+        history_export_message(row, own.into(), Some(peer.into()))
+    else {
+        panic!("a record")
+    };
+    assert!(media.is_empty());
+    let HistoryMessageImport::Row { peer_id, message } =
+        history_import_message(record, own.into()).unwrap()
+    else {
+        panic!("a row")
+    };
+    assert_eq!(peer_id, peer);
+    // A text body travels as MessageContent{text} and comes back as that, not as kind 0x01.
+    assert_eq!(&message.body[..5], b"CTM1\x03");
+    assert_eq!(
+        message.order_key,
+        "00000001700000000000-00000000000000000000-m1"
+    );
+    assert!(matches!(
+        history_import_message(vec![0xff], own.into()),
+        Err(HistoryError::Malformed)
+    ));
+    let chat = history_import_chat(history_export_chat(peer.into(), true)).unwrap();
+    assert_eq!((chat.peer_id.as_str(), chat.pin), (peer, true));
 }

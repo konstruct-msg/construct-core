@@ -18,6 +18,9 @@ pub mod channel;
 pub mod cth1;
 pub mod discovery;
 pub mod frames;
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+pub mod project;
+pub mod records;
 pub mod session;
 mod wire;
 
