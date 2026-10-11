@@ -239,6 +239,28 @@ fn contact_writes_and_our_profile_cross_the_boundary() {
         None
     );
     assert!(!store.set_contact_blocked("nobody".into(), true).unwrap());
+    assert!(
+        store
+            .set_pending_avatar("peer".into(), vec![10], 100)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_pending_avatar("peer".into(), vec![9], vec![2])
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_pending_avatar("peer".into(), vec![10], vec![2])
+            .unwrap()
+    );
+    let held = store.contact("peer".into()).unwrap().unwrap();
+    assert_eq!(
+        (held.avatar, held.pending_avatar_ref),
+        (Some(vec![2]), None)
+    );
+    assert!(store.every_contact(Some("peer".into())).unwrap().is_empty());
+    assert!(store.sharing_with(None).unwrap().is_empty());
 
     store
         .set_own_profile(LocalOwnProfile {
@@ -260,7 +282,7 @@ fn contact_writes_and_our_profile_cross_the_boundary() {
         seen.last().unwrap(),
         &("own_profile".to_string(), vec!["me".to_string()])
     );
-    assert_eq!(seen.iter().filter(|(t, _)| t == "contacts").count(), 3);
+    assert_eq!(seen.iter().filter(|(t, _)| t == "contacts").count(), 5);
 }
 
 /// The messages domain of 0.37.0 across the boundary: the status rule, the archive outcome, field

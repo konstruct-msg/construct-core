@@ -1839,12 +1839,12 @@ interface LocalStore {
     /// Takes the contact's chats and their messages with it.
     [Throws=LocalStoreError]
     void delete_contact(string id);
-    /// Every row, contacts or not, by id.
+    /// Every row, contacts or not, by id; `except_account` (our own) left out.
     [Throws=LocalStoreError]
-    sequence<LocalContact> every_contact();
-    /// The ids we share our profile with.
+    sequence<LocalContact> every_contact(string? except_account);
+    /// The ids we share our profile with; `except_account` (our own) left out.
     [Throws=LocalStoreError]
-    sequence<string> sharing_with();
+    sequence<string> sharing_with(string? except_account);
     [Throws=LocalStoreError]
     sequence<LocalContact> contacts_with_pending_avatar();
     [Throws=LocalStoreError]
@@ -1876,6 +1876,20 @@ interface LocalStore {
     /// The avatar and the one still to download, set together.
     [Throws=LocalStoreError]
     boolean set_contact_avatar(string id, bytes? avatar, bytes? pending_ref, i64? pending_since);
+    /// An avatar announced; the one shown stays until the download replaces it.
+    [Throws=LocalStoreError]
+    boolean set_pending_avatar(string id, bytes pending_ref, i64 since);
+    /// The avatar alone; one announced and still waiting keeps waiting.
+    [Throws=LocalStoreError]
+    boolean set_contact_avatar_keeping_pending(string id, bytes? avatar);
+    /// Each of the two below acts only while `expected_ref` is still the one waiting, checked in
+    /// the same statement; false when another was announced meanwhile, or there is no such row.
+    /// The download finished: it becomes the avatar and the wait ends.
+    [Throws=LocalStoreError]
+    boolean complete_pending_avatar(string id, bytes expected_ref, bytes avatar);
+    /// The wait ends without it; the avatar shown stays.
+    [Throws=LocalStoreError]
+    boolean drop_pending_avatar(string id, bytes expected_ref);
 
     [Throws=LocalStoreError]
     LocalOwnProfile? own_profile();

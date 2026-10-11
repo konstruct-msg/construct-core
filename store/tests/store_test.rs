@@ -618,6 +618,83 @@ fn each_contact_write_changes_only_its_fields() {
     assert_eq!(store.contact("a").unwrap(), Some(expected));
 }
 
+/// An announced avatar waits beside the one shown; its download replaces the avatar only while
+/// it is still the one waiting. Mutations: drop `pending_avatar_ref = ?2` from the completion —
+/// the late download overwrites; drop it from the drop — the newer announcement is lost.
+#[test]
+fn an_avatar_lands_only_while_it_is_the_one_waiting() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    let mut c = contact("a", "Al");
+    c.avatar = Some(vec![1]);
+    c.pending_avatar_ref = None;
+    c.pending_avatar_since = None;
+    store.upsert_contact(&c).unwrap();
+
+    assert!(store.set_pending_avatar("a", &[10], 100).unwrap());
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(
+        held.avatar,
+        Some(vec![1]),
+        "the shown avatar stays while one downloads"
+    );
+    assert_eq!(held.pending_avatar_ref, Some(vec![10]));
+    assert_eq!(held.pending_avatar_since, Some(100));
+
+    // A newer profile announces another while the first downloads.
+    assert!(store.set_pending_avatar("a", &[11], 200).unwrap());
+    assert!(!store.complete_pending_avatar("a", &[10], &[2]).unwrap());
+    assert!(!store.drop_pending_avatar("a", &[10]).unwrap());
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(held.avatar, Some(vec![1]));
+    assert_eq!(held.pending_avatar_ref, Some(vec![11]));
+
+    // The current one lands.
+    assert!(store.complete_pending_avatar("a", &[11], &[3]).unwrap());
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(held.avatar, Some(vec![3]));
+    assert_eq!(held.pending_avatar_ref, None);
+    assert_eq!(held.pending_avatar_since, None);
+
+    // One that is gone ends the wait and keeps the avatar.
+    assert!(store.set_pending_avatar("a", &[12], 300).unwrap());
+    assert!(store.drop_pending_avatar("a", &[12]).unwrap());
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(held.avatar, Some(vec![3]));
+    assert_eq!(held.pending_avatar_ref, None);
+    assert_eq!(held.pending_avatar_since, None);
+
+    // No such row.
+    assert!(
+        !store
+            .complete_pending_avatar("nobody", &[12], &[4])
+            .unwrap()
+    );
+    assert!(!store.drop_pending_avatar("nobody", &[12]).unwrap());
+}
+
+/// Writing the avatar alone leaves an announced one waiting. Mutation: make it clear the
+/// pending columns as `set_contact_avatar` does — the wait is lost.
+#[test]
+fn the_avatar_alone_keeps_the_one_waiting() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&contact("a", "Al")).unwrap();
+    assert!(store.set_pending_avatar("a", &[10], 100).unwrap());
+    assert!(
+        store
+            .set_contact_avatar_keeping_pending("a", Some(&[5]))
+            .unwrap()
+    );
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(held.avatar, Some(vec![5]));
+    assert_eq!(held.pending_avatar_ref, Some(vec![10]));
+    assert_eq!(held.pending_avatar_since, Some(100));
+    assert!(
+        !store
+            .set_contact_avatar_keeping_pending("nobody", None)
+            .unwrap()
+    );
+}
+
 /// A shared profile turns sharing on and writes the name and both times.
 #[test]
 fn a_shared_profile_is_applied_whole() {
@@ -696,7 +773,10 @@ fn every_row_includes_people_who_are_not_contacts() {
 
     let ids = |rows: Vec<Contact>| rows.into_iter().map(|c| c.id).collect::<Vec<_>>();
     assert_eq!(ids(store.contacts().unwrap()), vec!["b"]);
-    assert_eq!(ids(store.every_contact().unwrap()), vec!["a", "b"]);
+    assert_eq!(ids(store.every_contact(None).unwrap()), vec!["a", "b"]);
+    // A client may hold a row for its own account; the caller names it to leave it out.
+    // Mutation: drop `id IS NOT ?1` — "a" comes back.
+    assert_eq!(ids(store.every_contact(Some("a")).unwrap()), vec!["b"]);
 }
 
 /// The narrow reads answer from the field they are named for.
@@ -718,7 +798,10 @@ fn pins_pending_avatars_and_sharing_are_found_by_their_field() {
         pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
         vec!["a"]
     );
-    assert_eq!(store.sharing_with().unwrap(), vec!["a"]);
+    assert_eq!(store.sharing_with(None).unwrap(), vec!["a"]);
+    // Mutation: drop `id IS NOT ?1` from sharing_with — our own row is shared with.
+    assert_eq!(store.sharing_with(Some("a")).unwrap(), Vec::<String>::new());
+    assert_eq!(store.sharing_with(Some("b")).unwrap(), vec!["a"]);
 }
 
 /// Our profile is one row, not a contact. Mutation: drop the `one = 1` key — a second set adds a
@@ -743,7 +826,7 @@ fn our_profile_is_one_row_and_not_a_contact() {
     store.set_own_profile(&me).unwrap();
 
     assert_eq!(store.own_profile().unwrap(), Some(me));
-    assert!(store.every_contact().unwrap().is_empty());
+    assert!(store.every_contact(None).unwrap().is_empty());
     assert_eq!(
         seen.changes.lock().unwrap().last(),
         Some(&Change {

@@ -205,18 +205,20 @@ impl Store {
         Ok(())
     }
 
-    /// Every row, contacts or not (a peer we hold a key for, a blocked stranger), by id.
-    pub fn every_contact(&self) -> Result<Vec<Contact>> {
-        self.contacts_where("1", [])
+    /// Every row, contacts or not (a peer we hold a key for, a blocked stranger), by id. A row
+    /// for our own account, which a client may hold, is left out when `except_account` names it.
+    pub fn every_contact(&self, except_account: Option<&str>) -> Result<Vec<Contact>> {
+        self.contacts_where("id IS NOT ?1", [except_account])
     }
 
-    /// The people we share our profile with, by id.
-    pub fn sharing_with(&self) -> Result<Vec<String>> {
+    /// The people we share our profile with, by id; our own account left out as above.
+    pub fn sharing_with(&self, except_account: Option<&str>) -> Result<Vec<String>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT id FROM contacts WHERE am_i_sharing_with = 1 ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM contacts WHERE am_i_sharing_with = 1 AND id IS NOT ?1 ORDER BY id",
+        )?;
         let ids = stmt
-            .query_map([], |row| row.get(0))?
+            .query_map([except_account], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
     }
@@ -329,10 +331,71 @@ impl Store {
         )
     }
 
+    /// An avatar announced: the one to download and since when. The avatar shown stays until
+    /// the download replaces it.
+    pub fn set_pending_avatar(&self, id: &str, pending_ref: &[u8], since: i64) -> Result<bool> {
+        self.update_contact(
+            id,
+            "pending_avatar_ref = ?1, pending_avatar_since = ?2",
+            &[&pending_ref, &since],
+        )
+    }
+
+    /// The avatar alone; an announced one still waiting keeps waiting.
+    pub fn set_contact_avatar_keeping_pending(
+        &self,
+        id: &str,
+        avatar: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.update_contact(id, "avatar = ?1", &[&avatar])
+    }
+
+    /// The download of `expected_ref` finished: it becomes the avatar and the wait ends — unless
+    /// a newer profile announced another one meanwhile, and then nothing changes (false). One
+    /// statement, so no write can fall between the check and the change.
+    pub fn complete_pending_avatar(
+        &self,
+        id: &str,
+        expected_ref: &[u8],
+        avatar: &[u8],
+    ) -> Result<bool> {
+        self.update_contact_if(
+            id,
+            "avatar = ?1, pending_avatar_ref = NULL, pending_avatar_since = NULL",
+            "pending_avatar_ref = ?2",
+            &[&avatar, &expected_ref],
+        )
+    }
+
+    /// The wait for `expected_ref` ends without it (gone from the media store, expired); the
+    /// avatar shown stays. False, and nothing changes, when another one is announced by now.
+    pub fn drop_pending_avatar(&self, id: &str, expected_ref: &[u8]) -> Result<bool> {
+        self.update_contact_if(
+            id,
+            "pending_avatar_ref = NULL, pending_avatar_since = NULL",
+            "pending_avatar_ref = ?1",
+            &[&expected_ref],
+        )
+    }
+
     fn update_contact(&self, id: &str, set: &str, values: &[&dyn ToSql]) -> Result<bool> {
+        self.update_contact_if(id, set, "1", values)
+    }
+
+    /// `set` on the row `id` when `condition` also holds; both use the placeholders of `values`.
+    fn update_contact_if(
+        &self,
+        id: &str,
+        set: &str,
+        condition: &str,
+        values: &[&dyn ToSql],
+    ) -> Result<bool> {
         let mut args = values.to_vec();
         args.push(&id);
-        let sql = format!("UPDATE contacts SET {set} WHERE id = ?{}", args.len());
+        let sql = format!(
+            "UPDATE contacts SET {set} WHERE id = ?{} AND ({condition})",
+            args.len()
+        );
         let changed = self.lock().execute(&sql, args.as_slice())? > 0;
         if changed {
             self.notify(Table::Contacts, vec![id.to_string()]);
