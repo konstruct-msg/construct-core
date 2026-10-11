@@ -253,7 +253,13 @@ impl LocalStore {
     pub fn contacts(&self) -> Result<Vec<LocalContact>> {
         Ok(all(self.with(|s| s.contacts())?))
     }
-    pub fn delete_contact(&self, id: String) -> Result<()> {
+    pub fn insert_contact(&self, contact: LocalContact) -> Result<LocalInsert> {
+        Ok(self.with(|s| s.insert_contact(&contact.into()))?.into())
+    }
+    pub fn replace_contact(&self, contact: LocalContact) -> Result<bool> {
+        self.with(|s| s.replace_contact(&contact.into()))
+    }
+    pub fn delete_contact(&self, id: String) -> Result<bool> {
         self.with(|s| s.delete_contact(&id))
     }
     pub fn every_contact(&self, except_account: Option<String>) -> Result<Vec<LocalContact>> {

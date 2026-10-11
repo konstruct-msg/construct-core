@@ -218,7 +218,16 @@ fn contact_writes_and_our_profile_cross_the_boundary() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     store.set_observer(Some(Box::new(Seen(seen.clone()))));
 
-    store.upsert_contact(contact("peer")).unwrap();
+    assert!(matches!(
+        store.insert_contact(contact("peer")).unwrap(),
+        LocalInsert::Inserted
+    ));
+    assert!(matches!(
+        store.insert_contact(contact("peer")).unwrap(),
+        LocalInsert::AlreadyPresent
+    ));
+    assert!(store.replace_contact(contact("peer")).unwrap());
+    assert!(!store.replace_contact(contact("nobody")).unwrap());
     assert!(
         store
             .set_contact_alias("peer".into(), Some("B".into()))
@@ -282,7 +291,8 @@ fn contact_writes_and_our_profile_cross_the_boundary() {
         seen.last().unwrap(),
         &("own_profile".to_string(), vec!["me".to_string()])
     );
-    assert_eq!(seen.iter().filter(|(t, _)| t == "contacts").count(), 5);
+    // The insert and the replace that wrote; the repeated insert and the replace of no row did not.
+    assert_eq!(seen.iter().filter(|(t, _)| t == "contacts").count(), 6);
 }
 
 /// The messages domain of 0.37.0 across the boundary: the status rule, the archive outcome, field

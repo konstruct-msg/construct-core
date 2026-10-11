@@ -1829,16 +1829,24 @@ interface LocalStore {
     [Throws=LocalStoreError]
     void wipe();
 
+    /// The whole row, created or overwritten.
     [Throws=LocalStoreError]
     void upsert_contact(LocalContact contact);
+    /// The whole row, unless one with its id is held — that row is left as it is.
+    [Throws=LocalStoreError]
+    LocalInsert insert_contact(LocalContact contact);
+    /// Every field of the row `contact.id` set to `contact`'s, for a merge already decided; false:
+    /// no such row (a row deleted meanwhile stays deleted).
+    [Throws=LocalStoreError]
+    boolean replace_contact(LocalContact contact);
     [Throws=LocalStoreError]
     LocalContact? contact(string id);
     /// People marked as contacts, by the name shown for them.
     [Throws=LocalStoreError]
     sequence<LocalContact> contacts();
-    /// Takes the contact's chats and their messages with it.
+    /// Takes the contact's chats and their messages with it; false: no such row.
     [Throws=LocalStoreError]
-    void delete_contact(string id);
+    boolean delete_contact(string id);
     /// Every row, contacts or not, by id; `except_account` (our own) left out.
     [Throws=LocalStoreError]
     sequence<LocalContact> every_contact(string? except_account);
@@ -1847,6 +1855,7 @@ interface LocalStore {
     sequence<string> sharing_with(string? except_account);
     [Throws=LocalStoreError]
     sequence<LocalContact> contacts_with_pending_avatar();
+    /// An empty key pins nothing.
     [Throws=LocalStoreError]
     sequence<LocalIdentityKeyPin> identity_key_pins();
 
