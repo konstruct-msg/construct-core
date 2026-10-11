@@ -187,6 +187,11 @@ mirror!(LocalIssuedInvite <=> store::IssuedInvite {
 
 mirror!(LocalKvEntry <=> store::KvEntry { key: String, value: Vec<u8> });
 
+pub struct LocalMessageInsert {
+    pub message: LocalMessage,
+    pub search_text: Option<String>,
+}
+
 pub struct LocalPendingChunkMessage {
     pub sender_id: String,
     pub message_id: String,
@@ -411,6 +416,13 @@ impl LocalStore {
         Ok(self
             .with(|s| s.insert_message(&message.into(), search_text.as_deref()))?
             .into())
+    }
+    pub fn insert_messages(&self, messages: Vec<LocalMessageInsert>) -> Result<Vec<String>> {
+        let rows: Vec<(store::Message, Option<String>)> = messages
+            .into_iter()
+            .map(|m| (m.message.into(), m.search_text))
+            .collect();
+        self.with(|s| s.insert_messages(&rows))
     }
     pub fn edit_message(
         &self,

@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use construct_core::{
     HistoryError, HistoryMessageExport, HistoryMessageImport, LocalArchiveOutcome, LocalChat,
-    LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalOwnProfile, LocalPeerDevice,
-    LocalPendingChunk, LocalPendingResend, LocalStore, LocalStoreChange, LocalStoreError,
-    LocalStoreObserver, LocalStoreTable, history_export_chat, history_export_message,
-    history_import_chat, history_import_message,
+    LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalMessageInsert,
+    LocalOwnProfile, LocalPeerDevice, LocalPendingChunk, LocalPendingResend, LocalStore,
+    LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable, history_export_chat,
+    history_export_message, history_import_chat, history_import_message,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -389,6 +389,37 @@ fn message_writes_and_the_status_rule_cross_the_boundary() {
 }
 
 /// The service tables cross the FFI: every record and both table answers come back whole.
+/// 0.44.0: a batch crosses, and only what was added comes back.
+#[test]
+fn a_batch_of_messages_crosses() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    store.upsert_contact(contact("peer")).unwrap();
+    store
+        .upsert_chat(LocalChat {
+            id: "c1".into(),
+            peer_id: "peer".into(),
+            last_message_text: None,
+            last_message_time: None,
+            is_pinned: false,
+            unread_count: 0,
+        })
+        .unwrap();
+    let added = store
+        .insert_messages(vec![
+            LocalMessageInsert {
+                message: message("m1", "k1"),
+                search_text: Some("hello there".into()),
+            },
+            LocalMessageInsert {
+                message: message("m1", "k1"),
+                search_text: None,
+            },
+        ])
+        .unwrap();
+    assert_eq!(added, vec!["m1".to_string()]);
+    assert_eq!(store.chat_message_count("c1".into()).unwrap(), 1);
+}
+
 #[test]
 fn the_service_tables_cross() {
     let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
