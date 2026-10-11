@@ -256,11 +256,13 @@ impl LocalStore {
     pub fn delete_contact(&self, id: String) -> Result<()> {
         self.with(|s| s.delete_contact(&id))
     }
-    pub fn every_contact(&self) -> Result<Vec<LocalContact>> {
-        Ok(all(self.with(|s| s.every_contact())?))
+    pub fn every_contact(&self, except_account: Option<String>) -> Result<Vec<LocalContact>> {
+        Ok(all(
+            self.with(|s| s.every_contact(except_account.as_deref()))?
+        ))
     }
-    pub fn sharing_with(&self) -> Result<Vec<String>> {
-        self.with(|s| s.sharing_with())
+    pub fn sharing_with(&self, except_account: Option<String>) -> Result<Vec<String>> {
+        self.with(|s| s.sharing_with(except_account.as_deref()))
     }
     pub fn contacts_with_pending_avatar(&self) -> Result<Vec<LocalContact>> {
         Ok(all(self.with(|s| s.contacts_with_pending_avatar())?))
@@ -326,6 +328,27 @@ impl LocalStore {
                 pending_since,
             )
         })
+    }
+    pub fn set_pending_avatar(&self, id: String, pending_ref: Vec<u8>, since: i64) -> Result<bool> {
+        self.with(|s| s.set_pending_avatar(&id, &pending_ref, since))
+    }
+    pub fn set_contact_avatar_keeping_pending(
+        &self,
+        id: String,
+        avatar: Option<Vec<u8>>,
+    ) -> Result<bool> {
+        self.with(|s| s.set_contact_avatar_keeping_pending(&id, avatar.as_deref()))
+    }
+    pub fn complete_pending_avatar(
+        &self,
+        id: String,
+        expected_ref: Vec<u8>,
+        avatar: Vec<u8>,
+    ) -> Result<bool> {
+        self.with(|s| s.complete_pending_avatar(&id, &expected_ref, &avatar))
+    }
+    pub fn drop_pending_avatar(&self, id: String, expected_ref: Vec<u8>) -> Result<bool> {
+        self.with(|s| s.drop_pending_avatar(&id, &expected_ref))
     }
 
     pub fn own_profile(&self) -> Result<Option<LocalOwnProfile>> {
