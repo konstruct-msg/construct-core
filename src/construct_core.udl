@@ -1793,6 +1793,12 @@ dictionary LocalIssuedInvite {
 };
 
 /// One message with chunks held.
+/// A message and what it says, for the full-text index (null for media and control).
+dictionary LocalMessageInsert {
+    LocalMessage message;
+    string? search_text;
+};
+
 dictionary LocalPendingChunkMessage {
     string sender_id;
     string message_id;
@@ -1969,6 +1975,10 @@ interface LocalStore {
     /// `search_text` is what the message says, for the full-text index; null for media/control.
     [Throws=LocalStoreError]
     LocalInsert insert_message(LocalMessage message, string? search_text);
+    /// `insert_message` for each, in one transaction; the ids added, in order. One failure (a
+    /// chat that is not there) writes none of them.
+    [Throws=LocalStoreError]
+    sequence<string> insert_messages(sequence<LocalMessageInsert> messages);
     [Throws=LocalStoreError]
     boolean edit_message(string id, bytes body, string? search_text, i64 edited_at);
     /// The body and its search text replaced, the message not marked edited: a body read late —

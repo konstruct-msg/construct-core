@@ -650,30 +650,9 @@ impl Store {
         let inserted = {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
-            let added = tx.execute(
-                &format!(
-                    "INSERT OR IGNORE INTO messages ({MESSAGE_COLUMNS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
-                ),
-                params![
-                    m.id, m.chat_id, m.from_user_id, m.to_user_id, m.is_sent_by_me, m.timestamp,
-                    m.order_key, m.body, m.content_type, m.delivery_status, m.retry_count,
-                    m.suite_id, m.is_edited, m.edited_at, m.reply_to_message_id,
-                    m.reply_to_content, m.transcript_text, m.transcript_language,
-                    m.transcript_generated_at
-                ],
-            )?;
-            if added > 0
-                && let Some(text) = search_text.filter(|t| !t.is_empty())
-            {
-                tx.execute(
-                    "INSERT INTO message_search (rowid, text)
-                     SELECT rowid, ?2 FROM messages WHERE id = ?1",
-                    params![m.id, text],
-                )?;
-            }
+            let added = insert_message_in(&tx, m, search_text)?;
             tx.commit()?;
-            added > 0
+            added
         };
         if inserted {
             self.notify(Table::Messages, vec![m.id.clone()]);
@@ -681,6 +660,28 @@ impl Store {
         } else {
             Ok(Insert::AlreadyPresent)
         }
+    }
+
+    /// `insert_message` for each, in one transaction: a history import lands thousands at once,
+    /// and one commit each is one sync each. Returns the ids added, in order; a message already
+    /// held is kept. One failure writes none of them.
+    pub fn insert_messages(&self, messages: &[(Message, Option<String>)]) -> Result<Vec<String>> {
+        let added = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let mut added = Vec::new();
+            for (m, search_text) in messages {
+                if insert_message_in(&tx, m, search_text.as_deref())? {
+                    added.push(m.id.clone());
+                }
+            }
+            tx.commit()?;
+            added
+        };
+        if !added.is_empty() {
+            self.notify(Table::Messages, added.clone());
+        }
+        Ok(added)
     }
 
     /// An edit: the body and its search text replaced, the message marked edited.
@@ -1638,6 +1639,35 @@ const CONTACT_COLUMNS: &str = "id, username, display_name, local_alias, avatar,
     known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
     am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
     profile_edited_at_ms, pending_avatar_ref, pending_avatar_since";
+
+/// One message and its search text, unless a message with its id is held; whether it was added.
+fn insert_message_in(
+    tx: &rusqlite::Transaction<'_>,
+    m: &Message,
+    search_text: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let added = tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO messages ({MESSAGE_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+        ),
+        params![
+            m.id, m.chat_id, m.from_user_id, m.to_user_id, m.is_sent_by_me, m.timestamp,
+            m.order_key, m.body, m.content_type, m.delivery_status, m.retry_count,
+            m.suite_id, m.is_edited, m.edited_at, m.reply_to_message_id,
+            m.reply_to_content, m.transcript_text, m.transcript_language,
+            m.transcript_generated_at
+        ],
+    )? > 0;
+    if added && let Some(text) = search_text.filter(|t| !t.is_empty()) {
+        tx.execute(
+            "INSERT INTO message_search (rowid, text)
+             SELECT rowid, ?2 FROM messages WHERE id = ?1",
+            params![m.id, text],
+        )?;
+    }
+    Ok(added)
+}
 
 /// A whole contact row; `contact_params` binds it, the id first.
 const CONTACT_INSERT: &str = "INSERT INTO contacts (id, username, display_name, local_alias,

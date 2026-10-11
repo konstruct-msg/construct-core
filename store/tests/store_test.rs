@@ -1623,3 +1623,53 @@ fn entries_are_read_by_prefix() {
     );
     assert_eq!(store.entries_with_prefix("").unwrap().len(), 5);
 }
+
+// MARK: - A batch of messages (0.44.0)
+
+/// Mutation: notify per message, or drop the search text in the batch — the change count, or
+/// the search, comes out different.
+#[test]
+fn a_batch_of_messages_lands_in_one_write() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    store
+        .insert_message(&message("held", "c1", "k0", b"old"), None)
+        .unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    let added = store
+        .insert_messages(&[
+            (
+                message("m1", "c1", "k1", b"one"),
+                Some("findable phrase".into()),
+            ),
+            (message("held", "c1", "k9", b"new"), None),
+            (message("m2", "c1", "k2", b"two"), None),
+        ])
+        .unwrap();
+
+    assert_eq!(added, vec!["m1".to_string(), "m2".to_string()]);
+    assert_eq!(
+        store.message("held").unwrap().unwrap().body,
+        b"old".to_vec()
+    );
+    assert_eq!(store.search("findable", 10).unwrap().len(), 1);
+    let changes = seen.changes.lock().unwrap();
+    assert_eq!(changes.len(), 1, "one write, one change");
+    assert_eq!(changes[0].ids, vec!["m1".to_string(), "m2".to_string()]);
+}
+
+/// Mutation: commit each message on its own — "m1" stays behind the failure.
+#[test]
+fn a_batch_with_a_message_for_no_chat_writes_none() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    let result = store.insert_messages(&[
+        (message("m1", "c1", "k1", b"one"), None),
+        (message("orphan", "no-chat", "k2", b"two"), None),
+    ]);
+    assert!(result.is_err());
+    assert_eq!(store.message("m1").unwrap(), None);
+    assert_eq!(store.message_count().unwrap(), 0);
+}
