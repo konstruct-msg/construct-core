@@ -1163,6 +1163,17 @@ impl Store {
         Ok(())
     }
 
+    /// Removes one entry from the call log; false: no such row.
+    pub fn delete_call(&self, id: &str) -> Result<bool> {
+        let removed = self
+            .lock()
+            .execute("DELETE FROM calls WHERE id = ?1", [id])?;
+        if removed > 0 {
+            self.notify(Table::Calls, vec![id.to_string()]);
+        }
+        Ok(removed > 0)
+    }
+
     /// The call log, newest first.
     pub fn calls(&self, limit: u32) -> Result<Vec<CallRecord>> {
         let conn = self.lock();

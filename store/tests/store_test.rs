@@ -3,8 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use construct_store::{
-    Change, Chat, Contact, IdentityKeyPin, Insert, IssuedInvite, KvEntry, Message, OwnProfile,
-    PeerDevice, PendingChunk, PendingResend, Reaction, Store, StoreError, StoreObserver, Table,
+    CallRecord, Change, Chat, Contact, IdentityKeyPin, Insert, IssuedInvite, KvEntry, Message,
+    OwnProfile, PeerDevice, PendingChunk, PendingResend, Reaction, Store, StoreError,
+    StoreObserver, Table,
     delivery::{self, ArchiveOutcome, DELIVERED, FAILED, QUEUED, SENDING, SENT},
 };
 
@@ -1672,4 +1673,82 @@ fn a_batch_with_a_message_for_no_chat_writes_none() {
     assert!(result.is_err());
     assert_eq!(store.message("m1").unwrap(), None);
     assert_eq!(store.message_count().unwrap(), 0);
+}
+
+fn call(id: &str, started_at: Option<i64>, status: i16) -> CallRecord {
+    CallRecord {
+        id: id.into(),
+        peer_user_id: "peer".into(),
+        peer_name: "Bob".into(),
+        direction: 1,
+        status,
+        started_at,
+        ended_at: started_at.map(|t| t + 60),
+        duration_seconds: 60,
+    }
+}
+
+/// A call recorded again is one entry, carrying its last state: an incoming call is logged as
+/// missed and then answered, and the log shows it once, answered.
+#[test]
+fn a_call_recorded_again_is_one_entry_in_its_last_state() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_call(&call("c1", Some(100), 1)).unwrap();
+    store.upsert_call(&call("c1", Some(100), 0)).unwrap();
+    let log = store.calls(10).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].status, 0);
+}
+
+/// Newest first, a call with no start time last, and no more than asked for.
+#[test]
+fn the_call_log_is_newest_first_and_bounded() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_call(&call("old", Some(100), 0)).unwrap();
+    store.upsert_call(&call("undated", None, 3)).unwrap();
+    store.upsert_call(&call("new", Some(300), 0)).unwrap();
+    let ids = |limit| -> Vec<String> {
+        store
+            .calls(limit)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
+    };
+    assert_eq!(ids(10), vec!["new", "old", "undated"]);
+    assert_eq!(ids(2), vec!["new", "old"]);
+}
+
+/// Deleting one entry leaves the others, says whether it found one, and tells the observer —
+/// the log on screen follows from that.
+#[test]
+fn a_call_is_deleted_by_id_and_the_change_is_told() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_call(&call("keep", Some(100), 0)).unwrap();
+    store.upsert_call(&call("drop", Some(200), 1)).unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    assert!(store.delete_call("drop").unwrap());
+    assert!(
+        !store.delete_call("drop").unwrap(),
+        "nothing left to delete"
+    );
+    assert_eq!(
+        store
+            .calls(10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        vec!["keep"]
+    );
+    let changes = seen.changes.lock().unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "a delete that found nothing tells nothing"
+    );
+    assert_eq!(changes[0].table, Table::Calls);
+    assert_eq!(changes[0].ids, vec!["drop".to_string()]);
 }

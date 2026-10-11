@@ -559,6 +559,9 @@ impl LocalStore {
     pub fn calls(&self, limit: u32) -> Result<Vec<LocalCall>> {
         Ok(all(self.with(|s| s.calls(limit))?))
     }
+    pub fn delete_call(&self, id: String) -> Result<bool> {
+        self.with(|s| s.delete_call(&id))
+    }
 
     pub fn record_peer_device(&self, device: LocalPeerDevice) -> Result<LocalInsert> {
         Ok(self.with(|s| s.record_peer_device(&device.into()))?.into())
