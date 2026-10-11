@@ -158,6 +158,18 @@ impl OutgoingEncrypted {
     }
 }
 
+/// The peek's verdict on a decrypted payload, and the payload wiped: in the extension the text
+/// has no reader, so it is zeroed as soon as it is classified rather than left in freed memory.
+fn peek_verdict(plaintext: &mut Vec<u8>, content_type: u8) -> PeekVerdict {
+    use zeroize::Zeroize;
+    let kind = decrypted_kind(plaintext, content_type);
+    plaintext.zeroize();
+    match kind {
+        DecryptedKind::Message { announced: true } => PeekVerdict::Visible,
+        _ => PeekVerdict::Control,
+    }
+}
+
 /// What a sealed delivery is, decided without acting on it (`Orchestrator::peek_sealed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeekVerdict {
@@ -1807,21 +1819,10 @@ impl Orchestrator {
             .route_after_ack_check(&mut self.lifecycle, &incoming)
         {
             RoutingDecision::Decrypted {
-                contact_id,
-                message_id,
-                plaintext,
+                mut plaintext,
                 content_type,
                 ..
-            } => {
-                let notifies = decrypted_actions(contact_id, message_id, plaintext, content_type)
-                    .iter()
-                    .any(|action| matches!(action, Action::NotifyNewMessage { .. }));
-                if notifies {
-                    PeekVerdict::Visible
-                } else {
-                    PeekVerdict::Control
-                }
-            }
+            } => peek_verdict(&mut plaintext, content_type),
             // The key is already spent: the app read it first.
             RoutingDecision::Duplicate { .. } => PeekVerdict::AlreadyHandled,
             _ => PeekVerdict::Unreadable,
@@ -3038,51 +3039,88 @@ fn decrypt_failed(reason: String) -> Action {
 fn decrypted_actions(
     contact_id: String,
     message_id: String,
-    plaintext: Vec<u8>,
+    mut plaintext: Vec<u8>,
     content_type: u8,
 ) -> Vec<Action> {
-    let framed_call_signal = crate::knst::control_frame(&plaintext)
-        .filter(|(framed, _)| *framed == crate::knst::CONTENT_TYPE_CALL_SIGNAL)
-        .map(|(_, body)| body.to_vec());
-    if let Some(proto_bytes) = framed_call_signal {
-        return vec![Action::CallSignalDecrypted {
+    match decrypted_kind(&plaintext, content_type) {
+        DecryptedKind::FramedCallSignal => vec![Action::CallSignalDecrypted {
             contact_id,
             message_id,
-            proto_bytes,
-        }];
-    }
-
-    if let Some((content_type, body)) = crate::knst::control_frame(&plaintext)
-        .filter(|(framed, _)| crate::knst::is_silent_control(*framed))
-    {
-        return vec![Action::ControlFrameDecrypted {
+            proto_bytes: take_frame_body(&mut plaintext),
+        }],
+        DecryptedKind::ControlFrame(content_type) => vec![Action::ControlFrameDecrypted {
             contact_id,
             message_id,
             content_type,
-            body: body.to_vec(),
-        }];
-    }
-    if content_type == crate::knst::CONTENT_TYPE_CALL_SIGNAL {
+            body: take_frame_body(&mut plaintext),
+        }],
         // An identified envelope whose body is the signal itself, unframed.
-        return vec![Action::CallSignalDecrypted {
+        DecryptedKind::UnframedCallSignal => vec![Action::CallSignalDecrypted {
             contact_id,
             message_id,
             proto_bytes: plaintext,
-        }];
+        }],
+        DecryptedKind::Message { announced } => {
+            let mut actions = Vec::new();
+            if announced {
+                actions.push(Action::NotifyNewMessage {
+                    chat_id: contact_id.clone(),
+                    preview: preview(&plaintext),
+                });
+            }
+            actions.push(Action::MessageDecrypted {
+                contact_id,
+                message_id,
+                plaintext,
+            });
+            actions
+        }
     }
-    let mut actions = Vec::new();
-    if content_type != 13 && content_type != 14 {
-        actions.push(Action::NotifyNewMessage {
-            chat_id: contact_id.clone(),
-            preview: preview(&plaintext),
-        });
+}
+
+/// What a decrypted payload is, read by reference: the one classification the receive path
+/// (`decrypted_actions`) and the notification extension's peek (`peek_envelope`) both apply, so
+/// "is this announced" has a single answer. The order is the rule: a framed call signal, then a
+/// silent control frame, then a call signal named by its envelope, then a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecryptedKind {
+    /// A call signal in a KNST frame; the frame's body is the signal.
+    FramedCallSignal,
+    /// A silent control frame of this content type; the frame's body is its payload.
+    ControlFrame(u8),
+    /// A call signal whose envelope names it; the payload is the signal itself.
+    UnframedCallSignal,
+    /// A message, announced unless it is content type 13 or 14.
+    Message { announced: bool },
+}
+
+fn decrypted_kind(plaintext: &[u8], content_type: u8) -> DecryptedKind {
+    match crate::knst::control_frame(plaintext) {
+        Some((framed, _)) if framed == crate::knst::CONTENT_TYPE_CALL_SIGNAL => {
+            DecryptedKind::FramedCallSignal
+        }
+        Some((framed, _)) if crate::knst::is_silent_control(framed) => {
+            DecryptedKind::ControlFrame(framed)
+        }
+        _ if content_type == crate::knst::CONTENT_TYPE_CALL_SIGNAL => {
+            DecryptedKind::UnframedCallSignal
+        }
+        _ => DecryptedKind::Message {
+            announced: content_type != 13 && content_type != 14,
+        },
     }
-    actions.push(Action::MessageDecrypted {
-        contact_id,
-        message_id,
-        plaintext,
-    });
-    actions
+}
+
+/// The frame's body, copied out, and the whole decrypted frame wiped. Only the body leaves; the
+/// buffer it came from is zeroed rather than merely freed, so the rest of the frame does not stay
+/// readable in released memory.
+fn take_frame_body(plaintext: &mut Vec<u8>) -> Vec<u8> {
+    use zeroize::Zeroize;
+    let body = crate::knst::control_frame(plaintext)
+        .map(|(_, body)| body.to_vec())
+        .unwrap_or_default();
+    plaintext.zeroize();
+    body
 }
 
 #[cfg(test)]
@@ -3101,6 +3139,67 @@ mod tests {
     const SIGNAL: &[u8] = b"\x0a\x06call-1";
     /// The content type a sealed envelope carries: absent, the generic baseline.
     const SEALED: u8 = 0;
+
+    // ── Decrypted text is wiped, not merely freed ─────────────────────────────
+
+    /// Only the body leaves a control frame; the frame it came from is zeroed. `zeroize` on a
+    /// `Vec` writes zeros over its whole capacity and then empties it, so an emptied buffer is
+    /// the observable trace of the wipe.
+    ///
+    /// Mutation: drop `plaintext.zeroize()` in `take_frame_body` — this reddens.
+    #[test]
+    fn a_frame_body_is_copied_out_and_the_frame_wiped() {
+        let mut frame = control_frame(14, b"receipt");
+        let body = take_frame_body(&mut frame);
+        assert_eq!(body, b"receipt");
+        assert!(
+            frame.is_empty(),
+            "the decrypted frame is wiped once its body is out"
+        );
+    }
+
+    /// The extension's peek classifies, then wipes: the text has no reader there.
+    ///
+    /// Mutation: drop `plaintext.zeroize()` in `peek_verdict` — this reddens.
+    #[test]
+    fn a_peek_wipes_what_it_decrypted() {
+        for (mut plaintext, content_type, expected) in [
+            (b"hello".to_vec(), SEALED, PeekVerdict::Visible),
+            (control_frame(14, b"receipt"), SEALED, PeekVerdict::Control),
+            (control_frame(12, SIGNAL), SEALED, PeekVerdict::Control),
+            (b"heartbeat".to_vec(), 13, PeekVerdict::Control),
+        ] {
+            assert_eq!(peek_verdict(&mut plaintext, content_type), expected);
+            assert!(
+                plaintext.is_empty(),
+                "wiped after classification ({expected:?})"
+            );
+        }
+    }
+
+    /// One classification for both paths: what `decrypted_actions` announces is exactly what the
+    /// peek calls visible.
+    #[test]
+    fn the_peek_and_the_receive_path_agree() {
+        for (plaintext, content_type) in [
+            (b"hello".to_vec(), SEALED),
+            (control_frame(14, b"receipt"), SEALED),
+            (control_frame(12, SIGNAL), SEALED),
+            (b"heartbeat".to_vec(), 13),
+            (SIGNAL.to_vec(), 12),
+        ] {
+            let announced =
+                decrypted_actions("d".into(), "m".into(), plaintext.clone(), content_type)
+                    .iter()
+                    .any(|a| matches!(a, Action::NotifyNewMessage { .. }));
+            let mut copy = plaintext.clone();
+            assert_eq!(
+                peek_verdict(&mut copy, content_type) == PeekVerdict::Visible,
+                announced,
+                "{plaintext:?} / {content_type}"
+            );
+        }
+    }
 
     /// The defect: a sealed call signal (every one iOS sends) said GENERIC on the envelope and
     /// left as `MessageDecrypted`, with a notification. Mutation: read only `content_type` again
