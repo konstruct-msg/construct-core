@@ -126,14 +126,11 @@ impl Store {
 
     // MARK: - Contacts
 
+    /// The whole row, created or overwritten.
     pub fn upsert_contact(&self, c: &Contact) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO contacts (id, username, display_name, local_alias, avatar,
-                 known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
-                 am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
-                 profile_edited_at_ms, pending_avatar_ref, pending_avatar_since)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-             ON CONFLICT(id) DO UPDATE SET
+            &format!(
+                "{CONTACT_INSERT} ON CONFLICT(id) DO UPDATE SET
                  username = excluded.username, display_name = excluded.display_name,
                  local_alias = excluded.local_alias, avatar = excluded.avatar,
                  known_identity_key = excluded.known_identity_key,
@@ -144,30 +141,44 @@ impl Store {
                  kt_status = excluded.kt_status, security_notice = excluded.security_notice,
                  profile_edited_at_ms = excluded.profile_edited_at_ms,
                  pending_avatar_ref = excluded.pending_avatar_ref,
-                 pending_avatar_since = excluded.pending_avatar_since",
-            params![
-                c.id,
-                c.username,
-                c.display_name,
-                c.local_alias,
-                c.avatar,
-                c.known_identity_key,
-                c.account_address,
-                c.is_contact,
-                c.is_blocked,
-                c.is_sharing_with_me,
-                c.am_i_sharing_with,
-                c.shared_with_me_at,
-                c.added_at,
-                c.kt_status,
-                c.security_notice,
-                c.profile_edited_at_ms,
-                c.pending_avatar_ref,
-                c.pending_avatar_since
-            ],
+                 pending_avatar_since = excluded.pending_avatar_since"
+            ),
+            contact_params(c).as_slice(),
         )?;
         self.notify(Table::Contacts, vec![c.id.clone()]);
         Ok(())
+    }
+
+    /// The whole row, unless one with its id is held — that row is left as it is, which is what
+    /// "make sure we hold a row for them" needs: a read and then an upsert would overwrite the
+    /// fields another writer set between the two.
+    pub fn insert_contact(&self, c: &Contact) -> Result<Insert> {
+        let added = self.lock().execute(
+            &format!("{CONTACT_INSERT} ON CONFLICT(id) DO NOTHING"),
+            contact_params(c).as_slice(),
+        )?;
+        if added > 0 {
+            self.notify(Table::Contacts, vec![c.id.clone()]);
+            Ok(Insert::Inserted)
+        } else {
+            Ok(Insert::AlreadyPresent)
+        }
+    }
+
+    /// Every field of the row `c.id` set to `c`'s, for a merge the caller already decided (a
+    /// history import's); `false` when there is no such row — a row deleted meanwhile stays
+    /// deleted, where an upsert would bring it back.
+    pub fn replace_contact(&self, c: &Contact) -> Result<bool> {
+        let values = contact_params(c);
+        self.update_contact(
+            &c.id,
+            "username = ?2, display_name = ?3, local_alias = ?4, avatar = ?5,
+             known_identity_key = ?6, account_address = ?7, is_contact = ?8, is_blocked = ?9,
+             is_sharing_with_me = ?10, am_i_sharing_with = ?11, shared_with_me_at = ?12,
+             added_at = ?13, kt_status = ?14, security_notice = ?15, profile_edited_at_ms = ?16,
+             pending_avatar_ref = ?17, pending_avatar_since = ?18",
+            &values,
+        )
     }
 
     pub fn contact(&self, id: &str) -> Result<Option<Contact>> {
@@ -194,15 +205,15 @@ impl Store {
         Ok(rows)
     }
 
-    /// Removes the contact with its chats and their messages.
-    pub fn delete_contact(&self, id: &str) -> Result<()> {
+    /// Removes the contact with its chats and their messages; `false` when there was no such row.
+    pub fn delete_contact(&self, id: &str) -> Result<bool> {
         let removed = self
             .lock()
             .execute("DELETE FROM contacts WHERE id = ?1", [id])?;
         if removed > 0 {
             self.notify(Table::Contacts, vec![id.to_string()]);
         }
-        Ok(())
+        Ok(removed > 0)
     }
 
     /// Every row, contacts or not (a peer we hold a key for, a blocked stranger), by id. A row
@@ -228,12 +239,13 @@ impl Store {
         self.contacts_where("pending_avatar_ref IS NOT NULL", [])
     }
 
-    /// Every pinned identity key, by contact id.
+    /// Every pinned identity key, by contact id. An empty key pins nothing: it would derive a
+    /// device id of its own and answer for it.
     pub fn identity_key_pins(&self) -> Result<Vec<IdentityKeyPin>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, known_identity_key FROM contacts
-             WHERE known_identity_key IS NOT NULL ORDER BY id",
+             WHERE length(known_identity_key) > 0 ORDER BY id",
         )?;
         let pins = stmt
             .query_map([], |row| {
@@ -1626,6 +1638,36 @@ const CONTACT_COLUMNS: &str = "id, username, display_name, local_alias, avatar,
     known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
     am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
     profile_edited_at_ms, pending_avatar_ref, pending_avatar_since";
+
+/// A whole contact row; `contact_params` binds it, the id first.
+const CONTACT_INSERT: &str = "INSERT INTO contacts (id, username, display_name, local_alias,
+    avatar, known_identity_key, account_address, is_contact, is_blocked, is_sharing_with_me,
+    am_i_sharing_with, shared_with_me_at, added_at, kt_status, security_notice,
+    profile_edited_at_ms, pending_avatar_ref, pending_avatar_since)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+
+fn contact_params(c: &Contact) -> [&dyn ToSql; 18] {
+    [
+        &c.id,
+        &c.username,
+        &c.display_name,
+        &c.local_alias,
+        &c.avatar,
+        &c.known_identity_key,
+        &c.account_address,
+        &c.is_contact,
+        &c.is_blocked,
+        &c.is_sharing_with_me,
+        &c.am_i_sharing_with,
+        &c.shared_with_me_at,
+        &c.added_at,
+        &c.kt_status,
+        &c.security_notice,
+        &c.profile_edited_at_ms,
+        &c.pending_avatar_ref,
+        &c.pending_avatar_since,
+    ]
+}
 
 fn contact_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
     Ok(Contact {

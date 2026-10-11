@@ -580,6 +580,67 @@ fn a_contact_reads_back_as_written() {
     assert_eq!(store.contact("a").unwrap(), Some(full_contact("a")));
 }
 
+/// Mutation: `ON CONFLICT DO UPDATE` in `insert_contact` — the second insert overwrites the
+/// alias another writer set.
+#[test]
+fn an_insert_never_overwrites_a_held_row() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert_eq!(
+        store.insert_contact(&full_contact("a")).unwrap(),
+        Insert::Inserted
+    );
+    assert!(store.set_contact_alias("a", Some("Mine")).unwrap());
+
+    let mut other = full_contact("a");
+    other.display_name = "Someone else".into();
+    assert_eq!(
+        store.insert_contact(&other).unwrap(),
+        Insert::AlreadyPresent
+    );
+
+    let held = store.contact("a").unwrap().unwrap();
+    assert_eq!(held.display_name, "Ada");
+    assert_eq!(held.local_alias.as_deref(), Some("Mine"));
+}
+
+/// Mutation: write `replace_contact` as an upsert — the deleted row comes back.
+#[test]
+fn a_replace_writes_every_field_of_a_held_row_and_creates_none() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&contact("a", "Al")).unwrap();
+    assert!(store.replace_contact(&full_contact("a")).unwrap());
+    assert_eq!(store.contact("a").unwrap(), Some(full_contact("a")));
+
+    assert!(!store.replace_contact(&full_contact("gone")).unwrap());
+    assert_eq!(store.contact("gone").unwrap(), None);
+}
+
+#[test]
+fn a_delete_says_whether_there_was_a_row() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&contact("a", "Al")).unwrap();
+    assert!(store.delete_contact("a").unwrap());
+    assert!(!store.delete_contact("a").unwrap());
+}
+
+/// Mutation: `known_identity_key IS NOT NULL` again — the empty key is a pin.
+#[test]
+fn an_empty_identity_key_pins_nothing() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_contact(&full_contact("p")).unwrap();
+    let mut empty = contact("e", "E");
+    empty.known_identity_key = Some(Vec::new());
+    store.upsert_contact(&empty).unwrap();
+    store.upsert_contact(&contact("none", "N")).unwrap();
+    assert_eq!(
+        store.identity_key_pins().unwrap(),
+        vec![IdentityKeyPin {
+            contact_id: "p".into(),
+            key: vec![9; 32]
+        }]
+    );
+}
+
 /// A write names its fields and leaves the rest. Mutation: implement a setter as read, change,
 /// `upsert_contact` — a concurrent writer of another field is undone; here, a setter that
 /// rewrites more than its fields changes the row beyond the one field.
