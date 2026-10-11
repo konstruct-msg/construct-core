@@ -3500,6 +3500,52 @@ fn check_bundle_freshness(bundle: &BinaryKeyBundle) -> Result<(), CryptoError> {
     Ok(())
 }
 
+// ── Notification extension (decisions/notification-extension-reads-only.md) ─────────────────
+
+/// The orchestrator's own verdict type, not a mirror of it: one enum, two names for nothing.
+pub use crate::orchestration::PeekVerdict;
+
+pub trait PeekSessionSource: Send + Sync {
+    fn session(&self, device_id: String) -> Option<Vec<u8>>;
+}
+
+/// The extension's throwaway view of this device's sessions. It wraps an `Orchestrator` and
+/// exposes `peek` alone: no event, no export, no action reaches the platform from it.
+pub struct NotificationPeek {
+    inner: std::sync::Mutex<crate::orchestration::Orchestrator>,
+}
+
+impl NotificationPeek {
+    pub fn new(
+        key_record: Vec<u8>,
+        my_user_id: String,
+        orchestrator_state: Option<Vec<u8>>,
+    ) -> Result<Self, CryptoError> {
+        let _ = crate::config::Config::init();
+        let inner = crate::orchestration::Orchestrator::for_peek(
+            &key_record,
+            my_user_id,
+            orchestrator_state.as_deref(),
+        )
+        .map_err(|e| serialization_failed("NotificationPeek/new", e))?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
+    }
+
+    pub fn peek(
+        &self,
+        message_id: String,
+        sealed_inner: Vec<u8>,
+        sessions: Box<dyn PeekSessionSource>,
+    ) -> PeekVerdict {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.peek_sealed(&message_id, &sealed_inner, &mut |device| {
+            sessions.session(device.to_string())
+        })
+    }
+}
+
 pub struct OrchestratorCore {
     inner: std::sync::Mutex<crate::orchestration::Orchestrator>,
 }

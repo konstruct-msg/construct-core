@@ -22,7 +22,7 @@ pub mod frames;
 pub mod project;
 pub mod records;
 pub mod session;
-mod wire;
+pub(crate) mod wire;
 
 /// 512 MiB. A record announcing more is malformed and nothing is allocated for it. A legal
 /// 500 MB video fits; the encoder skips a blob at or over this and counts it.

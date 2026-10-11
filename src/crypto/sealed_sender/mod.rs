@@ -23,6 +23,7 @@
 pub mod book;
 pub mod envelope;
 pub mod first_flight;
+pub mod sealed_inner;
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};

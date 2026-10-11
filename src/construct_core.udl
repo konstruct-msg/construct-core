@@ -905,6 +905,37 @@ interface CfeAction {
     CheckAckInDb(string message_id);
 };
 
+// ── Notification extension (decisions/notification-extension-reads-only.md) ──
+
+/// What a sealed delivery is, decided without acting on it.
+enum PeekVerdict {
+    /// Already processed by the app: its message key is spent in the stored session.
+    "AlreadyHandled",
+    /// A message the app would announce.
+    "Visible",
+    /// A silent control frame, a call signal or a DECRYPTION_ERROR: nothing to announce.
+    "Control",
+    /// Not read here, for any reason. The alert shows.
+    "Unreadable",
+};
+
+/// The stored session state of a peer device, as the platform's secure store holds it.
+callback interface PeekSessionSource {
+    bytes? session(string device_id);
+};
+
+/// A throwaway view of this device's sessions for the notification extension. Built from the key
+/// record and the orchestrator state the app saved; it answers `peek` and nothing else. Nothing it
+/// does is saved, sent or marked, and no session state leaves it.
+interface NotificationPeek {
+    [Throws=CryptoError]
+    constructor(bytes key_record, string my_user_id, bytes? orchestrator_state);
+
+    /// The verdict on one delivery: `sealed_inner` is its `SealedInner` as the server returned it.
+    /// Peek a fetch's deliveries in server order on one instance.
+    PeekVerdict peek(string message_id, bytes sealed_inner, PeekSessionSource sessions);
+};
+
 /// Top-level orchestration facade.
 ///
 /// Swift / Kotlin call `handle_event_json` with a JSON-encoded `IncomingEvent`
