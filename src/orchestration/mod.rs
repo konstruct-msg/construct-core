@@ -39,7 +39,7 @@ pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
 pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation};
 pub use message_router::{IncomingMessage, MessageRouter, RoutingDecision};
-pub use orchestrator::Orchestrator;
+pub use orchestrator::{Orchestrator, PeekVerdict};
 pub use platform_bridge::PlatformBridge;
 #[cfg(feature = "post-quantum")]
 pub use pq_prekey_plan::{

@@ -158,6 +158,19 @@ impl OutgoingEncrypted {
     }
 }
 
+/// What a sealed delivery is, decided without acting on it (`Orchestrator::peek_sealed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeekVerdict {
+    /// Already processed by the app: its message key is spent in the stored session.
+    AlreadyHandled,
+    /// A message the app would announce.
+    Visible,
+    /// A silent control frame, a call signal or a DECRYPTION_ERROR: nothing to announce.
+    Control,
+    /// Not read here, for any reason. The alert shows.
+    Unreadable,
+}
+
 /// The KEM half of a first message, as the wire carried it.
 #[derive(Clone, Copy)]
 struct ResponderKem<'a> {
@@ -1686,6 +1699,133 @@ impl Orchestrator {
         envelope: &[u8],
     ) -> Option<crate::crypto::sealed_sender::book::OpenedEnvelope> {
         self.lifecycle.client.envelopes().open(envelope)
+    }
+
+    /// A throwaway instance for `peek_sealed`, built from what the app keeps: the key record
+    /// (`export_private_keys_cfe`) and, when there is one, the orchestrator state
+    /// (`export_orchestrator_state_cfe`), which carries the envelope book.
+    /// Session states are handed over per device as a peek asks for them.
+    pub fn for_peek(
+        key_record: &[u8],
+        my_user_id: String,
+        orchestrator_state: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        let keys = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+            key_record,
+            crate::cfe::CfeMessageType::PrivateKeys,
+        )
+        .map_err(|e| e.to_string())?;
+        let client = ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(keys)
+            .map_err(|e| e.to_string())?;
+        let mut peek = Self::new(client, my_user_id);
+        if let Some(state) = orchestrator_state {
+            peek.import_orchestrator_state_cfe(state)?;
+        }
+        Ok(peek)
+    }
+
+    /// What a sealed delivery carries, asked without consequences: the notification extension's
+    /// one question (construct-docs `decisions/notification-extension-reads-only.md`).
+    ///
+    /// `sealed_inner` is the delivery's `SealedInner` as the server returned it; the route is read
+    /// here (`sealed_route`), not by the platform. For a session envelope this runs what
+    /// `MessageReceived` runs after its ACK check: the router and the classification of
+    /// `decrypted_actions`. It returns only the verdict, and no action leaves, so nothing is
+    /// saved, sent or marked outside this instance. Meant for a throwaway instance built from a
+    /// snapshot. It advances that instance's ratchet in memory as the app's will, so several
+    /// deliveries are peeked in server order on one instance.
+    ///
+    /// A first flight or a certificate-sealed delivery is `Unreadable`, so the alert shows. Both
+    /// open a session or name a writer through steps that write, and both are rare against the
+    /// envelope a session's every later message, receipts included, travels in.
+    ///
+    /// `load_session` hands over the stored state of the device the envelope names, when this
+    /// instance does not hold it yet. A state that does not import is left where it is, and the
+    /// verdict is `Unreadable`.
+    pub fn peek_sealed(
+        &mut self,
+        message_id: &str,
+        sealed_inner: &[u8],
+        load_session: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    ) -> PeekVerdict {
+        use crate::crypto::sealed_sender::sealed_inner::{SealedRoute, sealed_route};
+
+        // No ACK cache check: the exported state carries none (`processed_ids` is written
+        // empty), and the app's processed ids live in its own store. What the app read is known
+        // here only by its key being spent.
+        match sealed_route(sealed_inner) {
+            Some(SealedRoute::SessionEnvelope(envelope)) => {
+                self.peek_envelope(message_id, envelope, load_session)
+            }
+            Some(SealedRoute::FirstFlight(_) | SealedRoute::SenderCertificate) | None => {
+                PeekVerdict::Unreadable
+            }
+        }
+    }
+
+    fn peek_envelope(
+        &mut self,
+        message_id: &str,
+        envelope: &[u8],
+        load_session: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    ) -> PeekVerdict {
+        use crate::crypto::sealed_sender::envelope::EnvelopeKind;
+
+        let Some(opened) = self.open_envelope(envelope) else {
+            return PeekVerdict::Unreadable;
+        };
+        if opened.kind == EnvelopeKind::DecryptionError {
+            return PeekVerdict::Control;
+        }
+        if !self.lifecycle.has_active_session(&opened.device) {
+            let Some(stored) = load_session(&opened.device) else {
+                return PeekVerdict::Unreadable;
+            };
+            if self
+                .lifecycle
+                .import_session_bytes(&opened.device, &stored)
+                .is_err()
+            {
+                return PeekVerdict::Unreadable;
+            }
+        }
+        let Ok(msg_number) = Self::routing_message_number(&opened.body) else {
+            return PeekVerdict::Unreadable;
+        };
+        let incoming = IncomingMessage {
+            sender_certificate: None,
+            envelope_session: Some(opened.session_id),
+            contact_id: opened.device,
+            wire_payload: opened.body,
+            message_id: message_id.to_string(),
+            msg_number,
+            // An envelope's outer type is generic; the frame inside says what it is.
+            content_type: 0,
+        };
+        match self
+            .router
+            .route_after_ack_check(&mut self.lifecycle, &incoming)
+        {
+            RoutingDecision::Decrypted {
+                contact_id,
+                message_id,
+                plaintext,
+                content_type,
+                ..
+            } => {
+                let notifies = decrypted_actions(contact_id, message_id, plaintext, content_type)
+                    .iter()
+                    .any(|action| matches!(action, Action::NotifyNewMessage { .. }));
+                if notifies {
+                    PeekVerdict::Visible
+                } else {
+                    PeekVerdict::Control
+                }
+            }
+            // The key is already spent: the app read it first.
+            RoutingDecision::Duplicate { .. } => PeekVerdict::AlreadyHandled,
+            _ => PeekVerdict::Unreadable,
+        }
     }
 
     /// Return a health snapshot for the session with `contact_id`, or `None` if absent.
@@ -5080,6 +5220,257 @@ mod pqxdh_v2_tests {
             alice.open_envelope(&envelope).is_none(),
             "not the writer's own to open"
         );
+    }
+
+    // ── The notification extension's peek (decisions/notification-extension-reads-only.md) ──
+
+    /// A `SealedInner` carrying `envelope`, as the server returns it.
+    fn sealed_inner_with(field: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::history::wire::write_varint(u64::from(field) << 3 | 2, &mut out);
+        crate::history::wire::write_varint(bytes.len() as u64, &mut out);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn sealed_envelope(envelope: &[u8]) -> Vec<u8> {
+        sealed_inner_with(21, envelope)
+    }
+
+    /// What the extension builds from the Keychain: the key record and the orchestrator state.
+    fn peek_of(reader: &Orchestrator, reader_id: &str) -> Orchestrator {
+        Orchestrator::for_peek(
+            &reader.export_private_keys_cfe().unwrap(),
+            reader_id.to_string(),
+            Some(&reader.export_orchestrator_state_cfe().unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// The stored session states of `reader`, as the Keychain hands them over.
+    fn stored_sessions(reader: &Orchestrator) -> impl FnMut(&str) -> Option<Vec<u8>> + '_ {
+        |device| reader.lifecycle.export_session_bytes_for(device).ok()
+    }
+
+    /// The extension's three answers on an established session: a message the app announces is
+    /// `Visible`, a receipt is `Control`, and after the peek the app opens both itself, on its own
+    /// state, as if the peek never happened.
+    ///
+    /// Mutation: make `peek_envelope` return `Visible` for any decrypt — the receipt reddens.
+    #[test]
+    fn a_peek_tells_a_message_from_a_receipt_and_leaves_both_to_the_app() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let text = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let text = alice.seal_envelope(&bob_id, &text).unwrap();
+        let receipt_frame = crate::knst::frame_whole(b"receipt", 14, &[0x5a; 16]).unwrap();
+        let receipt = alice.encrypt_bytes_for(&bob_id, &receipt_frame).unwrap();
+        let receipt = alice.seal_envelope(&bob_id, &receipt).unwrap();
+
+        let mut peek = peek_of(&bob, &bob_id);
+        let mut sessions = stored_sessions(&bob);
+        assert_eq!(
+            peek.peek_sealed("t", &sealed_envelope(&text), &mut sessions),
+            PeekVerdict::Visible
+        );
+        assert_eq!(
+            peek.peek_sealed("r", &sealed_envelope(&receipt), &mut sessions),
+            PeekVerdict::Control
+        );
+        drop(sessions);
+
+        let (_, actions) = deliver_envelope(&mut bob, "t", &text);
+        assert_eq!(
+            decrypted(&actions),
+            vec![("t".to_string(), b"hello".to_vec())]
+        );
+        let (_, actions) = deliver_envelope(&mut bob, "r", &receipt);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ControlFrameDecrypted { message_id, content_type: 14, .. } if message_id == "r"
+            )),
+            "the app still reads the receipt after the peek: {actions:?}"
+        );
+    }
+
+    /// What the app already processed is not news: its key is spent in the state the app saved,
+    /// and the router calls the copy a duplicate.
+    ///
+    /// Mutation: map `RoutingDecision::Duplicate` to `Unreadable` — this reddens.
+    #[test]
+    fn a_peek_ignores_what_the_app_already_read() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let wire = alice.encrypt_bytes_for(&bob_id, b"read").unwrap();
+        let envelope = alice.seal_envelope(&bob_id, &wire).unwrap();
+        let (_, actions) = deliver_envelope(&mut bob, "read", &envelope);
+        assert_eq!(decrypted(&actions).len(), 1);
+
+        let mut peek = peek_of(&bob, &bob_id);
+        assert_eq!(
+            peek.peek_sealed(
+                "read",
+                &sealed_envelope(&envelope),
+                &mut stored_sessions(&bob)
+            ),
+            PeekVerdict::AlreadyHandled
+        );
+    }
+
+    /// A DECRYPTION_ERROR comes back in an envelope like any message; it is the protocol talking
+    /// to itself, never something to announce.
+    #[test]
+    fn a_decryption_error_is_control() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.forget_contact_state(&alice_id);
+
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let envelope = alice.seal_envelope(&bob_id, &lost).unwrap();
+        let (_, actions) = deliver_envelope(&mut bob, "lost", &envelope);
+        let reply = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendDecryptionError { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("the reader answers along the pair");
+
+        let mut peek = peek_of(&alice, &alice_id);
+        assert_eq!(
+            peek.peek_sealed(
+                "err",
+                &sealed_envelope(&reply),
+                &mut stored_sessions(&alice)
+            ),
+            PeekVerdict::Control
+        );
+    }
+
+    /// Every doubt shows the alert: no stored state for the writer, a route a peek does not take,
+    /// a delivery that is not a `SealedInner` at all, an envelope no pair here matches.
+    #[test]
+    fn whatever_a_peek_cannot_read_is_unreadable() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let wire = alice.encrypt_bytes_for(&bob_id, b"m").unwrap();
+        let envelope = alice.seal_envelope(&bob_id, &wire).unwrap();
+
+        let mut peek = peek_of(&bob, &bob_id);
+        assert_eq!(
+            peek.peek_sealed("m", &sealed_envelope(&envelope), &mut |_| None),
+            PeekVerdict::Unreadable,
+            "no stored state for the writer"
+        );
+        let mut peek = peek_of(&bob, &bob_id);
+        let mut sessions = stored_sessions(&bob);
+        assert_eq!(
+            peek.peek_sealed("ff", &sealed_inner_with(22, b"first flight"), &mut sessions),
+            PeekVerdict::Unreadable,
+            "a first flight is not peeked"
+        );
+        assert_eq!(
+            peek.peek_sealed("junk", &[0xff, 0xff], &mut sessions),
+            PeekVerdict::Unreadable
+        );
+        let mut stranger = peek_of(&alice, &alice_id);
+        assert_eq!(
+            stranger.peek_sealed(
+                "m",
+                &sealed_envelope(&envelope),
+                &mut stored_sessions(&alice)
+            ),
+            PeekVerdict::Unreadable,
+            "the writer's own envelope matches no pair on its side"
+        );
+    }
+
+    /// The object the extension holds, over the bytes the Keychain holds: the key record, the
+    /// orchestrator state (the envelope book) and the session states, fetched by device
+    /// through the callback.
+    ///
+    /// Mutation: drop `orchestrator_state` in `NotificationPeek::new` — the receipt and the text
+    /// both read `Unreadable` (no envelope book to find the writer in).
+    #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+    #[test]
+    fn the_extension_peeks_through_the_ffi_object() {
+        struct Stored(std::collections::HashMap<String, Vec<u8>>);
+        impl crate::PeekSessionSource for Stored {
+            fn session(&self, device_id: String) -> Option<Vec<u8>> {
+                self.0.get(&device_id).cloned()
+            }
+        }
+
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let receipt_frame = crate::knst::frame_whole(b"receipt", 14, &[0x5a; 16]).unwrap();
+        let receipt = alice.encrypt_bytes_for(&bob_id, &receipt_frame).unwrap();
+        let receipt = alice.seal_envelope(&bob_id, &receipt).unwrap();
+        let text = alice.encrypt_bytes_for(&bob_id, b"hi").unwrap();
+        let text = alice.seal_envelope(&bob_id, &text).unwrap();
+
+        let peek = crate::NotificationPeek::new(
+            bob.export_private_keys_cfe().unwrap(),
+            bob_id.clone(),
+            Some(bob.export_orchestrator_state_cfe().unwrap()),
+        )
+        .unwrap();
+        let stored = || {
+            Box::new(Stored(
+                [(
+                    alice_id.clone(),
+                    bob.lifecycle.export_session_bytes_for(&alice_id).unwrap(),
+                )]
+                .into(),
+            ))
+        };
+        assert_eq!(
+            peek.peek("r".into(), sealed_envelope(&receipt), stored()),
+            PeekVerdict::Control
+        );
+        assert_eq!(
+            peek.peek("t".into(), sealed_envelope(&text), stored()),
+            PeekVerdict::Visible
+        );
+        assert!(
+            crate::NotificationPeek::new(b"not a key record".to_vec(), bob_id, None).is_err(),
+            "a key record that does not decode builds nothing"
+        );
+    }
+
+    /// Several deliveries from one session are peeked in server order on one instance, whose
+    /// ratchet advances in memory as the app's will.
+    #[test]
+    fn a_peek_reads_a_run_of_messages_in_order() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let envelopes: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                let wire = alice
+                    .encrypt_bytes_for(&bob_id, format!("m{i}").as_bytes())
+                    .unwrap();
+                alice.seal_envelope(&bob_id, &wire).unwrap()
+            })
+            .collect();
+
+        let mut peek = peek_of(&bob, &bob_id);
+        let mut sessions = stored_sessions(&bob);
+        for (i, envelope) in envelopes.iter().enumerate() {
+            assert_eq!(
+                peek.peek_sealed(&format!("m{i}"), &sealed_envelope(envelope), &mut sessions),
+                PeekVerdict::Visible,
+                "message {i}"
+            );
+        }
     }
 
     /// Until the peer answers, the handshake header rides on every message and the peer has no

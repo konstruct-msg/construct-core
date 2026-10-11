@@ -346,7 +346,7 @@ impl MessageRouter {
 
     /// Route steps 2-4 (post-ACK-check). Called by both `route_message` (for
     /// `NotProcessed` fast path) and `resume_after_ack_check` (after DB confirms absent).
-    fn route_after_ack_check(
+    pub(crate) fn route_after_ack_check(
         &mut self,
         lifecycle: &mut SessionLifecycleManager,
         msg: &IncomingMessage,
