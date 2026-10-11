@@ -2053,6 +2053,9 @@ interface LocalStore {
     void upsert_call(LocalCall call);
     [Throws=LocalStoreError]
     sequence<LocalCall> calls(u32 limit);
+    /// One entry out of the call log; false: no such row.
+    [Throws=LocalStoreError]
+    boolean delete_call(string id);
 
     /// An id already known keeps its first account.
     [Throws=LocalStoreError]

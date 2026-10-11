@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use construct_core::{
-    HistoryError, HistoryMessageExport, HistoryMessageImport, LocalArchiveOutcome, LocalChat,
-    LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalMessageInsert,
+    HistoryError, HistoryMessageExport, HistoryMessageImport, LocalArchiveOutcome, LocalCall,
+    LocalChat, LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalMessageInsert,
     LocalOwnProfile, LocalPeerDevice, LocalPendingChunk, LocalPendingResend, LocalStore,
     LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable, history_export_chat,
     history_export_message, history_import_chat, history_import_message,
@@ -555,4 +555,34 @@ fn the_history_projection_crosses() {
     ));
     let chat = history_import_chat(history_export_chat(peer.into(), true)).unwrap();
     assert_eq!((chat.peer_id.as_str(), chat.pin), (peer, true));
+}
+
+/// The call log crosses the boundary: recorded, listed newest first, one entry deleted.
+#[test]
+fn the_call_log_crosses_the_boundary() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    let call = |id: &str, started: i64| LocalCall {
+        id: id.into(),
+        peer_user_id: "peer".into(),
+        peer_name: "Bob".into(),
+        direction: 0,
+        status: 0,
+        started_at: Some(started),
+        ended_at: None,
+        duration_seconds: 0,
+    };
+    store.upsert_call(call("a", 100)).unwrap();
+    store.upsert_call(call("b", 200)).unwrap();
+    assert_eq!(
+        store
+            .calls(10)
+            .unwrap()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"]
+    );
+    assert!(store.delete_call("b".into()).unwrap());
+    assert!(!store.delete_call("b".into()).unwrap());
+    assert_eq!(store.calls(10).unwrap().len(), 1);
 }
