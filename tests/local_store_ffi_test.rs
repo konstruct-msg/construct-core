@@ -557,7 +557,7 @@ fn the_history_projection_crosses() {
     assert_eq!((chat.peer_id.as_str(), chat.pin), (peer, true));
 }
 
-/// The call log crosses the boundary: recorded, listed newest first, one entry deleted.
+/// The call log crosses the boundary: recorded, listed newest first, one entry deleted, cleared.
 #[test]
 fn the_call_log_crosses_the_boundary() {
     let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
@@ -585,4 +585,6 @@ fn the_call_log_crosses_the_boundary() {
     assert!(store.delete_call("b".into()).unwrap());
     assert!(!store.delete_call("b".into()).unwrap());
     assert_eq!(store.calls(10).unwrap().len(), 1);
+    assert_eq!(store.delete_all_calls().unwrap(), 1);
+    assert!(store.calls(10).unwrap().is_empty());
 }

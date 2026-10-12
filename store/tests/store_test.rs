@@ -1752,3 +1752,32 @@ fn a_call_is_deleted_by_id_and_the_change_is_told() {
     assert_eq!(changes[0].table, Table::Calls);
     assert_eq!(changes[0].ids, vec!["drop".to_string()]);
 }
+
+/// "Clear history": every entry goes, the count says how many there were, and the observer is told
+/// once with every id — and not at all when there was nothing to clear.
+#[test]
+fn the_call_log_is_cleared_at_once_and_the_change_is_told() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store.upsert_call(&call("b", Some(100), 0)).unwrap();
+    store.upsert_call(&call("a", Some(200), 1)).unwrap();
+    store.upsert_call(&call("c", None, 3)).unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    assert_eq!(store.delete_all_calls().unwrap(), 3);
+    assert!(store.calls(10).unwrap().is_empty());
+    assert_eq!(
+        store.delete_all_calls().unwrap(),
+        0,
+        "nothing left to clear"
+    );
+
+    let changes = seen.changes.lock().unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "one change for the clear, none for the empty one"
+    );
+    assert_eq!(changes[0].table, Table::Calls);
+    assert_eq!(changes[0].ids, vec!["a", "b", "c"]);
+}

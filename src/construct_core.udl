@@ -2056,6 +2056,9 @@ interface LocalStore {
     /// One entry out of the call log; false: no such row.
     [Throws=LocalStoreError]
     boolean delete_call(string id);
+    /// The whole call log out ("clear history"); how many entries it held.
+    [Throws=LocalStoreError]
+    u32 delete_all_calls();
 
     /// An id already known keeps its first account.
     [Throws=LocalStoreError]
