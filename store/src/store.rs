@@ -1174,6 +1174,21 @@ impl Store {
         Ok(removed > 0)
     }
 
+    /// Empties the call log; how many entries it held. The observer is told the ids removed, once,
+    /// and nothing when the log was already empty.
+    pub fn delete_all_calls(&self) -> Result<u32> {
+        let mut ids = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare("DELETE FROM calls RETURNING id")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let removed = ids.len() as u32;
+        ids.sort();
+        self.notify(Table::Calls, ids);
+        Ok(removed)
+    }
+
     /// The call log, newest first.
     pub fn calls(&self, limit: u32) -> Result<Vec<CallRecord>> {
         let conn = self.lock();

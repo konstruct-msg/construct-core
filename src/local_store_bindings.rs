@@ -563,6 +563,10 @@ impl LocalStore {
         self.with(|s| s.delete_call(&id))
     }
 
+    pub fn delete_all_calls(&self) -> Result<u32> {
+        self.with(|s| s.delete_all_calls())
+    }
+
     pub fn record_peer_device(&self, device: LocalPeerDevice) -> Result<LocalInsert> {
         Ok(self.with(|s| s.record_peer_device(&device.into()))?.into())
     }
