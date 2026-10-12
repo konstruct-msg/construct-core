@@ -362,6 +362,13 @@ fn message_writes_and_the_status_rule_cross_the_boundary() {
         pending.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
         ["m2"]
     );
+    assert!(
+        store
+            .own_messages_in_status(3, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "m2")
+    );
     let window = store
         .messages_from("c1".into(), "k2s".into(), "m2".into(), 10)
         .unwrap();

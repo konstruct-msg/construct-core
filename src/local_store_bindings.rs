@@ -507,6 +507,9 @@ impl LocalStore {
             s.pending_sends(chat_id.as_deref(), retry_ceiling, limit)
         })?))
     }
+    pub fn own_messages_in_status(&self, status: i16, limit: u32) -> Result<Vec<LocalMessage>> {
+        Ok(all(self.with(|s| s.own_messages_in_status(status, limit))?))
+    }
     pub fn message_count(&self) -> Result<u64> {
         self.with(|s| s.message_count())
     }

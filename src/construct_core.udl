@@ -2017,6 +2017,9 @@ interface LocalStore {
     /// Ours, queued or failed with `retry_count < retry_ceiling`; one chat, or every chat for null.
     [Throws=LocalStoreError]
     sequence<LocalMessage> pending_sends(string? chat_id, i16 retry_ceiling, u32 limit);
+    /// Ours in `status`, every chat, transcript order.
+    [Throws=LocalStoreError]
+    sequence<LocalMessage> own_messages_in_status(i16 status, u32 limit);
     [Throws=LocalStoreError]
     u64 message_count();
     /// How many messages a chat holds.

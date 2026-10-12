@@ -943,6 +943,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// Our messages in `status`, every chat, transcript order. A launch fails the `SENDING`
+    /// ones no send of this process owns; the store cannot know which those are.
+    pub fn own_messages_in_status(
+        &self,
+        status: DeliveryStatus,
+        limit: u32,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE is_sent_by_me = 1 AND delivery_status = ?1
+             ORDER BY order_key, id LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![status, limit], message_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// How many messages a chat holds — the activity a contact is ranked by.
     pub fn chat_message_count(&self, chat_id: &str) -> Result<u64> {
         Ok(self.lock().query_row(

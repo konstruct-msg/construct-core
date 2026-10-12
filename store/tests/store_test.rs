@@ -1237,6 +1237,32 @@ fn pending_sends_are_ours_queued_or_failed_with_attempts_left() {
     );
 }
 
+/// What a launch fails as stuck: ours, in the status asked, nothing else. Mutations: drop
+/// `is_sent_by_me = 1` — a peer's message is failed; drop the status — a delivered one is.
+#[test]
+fn own_messages_in_status_are_ours_in_that_status_only() {
+    let store = with_messages(4);
+    store.set_delivery_status("m1", QUEUED).unwrap();
+    store.set_delivery_status("m3", SENT).unwrap();
+    let mut theirs = message("t1", "c", "k0", b"x");
+    theirs.delivery_status = SENDING;
+    store.insert_message(&theirs, None).unwrap();
+
+    let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.own_messages_in_status(SENDING, 50).unwrap()),
+        ["m2", "m4"]
+    );
+    assert_eq!(
+        ids(store.own_messages_in_status(SENDING, 1).unwrap()),
+        ["m2"]
+    );
+    assert_eq!(
+        ids(store.own_messages_in_status(QUEUED, 50).unwrap()),
+        ["m1"]
+    );
+}
+
 /// A history snapshot reads every message of every chat a page at a time, and the count agrees.
 /// Mutation: page with `>=` — every page after the first repeats a row.
 #[test]
