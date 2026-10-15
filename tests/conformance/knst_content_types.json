@@ -22,8 +22,9 @@
     "disposition": "transcript_incoming | transcript_own_device | silent_control | not_carried",
     "routing_kind": "what a client's contentType -> routing-kind mapping must return",
     "session_control_op": "PING | READY | RESET_INIT | END | null — the SessionControl op it denotes",
-    "framed_side_channel": "call_signal | delivery_receipt | contact_card | profile | null — handler for a framed payload",
-    "sealed_inner_content_type": "may SealedInner.content_type carry this value (0 means absent)"
+    "framed_side_channel": "call_signal | delivery_receipt | contact_card | profile | read_sync | null — handler for a framed payload",
+    "sealed_inner_content_type": "may SealedInner.content_type carry this value (0 means absent)",
+    "own_devices_only": "may this type be sent ONLY to the sender's own other devices — a client must never address it to a contact, and a receiver must drop one that did not come from its own account"
   },
   "$notes": {
     "disposition": [
@@ -50,7 +51,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": true
+      "sealed_inner_content_type": true,
+      "own_devices_only": false
     },
     {
       "value": 1,
@@ -60,7 +62,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 2,
@@ -70,7 +73,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 10,
@@ -80,7 +84,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 11,
@@ -90,7 +95,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 12,
@@ -100,7 +106,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": "call_signal",
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 13,
@@ -110,7 +117,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 14,
@@ -120,7 +128,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": "delivery_receipt",
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 20,
@@ -130,7 +139,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 21,
@@ -140,7 +150,8 @@
       "routing_kind": "CONTROL_MESSAGE",
       "session_control_op": "END",
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 22,
@@ -150,7 +161,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 23,
@@ -160,7 +172,8 @@
       "routing_kind": "SENDER_SYNC",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": true
     },
     {
       "value": 24,
@@ -170,7 +183,8 @@
       "routing_kind": "SESSION_RESET_INIT",
       "session_control_op": "RESET_INIT",
       "framed_side_channel": null,
-      "sealed_inner_content_type": true
+      "sealed_inner_content_type": true,
+      "own_devices_only": false
     },
     {
       "value": 25,
@@ -180,7 +194,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": "PING",
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 26,
@@ -190,7 +205,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": "READY",
       "framed_side_channel": null,
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 27,
@@ -200,7 +216,8 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": "contact_card",
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
     },
     {
       "value": 28,
@@ -210,7 +227,8 @@
       "routing_kind": "CONTROL_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": null,
-      "sealed_inner_content_type": true
+      "sealed_inner_content_type": true,
+      "own_devices_only": false
     },
     {
       "value": 29,
@@ -220,7 +238,19 @@
       "routing_kind": "DIRECT_MESSAGE",
       "session_control_op": null,
       "framed_side_channel": "profile",
-      "sealed_inner_content_type": false
+      "sealed_inner_content_type": false,
+      "own_devices_only": false
+    },
+    {
+      "value": 30,
+      "name": "CONTENT_TYPE_READ_SYNC",
+      "knst_byte5": true,
+      "disposition": "silent_control",
+      "routing_kind": "SENDER_SYNC",
+      "session_control_op": null,
+      "framed_side_channel": "read_sync",
+      "sealed_inner_content_type": false,
+      "own_devices_only": true
     }
   ]
 }
