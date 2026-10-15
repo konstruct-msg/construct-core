@@ -35,7 +35,7 @@ pub const CONTENT_TYPE_CALL_SIGNAL: u8 = 12;
 /// notification or a transcript row — the rows of `knst_content_types.json` with
 /// `knst_byte5: true` and `disposition: silent_control` (12 is among them, and has its own
 /// action). Pinned against that file by a test, so a type added there and not here reddens.
-pub const SILENT_CONTROL_TYPES: [u8; 7] = [12, 13, 14, 25, 26, 27, 29];
+pub const SILENT_CONTROL_TYPES: [u8; 8] = [12, 13, 14, 25, 26, 27, 29, 30];
 
 /// Whether `content_type` in byte 5 makes a control frame silent.
 pub fn is_silent_control(content_type: u8) -> bool {
