@@ -5804,6 +5804,269 @@ mod pqxdh_v2_tests {
         assert!(alice.has_active_session(&bob_id));
     }
 
+    // ── Who can make a writer retire ──────────────────────────────────────────────
+    //
+    // An error about a message that came with a certificate arrives in an X25519 box sealed to
+    // the writer's identity key: anyone can seal one, and the box names no sender — the device it
+    // is filed under is the platform's. What it can make the writer do rests on the ratchet key it
+    // names, looked up among the states held with that one device: only the reader of the unread
+    // message's header has that key.
+
+    /// The sending key of `o`'s current state with `peer` — what a genuine error about a message
+    /// written on it names. A test reads it here; outside, only the reader of the header has it.
+    fn sending_key(o: &Orchestrator, peer: &str) -> Vec<u8> {
+        o.lifecycle
+            .client
+            .get_session(peer)
+            .expect("a current state")
+            .messaging_session()
+            .sending_ratchet_key()
+            .to_vec()
+    }
+
+    /// A decryption error as anyone can make one: sealed to `to`'s public identity key.
+    fn boxed_error(
+        to: &Orchestrator,
+        ratchet_key: Vec<u8>,
+        message_id: &str,
+        hint: DecryptionErrorHint,
+    ) -> Vec<u8> {
+        let identity = to.get_registration_bundle_fields().unwrap().identity_public;
+        crate::orchestration::decryption_error::DecryptionError {
+            ratchet_key,
+            message_id: message_id.to_string(),
+            hint,
+        }
+        .seal(&identity)
+        .unwrap()
+    }
+
+    fn boxed(o: &mut Orchestrator, contact_id: &str, payload: Vec<u8>) -> Vec<Action> {
+        o.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: contact_id.to_string(),
+            payload,
+            opened: false,
+        })
+    }
+
+    /// How many retires and resends `actions` ask for.
+    fn reactions(actions: &[Action]) -> (usize, usize) {
+        let retired = actions
+            .iter()
+            .filter(|a| matches!(a, Action::SessionRetired { .. }))
+            .count();
+        let resent = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ResendMessage { .. }))
+            .count();
+        (retired, resent)
+    }
+
+    /// Alice converged with `peer` too, so she holds a state with it beside the one with Bob.
+    fn second_peer(alice: &mut Orchestrator, alice_id: &str) -> (Orchestrator, String) {
+        let (mut peer, peer_id) = named_device();
+        let server = trusting_server(&mut peer);
+        converged(alice, alice_id, &mut peer, &peer_id, &server);
+        (peer, peer_id)
+    }
+
+    /// The right ratchet key, filed under another device — one Alice also holds a state with, or
+    /// one she holds nothing with — retires nothing and resends nothing: the key is looked up among
+    /// the states with the device the error is filed under, not among all of hers. The same box
+    /// filed under Bob does retire, so the box is not what was refused.
+    ///
+    /// Mutation: `ratchet_key_owner` matching the key against every device's current state
+    /// instead of `contact_id`'s — this reddens.
+    #[test]
+    fn a_boxed_error_with_the_right_key_filed_under_another_device_does_nothing() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let (_mallory, mallory_id) = second_peer(&mut alice, &alice_id);
+        let (_, stranger_id) = named_device();
+        let with_bob = alice.lifecycle.active_session_id(&bob_id);
+        let with_mallory = alice.lifecycle.active_session_id(&mallory_id);
+        let key = sending_key(&alice, &bob_id);
+
+        for from in [&mallory_id, &stranger_id] {
+            let forged = boxed_error(&alice, key.clone(), "m0", DecryptionErrorHint::None);
+            let answer = boxed(&mut alice, from, forged);
+            assert!(answer.is_empty(), "filed under {from}: {answer:?}");
+        }
+        assert_eq!(alice.lifecycle.active_session_id(&bob_id), with_bob);
+        assert_eq!(alice.lifecycle.active_session_id(&mallory_id), with_mallory);
+        assert_eq!(sending_key(&alice, &bob_id), key);
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), 0);
+        assert_eq!(alice.lifecycle.previous_state_count(&mallory_id), 0);
+
+        let genuine = boxed_error(&alice, key, "m0", DecryptionErrorHint::None);
+        assert_eq!(reactions(&boxed(&mut alice, &bob_id, genuine)), (1, 1));
+    }
+
+    /// A ratchet key that is none of Alice's — whatever the hint asks — changes nothing: the
+    /// current state stays, so the next send opens no handshake and spends none of Bob's one-time
+    /// prekeys, and nothing is resent. The keys tried are ones a forger has: zeros, any bytes, and
+    /// Alice's public identity key.
+    ///
+    /// Mutation: `ratchet_key_owner` answering `Current` for any key while a current state is
+    /// held — this reddens.
+    #[test]
+    fn a_made_up_ratchet_key_retires_nothing_and_opens_nothing() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let with_bob = alice.lifecycle.active_session_id(&bob_id);
+        let key = sending_key(&alice, &bob_id);
+        let identity = alice
+            .get_registration_bundle_fields()
+            .unwrap()
+            .identity_public;
+
+        for (n, made_up) in [vec![0; 32], vec![5; 32], identity].into_iter().enumerate() {
+            for hint in [
+                DecryptionErrorHint::None,
+                DecryptionErrorHint::PrekeyUnavailable,
+            ] {
+                let forged = boxed_error(&alice, made_up.clone(), &format!("m{n}"), hint);
+                let answer = boxed(&mut alice, &bob_id, forged);
+                assert!(answer.is_empty(), "key {n}, {hint:?}: {answer:?}");
+            }
+        }
+        assert_eq!(alice.lifecycle.active_session_id(&bob_id), with_bob);
+        assert_eq!(sending_key(&alice, &bob_id), key);
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), 0);
+        assert!(
+            alice.has_session_for_sending(&bob_id),
+            "the next send would open a new handshake"
+        );
+    }
+
+    /// A genuine error replayed after it has done its work — while no state is current, and again
+    /// once a new state is current and in use — retires nothing more and is not resent again.
+    ///
+    /// Mutation: drop the `resent_after_error` guard (resend on every error naming a key of ours)
+    /// — this reddens.
+    #[test]
+    fn a_replayed_error_retires_nothing_more_and_resends_nothing_more() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.forget_contact_state(&alice_id);
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        let payload = error_payload(&answer, "lost");
+
+        assert_eq!(
+            reactions(&boxed(&mut alice, &bob_id, payload.clone())),
+            (1, 1)
+        );
+        let previous = alice.lifecycle.previous_state_count(&bob_id);
+
+        let replay = boxed(&mut alice, &bob_id, payload.clone());
+        assert!(replay.is_empty(), "with no current state: {replay:?}");
+        assert!(!alice.has_active_session(&bob_id));
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), previous);
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let again = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        receive(&mut bob, &alice, &alice_id, &server, "lost-again", again);
+        let reply = bob.encrypt_bytes_for(&alice_id, b"got it").unwrap();
+        alice.decrypt_bytes_for(&bob_id, &reply).unwrap();
+        let fresh = alice.lifecycle.active_session_id(&bob_id);
+        let key = sending_key(&alice, &bob_id);
+        let previous = alice.lifecycle.previous_state_count(&bob_id);
+
+        let late = boxed(&mut alice, &bob_id, payload);
+        assert!(late.is_empty(), "with a new state in use: {late:?}");
+        assert_eq!(alice.lifecycle.active_session_id(&bob_id), fresh);
+        assert_eq!(sending_key(&alice, &bob_id), key);
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), previous);
+    }
+
+    /// The same genuine error many times over, before the platform has acted on any of it, draws
+    /// one retire and one resend in all.
+    ///
+    /// Mutation: retire on `RatchetKeyOwner::Previous` as on `Current` — this reddens; so does
+    /// dropping the `resent_after_error` guard.
+    #[test]
+    fn a_burst_of_one_error_draws_one_retire_and_one_resend() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.forget_contact_state(&alice_id);
+        let lost = alice.encrypt_bytes_for(&bob_id, b"lost").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "lost", lost);
+        let payload = error_payload(&answer, "lost");
+
+        let all: Vec<Action> = (0..8)
+            .flat_map(|_| boxed(&mut alice, &bob_id, payload.clone()))
+            .collect();
+        assert_eq!(reactions(&all), (1, 1), "{all:?}");
+        assert_eq!(alice.lifecycle.previous_state_count(&bob_id), 1);
+    }
+
+    /// An error in a session envelope is filed under the device whose pair opened it. Mallory,
+    /// who holds a pair with Alice, sends one quoting Alice's key with Bob: it opens as Mallory's,
+    /// and does nothing. One sealed on a pair Alice does not hold does not open at all.
+    ///
+    /// Mutation: `ratchet_key_owner` matching the key against every device's current state
+    /// instead of `contact_id`'s — this reddens.
+    #[test]
+    fn an_enveloped_error_names_the_pair_it_came_by_not_the_state_it_quotes() {
+        use crate::crypto::sealed_sender::envelope::EnvelopeKind;
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let (mut mallory, mallory_id) = second_peer(&mut alice, &alice_id);
+        let with_bob = alice.lifecycle.active_session_id(&bob_id);
+        let with_mallory = alice.lifecycle.active_session_id(&mallory_id);
+        let key = sending_key(&alice, &bob_id);
+        let error = crate::orchestration::decryption_error::DecryptionError {
+            ratchet_key: key.clone(),
+            message_id: "m0".to_string(),
+            hint: DecryptionErrorHint::None,
+        }
+        .encode()
+        .unwrap();
+
+        let on_mallorys_pair = mallory.lifecycle.active_session_id(&alice_id).unwrap();
+        let envelope = mallory
+            .lifecycle
+            .client
+            .envelopes()
+            .seal_reply(&on_mallorys_pair, &error)
+            .unwrap();
+        let opened = alice
+            .open_envelope(&envelope)
+            .expect("Alice holds the pair");
+        assert_eq!(opened.kind, EnvelopeKind::DecryptionError);
+        assert_eq!(opened.device, mallory_id);
+        let answer = alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: opened.device,
+            payload: opened.body,
+            opened: true,
+        });
+        assert!(answer.is_empty(), "{answer:?}");
+        assert_eq!(alice.lifecycle.active_session_id(&bob_id), with_bob);
+        assert_eq!(alice.lifecycle.active_session_id(&mallory_id), with_mallory);
+        assert_eq!(sending_key(&alice, &bob_id), key);
+
+        let (mut carol, carol_id) = named_device();
+        let server_c = trusting_server(&mut carol);
+        converged(&mut mallory, &mallory_id, &mut carol, &carol_id, &server_c);
+        let not_alices = mallory.lifecycle.active_session_id(&carol_id).unwrap();
+        let stray = mallory
+            .lifecycle
+            .client
+            .envelopes()
+            .seal_reply(&not_alices, &error)
+            .unwrap();
+        assert!(alice.open_envelope(&stray).is_none());
+    }
+
     /// One error per unread message: a redelivery is a duplicate by then.
     ///
     /// Mutation: drop the `mark_processed` in the `DecryptionErrorNeeded` arm — this reddens.
