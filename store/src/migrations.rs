@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::error::{Result, StoreError};
 
-const STEPS: &[&str] = &[
+pub(crate) const STEPS: &[&str] = &[
     // 1 — the model of iOS Core Data model 12.
     r#"
     CREATE TABLE contacts (
@@ -230,9 +230,47 @@ const STEPS: &[&str] = &[
         sitting     TEXT
     );
     "#,
+    // 5 — what is deleted leaves the search index (TODO 172).
+    //
+    // A contentless index cannot remove a row's terms: it does not have the row's text to find
+    // them by, so a delete leaves a tombstone and the terms stay in the segment until a merge.
+    // "Deleted" text stayed in the file, readable by anyone holding the key, and FTS5 ignores
+    // `secure-delete` on such a table without a word. The index now keeps its text, which is no
+    // new exposure — the message body beside it says the same — and `secure-delete` takes the
+    // terms out with the row.
+    //
+    // The text is rebuilt from the old index's own terms: a trigram at each position, so the
+    // first term and the last character of every one after it spell the text out, case-folded as
+    // the index folds it, which changes no match. A tombstone hides its row from the vocabulary
+    // too, so nothing deleted is carried over.
+    r#"
+    CREATE VIRTUAL TABLE temp.search_terms USING fts5vocab(main, message_search, 'instance');
+    CREATE TEMP TABLE search_text AS
+        SELECT doc AS id,
+               group_concat(CASE WHEN "offset" = 0 THEN term ELSE substr(term, 3) END, ''
+                            ORDER BY "offset") AS text
+        FROM temp.search_terms
+        GROUP BY doc;
+    DROP TABLE temp.search_terms;
+
+    DROP TRIGGER messages_leave_search;
+    DROP TABLE message_search;
+    CREATE VIRTUAL TABLE message_search USING fts5(text, tokenize = 'trigram');
+    INSERT INTO message_search (message_search, rank) VALUES ('secure-delete', 1);
+    INSERT INTO message_search (rowid, text) SELECT id, text FROM temp.search_text;
+    DROP TABLE temp.search_text;
+    CREATE TRIGGER messages_leave_search AFTER DELETE ON messages BEGIN
+        DELETE FROM message_search WHERE rowid = old.rowid;
+    END;
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;
+
+/// The step after which a store has been rewritten once without the free pages it carried.
+/// `secure_delete` zeroes what is freed from now on; what was freed before it is still in the
+/// file, and only a rewrite takes it out. Keyed by the schema version, so it runs exactly once.
+const SCRUBBED_AT: i64 = 5;
 
 pub(crate) fn run(conn: &mut Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -247,6 +285,12 @@ pub(crate) fn run(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(step)?;
         tx.pragma_update(None, "user_version", index as i64 + 1)?;
         tx.commit()?;
+    }
+    if found < SCRUBBED_AT {
+        // Outside any transaction: VACUUM refuses one. Its scratch copy is in memory
+        // (`SQLITE_TEMP_STORE=2`), so no temporary file holds the rows meanwhile.
+        conn.execute_batch("VACUUM;")?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     }
     Ok(())
 }

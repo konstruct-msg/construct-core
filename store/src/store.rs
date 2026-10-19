@@ -44,7 +44,7 @@ impl Store {
         Self::prepare(Connection::open_in_memory()?, key, None)
     }
 
-    fn prepare(mut conn: Connection, key: &[u8], path: Option<PathBuf>) -> Result<Self> {
+    fn prepare(conn: Connection, key: &[u8], path: Option<PathBuf>) -> Result<Self> {
         if key.len() != KEY_LEN {
             return Err(StoreError::KeyLength {
                 expected: KEY_LEN,
@@ -64,10 +64,29 @@ impl Store {
             }
             Err(e) => return Err(e.into()),
         }
+        Self::configure(conn, path)
+    }
+
+    /// Everything after the key: the pragmas and the schema. Apart so a test can run it over a
+    /// plain file and read what a holder of the key would read.
+    ///
+    /// What is deleted or overwritten leaves the disk with it. The pages are ciphertext, but under
+    /// the key the platform keeps beside the file, so whoever images a phone after its first
+    /// unlock holds both (2026-10-19, TODO 172). Three places would keep it:
+    /// - the freed space in a page, and pages on the freelist: `secure_delete` zeroes them;
+    /// - the WAL, which holds every page image written since it was last reset: a checkpoint after
+    ///   each commit, and `journal_size_limit = 0` truncating the log at each reset, so nothing
+    ///   older than the last commit survives in it;
+    /// - the search index: FTS5 marks a deleted row and keeps its terms until a merge; its own
+    ///   `secure-delete` (schema step 3) removes them at once.
+    fn configure(mut conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA secure_delete = ON;
+             PRAGMA journal_size_limit = 0;
+             PRAGMA wal_autocheckpoint = 1;",
         )?;
         migrations::run(&mut conn)?;
         Ok(Self {
@@ -1823,4 +1842,265 @@ fn hex(bytes: &[u8]) -> Zeroizing<String> {
         out.push(DIGITS[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// What a holder of the key reads in the files after a delete or an edit. The store runs over a
+/// plain file here — `configure` without `PRAGMA key` — so the bytes on disk are the pages as
+/// SQLCipher would decrypt them (TODO 172).
+#[cfg(test)]
+mod residue_tests {
+    use super::*;
+    use crate::model::{Chat, Contact, Message};
+
+    const BODY: &[u8] = b"body-Residue-Qzxjv";
+    const TEXT: &str = "said Qzxjvw once";
+    /// A trigram of `TEXT` as the index stores it: folded to lower case, so the body (capital Q)
+    /// cannot be what matches it.
+    const TERM: &[u8] = b"qzx";
+
+    fn open_plain(path: &Path) -> Store {
+        Store::configure(Connection::open(path).unwrap(), Some(path.to_path_buf())).unwrap()
+    }
+
+    fn with_message(store: &Store) {
+        store
+            .upsert_contact(&Contact {
+                id: "peer".into(),
+                is_contact: true,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_chat(&Chat {
+                id: "c1".into(),
+                peer_id: "peer".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .insert_message(
+                &Message {
+                    id: "m1".into(),
+                    chat_id: "c1".into(),
+                    order_key: "k1".into(),
+                    body: BODY.to_vec(),
+                    ..Default::default()
+                },
+                Some(TEXT),
+            )
+            .unwrap();
+    }
+
+    /// The database and its WAL, as an imaging tool copies them — while the store is open.
+    fn on_disk(path: &Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        if let Ok(more) = std::fs::read(format!("{}-wal", path.display())) {
+            bytes.extend(more);
+        }
+        bytes
+    }
+
+    fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Mutation: drop `secure_delete` — the body stays in the freed page; drop
+    /// `wal_autocheckpoint = 1` or `journal_size_limit = 0` — it stays in the WAL; drop step 5's
+    /// `secure-delete` — the index keeps its terms. Each reddens here.
+    #[test]
+    fn a_deleted_message_leaves_nothing_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = open_plain(&path);
+        with_message(&store);
+        assert!(holds(&on_disk(&path), BODY), "the probe sees a live body");
+        assert!(holds(&on_disk(&path), TERM), "the probe sees a live term");
+
+        store.delete_message("m1").unwrap();
+
+        assert!(
+            !holds(&on_disk(&path), BODY),
+            "the deleted body is still in the files"
+        );
+        assert!(
+            !holds(&on_disk(&path), TERM),
+            "the deleted text is still in the index"
+        );
+    }
+
+    /// Mutation: as above — an edit frees the old body exactly as a delete does.
+    #[test]
+    fn an_edit_leaves_only_the_new_text_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = open_plain(&path);
+        with_message(&store);
+
+        store
+            .edit_message("m1", b"body-after", Some("said after"), 2_000)
+            .unwrap();
+
+        let bytes = on_disk(&path);
+        assert!(holds(&bytes, b"body-after"));
+        assert!(
+            !holds(&bytes, BODY),
+            "the text before the edit is still in the files"
+        );
+        assert!(
+            !holds(&on_disk(&path), TERM),
+            "the text before the edit is still in the index"
+        );
+    }
+
+    /// A long write fills the WAL far past where the next short one ends. The log is reused from
+    /// its start after a checkpoint, so without truncation its tail keeps the long write's pages,
+    /// the body among them, after the body was deleted.
+    ///
+    /// Mutation: drop `journal_size_limit = 0` — this reddens.
+    #[test]
+    fn a_delete_after_a_long_write_leaves_nothing_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = open_plain(&path);
+        with_message(&store);
+        store.delete_message("m1").unwrap();
+        // The body again, last of a long batch: its page lands deep in the log.
+        let filler = vec![b'f'; 3_000];
+        let mut batch: Vec<(Message, Option<String>)> = (0..200)
+            .map(|i| {
+                let m = Message {
+                    id: format!("f{i:03}"),
+                    chat_id: "c1".into(),
+                    order_key: format!("f{i:03}"),
+                    body: filler.clone(),
+                    ..Default::default()
+                };
+                (m, None)
+            })
+            .collect();
+        batch.push((
+            Message {
+                id: "m2".into(),
+                chat_id: "c1".into(),
+                order_key: "z".into(),
+                body: BODY.to_vec(),
+                ..Default::default()
+            },
+            None,
+        ));
+        store.insert_messages(&batch).unwrap();
+        assert!(holds(&on_disk(&path), BODY), "the probe sees the live body");
+
+        store.delete_message("m2").unwrap();
+
+        assert!(
+            !holds(&on_disk(&path), BODY),
+            "the log's tail still holds the deleted body"
+        );
+    }
+
+    /// A store written before step 5: its free pages hold everything deleted until then, and its
+    /// contentless index the terms of every deleted or edited message.
+    ///
+    /// Mutation: drop the VACUUM after step 5 — the freed body stays; carry the index over as it
+    /// was (skip step 5's rebuild) — the old terms stay. The first assertions prove the old store
+    /// kept both, so the test can fail; the searches prove the rebuild lost no live text.
+    #[test]
+    fn an_older_store_is_rewritten_without_what_it_had_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            // The store as builds before step 5 left it: their pragmas, schema 4.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            for step in &migrations::STEPS[..4] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO contacts (id) VALUES ('peer');
+                 INSERT INTO chats (id, peer_id) VALUES ('c1', 'peer');",
+            )
+            .unwrap();
+            let add = |id: &str, body: &[u8], text: &str| {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, from_user_id, to_user_id, is_sent_by_me,
+                                           timestamp, order_key, body)
+                     VALUES (?1, 'c1', 'a', 'b', 0, 1000, ?1, ?2)",
+                    params![id, body],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO message_search (rowid, text)
+                     SELECT rowid, ?2 FROM messages WHERE id = ?1",
+                    params![id, text],
+                )
+                .unwrap();
+            };
+            add("m1", BODY, TEXT);
+            add("m2", b"live", "日本語のテキスト Hello");
+            add("m3", b"edited", "before Kwyrtx");
+            // Deleted, and edited the way builds before step 5 edited: the old row out, the new in.
+            conn.execute("DELETE FROM messages WHERE id = 'm1'", [])
+                .unwrap();
+            conn.execute_batch(
+                "DELETE FROM message_search WHERE rowid = (SELECT rowid FROM messages WHERE id = 'm3');
+                 INSERT INTO message_search (rowid, text)
+                     SELECT rowid, 'after the edit' FROM messages WHERE id = 'm3';",
+            )
+            .unwrap();
+        }
+        let before = on_disk(&path);
+        assert!(holds(&before, BODY), "the old store kept the deleted body");
+        assert!(holds(&before, TERM), "the old index kept the deleted text");
+        assert!(
+            holds(&before, b"kwy"),
+            "the old index kept the text before the edit"
+        );
+
+        let store = open_plain(&path);
+
+        assert_eq!(
+            store
+                .lock()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            migrations::VERSION
+        );
+        let after = on_disk(&path);
+        assert!(
+            !holds(&after, BODY),
+            "the upgrade left the freed body in the file"
+        );
+        assert!(
+            !holds(&after, TERM),
+            "the upgrade carried the deleted text over"
+        );
+        assert!(
+            !holds(&after, b"kwy"),
+            "the upgrade carried the text before the edit over"
+        );
+        let found = |q: &str| -> Vec<String> {
+            store
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.message_id)
+                .collect()
+        };
+        assert_eq!(found("テキスト"), vec!["m2"]);
+        assert_eq!(
+            found("hello"),
+            vec!["m2"],
+            "the rebuilt text matches as the old did"
+        );
+        assert_eq!(found("after the edit"), vec!["m3"]);
+        assert!(found("before").is_empty());
+        assert!(found("Qzxjvw").is_empty());
+
+        // And from here on a delete takes its terms with it.
+        store.delete_message("m2").unwrap();
+        assert!(found("テキスト").is_empty());
+        assert!(!holds(&on_disk(&path), "テキ".as_bytes()));
+    }
 }
