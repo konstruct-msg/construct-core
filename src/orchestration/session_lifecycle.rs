@@ -243,6 +243,7 @@ impl SessionLifecycleManager {
             pq_key_index: decoded.pq_key_index,
             pq_ratchet_field: decoded.pq_ratchet_field,
             identity_proof_ciphertext: decoded.identity_proof_ciphertext,
+            ad_version: decoded.ad_version,
         };
 
         let plaintext = self.decrypt_ratchet_message(contact_id, &msg)?;
