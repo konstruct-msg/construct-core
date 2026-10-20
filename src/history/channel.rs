@@ -169,7 +169,6 @@ pub fn sealed_len(prefix: [u8; 4]) -> Result<Option<usize>, HistoryFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "post-quantum")]
     use crate::history::vectors;
 
     const SNAPSHOT: [u8; 16] = [0xaa; 16];
@@ -177,7 +176,6 @@ mod tests {
 
     /// The file key from the vector's own inputs (receiver identity secret × sender ephemeral,
     /// and the Kyber decapsulation), and chunk 0 opening under it to the vector's plaintext.
-    #[cfg(feature = "post-quantum")]
     #[test]
     fn the_file_channel_key_and_chunk_zero_are_the_vectors() {
         #[allow(deprecated)]

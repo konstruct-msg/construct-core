@@ -31,6 +31,4 @@
 pub mod classic;
 
 /// Post-quantum hybrid suite (Ed25519 + ML-DSA-65 signatures).
-/// Available only when the `post-quantum` feature is enabled.
-#[cfg(feature = "post-quantum")]
 pub mod hybrid;

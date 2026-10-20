@@ -123,7 +123,6 @@ pub mod sealed_sender;
 pub mod device_copy_tag;
 
 /// Server keys rooted offline: delegations from a pinned hybrid root, labelled server signatures
-#[cfg(feature = "post-quantum")]
 pub mod server_trust;
 
 /// Kyber prekey signature check and the PQ-authentication label of a session
@@ -136,16 +135,12 @@ pub mod kyber_prekeys;
 pub mod social_recovery;
 
 // ============================================================================
-// Post-Quantum (conditionally compiled)
+// Post-Quantum
 // ============================================================================
 
-// Not feature-gated: the module carries its own #[cfg(not(feature =
-// "post-quantum"))] error stubs precisely so call sites (PQ ratchet in
-// double_ratchet/internals.rs) compile in default builds.
 pub mod pq_x3dh;
 
 /// Post-quantum hybrid crypto suite (Ed25519 + ML-DSA-65).
-#[cfg(feature = "post-quantum")]
 pub use crate::crypto::suites::hybrid;
 
 // ============================================================================

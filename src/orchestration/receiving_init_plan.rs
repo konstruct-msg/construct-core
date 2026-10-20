@@ -31,17 +31,11 @@ pub enum ReceivingInitKind {
 
 /// Classify one message.
 ///
-/// With `post-quantum` — every platform build — a KEM ciphertext is the handshake, at any message
-/// number. A build without it has no ciphertext to go by, and keeps the rule a classical first
-/// flight allows: message 0 without a PQ epoch, or any message naming a one-time pre-key.
+/// A KEM ciphertext is the handshake, at any message number; a message without one is mid-ratchet.
+/// Until 0.56.0 a build without `post-quantum` had no ciphertext to go by and kept the classical
+/// rule (message 0 without a PQ epoch, or any message naming a one-time pre-key); that build is gone.
 pub fn receiving_init_kind(carrier: &ReceivingInitCarrier) -> ReceivingInitKind {
     if carrier.kem_ciphertext_bytes > 0 {
-        return ReceivingInitKind::Handshake;
-    }
-    if cfg!(not(feature = "post-quantum"))
-        && (carrier.one_time_prekey_id != 0
-            || (carrier.message_number == 0 && carrier.pq_message_epoch == 0))
-    {
         return ReceivingInitKind::Handshake;
     }
     ReceivingInitKind::MidRatchet
@@ -85,7 +79,6 @@ mod tests {
 
     /// A build with PQXDH has no classical handshake: a bare message 0 is a DH chain restarting,
     /// not an opener.
-    #[cfg(feature = "post-quantum")]
     #[test]
     fn a_bare_first_message_is_not_a_handshake() {
         assert_eq!(
@@ -96,21 +89,6 @@ mod tests {
         with_otpk.one_time_prekey_id = 1_000_461;
         assert_eq!(
             receiving_init_kind(&with_otpk),
-            ReceivingInitKind::MidRatchet
-        );
-    }
-
-    #[cfg(not(feature = "post-quantum"))]
-    #[test]
-    fn a_classical_build_opens_from_a_bare_first_message() {
-        assert_eq!(
-            receiving_init_kind(&carrier(0, 0)),
-            ReceivingInitKind::Handshake
-        );
-        let mut leftover = carrier(0, 0);
-        leftover.pq_message_epoch = 4;
-        assert_eq!(
-            receiving_init_kind(&leftover),
             ReceivingInitKind::MidRatchet
         );
     }

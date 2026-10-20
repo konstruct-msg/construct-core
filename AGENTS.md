@@ -14,18 +14,18 @@
 
 ### Key Commands
 - **Build**: `cargo build`
-- **Test**: `cargo test --features post-quantum` for the core; `cargo test --features mac` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
+- **Test**: `cargo test` for the core; `cargo test --features mac` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
 - **Benchmarks**: `cargo bench --bench crypto_bench`
-- **Walkthrough**: `cargo run --example two_devices --features post-quantum` — two devices and a
+- **Walkthrough**: `cargo run --example two_devices` — two devices and a
   toy server in one process; prints every event the app feeds the core and every action the
   core returns, from registration to the fourth message. Read `examples/two_devices.rs` first
   when learning how the core is driven.
-- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default + `post-quantum` (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
+- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
 
 ### Feature Flags
-- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS, `post-quantum`).
-- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil + `post-quantum`.
-- `post-quantum`: Enables ML-KEM-1024/768 and ML-DSA support. Implied by every platform feature (a `compile_error!` in `lib.rs` guards that). Without it the core opens classical sessions only, which platform builds refuse.
+- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
+- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
+- `post-quantum`: an empty alias since 0.56.0 (TODO 203), kept one release so old commands still run. ML-KEM-1024/768 and ML-DSA are unconditional: there is no classical-only core, and nothing to forget in a build command.
 
 ## Development Conventions
 

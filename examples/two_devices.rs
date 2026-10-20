@@ -4,7 +4,7 @@
 //! Запуск:
 //!
 //! ```text
-//! cargo run --example two_devices --features post-quantum
+//! cargo run --example two_devices
 //! ```
 //!
 //! Что здесь показано. Ядро не делает ввода-вывода: на каждое событие (`IncomingEvent`) оно

@@ -292,7 +292,7 @@ impl KyberPrekeyStore {
     }
 }
 
-#[cfg(all(test, feature = "post-quantum"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

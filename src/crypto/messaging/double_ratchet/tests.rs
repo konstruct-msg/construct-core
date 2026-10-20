@@ -1,4 +1,3 @@
-#[cfg(feature = "post-quantum")]
 use super::PqRatchetWireField;
 use super::{
     AD_VERSION_HEADER, AD_VERSION_LEGACY, DoubleRatchetSession, EncryptedRatchetMessage,
@@ -1664,7 +1663,6 @@ fn test_ad_v3_normal_path_unaffected() {
 /// Session pair on `SuiteID::PQ_RATCHET` — same bootstrap as
 /// `make_session_pair`, different suite. Alice is the DR initiator and thus
 /// the (sole) PQ exchange initiator.
-#[cfg(feature = "post-quantum")]
 fn make_pq_session_pair(
     alice_uuid: &str,
     bob_uuid: &str,
@@ -1718,7 +1716,6 @@ fn make_pq_session_pair(
 /// One full conversational round: Alice → Bob, then Bob → Alice. Each
 /// direction change triggers a DH ratchet turn on the receiving side, which is
 /// what drives the PQ cadence. Panics if either decrypt fails.
-#[cfg(feature = "post-quantum")]
 fn pq_round(
     alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
     bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
@@ -1735,7 +1732,6 @@ fn pq_round(
 
 /// Drive a fresh pair up to (at least) the given completed epoch, panicking if
 /// it takes unreasonably long. Returns the number of rounds it took.
-#[cfg(feature = "post-quantum")]
 fn pq_drive_to_epoch(
     alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
     bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
@@ -1756,13 +1752,11 @@ fn pq_drive_to_epoch(
     );
 }
 
-#[cfg(feature = "post-quantum")]
 type Dr = DoubleRatchetSession<ClassicSuiteProvider>;
 
 /// This side's chain of `epoch` in the initiator→responder direction (`i2r`) or back — its send
 /// chain for its own direction, its receive chain for the other. Provisional (responder, not yet
 /// promoted) chains count.
-#[cfg(feature = "post-quantum")]
 fn pq_chain(s: &Dr, epoch: u32, i2r: bool) -> Option<super::PqChain> {
     let chains = s.pq_chains.iter().find(|c| c.epoch == epoch).or_else(|| {
         s.pending_pq_ciphertext
@@ -1778,7 +1772,6 @@ fn pq_chain(s: &Dr, epoch: u32, i2r: bool) -> Option<super::PqChain> {
 }
 
 /// The key a chain yields at `index`; `None` if the chain is already past it.
-#[cfg(feature = "post-quantum")]
 fn pq_key_at(mut chain: super::PqChain, index: u32) -> Option<Vec<u8>> {
     if chain.index > index {
         return None;
@@ -1793,7 +1786,6 @@ fn pq_key_at(mut chain: super::PqChain, index: u32) -> Option<Vec<u8>> {
 
 /// Two sessions hold the same chains of `epoch`: every direction both still hold yields the same
 /// key at the further of their two positions.
-#[cfg(feature = "post-quantum")]
 fn assert_pq_epoch_agrees(a: &Dr, b: &Dr, epoch: u32) {
     let mut compared = 0;
     for i2r in [true, false] {
@@ -1818,7 +1810,6 @@ fn assert_pq_epoch_agrees(a: &Dr, b: &Dr, epoch: u32) {
 /// encrypt/decrypt path, past multiple cadence firings, with every message
 /// decrypting and both sides converging on identical epoch chains. Under the
 /// removed root-key fold this scenario bricked at the first cadence firing.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_full_conversation_advances_epochs() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -1853,7 +1844,6 @@ fn test_pq_ratchet_full_conversation_advances_epochs() {
 
 /// The PQ secret must actually participate in the message key: corrupting one
 /// side's epoch secret must make decryption fail (and roll back cleanly).
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_secret_participates_in_message_key() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -1892,7 +1882,6 @@ fn test_pq_ratchet_secret_participates_in_message_key() {
 
 /// Tampering with the epoch tag on the wire must reject the message (key
 /// mismatch / unknown epoch), and the session must survive for a clean retry.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_tampered_epoch_tag_rejected_then_recovers() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -1926,7 +1915,6 @@ fn test_pq_ratchet_tampered_epoch_tag_rejected_then_recovers() {
 /// Bob receives a message tagged with the *new* epoch before an older message
 /// tagged with the *previous* epoch (classical skipped-key path) — both must
 /// decrypt, and promotion must not disturb the older message's key.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_reordered_delivery_across_epoch_boundary() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -1981,7 +1969,6 @@ fn test_pq_ratchet_reordered_delivery_across_epoch_boundary() {
 }
 
 /// A lost EK-carrying message is healed by re-attachment on the next message.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_lost_ek_carrier_healed_by_resend() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2018,7 +2005,6 @@ fn test_pq_ratchet_lost_ek_carrier_healed_by_resend() {
 
 /// A lost CT-carrying reply is healed the same way: the responder re-attaches
 /// the ciphertext to every message until the initiator's tag acknowledges it.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_lost_ct_carrier_healed_by_resend() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2054,7 +2040,6 @@ fn test_pq_ratchet_lost_ct_carrier_healed_by_resend() {
 
 /// Duplicate EK delivery must NOT re-encapsulate: re-encapsulating would
 /// silently replace the provisional secret the first ciphertext committed to.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_duplicate_ek_is_idempotent() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2097,7 +2082,6 @@ fn test_pq_ratchet_duplicate_ek_is_idempotent() {
 /// Abandon + re-propose: a ciphertext built against an abandoned keypair is
 /// rejected by `ek_hash`, and the re-proposed exchange (same epoch id, fresh
 /// keypair) completes cleanly.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_stale_ct_for_abandoned_keypair_ignored() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2160,7 +2144,6 @@ fn test_pq_ratchet_stale_ct_for_abandoned_keypair_ignored() {
 /// A malformed EK must be logged-and-dropped without affecting classical
 /// delivery of the message that carried it (fail-open on the PQ bonus layer,
 /// fail-closed stays reserved for the classical layer).
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_malformed_field_does_not_block_classical() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2209,7 +2192,6 @@ fn test_pq_ratchet_noop_on_non_pq_ratchet_suite() {
 
 /// Single-initiator discipline: the responder never starts an exchange no
 /// matter how many turns pass.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_responder_never_initiates() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2227,7 +2209,6 @@ fn test_pq_ratchet_responder_never_initiates() {
 }
 
 /// Cadence: the initiator starts an exchange on exactly the configured turn.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_cadence_fires_after_default_interval() {
     let (mut alice, _bob) = make_pq_session_pair(
@@ -2256,7 +2237,6 @@ fn test_pq_ratchet_cadence_fires_after_default_interval() {
 
 /// Chain retention is bounded: the current epoch and the one before it, and only the current one
 /// sends.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_chain_retention_bounded() {
     let (mut alice, _bob) = make_pq_session_pair(
@@ -2293,7 +2273,6 @@ fn test_pq_ratchet_chain_retention_bounded() {
 /// Serialize a live session through the full production path
 /// (`to_serializable` → `to_cfe_v1` → CFE envelope encode → decode →
 /// `from_cfe_v1` → `from_serializable`) and hand back the restored session.
-#[cfg(feature = "post-quantum")]
 fn cfe_round_trip(
     session: &DoubleRatchetSession<ClassicSuiteProvider>,
 ) -> DoubleRatchetSession<ClassicSuiteProvider> {
@@ -2312,7 +2291,6 @@ fn cfe_round_trip(
 /// holds a pending epoch-2 keypair, responder holds the provisional epoch-2
 /// secret + ciphertext, not yet promoted), restored through the full CFE
 /// path, and the conversation + exchange + cadence all continue seamlessly.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2388,7 +2366,6 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
 /// A suite-3 blob without the `pqr` field (written by the pre-persistence
 /// build) restores degraded-but-alive: classical DR state intact, PQ state
 /// empty. Peer messages tagged > 0 then fail loudly at decrypt.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_blob_without_pqr_restores_degraded() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2414,7 +2391,6 @@ fn test_pq_ratchet_blob_without_pqr_restores_degraded() {
 
 /// Old decoders (struct without the `pqr` field) must still parse new blobs:
 /// rmp_serde named-map encoding ignores unknown keys.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_new_blob_readable_by_old_decoder() {
     use serde::Deserialize;
@@ -2458,7 +2434,6 @@ fn test_pq_ratchet_new_blob_readable_by_old_decoder() {
 
 /// Structurally corrupted PQ state is dropped on restore (degrade-not-fail):
 /// the session survives, the PQ state is reset.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
     use serde_bytes::ByteBuf;
@@ -2495,7 +2470,6 @@ fn test_pq_ratchet_corrupted_state_dropped_on_restore() {
 
 /// The legacy JSON import path (`import_session` fallback) round-trips the PQ
 /// state too — `SerializableSession` carries it in both encodings.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_state_survives_json_round_trip() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2524,7 +2498,6 @@ fn test_pq_ratchet_state_survives_json_round_trip() {
 ///
 /// Mutation: stop advancing the receive chain in `pq_receive_key` (return a key without
 /// stepping) — the key is still derivable and this reddens.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr2_a_read_message_key_is_gone_from_both_sides() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2564,7 +2537,6 @@ fn test_pqr2_a_read_message_key_is_gone_from_both_sides() {
 
 /// Out of order inside an epoch: later keys first, the passed-over keys kept as skipped ones and
 /// spent when their messages arrive.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr2_messages_of_one_epoch_read_in_any_order() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2599,7 +2571,6 @@ fn test_pqr2_messages_of_one_epoch_read_in_any_order() {
 
 /// The index is authenticated: a message moved to another index fails, and the failed attempt
 /// consumes nothing — the original still decrypts.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr2_a_tampered_key_index_is_rejected_and_rolled_back() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2638,7 +2609,6 @@ fn test_pqr2_a_tampered_key_index_is_rejected_and_rolled_back() {
 /// Known answers for the three derivations, so another implementation can be checked against
 /// this one byte for byte (to be published with the conformance vectors). Changing any label,
 /// order or length changes them — and the wire with them.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr2_derivations_known_answers() {
     let chains = Dr::pq_epoch_chains(&[0x42; 32], 1, true).unwrap();
@@ -2670,7 +2640,6 @@ fn test_pqr2_derivations_known_answers() {
 /// chain key, the keys at index 0 and 1, and the message key mixed from index 0. All HKDF-SHA256
 /// (RFC 5869, empty salt except the mix); recomputed with a separate RFC 5869 implementation
 /// (Python `hmac`) when pinned, 2026-09-30.
-#[cfg(feature = "post-quantum")]
 const KNOWN_ANSWERS: [&str; 5] = [
     "1580b9a74a9abc6d8cefbaf561c65c64adc8b33849656f1b0051db2d9af8842f",
     "30730bf58df681adddf740b817d1c5ff17b8517b05e383fbe1dea05ead8ae57b",
@@ -2682,7 +2651,6 @@ const KNOWN_ANSWERS: [&str; 5] = [
 /// A stored suite-3 session does not come back: restore refuses the suite, and the caller holds
 /// no session, so the next send opens a suite-4 one. Reading it as suite 4 would key every message
 /// from chains it does not have.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr2_a_stored_suite_3_session_is_refused() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2705,7 +2673,6 @@ fn test_pqr2_a_stored_suite_3_session_is_refused() {
 /// carries a proposal anyway.
 ///
 /// Mutation: drop the age check from `maybe_start_pq_exchange_by_age` — this reddens.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr1_a_one_way_conversation_rekeys_once_the_epoch_is_old() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2743,7 +2710,6 @@ fn test_pqr1_a_one_way_conversation_rekeys_once_the_epoch_is_old() {
 
 /// Only the exchange initiator proposes, however old the epoch: two proposers would race for
 /// the same epoch id.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr1_the_responder_does_not_propose() {
     let (_alice, mut bob) = make_pq_session_pair(
@@ -2768,7 +2734,6 @@ fn test_pqr1_the_responder_does_not_propose() {
 /// Mutation: `pq_epoch_is_old` always false — this reddens. (Dropping only the call in
 /// `maybe_start_pq_exchange_by_age` does not: receipts also turn the DH ratchet, and the
 /// turn-counted path checks the same age.)
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr1_a_responder_only_conversation_rekeys_through_the_initiators_receipts() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2799,7 +2764,6 @@ fn test_pqr1_a_responder_only_conversation_rekeys_through_the_initiators_receipt
 }
 
 /// The epoch's start survives a restore, so a restart neither resets the clock nor fires early.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pqr1_the_epoch_age_survives_restore() {
     let (mut alice, mut bob) = make_pq_session_pair(
@@ -2823,7 +2787,6 @@ fn test_pqr1_the_epoch_age_survives_restore() {
 /// Mutation: drop any one of the four `extend_from_slice` groups under `version >= 4` in
 /// `associated_data` — the matching case below opens the tampered message.
 #[test]
-#[cfg(feature = "post-quantum")]
 fn ad_v4_binds_previous_chain_length_suite_pq_field_and_identity_proof() {
     let (mut alice, mut bob) = make_pq_session_pair("alice", "bob");
     // Alice has read v4 from Bob (as far as her state says), so she seals v4.

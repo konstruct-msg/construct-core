@@ -41,7 +41,6 @@ pub struct MLKEMEncapsulation {
 /// Generate an ML-KEM-768 keypair.
 ///
 /// Returns `(public_key, secret_key)` as raw bytes.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
     use getrandom_pq::SysRng;
     use getrandom_pq::rand_core::UnwrapErr;
@@ -61,16 +60,10 @@ pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
     })
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_keygen() -> Result<MLKEMKeyPair, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
 /// Encapsulate to a recipient's ML-KEM-768 public key.
 ///
 /// Returns `(ciphertext, shared_secret)`. The ciphertext is sent to the recipient;
 /// the shared secret is mixed into the session root key.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
     use ml_kem::{Encapsulate, EncapsulationKey, MlKem768};
     if pk_bytes.len() != MLKEM768_PK_SIZE {
@@ -95,15 +88,9 @@ pub fn mlkem768_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Strin
     })
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_encapsulate(_pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
 /// Decapsulate from a received ML-KEM-768 ciphertext using our secret key.
 ///
 /// Returns the shared secret, which must match the sender's shared secret.
-#[cfg(feature = "post-quantum")]
 #[allow(deprecated)] // ExpandedKeyEncoding: key format uses expanded bytes for backward compat
 pub fn mlkem768_decapsulate(
     sk_bytes: &[u8],
@@ -135,14 +122,6 @@ pub fn mlkem768_decapsulate(
     Ok(crate::crypto::SecretBytes::from_slice(&ss))
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem768_decapsulate(
-    _sk_bytes: &[u8],
-    _ct_bytes: &[u8],
-) -> Result<crate::crypto::SecretBytes, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
 // ── ML-KEM-1024: Kyber prekeys (PQXDH v2) ──────────────────────────────────────
 
 /// ML-KEM-1024 public (encapsulation) key size in bytes (NIST FIPS 203)
@@ -153,7 +132,6 @@ pub const MLKEM1024_CT_SIZE: usize = 1568;
 pub const MLKEM_SEED_SIZE: usize = 64;
 
 /// Generate a fresh ML-KEM-1024 key; returns `(seed, public_key)`.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem1024_generate() -> Result<(crate::crypto::SecretBytes, Vec<u8>), String> {
     use getrandom_pq::SysRng;
     use getrandom_pq::rand_core::UnwrapErr;
@@ -167,12 +145,6 @@ pub fn mlkem1024_generate() -> Result<(crate::crypto::SecretBytes, Vec<u8>), Str
     Ok((crate::crypto::SecretBytes::from_slice(&seed), public))
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem1024_generate() -> Result<(crate::crypto::SecretBytes, Vec<u8>), String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
-#[cfg(feature = "post-quantum")]
 fn mlkem1024_key_from_seed(
     seed: &[u8],
 ) -> Result<ml_kem::DecapsulationKey<ml_kem::MlKem1024>, String> {
@@ -191,7 +163,6 @@ fn mlkem1024_key_from_seed(
 }
 
 /// The ML-KEM-1024 public key a seed expands to.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem1024_public_from_seed(seed: &[u8]) -> Result<Vec<u8>, String> {
     use ml_kem::KeyExport;
     Ok(mlkem1024_key_from_seed(seed)?
@@ -200,13 +171,7 @@ pub fn mlkem1024_public_from_seed(seed: &[u8]) -> Result<Vec<u8>, String> {
         .to_vec())
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem1024_public_from_seed(_seed: &[u8]) -> Result<Vec<u8>, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
 /// Encapsulate to an ML-KEM-1024 public key.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem1024_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
     use getrandom_pq::SysRng;
     use getrandom_pq::rand_core::UnwrapErr;
@@ -230,16 +195,10 @@ pub fn mlkem1024_encapsulate(pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, Stri
     })
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem1024_encapsulate(_pk_bytes: &[u8]) -> Result<MLKEMEncapsulation, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
 /// Decapsulate an ML-KEM-1024 ciphertext with the key a seed expands to.
 ///
 /// A ciphertext for another key does **not** fail: ML-KEM's implicit rejection returns a
 /// pseudorandom secret, so a wrong key surfaces later, as an AEAD failure, never here.
-#[cfg(feature = "post-quantum")]
 pub fn mlkem1024_decapsulate(
     seed: &[u8],
     ct_bytes: &[u8],
@@ -257,15 +216,7 @@ pub fn mlkem1024_decapsulate(
     Ok(crate::crypto::SecretBytes::from_slice(&ss))
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mlkem1024_decapsulate(
-    _seed: &[u8],
-    _ct_bytes: &[u8],
-) -> Result<crate::crypto::SecretBytes, String> {
-    Err("post-quantum feature not enabled".to_string())
-}
-
-#[cfg(all(test, feature = "post-quantum"))]
+#[cfg(test)]
 mod mlkem1024_tests {
     use super::*;
 

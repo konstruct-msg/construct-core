@@ -191,11 +191,8 @@ pub enum PeekVerdict {
 #[derive(Clone, Copy)]
 struct ResponderKem<'a> {
     pqxdh_v2: bool,
-    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
     kyber_prekey_id: u32,
-    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
     kem_ciphertext: &'a [u8],
-    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
     kem_identity: Option<&'a [u8]>,
 }
 
@@ -721,11 +718,10 @@ impl Orchestrator {
 
     /// Open a session to `contact_id` from its fetched bundle — PQXDH v2.
     ///
-    /// With `post-quantum` (every platform build) PQ is mandatory: the Kyber prekey is chosen and
-    /// checked by `plan_pqxdh`, and a bundle that does not yield one is refused **before anything
-    /// is created** (`PQ_REQUIRED: <reason>`). The ML-KEM-1024 secret goes into the session's
-    /// initial key; the ciphertext and the prekey ids ride on every message of the first flight
-    /// (`PrekeyHeader`) until the peer answers. Without `post-quantum` the session is classical.
+    /// PQ is mandatory: the Kyber prekey is chosen and checked by `plan_pqxdh`, and a bundle that
+    /// does not yield one is refused **before anything is created** (`PQ_REQUIRED: <reason>`).
+    /// The ML-KEM-1024 secret goes into the session's initial key; the ciphertext and the prekey
+    /// ids ride on every message of the first flight (`PrekeyHeader`) until the peer answers.
     pub fn init_session_with_bundle(
         &mut self,
         contact_id: &str,
@@ -746,7 +742,6 @@ impl Orchestrator {
             ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
         let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
 
-        #[cfg(feature = "post-quantum")]
         let (header, hybrid_pin, first_flight) = {
             use crate::crypto::handshake::PqxdhInput;
             use crate::orchestration::pq_prekey_plan::{
@@ -864,33 +859,6 @@ impl Orchestrator {
                 Some(choice.hybrid_identity_fingerprint),
                 Some(first_flight),
             )
-        };
-
-        #[cfg(not(feature = "post-quantum"))]
-        let (header, hybrid_pin, first_flight): (
-            PrekeyHeader,
-            Option<[u8; 32]>,
-            Option<crate::crypto::sealed_sender::first_flight::FiledFirstFlightKey>,
-        ) = {
-            let _ = &kyber;
-            self.lifecycle
-                .client
-                .init_session_with_pq(
-                    contact_id,
-                    &public_bundle,
-                    &remote_identity,
-                    one_time_prekey_id,
-                    allow_stale,
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-            let header = PrekeyHeader {
-                one_time_prekey_id,
-                kyber_prekey_id: 0,
-                kem_ciphertext: Vec::new(),
-                kem_identity: Vec::new(),
-            };
-            (header, None, None)
         };
 
         // The header carries the OTPK id now; the client's own copy would only go stale.
@@ -1011,7 +979,6 @@ impl Orchestrator {
     /// platform cached them. Each is kept only if a root this build pins signed it; the rest are
     /// ignored, so a server cannot add a key by serving one. Returns how many were admitted.
     /// In memory, like the Ed25519 keys: the platform hands them over at every launch.
-    #[cfg(feature = "post-quantum")]
     pub fn admit_server_delegations(&mut self, delegations: Vec<Vec<u8>>) -> u32 {
         let mut admitted = 0;
         for d in delegations {
@@ -1268,7 +1235,6 @@ impl Orchestrator {
     /// from a build this one does not talk to (`PQXDH_REQUIRED`). A prekey this device no longer
     /// holds — a one-time key already burned, a signed prekey past its 14 days — means the
     /// session cannot be derived at all (`PQXDH_KEY_UNAVAILABLE`).
-    #[cfg(feature = "post-quantum")]
     fn responder_kem(
         &self,
         ratchet_suite_id: u16,
@@ -1303,7 +1269,6 @@ impl Orchestrator {
     /// After a responder init built on Kyber prekey `kyber_prekey_id`: label the session, and burn
     /// the key if it was one-time. The burn marks the prekeys dirty
     /// (`take_kyber_prekeys_to_persist`).
-    #[cfg(feature = "post-quantum")]
     fn after_responder_init(&mut self, contact_id: &str, kyber_prekey_id: u32) {
         if kyber_prekey_id >= crate::crypto::kyber_prekeys::KYBER_OTPK_ID_START
             && self
@@ -1430,30 +1395,19 @@ impl Orchestrator {
         one_time_prekey_id: u32,
         kem: ResponderKem<'_>,
     ) -> Result<Vec<u8>, String> {
-        #[cfg(feature = "post-quantum")]
         let (kyber_public, shared) = self.responder_kem(
             message.suite_id,
             kem.pqxdh_v2,
             kem.kyber_prekey_id,
             kem.kem_ciphertext,
         )?;
-        #[cfg(feature = "post-quantum")]
         let (kem_identity, answer) = self.admit_kem_identity(contact_id, kem.kem_identity)?;
-        #[cfg(feature = "post-quantum")]
         let pq = Some(crate::crypto::handshake::PqxdhInput {
             shared_secret: shared.expose(),
             kyber_public: &kyber_public,
             kem_ciphertext: kem.kem_ciphertext,
             initiator_kem_identity: kem_identity,
         });
-        #[cfg(not(feature = "post-quantum"))]
-        let pq: Option<crate::crypto::handshake::PqxdhInput<'_>> = if kem.pqxdh_v2 {
-            return Err(
-                "PQXDH_REQUIRED: a PQXDH v2 first message needs a post-quantum build".into(),
-            );
-        } else {
-            None
-        };
 
         let (_session_id, plaintext) = self
             .lifecycle
@@ -1467,7 +1421,6 @@ impl Orchestrator {
                 pq.as_ref(),
             )
             .map_err(|e| e.to_string())?;
-        #[cfg(feature = "post-quantum")]
         {
             let answered = self
                 .lifecycle
@@ -1515,7 +1468,6 @@ impl Orchestrator {
     /// RESPONDER: the initiator's KEM identity key, checked against the one pinned for its device,
     /// and the answer to it (`IdentityProof`). Mandatory — a first flight that names no key is
     /// refused, as one without an ML-KEM ciphertext is (decisions/responder-authenticates-initiator-by-kem.md).
-    #[cfg(feature = "post-quantum")]
     fn admit_kem_identity<'a>(
         &self,
         contact_id: &str,
@@ -2714,14 +2666,10 @@ impl Orchestrator {
             timer_id: "gc_sweep".to_string(),
             delay_ms: 5_000,
         }];
-        // Only a build that opens v2 sessions can upgrade anything: without `post-quantum` the
-        // reopened session would be classical again, and the sweep would reopen it every launch.
-        if cfg!(feature = "post-quantum") {
-            actions.push(Action::ScheduleTimer {
-                timer_id: "pq_upgrade_sweep".to_string(),
-                delay_ms: PQ_UPGRADE_SWEEP_DELAY_MS,
-            });
-        }
+        actions.push(Action::ScheduleTimer {
+            timer_id: "pq_upgrade_sweep".to_string(),
+            delay_ms: PQ_UPGRADE_SWEEP_DELAY_MS,
+        });
         actions
     }
 
@@ -2804,7 +2752,7 @@ impl Orchestrator {
                 });
                 actions
             }
-            "pq_upgrade_sweep" if cfg!(feature = "post-quantum") => self.pq_upgrade_sweep(),
+            "pq_upgrade_sweep" => self.pq_upgrade_sweep(),
             _ => vec![],
         }
     }
@@ -3521,9 +3469,8 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Action::ScheduleTimer { .. }))
             .collect();
-        // GC; plus the PQXDH v2 upgrade sweep where this build opens v2 sessions.
-        let expected = if cfg!(feature = "post-quantum") { 2 } else { 1 };
-        assert_eq!(timers.len(), expected);
+        // GC, plus the PQXDH v2 upgrade sweep.
+        assert_eq!(timers.len(), 2);
     }
 
     #[test]
@@ -3701,7 +3648,7 @@ mod tests {
 
 /// PQXDH v2 as the orchestrator carries it out, end to end: two orchestrators, the wire format in
 /// between, the responder's Kyber keys held by its own core.
-#[cfg(all(test, feature = "post-quantum"))]
+#[cfg(test)]
 mod pqxdh_v2_tests {
     use super::*;
     use crate::crypto::keys::KeyManager;

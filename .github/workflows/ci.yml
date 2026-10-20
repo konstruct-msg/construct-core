@@ -62,21 +62,15 @@ jobs:
         working-directory: construct-core
         run: .github/scripts/check-secret-logging.sh
 
+      # Default features are the core every build ships: ML-KEM/ML-DSA are unconditional since
+      # 0.56.0, so there is no classical-only configuration to check separately.
       - name: Clippy (default features)
         working-directory: construct-core
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (post-quantum)
-        working-directory: construct-core
-        run: cargo clippy --all-targets --features post-quantum -- -D warnings
-
       - name: Run tests (default)
         working-directory: construct-core
         run: cargo test
-
-      - name: Run tests (post-quantum)
-        working-directory: construct-core
-        run: cargo test --features post-quantum
 
       # `uniffi_bindings` is gated on ios/mac/android, so neither step above compiles it — and
       # its `mod tests` went with it. 16 tests covering the surface all three platforms call
@@ -84,7 +78,7 @@ jobs:
       # the function was absent from the UDL and unreachable from every client. `cargo check
       # --features mac` further down catches compile errors only, which is exactly why the gap
       # was invisible: the module built, so nothing looked missing.
-      # `mac` implies `post-quantum`, so this is also the feature set every platform ships.
+      # `mac` is the feature set every platform ships.
       - name: Run tests (exported UniFFI surface)
         working-directory: construct-core
         run: cargo test --features mac
@@ -323,7 +317,7 @@ jobs:
 
           ## Features compiled in
           - `android` (UniFFI Kotlin bindings, construct-veil transport)
-          - `post-quantum` (Kyber-768 OTPK, ML-DSA signing)
+          - ML-KEM-1024 / ML-KEM-768 / ML-DSA-65, unconditional
 
           ## Which build is this
           The rolling `latest` release republishes one fixed filename on every

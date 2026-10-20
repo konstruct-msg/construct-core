@@ -27,7 +27,7 @@ jobs:
 
       - name: Build
         run: >
-          cargo build --release --locked --features post-quantum --bin konstruct-root
+          cargo build --release --locked --bin konstruct-root
           --target x86_64-unknown-linux-musl
 
       - name: Static, runs, hash

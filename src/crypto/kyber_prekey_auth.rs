@@ -80,7 +80,6 @@ pub fn check_kyber_prekey_signature_v2(
 /// What this does **not** establish on its own: that `hybrid_identity_key` is the device's. The
 /// bundle binds it to the device only by an Ed25519 cross-signature (key-service field 21), which
 /// is exactly what such an adversary could forge. The caller pins the hybrid key per device.
-#[cfg(feature = "post-quantum")]
 pub fn check_kyber_prekey_hybrid_signature(
     hybrid_identity_key: &[u8],
     kyber_public: &[u8],
@@ -247,7 +246,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "post-quantum")]
     #[test]
     fn the_hybrid_signature_verifies_over_the_same_v2_message() {
         use crate::crypto::suites::hybrid::HybridSuiteProvider;
