@@ -24,6 +24,5 @@ pub use padding::{
     DEFAULT_BLOCK_SIZE, PaddingError, pad_message, pad_message_default, unpad_message,
 };
 pub use timing::{
-    TimingConfig, battery_aware_jitter, jittered_interval, random_send_delay,
-    recommended_send_delay,
+    battery_aware_jitter, jittered_interval, random_send_delay, recommended_send_delay,
 };

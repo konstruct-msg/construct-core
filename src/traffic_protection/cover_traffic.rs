@@ -6,7 +6,7 @@
 //!
 //! - Battery-aware: auto-disable when battery < 20%
 //! - Network coalescing: piggyback on real messages
-//! - Adaptive intervals: increase when idle
+//! - Adaptive intervals: increase when idle, with a random gap so the cadence is not a signature
 //! - Minimal wake-ups: use existing network windows
 //!
 //! ## Usage Example
@@ -22,59 +22,29 @@
 //!
 //! // Check if should send dummy
 //! if manager.should_send_dummy() {
-//!     let dummy = generate_dummy_message(255);
-//!     // Send to server
+//!     let dummy = manager.generate_dummy();
+//!     // Send to server as the transport's dummy type
 //! }
 //!
 //! // Record real message sent (for coalescing)
 //! manager.record_real_message_sent();
 //! ```
 
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use rand::{Rng, RngCore};
+use std::time::{Duration, Instant};
 
-/// Marker bytes for dummy messages (server ignores these)
-const DUMMY_MARKER: &[u8] = b"__CONSTRUCT_DUMMY__";
-
-/// Dummy message payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DummyMessage {
-    /// Marker bytes to identify as dummy — stored as raw bytes, never converted to String
-    #[serde(with = "serde_bytes")]
-    marker: Vec<u8>,
-
-    /// Random padding
-    #[serde(with = "serde_bytes")]
-    padding: Vec<u8>,
-}
-
-/// Generate a dummy message that looks like real traffic
+/// Generate a dummy message body of exactly `size` random bytes.
 ///
-/// # Arguments
-/// * `size` - Target size in bytes (will pad to this size)
-///
-/// # Returns
-/// Serialized dummy message bytes
-///
-/// # Energy Efficiency
-/// - Pre-allocated buffer
-/// - Single RNG call
+/// A dummy is told apart from a real message by the envelope the transport puts around it
+/// (the server drops the dummy type), never by its content, so the body carries no marker:
+/// a marker would be the one thing an observer could look for. The body is exactly `size`
+/// bytes so that a dummy and a real message of the configured size are the same length on
+/// the wire — until 0.54.1 the body was built as a serialised struct and came out ~27 bytes
+/// short of `size`, which made every dummy recognisable by length alone.
 pub fn generate_dummy_message(size: usize) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-
-    let overhead = DUMMY_MARKER.len() + 32; // Approximate serialization overhead
-    let padding_size = size.saturating_sub(overhead);
-
-    let mut padding = vec![0u8; padding_size];
-    rng.fill_bytes(&mut padding);
-
-    let dummy = DummyMessage {
-        marker: DUMMY_MARKER.to_vec(),
-        padding,
-    };
-
-    rmp_serde::to_vec(&dummy).unwrap_or_else(|_| vec![0u8; size])
+    let mut body = vec![0u8; size];
+    rand::thread_rng().fill_bytes(&mut body);
+    body
 }
 
 /// Configuration for cover traffic generation
@@ -136,10 +106,11 @@ pub struct CoverTrafficManager {
     /// Last time a real message was sent
     last_real_message: Option<Instant>,
 
-    /// Last time a dummy message was sent
-    last_dummy_message: Option<Instant>,
+    /// The next dummy is not due before this instant (set when a dummy goes out).
+    next_dummy_not_before: Option<Instant>,
 
-    /// Current adaptive interval (adjusts based on activity)
+    /// Current adaptive base interval (adjusts based on activity). The actual gap between two
+    /// dummies is drawn uniformly from `[base, base * 3 / 2]` — see `generate_dummy_at`.
     current_interval_ms: u64,
 
     /// Number of consecutive dummy messages sent
@@ -151,12 +122,15 @@ pub struct CoverTrafficManager {
 
 impl CoverTrafficManager {
     /// Create a new manager with the given configuration
-    pub fn new(config: CoverTrafficConfig) -> Self {
+    pub fn new(mut config: CoverTrafficConfig) -> Self {
+        // A ceiling below the floor would make adaptation *shorten* the interval below the
+        // configured minimum; the floor wins.
+        config.max_interval_ms = config.max_interval_ms.max(config.min_interval_ms);
         Self {
             current_interval_ms: config.min_interval_ms,
             battery_level: 1.0, // Assume full battery initially
             last_real_message: None,
-            last_dummy_message: None,
+            next_dummy_not_before: None,
             consecutive_dummies: 0,
             config,
             metrics: EnergyMetrics::default(),
@@ -177,7 +151,11 @@ impl CoverTrafficManager {
 
     /// Record that a real message was sent (for coalescing)
     pub fn record_real_message_sent(&mut self) {
-        self.last_real_message = Some(Instant::now());
+        self.record_real_message_sent_at(Instant::now());
+    }
+
+    fn record_real_message_sent_at(&mut self, now: Instant) {
+        self.last_real_message = Some(now);
 
         // Reset adaptive interval when user is active
         self.current_interval_ms = self.config.min_interval_ms;
@@ -192,6 +170,10 @@ impl CoverTrafficManager {
     /// - Enough time has passed since last dummy
     /// - No real message was sent recently (coalescing)
     pub fn should_send_dummy(&mut self) -> bool {
+        self.should_send_dummy_at(Instant::now())
+    }
+
+    fn should_send_dummy_at(&mut self, now: Instant) -> bool {
         // Check if active
         if !self.is_active() {
             // Enabled but under the battery threshold: that is the skip this counter names.
@@ -201,8 +183,6 @@ impl CoverTrafficManager {
             }
             return false;
         }
-
-        let now = Instant::now();
 
         // Check coalescing: skip if real message sent recently
         if self.config.coalesce_with_real_messages
@@ -215,12 +195,11 @@ impl CoverTrafficManager {
             }
         }
 
-        // Check interval: has enough time passed since last dummy?
-        if let Some(last_dummy) = self.last_dummy_message {
-            let elapsed = now.duration_since(last_dummy).as_millis() as u64;
-            if elapsed < self.current_interval_ms {
-                return false;
-            }
+        // Check interval: is the next dummy due yet?
+        if let Some(not_before) = self.next_dummy_not_before
+            && now < not_before
+        {
+            return false;
         }
 
         // All checks passed
@@ -234,12 +213,22 @@ impl CoverTrafficManager {
     /// # Returns
     /// Serialized dummy message ready to send
     pub fn generate_dummy(&mut self) -> Vec<u8> {
-        self.last_dummy_message = Some(Instant::now());
+        self.generate_dummy_at(Instant::now())
+    }
+
+    fn generate_dummy_at(&mut self, now: Instant) -> Vec<u8> {
         self.consecutive_dummies += 1;
         self.metrics.dummies_sent += 1;
 
         // Adaptive interval: increase if sending many dummies in a row
         self.adapt_interval();
+
+        // The gap to the next dummy is drawn at random from [base, base * 3 / 2]. A fixed
+        // gap is a signature: an observer who sees one message every 30.000 s knows which
+        // ones are the dummies, and the real messages are the rest.
+        let base = self.current_interval_ms;
+        let gap = rand::thread_rng().gen_range(base..=base.saturating_add(base / 2));
+        self.next_dummy_not_before = Some(now + Duration::from_millis(gap));
 
         generate_dummy_message(self.config.message_size)
     }
@@ -250,8 +239,11 @@ impl CoverTrafficManager {
     fn adapt_interval(&mut self) {
         // Increase interval every 5 consecutive dummies
         if self.consecutive_dummies.is_multiple_of(5) && self.consecutive_dummies > 0 {
-            self.current_interval_ms =
-                (self.current_interval_ms * 3 / 2).min(self.config.max_interval_ms);
+            // `+ 1` so that a 1 ms floor still grows (1 * 3 / 2 == 1 in integers).
+            let grown = (self.current_interval_ms.saturating_mul(3) / 2).saturating_add(1);
+            self.current_interval_ms = grown
+                .min(self.config.max_interval_ms)
+                .max(self.config.min_interval_ms);
         }
     }
 
@@ -265,7 +257,8 @@ impl CoverTrafficManager {
         self.metrics = EnergyMetrics::default();
     }
 
-    /// Get current adaptive interval (for debugging/monitoring)
+    /// Get current adaptive base interval (for debugging/monitoring). The next dummy is due
+    /// somewhere in `[base, base * 3 / 2]` after the previous one.
     pub fn current_interval_ms(&self) -> u64 {
         self.current_interval_ms
     }
@@ -292,15 +285,33 @@ pub struct EnergyMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::time::Duration;
+
+    fn active(config: CoverTrafficConfig) -> CoverTrafficManager {
+        let mut manager = CoverTrafficManager::new(CoverTrafficConfig {
+            enabled: true,
+            ..config
+        });
+        manager.update_battery_level(1.0);
+        manager
+    }
+
     #[test]
-    fn test_dummy_message_size() {
-        for size in [128, 255, 512, 1024] {
-            let dummy = generate_dummy_message(size);
-            // Allow some variance due to serialization
-            assert!(dummy.len() >= size / 2 && dummy.len() <= size * 2);
+    fn a_dummy_is_exactly_the_configured_size() {
+        for size in [0, 1, 128, 255, 256, 512, 1024] {
+            assert_eq!(generate_dummy_message(size).len(), size, "size {size}");
         }
+    }
+
+    #[test]
+    fn a_dummy_carries_no_marker_and_is_not_a_constant() {
+        let a = generate_dummy_message(255);
+        let b = generate_dummy_message(255);
+        assert_ne!(a, b, "two dummies must not be identical");
+        assert!(
+            !a.windows(11).any(|w| w == b"__CONSTRUCT"),
+            "a dummy must not carry a recognisable marker"
+        );
     }
 
     #[test]
@@ -334,83 +345,138 @@ mod tests {
     }
 
     #[test]
-    fn test_coalescing_behavior() {
-        let config = CoverTrafficConfig {
-            enabled: true,
+    fn a_real_message_inside_the_coalesce_window_suppresses_the_dummy() {
+        let mut manager = active(CoverTrafficConfig {
             coalesce_with_real_messages: true,
-            coalesce_window_ms: 100, // 100ms for faster testing
+            coalesce_window_ms: 100,
             ..Default::default()
-        };
+        });
+        let t0 = Instant::now();
 
-        let mut manager = CoverTrafficManager::new(config);
-        manager.update_battery_level(1.0);
-
-        // Record real message
-        manager.record_real_message_sent();
-
-        // Should not send dummy within coalesce window
-        assert!(!manager.should_send_dummy());
+        manager.record_real_message_sent_at(t0);
+        assert!(!manager.should_send_dummy_at(t0 + Duration::from_millis(50)));
         assert_eq!(manager.metrics().coalesced_count, 1);
 
-        // Wait for coalesce window to pass
-        thread::sleep(Duration::from_millis(150));
-
-        // Now should be able to send
-        assert!(manager.should_send_dummy());
+        assert!(manager.should_send_dummy_at(t0 + Duration::from_millis(150)));
     }
 
     #[test]
-    fn test_adaptive_interval() {
-        let config = CoverTrafficConfig {
-            enabled: true,
-            min_interval_ms: 10, // Very short for testing
-            max_interval_ms: 1000,
+    fn the_gap_between_dummies_is_not_fixed() {
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 30_000,
+            max_interval_ms: 30_000,
             ..Default::default()
-        };
-
-        let mut manager = CoverTrafficManager::new(config);
-        manager.update_battery_level(1.0);
-
-        let initial_interval = manager.current_interval_ms();
-
-        // Send multiple dummies to trigger adaptive interval
-        for _ in 0..10 {
-            if manager.should_send_dummy() {
-                manager.generate_dummy();
-                thread::sleep(Duration::from_millis(20)); // Wait for interval
-            }
+        });
+        let t0 = Instant::now();
+        let mut gaps = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            manager.generate_dummy_at(t0);
+            let due = manager.next_dummy_not_before.unwrap();
+            let gap = due.duration_since(t0).as_millis() as u64;
+            assert!(
+                (30_000..=45_000).contains(&gap),
+                "gap {gap} outside [base, 1.5 base]"
+            );
+            gaps.insert(gap);
         }
+        assert!(
+            gaps.len() > 1,
+            "64 draws gave one gap: the cadence is deterministic"
+        );
+    }
 
-        // Interval should have increased
-        assert!(manager.current_interval_ms() > initial_interval);
-        assert!(manager.current_interval_ms() <= config.max_interval_ms);
+    #[test]
+    fn a_dummy_is_not_due_before_its_gap_and_is_due_after() {
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 1_000,
+            max_interval_ms: 1_000,
+            coalesce_with_real_messages: false,
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        assert!(
+            manager.should_send_dummy_at(t0),
+            "nothing sent yet: due now"
+        );
+        manager.generate_dummy_at(t0);
+        assert!(!manager.should_send_dummy_at(t0 + Duration::from_millis(999)));
+        assert!(manager.should_send_dummy_at(t0 + Duration::from_millis(1_500)));
+    }
+
+    #[test]
+    fn the_base_interval_grows_every_five_dummies_up_to_the_ceiling() {
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 10,
+            max_interval_ms: 1_000,
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        let initial = manager.current_interval_ms();
+        for _ in 0..4 {
+            manager.generate_dummy_at(t0);
+        }
+        assert_eq!(
+            manager.current_interval_ms(),
+            initial,
+            "no growth before the fifth"
+        );
+        manager.generate_dummy_at(t0);
+        assert!(manager.current_interval_ms() > initial);
+        for _ in 0..200 {
+            manager.generate_dummy_at(t0);
+        }
+        assert_eq!(
+            manager.current_interval_ms(),
+            1_000,
+            "capped at the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_one_millisecond_floor_still_grows() {
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 1,
+            max_interval_ms: 1_000,
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            manager.generate_dummy_at(t0);
+        }
+        assert!(manager.current_interval_ms() > 1);
+    }
+
+    #[test]
+    fn a_ceiling_below_the_floor_never_shortens_the_interval_below_the_floor() {
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 100,
+            max_interval_ms: 50,
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            manager.generate_dummy_at(t0);
+        }
+        assert!(manager.current_interval_ms() >= 100);
     }
 
     #[test]
     fn test_metrics_tracking() {
-        let config = CoverTrafficConfig {
-            enabled: true,
-            min_interval_ms: 10, // Very short for testing
+        let mut manager = active(CoverTrafficConfig {
+            min_interval_ms: 10,
             ..Default::default()
-        };
-
-        let mut manager = CoverTrafficManager::new(config);
-        manager.update_battery_level(1.0);
-
-        // Send some dummies
+        });
+        let mut t = Instant::now();
         for _ in 0..3 {
-            if manager.should_send_dummy() {
-                manager.generate_dummy();
-                thread::sleep(Duration::from_millis(20)); // Wait for interval
-            }
+            assert!(manager.should_send_dummy_at(t));
+            manager.generate_dummy_at(t);
+            t += Duration::from_millis(20);
         }
-
-        let metrics = manager.metrics();
-        assert_eq!(metrics.dummies_sent, 3);
+        assert_eq!(manager.metrics().dummies_sent, 3);
 
         // A real message just went out: the next dummy is coalesced
-        manager.record_real_message_sent();
-        assert!(!manager.should_send_dummy());
+        manager.record_real_message_sent_at(t);
+        assert!(!manager.should_send_dummy_at(t));
         assert_eq!(manager.metrics().coalesced_count, 1);
     }
 
