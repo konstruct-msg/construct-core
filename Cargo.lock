@@ -537,9 +537,7 @@ version = "0.56.0"
 dependencies = [
  "aes-gcm",
  "argon2",
- "base64",
  "bip39",
- "bytes",
  "chacha20poly1305",
  "construct-server-trust",
  "construct-store",
