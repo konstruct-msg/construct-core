@@ -4,7 +4,8 @@
 //!
 //! The Tauri desktops and the TUI use `construct_store` directly and never see this file.
 
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use construct_store as store;
 
@@ -201,9 +202,14 @@ mirror!(LocalSearchHit <=> store::SearchHit {
     message_id: String, chat_id: String, timestamp: i64,
 });
 
-/// The store, closable: `wipe` takes it out, and every call after is `Closed`.
+/// The store, closable: `wipe` takes it out, and every call after is `Closed` — except another
+/// `wipe` while files of the first one are still on disk, which removes them.
 pub struct LocalStore {
     inner: RwLock<Option<store::Store>>,
+    /// The path of a wiped store whose files could not all be removed. Until 2026-10-20 a failed
+    /// wipe had already dropped the handle, so the retry answered `Closed` and the files stayed
+    /// (TODO 196).
+    wipe_retry: Mutex<Option<PathBuf>>,
 }
 
 fn all<T, U: From<T>>(rows: Vec<T>) -> Vec<U> {
@@ -214,12 +220,14 @@ impl LocalStore {
     pub fn new(path: String, key: Vec<u8>) -> Result<Self> {
         Ok(Self {
             inner: RwLock::new(Some(store::Store::open(path, &key)?)),
+            wipe_retry: Mutex::new(None),
         })
     }
 
     pub fn in_memory(key: Vec<u8>) -> Result<Self> {
         Ok(Self {
             inner: RwLock::new(Some(store::Store::open_in_memory(&key)?)),
+            wipe_retry: Mutex::new(None),
         })
     }
 
@@ -243,9 +251,26 @@ impl LocalStore {
 
     pub fn wipe(&self) -> Result<()> {
         let taken = self.inner.write().unwrap_or_else(|e| e.into_inner()).take();
+        let mut retry = self.wipe_retry.lock().unwrap_or_else(|e| e.into_inner());
         match taken {
-            Some(store) => Ok(store.wipe()?),
-            None => Err(LocalStoreError::Closed),
+            Some(store) => {
+                let path = store.path().map(Path::to_path_buf);
+                match store.wipe() {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        *retry = path;
+                        Err(e.into())
+                    }
+                }
+            }
+            None => match retry.clone() {
+                Some(path) => {
+                    store::Store::remove_files(&path)?;
+                    *retry = None;
+                    Ok(())
+                }
+                None => Err(LocalStoreError::Closed),
+            },
         }
     }
 

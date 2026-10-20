@@ -263,14 +263,24 @@ pub(crate) const STEPS: &[&str] = &[
         DELETE FROM message_search WHERE rowid = old.rowid;
     END;
     "#,
+    // 6 — the store's own bookkeeping, apart from `kv`, which is the client's (TODO 196).
+    r#"
+    CREATE TABLE store_meta (
+        key   TEXT PRIMARY KEY NOT NULL,
+        value BLOB NOT NULL
+    );
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;
 
-/// The step after which a store has been rewritten once without the free pages it carried.
-/// `secure_delete` zeroes what is freed from now on; what was freed before it is still in the
-/// file, and only a rewrite takes it out. Keyed by the schema version, so it runs exactly once.
-const SCRUBBED_AT: i64 = 5;
+/// The `store_meta` key marking that the store has been rewritten once (VACUUM) without the free pages
+/// it carried. `secure_delete` zeroes what is freed from now on; what was freed before it is
+/// still in the file, and only a rewrite takes it out. Its own mark, written after the rewrite:
+/// until 2026-10-20 this was keyed by the schema version, which the step commits *before* the
+/// VACUUM runs, so a crash or a failed VACUUM between the two left the store "at version 5" and
+/// never scrubbed (TODO 196). A fresh store has nothing to scrub and is marked at once.
+pub(crate) const SCRUB_MARK_KEY: &str = "store:scrubbed";
 
 pub(crate) fn run(conn: &mut Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -286,11 +296,22 @@ pub(crate) fn run(conn: &mut Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", index as i64 + 1)?;
         tx.commit()?;
     }
-    if found < SCRUBBED_AT {
-        // Outside any transaction: VACUUM refuses one. Its scratch copy is in memory
-        // (`SQLITE_TEMP_STORE=2`), so no temporary file holds the rows meanwhile.
-        conn.execute_batch("VACUUM;")?;
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let scrubbed = conn.query_row(
+        "SELECT count(*) FROM store_meta WHERE key = ?1",
+        [SCRUB_MARK_KEY],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !scrubbed {
+        if found > 0 {
+            // Outside any transaction: VACUUM refuses one. Its scratch copy is in memory
+            // (`SQLITE_TEMP_STORE=2`), so no temporary file holds the rows meanwhile.
+            conn.execute_batch("VACUUM;")?;
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?1, x'01')",
+            [SCRUB_MARK_KEY],
+        )?;
     }
     Ok(())
 }

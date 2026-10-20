@@ -78,7 +78,7 @@ impl Store {
     ///   each commit, and `journal_size_limit = 0` truncating the log at each reset, so nothing
     ///   older than the last commit survives in it;
     /// - the search index: FTS5 marks a deleted row and keeps its terms until a merge; its own
-    ///   `secure-delete` (schema step 3) removes them at once.
+    ///   `secure-delete` (schema step 5) removes them at once.
     fn configure(mut conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -105,23 +105,43 @@ impl Store {
         *self.observer.write().unwrap_or_else(|e| e.into_inner()) = observer;
     }
 
+    /// Where the store's file is; `None` for one in memory.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Close the store and delete its files. The platform deletes the key; without it anything
-    /// this misses is ciphertext nobody can open.
+    /// this misses is ciphertext nobody can open. On an error the connection is closed and the
+    /// files that could be removed are gone; `remove_files` on `path()` tries the rest again.
     pub fn wipe(self) -> Result<()> {
         let Self { conn, path, .. } = self;
         let conn = conn.into_inner().unwrap_or_else(|e| e.into_inner());
         conn.close().map_err(|(_, e)| e)?;
-        if let Some(path) = path {
-            for suffix in ["", "-wal", "-shm", "-journal"] {
-                let file = PathBuf::from(format!("{}{suffix}", path.display()));
-                match std::fs::remove_file(&file) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+        match path {
+            Some(path) => Self::remove_files(&path),
+            None => Ok(()),
+        }
+    }
+
+    /// Delete the files of a store at `path` — the database, its WAL, its shared memory and its
+    /// rollback journal. Every one is tried; the first error is reported after that, so a retry
+    /// has less to do (TODO 196).
+    pub fn remove_files(path: &Path) -> Result<()> {
+        let mut first_error = None;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    first_error.get_or_insert(e);
                 }
             }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -225,12 +245,31 @@ impl Store {
     }
 
     /// Removes the contact with its chats and their messages; `false` when there was no such row.
+    /// The chats and messages the cascade removes are announced like a direct delete, and the
+    /// reactions on those messages go with them (no foreign key holds them). Until 2026-10-20
+    /// only the contact was announced (TODO 196).
     pub fn delete_contact(&self, id: &str) -> Result<bool> {
-        let removed = self
-            .lock()
-            .execute("DELETE FROM contacts WHERE id = ?1", [id])?;
+        let (removed, chats, messages) = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let chats = ids_where(&tx, "SELECT id FROM chats WHERE peer_id = ?1", [id])?;
+            let mut messages = Vec::new();
+            for chat in &chats {
+                messages.extend(ids_where(
+                    &tx,
+                    "SELECT id FROM messages WHERE chat_id = ?1",
+                    [chat.as_str()],
+                )?);
+            }
+            let removed = tx.execute("DELETE FROM contacts WHERE id = ?1", [id])?;
+            delete_reactions_on(&tx, &messages)?;
+            tx.commit()?;
+            (removed, chats, messages)
+        };
         if removed > 0 {
             self.notify(Table::Contacts, vec![id.to_string()]);
+            self.notify(Table::Chats, chats);
+            self.notify(Table::Messages, messages);
         }
         Ok(removed > 0)
     }
@@ -577,11 +616,18 @@ impl Store {
 
     /// Removes the chat and its messages; their search entries go with them (trigger).
     pub fn delete_chat(&self, id: &str) -> Result<()> {
-        let removed = self
-            .lock()
-            .execute("DELETE FROM chats WHERE id = ?1", [id])?;
+        let (removed, messages) = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let messages = ids_where(&tx, "SELECT id FROM messages WHERE chat_id = ?1", [id])?;
+            let removed = tx.execute("DELETE FROM chats WHERE id = ?1", [id])?;
+            delete_reactions_on(&tx, &messages)?;
+            tx.commit()?;
+            (removed, messages)
+        };
         if removed > 0 {
             self.notify(Table::Chats, vec![id.to_string()]);
+            self.notify(Table::Messages, messages);
         }
         Ok(())
     }
@@ -1008,9 +1054,14 @@ impl Store {
     }
 
     pub fn delete_message(&self, id: &str) -> Result<()> {
-        let removed = self
-            .lock()
-            .execute("DELETE FROM messages WHERE id = ?1", [id])?;
+        let removed = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let removed = tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+            delete_reactions_on(&tx, std::slice::from_ref(&id.to_string()))?;
+            tx.commit()?;
+            removed
+        };
         if removed > 0 {
             self.notify(Table::Messages, vec![id.to_string()]);
         }
@@ -1838,6 +1889,27 @@ fn hex(bytes: &[u8]) -> Zeroizing<String> {
 /// What a holder of the key reads in the files after a delete or an edit. The store runs over a
 /// plain file here — `configure` without `PRAGMA key` — so the bytes on disk are the pages as
 /// SQLCipher would decrypt them (TODO 172).
+/// The ids one query selects, in its order.
+fn ids_where<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(params, |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The reactions on `message_ids`, whichever case their target was stored in (`reactions_in_chat`
+/// joins on `lower(m.id)`; the other paths match exactly).
+fn delete_reactions_on(conn: &Connection, message_ids: &[String]) -> Result<()> {
+    for id in message_ids {
+        conn.execute(
+            "DELETE FROM reactions WHERE lower(target_message_id) = lower(?1)",
+            [id],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod residue_tests {
     use super::*;
@@ -2093,5 +2165,68 @@ mod residue_tests {
         store.delete_message("m2").unwrap();
         assert!(found("テキスト").is_empty());
         assert!(!holds(&on_disk(&path), "テキ".as_bytes()));
+    }
+
+    /// The rewrite that takes old free pages out runs until its mark is written, however many
+    /// opens that takes — not once per schema version.
+    ///
+    /// Mutation: key the scrub on `user_version` again — the second open finds the version
+    /// current, skips the VACUUM, and the freelist is still there.
+    #[test]
+    fn the_scrub_runs_until_it_is_marked_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.db");
+        let freelist = |store: &Store| -> i64 {
+            store
+                .lock()
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .unwrap()
+        };
+        let marked = |store: &Store| -> bool {
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM store_meta WHERE key = ?1",
+                    [migrations::SCRUB_MARK_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        };
+
+        let store = open_plain(&path);
+        assert!(marked(&store), "a fresh store is marked");
+        with_message(&store);
+        store
+            .insert_message(
+                &Message {
+                    id: "big".into(),
+                    chat_id: "c1".into(),
+                    order_key: "k2".into(),
+                    body: vec![0x5a; 512 * 1024],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        store.delete_message("big").unwrap();
+        assert!(freelist(&store) > 0, "the deleted body left free pages");
+        // The mark is lost — the crash between the schema step and the VACUUM, in effect.
+        store
+            .lock()
+            .execute(
+                "DELETE FROM store_meta WHERE key = ?1",
+                [migrations::SCRUB_MARK_KEY],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = open_plain(&path);
+        assert_eq!(freelist(&store), 0, "rewritten on open");
+        assert!(marked(&store));
+        drop(store);
+
+        let store = open_plain(&path);
+        assert!(marked(&store), "and stays marked");
     }
 }
