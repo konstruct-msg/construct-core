@@ -381,6 +381,12 @@ impl CryptoProvider for HybridSuiteProvider {
         let ephemeral_pk = KemPublicKeyDalek::from(&ephemeral_secret);
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
 
+        if !shared_secret.was_contributory() {
+            // A low-order peer point makes the shared secret all zero whatever our key is.
+            return Err(CryptoError::InvalidInputError(
+                "X25519 peer key is of low order".to_string(),
+            ));
+        }
         Ok((
             ephemeral_pk.to_bytes().to_vec(),
             shared_secret.to_bytes().to_vec(),
@@ -401,10 +407,14 @@ impl CryptoProvider for HybridSuiteProvider {
         })?;
         let ephemeral_pk = KemPublicKeyDalek::from(*ct_bytes);
 
-        Ok(static_secret
-            .diffie_hellman(&ephemeral_pk)
-            .to_bytes()
-            .to_vec())
+        let shared_secret = static_secret.diffie_hellman(&ephemeral_pk);
+        if !shared_secret.was_contributory() {
+            // A low-order peer point makes the shared secret all zero whatever our key is.
+            return Err(CryptoError::InvalidInputError(
+                "X25519 peer key is of low order".to_string(),
+            ));
+        }
+        Ok(shared_secret.to_bytes().to_vec())
     }
 
     // ── AEAD: ChaCha20-Poly1305 (identical to Classic) ────────────────────────

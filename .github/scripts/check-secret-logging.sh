@@ -28,6 +28,13 @@ if grep -rnE '^\s*[a-z0-9_]*(priv|secret)[a-z0-9_]*\s*=\s*[%?]' src --include='*
     fail=1
 fi
 
+# 3. A session id written whole. It is an AD component and the one secret between a forged first
+#    message and the initiator's empty receiving chain; `id_prefix` is enough to correlate lines.
+if grep -rnE '^\s*session_id\s*=\s*[%?]' src --include='*.rs' | grep -v 'id_prefix(' | grep -v '/tests\.rs:'; then
+    echo "::error::session_id logged whole — use double_ratchet::id_prefix"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi

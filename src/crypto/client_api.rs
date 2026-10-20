@@ -464,7 +464,7 @@ where
         info!(
             target: "crypto::client",
             contact_id = %contact_id,
-            session_id = %session_id,
+            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(&session_id),
             "Session initialized successfully"
         );
 
@@ -738,7 +738,7 @@ where
                     info!(
                         target: "crypto::client",
                         contact_id = %contact_id,
-                        session_id = %session_id,
+                        session_id = %crate::crypto::messaging::double_ratchet::id_prefix(&session_id),
                         plaintext_len = %plaintext.len(),
                         "Receiving session initialized and first message decrypted"
                     );

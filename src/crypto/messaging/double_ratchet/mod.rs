@@ -149,7 +149,7 @@ pub struct DrHealthSnapshot {
 /// PQ-ratchet exchange (see `internals::maybe_advance_pq_ratchet`).
 /// The public half rides on outgoing messages until the peer replies with a
 /// ciphertext; the secret half is zeroized on drop or on successful decapsulation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct PqRatchetKeyPair {
     pub(super) public: Vec<u8>,
     pub(super) secret: Vec<u8>,
@@ -158,6 +158,22 @@ pub(super) struct PqRatchetKeyPair {
 impl Zeroize for PqRatchetKeyPair {
     fn zeroize(&mut self) {
         self.secret.zeroize();
+    }
+}
+
+/// Every copy wipes itself — the snapshot `decrypt` takes, the value `take()` moves out — not
+/// only the one the session drops (TODO 198).
+impl Drop for PqRatchetKeyPair {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl std::fmt::Debug for PqRatchetKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PqRatchetKeyPair")
+            .field("public_len", &self.public.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -189,6 +205,14 @@ pub(super) struct PqChain {
 impl Zeroize for PqChain {
     fn zeroize(&mut self) {
         self.key.zeroize();
+    }
+}
+
+/// See `PqRatchetKeyPair`: the epoch chains are cloned into every decrypt snapshot and moved
+/// out of a pending ciphertext on promotion; each copy wipes itself.
+impl Drop for PqChain {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 

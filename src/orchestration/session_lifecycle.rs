@@ -391,7 +391,7 @@ impl SessionLifecycleManager {
         tracing::info!(
             target: "crypto::lifecycle",
             contact_id = %contact_id,
-            session_id = %promoted.session.session_id(),
+            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(promoted.session.session_id()),
             "a previous state decrypted — promoted to current"
         );
         self.install_current(contact_id, promoted.session);

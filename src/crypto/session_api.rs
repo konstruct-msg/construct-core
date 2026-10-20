@@ -218,7 +218,7 @@ where
 
         info!(
             target: "crypto::session",
-            session_id = %messaging_session.session_id(),
+            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(messaging_session.session_id()),
             "Session initialized successfully"
         );
 
@@ -331,7 +331,7 @@ where
 
         info!(
             target: "crypto::session",
-            session_id = %messaging_session.session_id(),
+            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(messaging_session.session_id()),
             plaintext_len = %plaintext.len(),
             "Session initialized and first message decrypted successfully"
         );

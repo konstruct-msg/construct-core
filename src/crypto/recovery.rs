@@ -34,6 +34,21 @@ pub struct RecoveryKeypair {
     pub public_key: [u8; 32],
 }
 
+impl Drop for RecoveryKeypair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RecoveryKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryKeypair")
+            .field("public_key", &hex::encode(self.public_key))
+            .finish_non_exhaustive()
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Generate a BIP39 mnemonic with the given word count (12 or 24).
