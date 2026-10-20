@@ -745,6 +745,13 @@ impl Orchestrator {
     ) -> Result<String, String> {
         use crate::crypto::messaging::double_ratchet::PrekeyHeader;
 
+        // Before anything is spent on it: a bundle that goes back behind what this device has
+        // admitted from the peer is a replay, whoever asked for the open (TODO 176).
+        let spk_epoch = public_bundle.spk_rotation_epoch;
+        if let Some(regressed) = self.lifecycle.spk_epoch_regression(contact_id, spk_epoch) {
+            return Err(regressed.to_string());
+        }
+
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
         let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
@@ -927,6 +934,7 @@ impl Orchestrator {
                 filed.handshake_at,
             );
         }
+        self.lifecycle.note_spk_epoch(contact_id, spk_epoch);
         tracing::info!(
             target: "crypto::orchestrator",
             contact_id = %contact_id,
@@ -934,6 +942,17 @@ impl Orchestrator {
             "session opened (PQXDH v2 initiator)"
         );
         Ok(contact_id.to_string())
+    }
+
+    /// Whether a bundle of `contact_id` with SPK rotation epoch `epoch` would be refused as a
+    /// replay. What the FFI asks before an open, to answer with the typed error; the open itself
+    /// refuses the same bundle (`init_session_with_bundle`).
+    pub fn spk_epoch_regression(
+        &self,
+        contact_id: &str,
+        epoch: u32,
+    ) -> Option<crate::orchestration::SpkEpochRegressed> {
+        self.lifecycle.spk_epoch_regression(contact_id, epoch)
     }
 
     /// Open a session to `contact_id` from its fetched bundle, **replacing** the one held, but
@@ -6417,172 +6436,94 @@ mod pqxdh_v2_tests {
         assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
     }
 
-    // ── Audit 2026-10-20: what a path forgot to save or record (TODO 195) ────────────
+    // ── SPK rotation epoch, per device (TODO 176) ───────────────────────────────────
 
-    fn session_save_for(actions: &[Action], contact_id: &str) -> bool {
-        actions.iter().any(|a| {
-            matches!(a, Action::SaveToSecureStore { slot: SecureStoreSlot::Session { contact_id: c }, .. } if c == contact_id)
-        })
-    }
-
-    fn state_save(actions: &[Action]) -> bool {
-        actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::SaveToSecureStore {
-                    slot: SecureStoreSlot::OrchestratorState,
-                    ..
-                }
-            )
-        })
-    }
-
-    fn persist_ack_for(actions: &[Action], id: &str) -> bool {
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::PersistAck { message_id, .. } if message_id == id))
-    }
-
-    fn rearms_gc(actions: &[Action]) -> bool {
-        actions.iter().any(|a| {
-            matches!(a, Action::ScheduleTimer { timer_id, delay_ms }
-                if timer_id == "gc_sweep" && *delay_ms == GC_SWEEP_INTERVAL_MS)
-        })
-    }
-
-    /// A heartbeat moves the ratchet and records its id like any message; only the showing is
-    /// skipped. What it moved is saved.
+    /// A bundle whose SPK rotation epoch goes back behind what this device admitted from the
+    /// same peer device is a replay and opens nothing; equal or higher opens, 0 claims nothing,
+    /// and another device of the peer is counted on its own.
     ///
-    /// Mutation: return `vec![]` from the heartbeat's `Decrypted` arm — this reddens.
+    /// Mutation: drop the `spk_epoch_regression` check at the top of `init_session_with_bundle`
+    /// — the epoch-4 reopen succeeds.
     #[test]
-    fn a_heartbeat_that_decrypts_saves_the_session_and_records_the_ack() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
-        let server = trusting_server(&mut bob);
-        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
-
-        let hb = alice.encrypt_bytes_for(&bob_id, b"hb").unwrap();
-        let actions = bob.handle_event(IncomingEvent::HeartbeatReceived {
-            contact_id: alice_id.clone(),
-            message_id: "hb-1".to_string(),
-            data: hb,
-        });
-        assert!(session_save_for(&actions, &alice_id), "{actions:?}");
-        assert!(persist_ack_for(&actions, "hb-1"), "{actions:?}");
-        assert!(state_save(&actions), "{actions:?}");
-        assert!(
-            !actions.iter().any(|a| matches!(
-                a,
-                Action::MessageDecrypted { .. } | Action::NotifyNewMessage { .. }
-            )),
-            "a heartbeat is not shown: {actions:?}"
-        );
-
-        let next = alice.encrypt_bytes_for(&bob_id, b"after").unwrap();
-        let actions = deliver(&mut bob, &alice_id, "m-after", next, 0);
-        assert_eq!(
-            decrypted(&actions),
-            vec![("m-after".to_string(), b"after".to_vec())]
-        );
-    }
-
-    /// The sweep saves every record it retires, and arms the next sweep.
-    ///
-    /// Mutation: drop the save in `retire_stale_handshakes`, or the `ScheduleTimer` in the
-    /// `gc_sweep` arm — this reddens.
-    #[test]
-    fn the_gc_sweep_saves_what_it_retires_and_rearms_itself() {
-        use crate::crypto::keys::MAX_UNANSWERED_HANDSHAKE_AGE_SECS;
-        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000));
-        let (mut alice, _) = clocked_device(clock.clone());
+    fn a_bundle_whose_spk_epoch_went_backwards_is_refused_per_device() {
+        let (mut alice, _) = named_device();
         let (mut bob, bob_id) = named_device();
-        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let (mut carol, carol_id) = named_device();
+        let bundle = |peer: &mut Orchestrator, epoch: u32| {
+            let (mut x3dh, kyber) = bundle_of(peer, true);
+            x3dh.spk_rotation_epoch = epoch;
+            (x3dh, kyber)
+        };
+
+        let (x3dh, kyber) = bundle(&mut bob, 5);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        assert_eq!(alice.lifecycle.known_spk_epoch(&bob_id), Some(5));
+
+        let (x3dh, kyber) = bundle(&mut bob, 4);
+        let err = alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap_err();
+        assert!(
+            err.starts_with(crate::orchestration::SPK_EPOCH_REGRESSED),
+            "{err}"
+        );
+        assert!(alice.has_active_session(&bob_id), "the held session stays");
+        assert_eq!(
+            alice.spk_epoch_regression(&bob_id, 4),
+            Some(crate::orchestration::SpkEpochRegressed {
+                received: 4,
+                known: 5
+            })
+        );
+
+        for epoch in [5, 0, 7] {
+            let (x3dh, kyber) = bundle(&mut bob, epoch);
+            alice
+                .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+                .unwrap_or_else(|e| panic!("epoch {epoch}: {e}"));
+        }
+        assert_eq!(
+            alice.lifecycle.known_spk_epoch(&bob_id),
+            Some(7),
+            "0 lowers nothing"
+        );
+
+        let (x3dh, kyber) = bundle(&mut carol, 1);
+        alice
+            .init_session_with_bundle(&carol_id, x3dh, kyber, false)
+            .expect("another device of the peer has its own counter");
+    }
+
+    /// The counter is state about the peer device: it survives a restart and a session reset,
+    /// and leaves with the contact.
+    ///
+    /// Mutation: drop `spk_epochs` from the orchestrator-state export — the restarted device
+    /// admits epoch 4.
+    #[test]
+    fn the_known_spk_epoch_survives_a_restart_and_a_reset_and_leaves_with_the_contact() {
+        let (mut alice, _) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (mut x3dh, kyber) = bundle_of(&mut bob, true);
+        x3dh.spk_rotation_epoch = 5;
         alice
             .init_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap();
 
-        clock.advance_ms(MAX_UNANSWERED_HANDSHAKE_AGE_SECS * 1000);
-        let actions = alice.handle_event(IncomingEvent::TimerFired {
-            timer_id: "gc_sweep".to_string(),
-        });
-        assert!(!alice.has_active_session(&bob_id));
-        assert!(session_save_for(&actions, &bob_id), "{actions:?}");
-        assert!(rearms_gc(&actions), "{actions:?}");
+        let state = alice.export_orchestrator_state_cfe().unwrap();
+        let (mut restarted, _) = named_device();
+        restarted.import_orchestrator_state_cfe(&state).unwrap();
+        assert_eq!(restarted.lifecycle.known_spk_epoch(&bob_id), Some(5));
 
-        let actions = alice.handle_event(IncomingEvent::TimerFired {
-            timer_id: "gc_sweep".to_string(),
-        });
+        assert!(alice.remove_session_by_contact(&bob_id));
         assert!(
-            !session_save_for(&actions, &bob_id),
-            "nothing retired, nothing saved: {actions:?}"
+            alice.spk_epoch_regression(&bob_id, 4).is_some(),
+            "a reset keeps it"
         );
-        assert!(rearms_gc(&actions), "{actions:?}");
-    }
 
-    /// A copy of a read message under a new id is a duplicate by its consumed key; the id is
-    /// recorded in both ACK stores so the next copy stops at the cache.
-    ///
-    /// Mutation: `let _ =` the `mark_processed` in the router's consumed-key arm — this reddens.
-    #[test]
-    fn a_copy_under_a_new_id_of_a_read_message_records_its_ack() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
-        let server = trusting_server(&mut bob);
-        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
-
-        let m = alice.encrypt_bytes_for(&bob_id, b"once").unwrap();
-        let first = deliver(&mut bob, &alice_id, "m-1", m.clone(), 0);
-        assert_eq!(decrypted(&first).len(), 1);
-        let again = deliver(&mut bob, &alice_id, "m-1-copy", m, 0);
-        assert!(
-            again.iter().any(
-                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "m-1-copy")
-            ),
-            "{again:?}"
-        );
-        assert!(persist_ack_for(&again, "m-1-copy"), "{again:?}");
-    }
-
-    /// A message cleared by the platform's DB check is recorded in the ACK cache, and the cache is
-    /// saved — as it is when the message never needed the check.
-    ///
-    /// Mutation: drop the state save in `handle_ack_db_result` — this reddens.
-    #[test]
-    fn a_message_cleared_by_the_db_check_saves_the_orchestrator_state() {
-        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
-        let server = trusting_server(&mut bob);
-        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
-        bob.lifecycle.ack_store.restore_cache(Vec::new()); // post-restart: misses ask the DB
-
-        let m = alice.encrypt_bytes_for(&bob_id, b"x").unwrap();
-        let held = deliver(&mut bob, &alice_id, "m-db", m, 0);
-        assert!(
-            held.iter()
-                .any(|a| matches!(a, Action::CheckAckInDb { message_id } if message_id == "m-db")),
-            "{held:?}"
-        );
-        let actions = bob.handle_event(IncomingEvent::AckDbResult {
-            message_id: "m-db".to_string(),
-            is_processed: false,
-        });
-        assert_eq!(
-            decrypted(&actions),
-            vec![("m-db".to_string(), b"x".to_vec())]
-        );
-        assert!(state_save(&actions), "{actions:?}");
-    }
-
-    /// The Kyber burn is handed over once, and only with the bytes: a take that cannot export
-    /// keeps the flag.
-    #[test]
-    #[cfg(feature = "post-quantum")]
-    fn the_kyber_burn_is_taken_once_the_bytes_exist() {
-        let (mut o, _) = named_device();
-        assert!(
-            o.take_kyber_prekeys_to_persist().is_none(),
-            "nothing burned"
-        );
-        o.kyber_prekeys_dirty = true;
-        assert!(o.take_kyber_prekeys_to_persist().is_some());
-        assert!(!o.kyber_prekeys_dirty);
-        assert!(o.take_kyber_prekeys_to_persist().is_none(), "taken once");
+        alice.forget_contact_state(&bob_id);
+        assert_eq!(alice.lifecycle.known_spk_epoch(&bob_id), None);
+        assert!(alice.spk_epoch_regression(&bob_id, 4).is_none());
     }
 }

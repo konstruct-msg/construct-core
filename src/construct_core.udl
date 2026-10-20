@@ -386,6 +386,11 @@ enum CryptoError {
     "MessagePackDeserializationFailed",
     "PeerSpkStale",
     "PowDifficultyTooHigh",
+    // The bundle's SPK rotation epoch is below the one already admitted from the same peer
+    // device: a replayed bundle. Per device, kept across a session reset, cleared by
+    // `forget_contact_state`. The same refusal on the `OpenSession` answer path is an
+    // `OPEN_SESSION_REFUSED` whose message starts with `SPK_EPOCH_REGRESSED:`.
+    "PeerSpkEpochRegressed",
 };
 
 dictionary OtpkPair {
