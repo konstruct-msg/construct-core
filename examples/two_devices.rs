@@ -14,9 +14,20 @@
 //! каждый байт. В iOS ровно те же действия исполняет Swift, в Android — Kotlin; ядро не знает
 //! разницы.
 //!
+//! Сценарии, по порядку в `main`:
+//!
+//! 1. Регистрация и первая переписка: сессия открывается у отправителя из бандла получателя,
+//!    у получателя — из заголовка первого сообщения.
+//! 2. Перезапуск: устройство «умирает» (ядро уничтожается) и поднимается заново из того, что
+//!    приложение успело сохранить, — и переписка продолжается с того же места.
+//! 3. Повторная доставка: сервер приносит уже прочитанное сообщение дважды — до перезапуска
+//!    его узнаёт ACK-кэш в памяти, после перезапуска ядро спрашивает базу ACK приложения.
+//! 4. Потерянное состояние оркестратора: ключи и запись сессии на месте, а сессия всё равно не
+//!    восстанавливается — и почему.
+//!
 //! Читать сверху вниз: `Device` (устройство: ядро + его «Keychain»), `Server` (хранит бандлы
 //! ключей, подписывает сертификаты отправителя, носит почту), `execute` (исполнитель действий —
-//! то, чем в реальном приложении является главный цикл), `main` (сценарий).
+//! то, чем в реальном приложении является главный цикл), `main` (сценарии).
 
 use std::collections::HashMap;
 
@@ -25,7 +36,7 @@ use construct_core::crypto::handshake::x3dh::X3DHPublicKeyBundle;
 use construct_core::crypto::sealed_sender::{SenderCertificate, build_cert_sign_payload};
 use construct_core::crypto::suites::classic::ClassicSuiteProvider;
 use construct_core::orchestration::orchestrator::{KyberBundleKeys, Orchestrator, SessionBundle};
-use construct_core::orchestration::{Action, IncomingEvent};
+use construct_core::orchestration::{Action, IncomingEvent, SecureStoreSlot};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -33,6 +44,32 @@ use rand::rngs::OsRng;
 // ─────────────────────────────────────────────────────────────────────────────
 // Устройство
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Что приложение хранит в Keychain, по слотам.
+///
+/// Два слота ядро называет само (`SecureStoreSlot` в действии `SaveToSecureStore`); ещё два —
+/// ключи и Kyber-преключи — приложение сохраняет по своей инициативе, вызывая экспорт. В iOS
+/// это четыре разных записи Keychain с разными политиками доступа.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Slot {
+    /// Identity, signing и SPK вместе с гибридным ключом подписи: `export_private_keys_cfe`.
+    PrivateKeys,
+    /// ML-KEM-1024 преключи с приватными половинами: `export_kyber_prekeys_cfe`.
+    KyberPrekeys,
+    /// Координационное состояние: ACK-кэш, блокировки открытия, эпохи SPK контактов.
+    OrchestratorState,
+    /// Запись сессии с одним контактом: текущее состояние храповика и предыдущие.
+    Session(String),
+}
+
+impl From<SecureStoreSlot> for Slot {
+    fn from(slot: SecureStoreSlot) -> Self {
+        match slot {
+            SecureStoreSlot::OrchestratorState => Slot::OrchestratorState,
+            SecureStoreSlot::Session { contact_id } => Slot::Session(contact_id),
+        }
+    }
+}
 
 /// Одно устройство: ядро и то, что приложение хранит для него.
 ///
@@ -47,9 +84,8 @@ struct Device {
     /// `contact_id`, которым устройства называют друг друга во всех вызовах ядра.
     id: String,
     core: Orchestrator,
-    /// «Keychain»: слот → байты. Ключ `String`, потому что `SecureStoreSlot` — enum с данными,
-    /// и для примера проще печатать его `Debug`-представление, чем выводить `Hash` для него.
-    secure_store: HashMap<String, Vec<u8>>,
+    /// «Keychain».
+    secure_store: HashMap<Slot, Vec<u8>>,
     /// «База ACK»: id сообщений, которые устройство уже обработало. Ядро держит такой же список
     /// в памяти, а это — его долговечная копия, которую оно просит сохранить (`PersistAck`).
     ack_db: Vec<String>,
@@ -81,13 +117,125 @@ impl Device {
         let id = construct_core::device_id::derive_device_id(&identity);
         core.set_my_user_id(id.clone());
 
-        Self {
+        let mut device = Self {
             label,
             id,
             core,
             secure_store: HashMap::new(),
             ack_db: Vec::new(),
+        };
+        device.persist_keys();
+        device
+    }
+
+    /// Сохранить ключи — то, о чём ядро *не* просит действием, а приложение делает само после
+    /// регистрации и после каждой ротации. Потерять этот слот — потерять устройство.
+    fn persist_keys(&mut self) {
+        let keys = self.core.export_private_keys_cfe().expect("export keys");
+        let kyber = self
+            .core
+            .export_kyber_prekeys_cfe()
+            .expect("export kyber prekeys");
+        println!(
+            "    {} ⟶ Keychain[PrivateKeys] = {} байт, Keychain[KyberPrekeys] = {} байт",
+            self.label,
+            keys.len(),
+            kyber.len()
+        );
+        self.secure_store.insert(Slot::PrivateKeys, keys);
+        self.secure_store.insert(Slot::KyberPrekeys, kyber);
+    }
+
+    /// Перезапуск: процесс умер, ядро с ним; в живых — только Keychain и база ACK.
+    ///
+    /// `self` берётся по значению: старое ядро уничтожается здесь, и вернуть его нельзя —
+    /// компилятор не даст пользоваться `bob` после `bob.restart(..)`. Это и есть смысл сцены.
+    ///
+    /// Порядок — тот же, что у iOS `CryptoManager.reloadCoreFromKeychain`: ключи, Kyber-преключи,
+    /// состояние оркестратора, затем сессии (iOS поднимает их лениво, по первому обращению к
+    /// контакту), затем событие `AppLaunched`. `with_orchestrator_state = false` моделирует
+    /// запуск, при котором этот слот не прочитался; сценарий 4 показывает, чем это кончается.
+    fn restart(self, server: &mut Server, with_orchestrator_state: bool) -> Self {
+        let Device {
+            label,
+            id,
+            core: old_core,
+            secure_store,
+            ack_db,
+        } = self;
+        drop(old_core); // процесс умер
+        println!(
+            "\n[{label}] перезапуск (слотов в Keychain: {})",
+            secure_store.len()
+        );
+
+        let keys = secure_store
+            .get(&Slot::PrivateKeys)
+            .expect("no keys: this device is gone for good");
+        let record = construct_core::cfe::decode_as::<construct_core::cfe::CfePrivateKeysV1>(
+            keys,
+            construct_core::cfe::CfeMessageType::PrivateKeys,
+        )
+        .expect("key record");
+        let client =
+            ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(record).expect("keys");
+        let mut core = Orchestrator::new(client, id.clone());
+        println!(
+            "    {label}: ключи восстановлены, id тот же: {}",
+            short(&id)
+        );
+
+        if let Some(kyber) = secure_store.get(&Slot::KyberPrekeys) {
+            core.import_kyber_prekeys_cfe(kyber).expect("kyber prekeys");
+            println!(
+                "    {label}: Kyber-преключи восстановлены ({} одноразовых осталось)",
+                core.kyber_one_time_prekey_count()
+            );
         }
+        match secure_store.get(&Slot::OrchestratorState) {
+            Some(state) if with_orchestrator_state => {
+                core.import_orchestrator_state_cfe(state)
+                    .expect("orchestrator state");
+                println!("    {label}: состояние оркестратора восстановлено (ACK-кэш в памяти)");
+            }
+            _ => println!("    {label}: состояние оркестратора НЕ восстановлено — ACK-кэш пуст"),
+        }
+        let mut sessions = 0;
+        for (slot, data) in &secure_store {
+            if let Slot::Session(contact_id) = slot {
+                // `match` на `Result`: обе ветки обязательны, и отказ ядра — тоже ответ.
+                // Приложение в этом случае считает сессию отсутствующей: следующая отправка
+                // откроет новую (так документирован `SESSION_PREDATES_ENVELOPE`).
+                match core.import_session_cfe(contact_id, data) {
+                    Ok(session_id) => {
+                        sessions += 1;
+                        println!(
+                            "    {label}: сессия с {} восстановлена ({})",
+                            short(contact_id),
+                            short(&session_id)
+                        );
+                    }
+                    Err(reason) => println!(
+                        "    {label} ✗ сессия с {} НЕ восстановлена: {reason}",
+                        short(contact_id)
+                    ),
+                }
+            }
+        }
+        println!("    {label}: сессий восстановлено {sessions}");
+        // Ключ сервера не хранится в ядре: приложение передаёт его при каждом запуске.
+        core.set_trusted_server_keys(vec![server.verifying_key()]);
+
+        let mut device = Self {
+            label,
+            id,
+            core,
+            secure_store,
+            ack_db,
+        };
+        let actions = device.core.handle_event(IncomingEvent::AppLaunched);
+        execute(&mut device, server, actions);
+        device
     }
 }
 
@@ -100,6 +248,7 @@ impl Device {
 /// В настоящем протоколе сертификат лежит *внутри* запечатанного конверта (sealed sender), и
 /// сервер его не видит — он знает только получателя. Здесь конверта нет, поэтому сертификат
 /// едет рядом; для ядра получателя разницы нет: оно получает его в `MessageReceived`.
+#[derive(Clone)]
 struct Delivery {
     to: String,
     from: String,
@@ -131,6 +280,9 @@ struct Server {
     key: SigningKey,
     registrations: HashMap<String, Registration>,
     mailbox: Vec<Delivery>,
+    /// Всё, что сервер когда-либо доставил: настоящий сервер хранит письмо, пока клиент не
+    /// подтвердит получение, и после обрыва связи приносит его снова (сценарий 3).
+    delivered: Vec<Delivery>,
 }
 
 impl Server {
@@ -141,6 +293,7 @@ impl Server {
             key: SigningKey::from_bytes(&seed),
             registrations: HashMap::new(),
             mailbox: Vec::new(),
+            delivered: Vec::new(),
         }
     }
 
@@ -172,6 +325,10 @@ impl Server {
             .core
             .generate_kyber_one_time_prekeys(3)
             .expect("otpks");
+        // Одноразовые ключи только что родились: их приватные половины надо сохранить до того,
+        // как публичные уйдут на сервер, иначе после перезапуска ядро не сможет открыть сессию,
+        // в которой отправитель воспользовался одним из них.
+        device.persist_keys();
 
         println!(
             "  [server] {} зарегистрировано: identity {} байт, Kyber SPK {} байт, {} одноразовых",
@@ -263,25 +420,41 @@ impl Server {
         let mail = std::mem::take(&mut self.mailbox);
         let (mine, others): (Vec<_>, Vec<_>) = mail.into_iter().partition(|d| d.to == device.id);
         self.mailbox = others;
-
         for d in mine {
-            println!(
-                "\n  [server] → {}: сообщение {} от {} ({} байт)",
-                device.label,
-                d.message_id,
-                short(&d.from),
-                d.payload.len()
-            );
-            let actions = device.core.handle_event(IncomingEvent::MessageReceived {
-                message_id: d.message_id,
-                from: d.from,
-                data: d.payload,
-                content_type: d.content_type,
-                sender_certificate: Some(Box::new(d.certificate)),
-                envelope_session: None,
-            });
-            execute(device, self, actions);
+            self.delivered.push(d.clone());
+            self.deliver_one(device, d);
         }
+    }
+
+    /// Принести ещё раз письмо, которое уже доставлялось: так ведёт себя сервер после обрыва
+    /// связи, пока не получил подтверждения.
+    fn redeliver(&mut self, device: &mut Device, message_id: &str) {
+        let d = self
+            .delivered
+            .iter()
+            .find(|d| d.message_id == message_id && d.to == device.id)
+            .expect("was delivered before")
+            .clone();
+        self.deliver_one(device, d);
+    }
+
+    fn deliver_one(&mut self, device: &mut Device, d: Delivery) {
+        println!(
+            "\n  [server] → {}: сообщение {} от {} ({} байт)",
+            device.label,
+            d.message_id,
+            short(&d.from),
+            d.payload.len()
+        );
+        let actions = device.core.handle_event(IncomingEvent::MessageReceived {
+            message_id: d.message_id,
+            from: d.from,
+            data: d.payload,
+            content_type: d.content_type,
+            sender_certificate: Some(Box::new(d.certificate)),
+            envelope_session: None,
+        });
+        execute(device, self, actions);
     }
 }
 
@@ -302,12 +475,14 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
             Action::SaveToSecureStore { slot, data } => {
                 // `data` — `SecretBytes`: обнуляется при освобождении и не печатается в Debug.
                 let bytes = data.expose().to_vec();
+                let slot = Slot::from(slot);
                 println!(
-                    "    {} ⟶ Keychain[{slot:?}] = {} байт",
+                    "    {} ⟶ Keychain[{}] = {} байт",
                     device.label,
+                    slot_name(&slot),
                     bytes.len()
                 );
-                device.secure_store.insert(format!("{slot:?}"), bytes);
+                device.secure_store.insert(slot, bytes);
             }
             Action::SendEncryptedMessage {
                 to,
@@ -332,8 +507,8 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
                 });
             }
             Action::OpenSession { contact_id } => {
-                // Сессии с этим контактом нет: ядро просит бандл. Приложение идёт на сервер и
-                // отвечает событием `SessionBundleFetched` — с бандлом или с ошибкой.
+                // Ядро само хочет переоткрыть сессию (апгрейд до PQXDH v2). Приложение идёт на
+                // сервер и отвечает событием `SessionBundleFetched` — с бандлом или с ошибкой.
                 println!(
                     "    {} ⟶ сервер: дай бандл {}",
                     device.label,
@@ -373,6 +548,19 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
                     opened.opened_device.as_deref().map(short),
                     opened.opener_message_id
                 );
+                // Открытие на приёме сжигает одноразовый Kyber-преключ, если отправитель его
+                // взял. Сожжённый ключ должен исчезнуть из Keychain до следующего запуска: иначе
+                // после перезапуска он «воскреснет», а повторное использование одноразового
+                // ключа — ровно то, чего он существует не допускать. В UDL это поле
+                // `kyber_prekeys` в `ReceivingOpenResult`.
+                if let Some(kyber) = device.core.take_kyber_prekeys_to_persist() {
+                    println!(
+                        "    {} ⟶ Keychain[KyberPrekeys] = {} байт (одноразовый ключ сожжён)",
+                        device.label,
+                        kyber.len()
+                    );
+                    device.secure_store.insert(Slot::KyberPrekeys, kyber);
+                }
                 execute(device, server, opened.actions);
             }
             Action::MessageDecrypted {
@@ -407,6 +595,33 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
             } => {
                 device.ack_db.push(message_id);
             }
+            Action::CheckAckInDb { message_id } => {
+                // Кэш в памяти знает только то, что обработано в этом процессе. После перезапуска
+                // ядро работает в режиме «каждый незнакомый id — вопрос к базе» (`AckStore`,
+                // post-restart mode): база приложения — единственная память о прошлых запусках,
+                // а расшифровывать дубликат нельзя — ключ сообщения уже потрачен.
+                let is_processed = device.ack_db.contains(&message_id);
+                println!(
+                    "    {}: ядро спрашивает базу ACK про {message_id} — {}",
+                    device.label,
+                    if is_processed {
+                        "уже было"
+                    } else {
+                        "новое"
+                    }
+                );
+                let next = device.core.handle_event(IncomingEvent::AckDbResult {
+                    message_id,
+                    is_processed,
+                });
+                execute(device, server, next);
+            }
+            Action::DuplicateDropped { message_id } => {
+                println!(
+                    "    {}: {message_id} уже обработано — отброшено, пользователь не увидит",
+                    device.label
+                );
+            }
             Action::MarkMessageDelivered { message_id } => {
                 println!("    {}: {message_id} доставлено", device.label);
             }
@@ -421,16 +636,14 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
             Action::NotifyError { code, message } => {
                 println!("    {} ✗ {code}: {message}", device.label);
             }
-            // Остальные действия в этом сценарии не возникают; печатаем, если вдруг.
+            // Остальные действия в этих сценариях не возникают; печатаем, если вдруг.
             other @ (Action::CallSignalDecrypted { .. }
             | Action::ControlFrameDecrypted { .. }
             | Action::PruneAckStore { .. }
-            | Action::DuplicateDropped { .. }
             | Action::MalformedDropped { .. }
             | Action::SendDecryptionError { .. }
             | Action::SessionRetired { .. }
-            | Action::ResendMessage { .. }
-            | Action::CheckAckInDb { .. }) => {
+            | Action::ResendMessage { .. }) => {
                 println!("    {}: {other:?}", device.label);
             }
         }
@@ -485,12 +698,38 @@ fn short(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+fn slot_name(slot: &Slot) -> String {
+    match slot {
+        Slot::PrivateKeys => "PrivateKeys".to_string(),
+        Slot::KyberPrekeys => "KyberPrekeys".to_string(),
+        Slot::OrchestratorState => "OrchestratorState".to_string(),
+        Slot::Session(contact_id) => format!("Session({})", short(contact_id)),
+    }
+}
+
+fn health_line(device: &Device, peer: &str) {
+    let health = device
+        .core
+        .get_session_health(peer)
+        .expect("session exists");
+    println!(
+        "  {}: отправлено в текущей цепочке {}, получено {}, PQ: {:?} / {:?}; Keychain: {} слотов, ACK: {}",
+        device.label,
+        health.messages_sent,
+        health.messages_received,
+        health.pq_handshake,
+        health.pq_authentication,
+        device.secure_store.len(),
+        device.ack_db.len()
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Сценарий
+// Сценарии
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("== Регистрация ==");
+    println!("==== 1. Регистрация и первая переписка ====");
     let mut server = Server::new();
     let mut alice = Device::new("alice");
     let mut bob = Device::new("bob");
@@ -521,29 +760,51 @@ fn main() {
     server.deliver_to(&mut bob);
 
     println!("\n== Что осталось у каждого ==");
-    for device in [&alice, &bob] {
-        let peer = if device.id == alice_id {
-            &bob_id
-        } else {
-            &alice_id
-        };
-        let health = device
-            .core
-            .get_session_health(peer)
-            .expect("session exists");
-        println!(
-            "  {}: отправлено в текущей цепочке {}, получено {}, PQ: {:?} / {:?}; Keychain: {} слотов, ACK: {}",
-            device.label,
-            health.messages_sent,
-            health.messages_received,
-            health.pq_handshake,
-            health.pq_authentication,
-            device.secure_store.len(),
-            device.ack_db.len()
-        );
-    }
+    health_line(&alice, &bob_id);
+    health_line(&bob, &alice_id);
+
+    println!("\n\n==== 3а. Сервер приносит m4 ещё раз — до перезапуска ====");
+    // Кэш в памяти помнит m4: ядро отбрасывает дубликат само, базу не спрашивает.
+    server.redeliver(&mut bob, "m4");
+
+    println!("\n\n==== 2. Перезапуск Боба ====");
+    // Всё, что было в `bob.core`, сейчас исчезнет. Переменная `bob` после этой строки — уже
+    // новое устройство, собранное из Keychain; к старому ядру доступа нет ни у кого.
+    let mut bob = bob.restart(&mut server, true);
+
+    println!("\n== Переписка продолжается с того же места ==");
+    send(&mut alice, &mut server, &bob_id, "m5", "Ты перезапускался?");
+    server.deliver_to(&mut bob);
+    send(&mut bob, &mut server, &alice_id, "m6", "Да, и всё помню");
+    server.deliver_to(&mut alice);
+    health_line(&alice, &bob_id);
+    health_line(&bob, &alice_id);
+
+    println!("\n\n==== 3б. Сервер приносит m3 ещё раз — после перезапуска ====");
+    // Кэш пуст: ядро спрашивает базу ACK, база помнит, дубликат отброшен.
+    server.redeliver(&mut bob, "m3");
+
+    println!("\n\n==== 4. Перезапуск без состояния оркестратора ====");
+    // Ключи на месте, запись сессии на месте — а сессия не восстанавливается. В состоянии
+    // оркестратора живёт envelope book: ключи, которыми запечатываются конверты sealed sender
+    // этой сессии. Они выводятся из корня рукопожатия, который не хранится, поэтому запись
+    // сессии без книги — состояние, на котором ничего нельзя ни запечатать, ни найти. Ядро
+    // отказывает (`SESSION_PREDATES_ENVELOPE`), приложение считает сессию отсутствующей, и
+    // следующая отправка откроет новую. Вывод: слот OrchestratorState так же важен, как ключи.
+    let bob = bob.restart(&mut server, false);
     println!(
-        "  сервер: {} писем в очереди, ни одного ключа",
-        server.mailbox.len()
+        "  bob: сессия с alice есть? {}",
+        bob.core.has_active_session(&alice_id)
+    );
+
+    println!("\n== Keychain цел — обычный перезапуск возвращает всё ==");
+    let mut bob = bob.restart(&mut server, true);
+    send(&mut alice, &mut server, &bob_id, "m7", "Проверка связи");
+    server.deliver_to(&mut bob);
+    health_line(&bob, &alice_id);
+    println!(
+        "  сервер: {} писем в очереди, {} доставлено, ни одного ключа",
+        server.mailbox.len(),
+        server.delivered.len()
     );
 }
