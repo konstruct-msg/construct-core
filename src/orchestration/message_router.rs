@@ -34,6 +34,9 @@ use crate::orchestration::session_lifecycle::SessionLifecycleManager;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_PENDING_PER_USER: usize = 100;
+/// The longest a message waits in a pending queue before it is dropped (see `enqueue_or_reject`).
+/// A queued message was never acknowledged, so the server still holds it.
+const MAX_PENDING_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Outcome of routing one message.
 #[derive(Debug, Clone)]
@@ -66,8 +69,12 @@ pub enum RoutingDecision {
         envelope_session: Option<String>,
         reason: String,
     },
-    /// Message already processed — discard.
-    Duplicate { message_id: String },
+    /// Message already processed — discard. `actions` is what recording it as processed asked
+    /// for, when this copy was the first the ACK store saw (a consumed key, not a cache hit).
+    Duplicate {
+        message_id: String,
+        actions: Vec<Action>,
+    },
     /// ACK status unknown — buffered pending a DB check (platform feeds back `AckDbResult`).
     PendingAckCheck { message_id: String },
     /// Pending queue for this contact is full — apply backpressure.
@@ -131,8 +138,8 @@ pub struct MessageRouter {
 
 /// How recently a queued handshake must have arrived to count as the peer opening a session *now*.
 ///
-/// A queued handshake has no upper age — it waits until a session opens or the queue is dropped —
-/// so "we hold a handshake" and "their init is in flight" are different statements. Once a bundle
+/// A queued handshake waits until a session opens, the queue is dropped or `MAX_PENDING_AGE_MS`
+/// passes, so "we hold a handshake" and "their init is in flight" are different statements. Once a bundle
 /// is in hand a receiving init completes in hundredths of a second and the fetch in front of it
 /// takes about one; twenty seconds bounds the case where the handshake cannot be opened at all.
 /// That case deadlocked 2026-09-04 18:08, when an unopenable handshake answered "in flight"
@@ -199,6 +206,7 @@ impl MessageRouter {
             AckCheckResult::InCache => {
                 return RoutingDecision::Duplicate {
                     message_id: msg.message_id.clone(),
+                    actions: Vec::new(),
                 };
             }
             AckCheckResult::NeedDbCheck => {
@@ -247,16 +255,26 @@ impl MessageRouter {
         }
         // Re-queue any messages that were not processed due to early exit.
         if remaining_start < queued.len() {
-            let queue = self
-                .pending_queues
-                .entry(contact_id.to_string())
-                .or_default();
-            for msg in queued.into_iter().skip(remaining_start) {
-                queue.push_front(msg);
-            }
+            self.requeue_tail(
+                contact_id,
+                queued.into_iter().skip(remaining_start).collect(),
+            );
         }
         self.prune_arrivals();
         results
+    }
+
+    /// Put `tail` back at the head of `contact_id`'s queue, in its own order, ahead of whatever
+    /// arrived during the drain. Until 2026-10-20 it was pushed to the front one by one, which
+    /// reversed it (TODO 195).
+    fn requeue_tail(&mut self, contact_id: &str, tail: Vec<IncomingMessage>) {
+        let queue = self
+            .pending_queues
+            .entry(contact_id.to_string())
+            .or_default();
+        for msg in tail.into_iter().rev() {
+            queue.push_front(msg);
+        }
     }
 
     /// Number of queued messages for `contact_id`.
@@ -337,6 +355,7 @@ impl MessageRouter {
         if is_processed {
             return RoutingDecision::Duplicate {
                 message_id: message_id.to_string(),
+                actions: Vec::new(),
             };
         }
 
@@ -380,9 +399,12 @@ impl MessageRouter {
                     msg_number = msg.msg_number,
                     "decrypt found the key already consumed — duplicate, session kept"
                 );
-                let _ = lifecycle.ack_store.mark_processed(&msg.message_id);
+                // Recorded in both ACK stores: the platform's too, or after a restart the same
+                // copy would take the DB round trip again (TODO 195).
+                let actions = lifecycle.ack_store.mark_processed(&msg.message_id);
                 RoutingDecision::Duplicate {
                     message_id: msg.message_id.clone(),
+                    actions,
                 }
             }
             // No state we hold is the one it was written on, and it says how to build that one:
@@ -422,6 +444,17 @@ impl MessageRouter {
                 queued_count: queue.len(),
             };
         }
+
+        // What has waited past `MAX_PENDING_AGE_MS` is dropped before the bound is applied: the
+        // server redelivers what was never acknowledged, so nothing is lost, and a queue of stale
+        // openers no longer locks a contact out with `QueueFull` for good (TODO 195).
+        let now = self.clock.now_ms();
+        let arrived_at = &self.arrived_at;
+        queue.retain(|q| {
+            arrived_at
+                .get(&q.message_id)
+                .is_none_or(|at| now.saturating_sub(*at) <= MAX_PENDING_AGE_MS)
+        });
 
         if queue.len() >= self.max_pending_per_user {
             return RoutingDecision::QueueFull {
@@ -738,5 +771,64 @@ mod tests {
         let decision = router.route_message(&mut lifecycle, &msg("bob", "m5", 5));
         assert!(matches!(decision, RoutingDecision::NeedSessionInit { .. }));
         assert_eq!(router.pending_count("bob"), 1);
+    }
+
+    // ── Audit 2026-10-20 (TODO 195) ──────────────────────────────────────────────
+
+    /// What a drain could not process goes back in its own order, ahead of what arrived during
+    /// the drain.
+    ///
+    /// Mutation: push the tail to the front in forward order — `t3, t2, t1` reddens this.
+    #[test]
+    fn a_requeued_tail_keeps_its_order_ahead_of_new_arrivals() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        router.route_message(&mut lifecycle, &msg("bob", "new", 0));
+        router.requeue_tail(
+            "bob",
+            vec![
+                msg("bob", "t1", 1),
+                msg("bob", "t2", 2),
+                msg("bob", "t3", 3),
+            ],
+        );
+        let ids: Vec<&str> = router.pending_queues["bob"]
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(ids, ["t1", "t2", "t3", "new"]);
+    }
+
+    /// A queue of openers past their age no longer locks the contact out: they are dropped when
+    /// the next one arrives, and it is queued.
+    ///
+    /// Mutation: drop the `retain` in `enqueue_or_reject` — the fresh opener gets `QueueFull`.
+    #[test]
+    fn a_queued_message_past_its_age_is_dropped_and_the_queue_takes_new_ones() {
+        let clock = std::sync::Arc::new(crate::orchestration::clock::MockClock::new(1_000_000));
+        let mut router = MessageRouter::with_clock(clock.clone());
+        let mut lifecycle = make_lifecycle("alice");
+        for i in 0..MAX_PENDING_PER_USER {
+            router.route_message(&mut lifecycle, &msg("bob", &format!("m{i}"), i as u32));
+        }
+        assert!(matches!(
+            router.route_message(&mut lifecycle, &msg("bob", "over", 999)),
+            RoutingDecision::QueueFull { .. }
+        ));
+
+        clock.advance_ms(MAX_PENDING_AGE_MS + 1);
+        let fresh = router.route_message(&mut lifecycle, &msg("bob", "fresh", 1000));
+        assert!(
+            matches!(
+                fresh,
+                RoutingDecision::NeedSessionInit {
+                    queued_count: 1,
+                    ..
+                }
+            ),
+            "{fresh:?}"
+        );
+        assert_eq!(router.pending_count("bob"), 1);
+        assert!(router.handshake_arrived_within(&["bob".to_string()], 1000));
     }
 }
