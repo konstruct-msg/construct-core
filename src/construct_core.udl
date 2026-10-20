@@ -473,39 +473,6 @@ dictionary RecoveryKeypair {
     bytes public_key;
 };
 
-// ============================================================================
-// Traffic Protection (Cover Traffic & Timing)
-// ============================================================================
-
-dictionary CoverTrafficConfig {
-    boolean enabled;
-    float battery_level_threshold;
-    u64 min_interval_ms;
-    u64 max_interval_ms;
-    u64 message_size;
-    boolean coalesce_with_real_messages;
-    u64 coalesce_window_ms;
-};
-
-dictionary EnergyMetrics {
-    u64 dummies_sent;
-    u64 coalesced_count;
-    u64 battery_skipped;
-};
-
-interface TrafficProtectionManager {
-    constructor(CoverTrafficConfig config);
-
-    void update_battery_level(float level);
-    void record_real_message_sent();
-    boolean should_send_dummy();
-    bytes generate_dummy();
-    EnergyMetrics get_metrics();
-    void reset_metrics();
-    u64 current_interval_ms();
-    boolean is_currently_active();
-};
-
 // ── Post-Quantum Cryptography (ML-KEM) ───────────────────────────────────────
 
 /// Result of an ML-KEM-1024 encapsulation (history transfer to a peer's Kyber SPK).
@@ -586,12 +553,9 @@ namespace construct_core {
 
     boolean verify_recovery_signature(bytes public_key, string message, bytes signature);
 
-    // Traffic Protection Functions
-
-    // Timing Functions
-    u64 jittered_interval_ms(u64 base_ms, u64 jitter_ms);
-    u64 random_send_delay_ms(u64 max_delay_ms);
-    u64 battery_aware_jitter_ms(u64 base_ms, u64 max_jitter_ms, float battery_level);
+    // Timing: the one traffic-shaping export left. Cover traffic (`TrafficProtectionManager`)
+    // was retired in 0.55.0 — dummies cost network and battery and no client ever sent one
+    // (construct-docs/decisions/cover-traffic-retired.md).
     u64 recommended_send_delay_ms(boolean is_high_priority, float battery_level);
 
     // ── Post-Quantum KEM (ML-KEM-1024) ───────────────────────────────────────
