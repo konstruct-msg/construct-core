@@ -60,6 +60,22 @@ pub enum CryptoError {
     /// The peer must open their app to trigger SPK rotation before a session can be established.
     #[error("Peer SPK is stale: age_secs={age_secs}")]
     PeerSpkStale { age_secs: u64 },
+
+    /// The server asked for more leading zero bits than `pow::MAX_POW_DIFFICULTY`: no search
+    /// is started. Registration cannot proceed against that server.
+    #[error("PoW difficulty {difficulty} is past the limit {max}")]
+    PowDifficultyTooHigh { difficulty: u32, max: u32 },
+}
+
+impl From<crate::pow::PowError> for CryptoError {
+    fn from(err: crate::pow::PowError) -> Self {
+        match err {
+            crate::pow::PowError::DifficultyTooHigh { difficulty, max } => {
+                CryptoError::PowDifficultyTooHigh { difficulty, max }
+            }
+            crate::pow::PowError::Hash(_) => CryptoError::InitializationFailed,
+        }
+    }
 }
 
 impl From<crate::error::CryptoError> for CryptoError {
@@ -2832,8 +2848,8 @@ mod tests {
 
 /// Compute Argon2id-based Proof of Work
 /// UniFFI wrapper - accepts owned String instead of &str
-pub fn compute_pow(challenge: String, difficulty: u32) -> PowSolution {
-    crate::pow::compute_pow(&challenge, difficulty)
+pub fn compute_pow(challenge: String, difficulty: u32) -> Result<PowSolution, CryptoError> {
+    Ok(crate::pow::compute_pow(&challenge, difficulty)?)
 }
 
 /// Compute PoW with progress callback
@@ -2842,8 +2858,12 @@ pub fn compute_pow_with_progress(
     challenge: String,
     difficulty: u32,
     progress_callback: Option<Box<dyn PowProgressCallback>>,
-) -> PowSolution {
-    crate::pow::compute_pow_with_progress(&challenge, difficulty, progress_callback)
+) -> Result<PowSolution, CryptoError> {
+    Ok(crate::pow::compute_pow_with_progress(
+        &challenge,
+        difficulty,
+        progress_callback,
+    )?)
 }
 
 /// Verify PoW solution (server-side)  

@@ -81,8 +81,11 @@ namespace construct_core {
     sequence<DeliveryTarget> plan_send(sequence<string> recipient_device_ids, sequence<string> own_device_ids, string our_device_id, boolean recipient_is_self);
 
     
-    // Proof of Work functions
+    // Proof of Work functions. `PowDifficultyTooHigh` for a difficulty past 32: no 32-byte hash
+    // has more than 256 leading zero bits, and the search past 2^32 attempts never ended.
+    [Throws=CryptoError]
     PowSolution compute_pow(string challenge, u32 difficulty);
+    [Throws=CryptoError]
     PowSolution compute_pow_with_progress(
         string challenge,
         u32 difficulty,
@@ -382,6 +385,7 @@ enum CryptoError {
     "SerializationFailed",
     "MessagePackDeserializationFailed",
     "PeerSpkStale",
+    "PowDifficultyTooHigh",
 };
 
 dictionary OtpkPair {
