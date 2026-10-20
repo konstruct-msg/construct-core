@@ -166,11 +166,7 @@ fn box_key(dh: &[u8; 32], ff_key: &FirstFlightKey, eph: &[u8], kem_ciphertext: &
     key
 }
 
-fn key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CryptoError> {
-    bytes.try_into().map_err(|_| {
-        CryptoError::InvalidInputError(format!("{what} must be 32 bytes, got {}", bytes.len()))
-    })
-}
+use crate::crypto::as_key32 as key32;
 
 /// Seal a first-flight `wire_payload` and the sender `certificate` to `recipient_identity`.
 /// Refuses a wire payload that carries no ML-KEM handshake: there is nothing to key the box with,

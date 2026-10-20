@@ -334,6 +334,12 @@ impl MlsStore {
     ) -> Result<Self, MlsError> {
         let payload: CfeMlsStoreV1 = cfe::decode_as(data, CfeMessageType::MlsStore)
             .map_err(|e| MlsError::SerializationError(format!("cfe decode: {e}")))?;
+        if payload.version != 1 {
+            return Err(MlsError::SerializationError(format!(
+                "mls store version {} is not supported (this core reads 1)",
+                payload.version
+            )));
+        }
 
         let store = Self::new(signer_private_key, signer_public_key);
         {
@@ -480,6 +486,19 @@ mod tests {
         let ct = carol.encrypt(&group_id, b"hi all").expect("encrypt");
         assert_eq!(alice.decrypt(&group_id, &ct).expect("decrypt"), b"hi all");
         assert_eq!(bob.decrypt(&group_id, &ct).expect("decrypt"), b"hi all");
+    }
+
+    #[test]
+    fn a_store_written_by_a_later_layout_is_refused_not_misread() {
+        let later = cfe::encode(
+            CfeMessageType::MlsStore,
+            &CfeMlsStoreV1 {
+                version: 2,
+                entries: vec![],
+            },
+        )
+        .expect("encode");
+        assert!(MlsStore::import_cfe(&later, vec![0u8; 32], vec![0u8; 32]).is_err());
     }
 
     #[test]

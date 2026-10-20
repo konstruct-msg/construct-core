@@ -171,14 +171,7 @@ fn derive_token(n_compressed: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Constant-time byte comparison (avoids timing side-channel).
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+use crate::crypto::ct_eq as constant_time_eq;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // UniFFI wrappers (called from Swift via construct_core.udl)

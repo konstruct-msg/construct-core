@@ -839,6 +839,12 @@ impl SerializableSession {
     }
 
     pub fn from_cfe_v1(data: crate::cfe::CfeSessionStateV1) -> Result<Self, String> {
+        if data.ver != 1 {
+            return Err(format!(
+                "session state version {} is not supported (this core reads 1)",
+                data.ver
+            ));
+        }
         let suite_id: u16 = data.suite_id as u16;
         let session_id_hex = hex::encode(data.session_id.as_ref());
 

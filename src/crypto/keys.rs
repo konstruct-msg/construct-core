@@ -753,7 +753,7 @@ impl<P: CryptoProvider> KeyManager<P> {
     }
 
     fn now() -> u64 {
-        u64::try_from(crate::utils::time::current_timestamp()).unwrap_or(0)
+        crate::utils::time::now()
     }
 
     fn crypto_err(message: String) -> ConstructError {

@@ -68,7 +68,7 @@ use std::marker::PhantomData;
 /// 1–3 week trip) still yields a clean session, and only genuinely long-dormant peers (a month+)
 /// are reached via the degraded path. Authenticity is unaffected (identity key permanent, SPK
 /// signature still verified); only first-message forward secrecy is marginally older.
-const SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+pub const SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
 
 /// Validate that a received `X3DHPublicKeyBundle` is not stale.
 ///
@@ -96,10 +96,7 @@ where
         return Ok(()); // legacy server — no timestamp provided
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::utils::time::now();
 
     let age = now.saturating_sub(spk_uploaded_at);
     if age > SPK_MAX_AGE_SECS {
@@ -862,11 +859,8 @@ where
         let Some(session) = self.sessions.remove(contact_id) else {
             return false;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.envelopes.retire_session(session.session_id(), now);
+        self.envelopes
+            .retire_session(session.session_id(), crate::utils::time::now());
         true
     }
 

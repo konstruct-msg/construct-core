@@ -108,10 +108,7 @@ impl std::fmt::Display for HistoryFailure {
 
 impl std::error::Error for HistoryFailure {}
 
-/// Equal length and equal bytes, without returning at the first difference.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+pub(crate) use crate::crypto::ct_eq;
 
 #[cfg(test)]
 pub(crate) mod vectors {

@@ -39,7 +39,8 @@ pub const KYBER_PREKEY_SIGN_SUITE_V2: u8 = 0x11;
 /// The oldest a Kyber SPK may be, by its **signed** `created_at`, for an initiator to encapsulate
 /// to it. Not subject to `allow_stale`: that override exists because the classic SPK's upload
 /// time is the server's unsigned word; here, skipping the check is the replay attack itself.
-pub const KYBER_SPK_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+/// The same 30 days as the classic SPK's `client_api::SPK_MAX_AGE_SECS`: one rule, two keys.
+pub const KYBER_SPK_MAX_AGE_SECS: u64 = crate::crypto::client_api::SPK_MAX_AGE_SECS;
 
 /// `"KonstruktX3DH-v1" ‖ 0x00 0x11 ‖ created_at (u64 BE) ‖ kyber_public` — what the device's
 /// identity key (Ed25519, and the hybrid key) signs for every v2 Kyber prekey, SPK and OTPK

@@ -9,13 +9,34 @@ pub const CFE_MAGIC: [u8; 2] = [0x43, 0x46]; // "CF"
 pub const CFE_VERSION: u8 = 0x01;
 pub const CFE_HEADER_LEN: usize = 16;
 
-/// Maximum allowed payload size (256 KiB).
+/// Largest payload of a message-sized envelope (`Generic`, 256 KiB).
 ///
-/// Plaintext is limited to 64 KiB (`MAX_MESSAGE_SIZE`). After PKCS7 padding (~66 KB) and
-/// AEAD encryption (+16 bytes), plus double-ratchet header overhead, a legitimate envelope
-/// is always well under 128 KiB. We use 256 KiB as a generous upper bound to prevent an
-/// attacker from triggering a multi-MiB heap allocation before AEAD authentication fails.
+/// Plaintext is limited to 64 KiB (`MAX_MESSAGE_SIZE`); after padding, AEAD and the ratchet
+/// header a legitimate message envelope is well under 128 KiB. The cap stops an attacker from
+/// making the reader allocate multi-MiB buffers before authentication fails.
 pub const MAX_PAYLOAD_LEN: usize = 256 * 1024;
+
+/// Largest payload of a state blob (64 MiB): the orchestrator state, the MLS store, a session
+/// record and the key stores grow with use and are read back from this device's own secure
+/// store, never from the network. Until 0.54.2 every type shared the 256 KiB cap, and only on
+/// decode: a state blob that grew past it was written without complaint and refused at the
+/// next launch, so the state it held was gone.
+pub const MAX_STATE_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+
+/// The payload cap of `msg_type`, applied on both sides: `encode` refuses to write a blob the
+/// reader would refuse, so the writer learns at write time, not the next launch.
+pub fn max_payload_len(msg_type: CfeMessageType) -> usize {
+    match msg_type {
+        CfeMessageType::Generic => MAX_PAYLOAD_LEN,
+        CfeMessageType::PrivateKeys
+        | CfeMessageType::SessionState
+        | CfeMessageType::OtpkBundle
+        | CfeMessageType::RegistrationBundle
+        | CfeMessageType::OrchestratorState
+        | CfeMessageType::KyberPrivateKeys
+        | CfeMessageType::MlsStore => MAX_STATE_PAYLOAD_LEN,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfeEnvelope {
@@ -30,6 +51,13 @@ pub struct CfeEnvelope {
 pub fn encode<T: Serialize>(msg_type: CfeMessageType, value: &T) -> Result<Vec<u8>, CfeError> {
     let payload =
         rmp_serde::to_vec_named(value).map_err(|e| CfeError::SerializeFailed(e.to_string()))?;
+    let max = max_payload_len(msg_type);
+    if payload.len() > max {
+        return Err(CfeError::PayloadTooLarge {
+            max,
+            got: payload.len(),
+        });
+    }
 
     let crc = {
         let mut hasher = Crc32Hasher::new();
@@ -100,9 +128,10 @@ pub fn parse_header(data: &[u8]) -> Result<CfeEnvelope, CfeError> {
     }
 
     let payload_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    if payload_len > MAX_PAYLOAD_LEN {
+    let max = max_payload_len(msg_type);
+    if payload_len > max {
         return Err(CfeError::PayloadTooLarge {
-            max: MAX_PAYLOAD_LEN,
+            max,
             got: payload_len,
         });
     }
@@ -220,5 +249,54 @@ mod tests {
 
         let err = decode(&bytes).expect_err("must fail");
         assert!(matches!(err, CfeError::PayloadTooLarge { .. }));
+    }
+
+    #[derive(Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Big {
+        #[serde(with = "serde_bytes")]
+        blob: Vec<u8>,
+    }
+
+    #[test]
+    fn a_state_blob_past_256_kib_is_written_and_read_back() {
+        let big = Big {
+            blob: vec![7u8; MAX_PAYLOAD_LEN + 1],
+        };
+        for msg_type in [
+            CfeMessageType::OrchestratorState,
+            CfeMessageType::MlsStore,
+            CfeMessageType::SessionState,
+            CfeMessageType::PrivateKeys,
+            CfeMessageType::OtpkBundle,
+            CfeMessageType::KyberPrivateKeys,
+            CfeMessageType::RegistrationBundle,
+        ] {
+            let bytes = encode(msg_type, &big).expect("a state blob is not capped at 256 KiB");
+            let back: Big = decode_as(&bytes, msg_type).expect("and reads back");
+            assert_eq!(back, big);
+        }
+    }
+
+    #[test]
+    fn a_generic_payload_past_256_kib_is_refused_when_written_not_when_read() {
+        let big = Big {
+            blob: vec![7u8; MAX_PAYLOAD_LEN + 1],
+        };
+        assert!(matches!(
+            encode(CfeMessageType::Generic, &big),
+            Err(CfeError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_blob_past_its_own_cap_is_refused_on_read() {
+        // A header that claims more than the state cap is refused before any allocation.
+        let mut bytes = encode(CfeMessageType::OrchestratorState, &Big { blob: vec![1] }).unwrap();
+        let claimed = (MAX_STATE_PAYLOAD_LEN as u32 + 1).to_le_bytes();
+        bytes[8..12].copy_from_slice(&claimed);
+        assert!(matches!(
+            decode_as::<Big>(&bytes, CfeMessageType::OrchestratorState),
+            Err(CfeError::PayloadTooLarge { .. })
+        ));
     }
 }

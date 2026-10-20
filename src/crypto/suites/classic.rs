@@ -275,7 +275,7 @@ impl CryptoProvider for ClassicSuiteProvider {
     }
 
     fn suite_id() -> u16 {
-        crate::config::Config::global().classic_suite_id
+        crate::crypto::suite_id::SuiteID::CLASSIC.as_u16()
     }
 }
 

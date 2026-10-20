@@ -156,4 +156,19 @@ pub use provider::CryptoProvider;
 
 // Suite ID with validation
 pub mod suite_id;
+
+/// A 32-byte key out of a slice, or an `InvalidInputError` naming `what` and the length it got.
+pub(crate) fn as_key32(bytes: &[u8], what: &str) -> Result<[u8; 32], crate::error::CryptoError> {
+    bytes.try_into().map_err(|_| {
+        crate::error::CryptoError::InvalidInputError(format!(
+            "{what} must be 32 bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
+/// Equal length and equal bytes, without returning at the first difference.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 pub use suite_id::{InvalidSuiteId, SuiteID};

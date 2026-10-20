@@ -622,6 +622,14 @@ impl SessionLifecycleManager {
             CfeMessageType::OrchestratorState,
         )
         .map_err(|e| e.to_string())?;
+        if state.ver != 1 {
+            // A later core wrote a layout this one does not know; reading it as v1 would keep
+            // the fields it recognises and silently drop the rest.
+            return Err(format!(
+                "orchestrator state version {} is not supported (this core reads 1)",
+                state.ver
+            ));
+        }
 
         // Restore ACK cache.
         self.ack_store.restore_cache(
@@ -1565,6 +1573,26 @@ mod tests {
     /// A blob written before 2026-10-20 carries the prekey tracker under `ptk` (and, in
     /// general, keys this build no longer knows); the named-map codec ignores them and the rest
     /// of the state is restored (TODO 199).
+    #[test]
+    fn an_orchestrator_state_blob_of_a_later_version_is_refused_not_misread() {
+        use crate::cfe::{CfeMessageType, CfeOrchestratorStateV1};
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let bytes = mgr
+            .export_orchestrator_state_cfe(&std::collections::HashSet::new())
+            .unwrap();
+        let mut state = crate::cfe::decode_as::<CfeOrchestratorStateV1>(
+            &bytes,
+            CfeMessageType::OrchestratorState,
+        )
+        .unwrap();
+        assert_eq!(state.ver, 1);
+        state.ver = 2;
+        let later = crate::cfe::encode(CfeMessageType::OrchestratorState, &state).unwrap();
+        let err = mgr.import_orchestrator_state_cfe(&later).unwrap_err();
+        assert!(err.contains("version 2"), "{err}");
+    }
+
     #[test]
     fn an_orchestrator_state_blob_with_the_retired_ptk_key_still_imports() {
         use crate::cfe::{CfeAckRecordV1, CfeMessageType};
