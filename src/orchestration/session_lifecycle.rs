@@ -91,6 +91,13 @@ pub struct SessionLifecycleManager {
     /// counterpart of `hybrid_identity_pins`: what a quantum adversary holding the device's X25519
     /// key and a forged server certificate still cannot present.
     kem_identity_pins: std::collections::BTreeMap<String, [u8; 32]>,
+    /// Device → the highest SPK rotation epoch a bundle of that device has been admitted with.
+    /// A bundle below it is a replay — an old bundle served again, its one-time prekey possibly
+    /// already spent — and is refused (`spk_epoch_regression`). Per device, since the bundle
+    /// names one: keyed by account, as iOS kept it until 2026-10-20, a peer's second device
+    /// compared against the first's counter — a false refusal one way, a weakened check the
+    /// other (TODO 176). Epoch 0 is a server that has not migrated, and claims nothing.
+    spk_epochs: std::collections::BTreeMap<String, u32>,
     my_user_id: String,
     clock: Arc<dyn Clock>,
     /// How late messages arrive, for this process (PQR-4). Diagnostics only.
@@ -126,6 +133,7 @@ impl SessionLifecycleManager {
             prekey_tracker: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
             kem_identity_pins: std::collections::BTreeMap::new(),
+            spk_epochs: std::collections::BTreeMap::new(),
             reorder_stats: super::ReorderStats::default(),
             my_user_id,
             clock,
@@ -168,6 +176,38 @@ impl SessionLifecycleManager {
         // local state about that contact like the rest.
         self.hybrid_identity_pins.remove(contact_id);
         self.kem_identity_pins.remove(contact_id);
+        self.spk_epochs.remove(contact_id);
+    }
+
+    /// Whether a bundle of `device_id` with SPK rotation epoch `epoch` goes back behind what this
+    /// device has already admitted from it. `None` admits; epoch 0 always does (a server that
+    /// has not migrated). A session reset keeps the epoch: that is exactly when a replayed bundle
+    /// would be offered. Only `forget_contact_state` lets it go.
+    pub fn spk_epoch_regression(&self, device_id: &str, epoch: u32) -> Option<SpkEpochRegressed> {
+        if epoch == 0 {
+            return None;
+        }
+        match self.spk_epochs.get(device_id) {
+            Some(&known) if epoch < known => Some(SpkEpochRegressed {
+                received: epoch,
+                known,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Record `epoch` as admitted from `device_id`, if it is higher than what is known.
+    pub fn note_spk_epoch(&mut self, device_id: &str, epoch: u32) {
+        if epoch == 0 {
+            return;
+        }
+        let known = self.spk_epochs.entry(device_id.to_string()).or_insert(0);
+        *known = (*known).max(epoch);
+    }
+
+    /// The highest SPK rotation epoch admitted from `device_id`, if any.
+    pub fn known_spk_epoch(&self, device_id: &str) -> Option<u32> {
+        self.spk_epochs.get(device_id).copied()
     }
 
     /// Now, by the injected clock (unix seconds).
@@ -580,6 +620,14 @@ impl SessionLifecycleManager {
                 })
                 .collect(),
             envelope_book: self.client.envelopes().to_cfe(),
+            spk_epochs: self
+                .spk_epochs
+                .iter()
+                .map(|(device, epoch)| crate::cfe::CfeSpkEpochV1 {
+                    device_id: device.clone(),
+                    epoch: *epoch,
+                })
+                .collect(),
         };
 
         crate::cfe::encode(CfeMessageType::OrchestratorState, &state).map_err(|e| e.to_string())
@@ -625,6 +673,12 @@ impl SessionLifecycleManager {
         };
         self.hybrid_identity_pins = pins(state.hybrid_identity_pins);
         self.kem_identity_pins = pins(state.kem_identity_pins);
+        self.spk_epochs = state
+            .spk_epochs
+            .into_iter()
+            .filter(|e| e.epoch > 0)
+            .map(|e| (e.device_id, e.epoch))
+            .collect();
         let mut envelopes =
             crate::crypto::sealed_sender::book::EnvelopeBook::from_cfe(&state.envelope_book);
         envelopes.prune(self.clock.now_secs());
@@ -1526,6 +1580,7 @@ mod tests {
         // lose dedup state it already had in memory.
         use crate::cfe::{CfeAckRecordV1, CfeMessageType, CfeOrchestratorStateV1};
         let legacy = CfeOrchestratorStateV1 {
+            spk_epochs: Vec::new(),
             ver: 1,
             my_user_id: "alice".to_string(),
             processed_ids: vec![
@@ -1595,5 +1650,28 @@ mod tests {
             "JSON/CFE ratio: {:.1}x",
             json_str.len() as f64 / cfe_bytes.len() as f64
         );
+    }
+}
+
+/// The error prefix a refused bundle's reason starts with on the event path
+/// (`OPEN_SESSION_REFUSED`), beside `PQ_REQUIRED`.
+pub const SPK_EPOCH_REGRESSED: &str = "SPK_EPOCH_REGRESSED";
+
+/// A bundle whose SPK rotation epoch is below the one already admitted from the same device —
+/// an old bundle served again (TODO 176).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpkEpochRegressed {
+    pub received: u32,
+    pub known: u32,
+}
+
+impl std::fmt::Display for SpkEpochRegressed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{SPK_EPOCH_REGRESSED}: the bundle's SPK rotation epoch {} is below the {} already \
+             admitted from this device",
+            self.received, self.known
+        )
     }
 }
