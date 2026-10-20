@@ -595,3 +595,27 @@ fn the_call_log_crosses_the_boundary() {
     assert_eq!(store.delete_all_calls().unwrap(), 1);
     assert!(store.calls(10).unwrap().is_empty());
 }
+
+/// A wipe that failed to remove a file is not `Closed` for good: the next `wipe` removes what
+/// is left, and only then is the object closed.
+///
+/// Mutation: drop `wipe_retry` and answer `Closed` from a `None` inner — the second wipe reddens.
+#[test]
+fn a_failed_wipe_can_be_retried_until_the_files_are_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retry.db");
+    let store = LocalStore::new(path.to_string_lossy().into(), KEY.to_vec()).unwrap();
+    store.upsert_contact(contact("peer")).unwrap();
+    let blocker = dir.path().join("retry.db-journal");
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::write(blocker.join("x"), b"x").unwrap();
+
+    assert!(store.wipe().is_err());
+    assert!(matches!(store.contacts(), Err(LocalStoreError::Closed)));
+    assert!(!path.exists());
+
+    std::fs::remove_dir_all(&blocker).unwrap();
+    store.wipe().unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(matches!(store.wipe(), Err(LocalStoreError::Closed)));
+}
