@@ -15,6 +15,12 @@ use thiserror::Error;
 /// Must be <= 255 to fit padding length in u8
 pub const DEFAULT_BLOCK_SIZE: usize = 255;
 
+/// Largest block size the PKCS#7-style scheme can express: the padding length is one byte
+/// and must be at least 1, so a block of 256 would need a padding length of 256 for an
+/// input that is a whole number of blocks — which the byte cannot hold (it would read as 0
+/// and `unpad_message` would reject its own output).
+pub const MAX_BLOCK_SIZE: usize = 255;
+
 /// Maximum supported message size (64KB)
 pub const MAX_MESSAGE_SIZE: usize = 65536;
 
@@ -28,13 +34,16 @@ pub enum PaddingError {
 
     #[error("Message is empty")]
     EmptyMessage,
+
+    #[error("Block size {0} is not in 1..={MAX_BLOCK_SIZE}")]
+    InvalidBlockSize(usize),
 }
 
 /// Pad a message to a multiple of block_size using PKCS7-style padding
 ///
 /// # Arguments
 /// * `plaintext` - Original message bytes
-/// * `block_size` - Block size to pad to (default: 256 bytes)
+/// * `block_size` - Block size to pad to, `1..=255` (default: 255 bytes)
 ///
 /// # Returns
 /// Padded message where:
@@ -54,6 +63,9 @@ pub enum PaddingError {
 /// assert_eq!(padded.len(), 255);
 /// ```
 pub fn pad_message(plaintext: &[u8], block_size: usize) -> Result<Vec<u8>, PaddingError> {
+    if block_size == 0 || block_size > MAX_BLOCK_SIZE {
+        return Err(PaddingError::InvalidBlockSize(block_size));
+    }
     if plaintext.len() > MAX_MESSAGE_SIZE {
         return Err(PaddingError::MessageTooLarge(
             plaintext.len(),
@@ -66,8 +78,7 @@ pub fn pad_message(plaintext: &[u8], block_size: usize) -> Result<Vec<u8>, Paddi
     let padded_len = blocks * block_size;
     let padding_len = padded_len - plaintext.len();
 
-    // Padding length must fit in u8 (1-255)
-    // Since block_size <= 256, this is always true
+    // Padding length is in 1..=block_size <= 255, so it fits the byte.
     let padding_byte = padding_len as u8;
 
     // Pre-allocate with exact capacity (energy efficient)
@@ -79,7 +90,7 @@ pub fn pad_message(plaintext: &[u8], block_size: usize) -> Result<Vec<u8>, Paddi
     Ok(result)
 }
 
-/// Pad message with default block size (256 bytes)
+/// Pad message with default block size (255 bytes)
 pub fn pad_message_default(plaintext: &[u8]) -> Result<Vec<u8>, PaddingError> {
     pad_message(plaintext, DEFAULT_BLOCK_SIZE)
 }
@@ -186,7 +197,26 @@ mod tests {
     #[test]
     fn test_message_too_large() {
         let huge_msg = vec![0u8; MAX_MESSAGE_SIZE + 1];
-        assert!(pad_message(&huge_msg, 256).is_err());
+        assert!(pad_message(&huge_msg, 255).is_err());
+    }
+
+    #[test]
+    fn a_block_size_of_zero_is_refused_not_divided_by() {
+        assert!(matches!(
+            pad_message(b"x", 0),
+            Err(PaddingError::InvalidBlockSize(0))
+        ));
+    }
+
+    #[test]
+    fn a_block_size_of_256_is_refused_because_unpad_could_not_read_it_back() {
+        // On the old code this returned 256 bytes ending in 0x00, which unpad rejects.
+        assert!(matches!(
+            pad_message(b"", 256),
+            Err(PaddingError::InvalidBlockSize(256))
+        ));
+        assert!(pad_message(b"", 255).is_ok());
+        assert!(pad_message(b"", 1).is_ok());
     }
 
     #[test]

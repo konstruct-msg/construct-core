@@ -16,7 +16,7 @@
 //! use std::time::Duration;
 //!
 //! // Add jitter to heartbeat
-//! let heartbeat = jittered_interval(30_000, 5_000); // 30s ± 5s
+//! let heartbeat = jittered_interval(30_000, 5_000); // 30s + 0..5s (jitter is only ever added)
 //!
 //! // Delay message sending (prevents timing correlation)
 //! let delay = random_send_delay(100); // 0-100ms
@@ -37,10 +37,11 @@ use std::time::Duration;
 /// * `jitter_ms` - Maximum random jitter to add
 ///
 /// # Returns
-/// Duration with random jitter added
+/// Duration with random jitter added — `base_ms + [0, jitter_ms]`, never below `base_ms`.
+/// Saturates at `u64::MAX` ms instead of overflowing.
 pub fn jittered_interval(base_ms: u64, jitter_ms: u64) -> Duration {
     let jitter = rand::thread_rng().gen_range(0..=jitter_ms);
-    Duration::from_millis(base_ms + jitter)
+    Duration::from_millis(base_ms.saturating_add(jitter))
 }
 
 /// Generate a random delay before sending a message
@@ -110,37 +111,6 @@ pub fn recommended_send_delay(is_high_priority: bool, battery_level: f32) -> Dur
     } else {
         // Normal case
         random_send_delay(100)
-    }
-}
-
-/// Configuration for timing behavior
-#[derive(Debug, Clone, Copy)]
-pub struct TimingConfig {
-    /// Base heartbeat interval (seconds)
-    pub heartbeat_interval_sec: u64,
-
-    /// Heartbeat jitter (milliseconds)
-    pub heartbeat_jitter_ms: u64,
-
-    /// Maximum send delay (milliseconds)
-    pub max_send_delay_ms: u64,
-
-    /// Enable timing protection
-    pub enabled: bool,
-
-    /// Battery-aware mode (reduce jitter when battery low)
-    pub battery_aware: bool,
-}
-
-impl Default for TimingConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_interval_sec: 30,
-            heartbeat_jitter_ms: 5000, // ±5 seconds
-            max_send_delay_ms: 100,    // 0-100ms delay
-            enabled: true,
-            battery_aware: true, // Enable battery awareness by default
-        }
     }
 }
 
@@ -217,12 +187,8 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_config_defaults() {
-        let config = TimingConfig::default();
-        assert!(config.enabled);
-        assert!(config.battery_aware);
-        assert_eq!(config.heartbeat_interval_sec, 30);
-        assert_eq!(config.heartbeat_jitter_ms, 5000);
-        assert_eq!(config.max_send_delay_ms, 100);
+    fn a_jittered_interval_near_the_top_of_u64_saturates_instead_of_overflowing() {
+        let duration = jittered_interval(u64::MAX - 1, 10);
+        assert_eq!(duration, Duration::from_millis(u64::MAX));
     }
 }
