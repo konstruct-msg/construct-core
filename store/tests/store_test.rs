@@ -933,10 +933,9 @@ fn a_peer_has_one_chat() {
     assert_eq!(store.chat_for_peer("nobody").unwrap(), None);
 }
 
-/// Messages arrive out of order; the preview only moves forward. Mutation: drop the time
-/// condition from `advance_chat_preview` — the late older message replaces the newer preview.
+/// The preview is set whatever it was, back in time too, and cleared when no message is left.
 #[test]
-fn the_preview_moves_forward_unless_set() {
+fn the_preview_is_set_and_cleared() {
     let store = store_with_peer("p");
     store.upsert_chat(&chat("c", "p", None, false)).unwrap();
     let preview = |s: &Store| {
@@ -944,13 +943,12 @@ fn the_preview_moves_forward_unless_set() {
         (c.last_message_text, c.last_message_time)
     };
 
-    assert!(store.advance_chat_preview("c", "first", 10).unwrap());
-    assert!(store.advance_chat_preview("c", "newer", 20).unwrap());
-    assert!(!store.advance_chat_preview("c", "late", 15).unwrap());
+    assert!(
+        store
+            .set_chat_preview("c", Some("newer"), Some(20))
+            .unwrap()
+    );
     assert_eq!(preview(&store), (Some("newer".into()), Some(20)));
-    assert!(store.advance_chat_preview("c", "edited", 20).unwrap());
-    assert_eq!(preview(&store), (Some("edited".into()), Some(20)));
-
     assert!(store.set_chat_preview("c", Some("left"), Some(3)).unwrap());
     assert_eq!(preview(&store), (Some("left".into()), Some(3)));
     assert!(store.set_chat_preview("c", None, None).unwrap());
@@ -1011,7 +1009,6 @@ fn each_chat_write_changes_only_its_fields() {
     for missing in [
         store.set_chat_pinned("nobody", true).unwrap(),
         store.increment_unread("nobody").unwrap(),
-        store.advance_chat_preview("nobody", "x", 1).unwrap(),
         store.set_chat_preview("nobody", None, None).unwrap(),
     ] {
         assert!(!missing);

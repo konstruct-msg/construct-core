@@ -1954,10 +1954,9 @@ interface LocalStore {
     [Throws=LocalStoreError]
     LocalChat? chat_for_peer(string peer_id);
     /// Each write below changes its named fields of one chat in one statement; false: no such chat.
-    /// Moves the preview unless the one shown is newer; false also when it is.
-    [Throws=LocalStoreError]
-    boolean advance_chat_preview(string id, string text, i64 time);
-    /// Sets the preview whatever it was — after a deletion; both null when no message is left.
+    /// Sets the preview whatever it was. Which message it shows is the client's to say, as the
+    /// transcript's last in the server's order — never by a message's own time, which is the
+    /// sender's clock. Both null when no message is left.
     [Throws=LocalStoreError]
     boolean set_chat_preview(string id, string? text, i64? time);
     [Throws=LocalStoreError]

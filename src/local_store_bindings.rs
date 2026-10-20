@@ -381,9 +381,6 @@ impl LocalStore {
     pub fn chat_for_peer(&self, peer_id: String) -> Result<Option<LocalChat>> {
         Ok(self.with(|s| s.chat_for_peer(&peer_id))?.map(Into::into))
     }
-    pub fn advance_chat_preview(&self, id: String, text: String, time: i64) -> Result<bool> {
-        self.with(|s| s.advance_chat_preview(&id, &text, time))
-    }
     pub fn set_chat_preview(
         &self,
         id: String,
