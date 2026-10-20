@@ -2807,3 +2807,116 @@ fn test_pqr1_the_epoch_age_survives_restore() {
     let restored = cfe_round_trip(&alice);
     assert_eq!(restored.pq_epoch_since, 1_700_000_000);
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Audit 2026-10-20 — order of the decrypt steps and of the encrypt commit.
+// Each test reddens on the code before its fix (TODO 189, 190, 191).
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A message from the DH chain the ratchet has already moved past is read from its stored key,
+/// and the live state is left alone.
+///
+/// Mutation: perform the DH step before the skipped-key lookup — Bob "steps back" onto A1 from
+/// the A2 root, a2 still decrypts from its stored key, and a4 then fails AEAD.
+#[test]
+fn a_late_message_from_the_previous_dh_chain_does_not_step_the_ratchet() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    // Alice on chain A1 sends two messages; only the first reaches Bob now.
+    let a1 = alice.encrypt(b"a1").unwrap();
+    let a2 = alice.encrypt(b"a2").unwrap();
+    assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
+    // Bob replies with his new DH key; Alice reads it and turns to chain A2.
+    let b1 = bob.encrypt(b"b1").unwrap();
+    assert_eq!(alice.decrypt(&b1).unwrap(), b"b1");
+    let a3 = alice.encrypt(b"a3").unwrap();
+    assert_eq!(bob.decrypt(&a3).unwrap(), b"a3"); // Bob turns to A2, stores a2's key
+    let root_after_turn = bob.root_key.clone();
+    let remote_after_turn: Option<Vec<u8>> = bob.remote_dh_public.clone();
+
+    // The late a2 (chain A1) arrives.
+    assert_eq!(bob.decrypt(&a2).unwrap(), b"a2");
+    assert_eq!(
+        bob.root_key, root_after_turn,
+        "a stored key must not move the root"
+    );
+    assert_eq!(
+        bob.remote_dh_public, remote_after_turn,
+        "a stored key must not move the remote DH key"
+    );
+    assert!(
+        bob.skipped_message_keys.is_empty() && bob.skipped_key_timestamps.is_empty(),
+        "the stored key and its timestamp are consumed"
+    );
+
+    // Both directions still work.
+    let a4 = alice.encrypt(b"a4").unwrap();
+    assert_eq!(bob.decrypt(&a4).unwrap(), b"a4");
+    let b2 = bob.encrypt(b"b2").unwrap();
+    assert_eq!(alice.decrypt(&b2).unwrap(), b"b2");
+    let a5 = alice.encrypt(b"a5").unwrap();
+    assert_eq!(bob.decrypt(&a5).unwrap(), b"a5");
+}
+
+/// A chain longer than `max_message_jump` followed by a DH turn: every message of the new chain
+/// is read. The PN bound applies to the step that walks the old chain, not to each message after.
+///
+/// Mutation: check `previous_chain_length` on every message — the second message of the new
+/// chain is refused with "Previous chain length jump too large".
+#[test]
+fn a_long_chain_then_a_dh_turn_keeps_reading() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    let jump = crate::config::Config::global().max_message_jump;
+    for i in 0..(jump + 50) {
+        let m = alice.encrypt(b"x").unwrap();
+        bob.decrypt(&m)
+            .unwrap_or_else(|e| panic!("message {i} on the first chain: {e}"));
+    }
+    let b1 = bob.encrypt(b"b1").unwrap();
+    alice.decrypt(&b1).unwrap();
+    for i in 0..3 {
+        let m = alice.encrypt(b"y").unwrap();
+        bob.decrypt(&m)
+            .unwrap_or_else(|e| panic!("message {i} on the new chain: {e}"));
+    }
+}
+
+/// The DoS bound on a DH step is the message number itself: the new chain starts at 0, so a
+/// number past `max_message_jump` on the first message of a chain is refused regardless of how
+/// long the old chain was.
+#[test]
+fn the_jump_bound_on_a_dh_step_is_against_zero() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    let jump = crate::config::Config::global().max_message_jump;
+    let b1 = bob.encrypt(b"b1").unwrap();
+    alice.decrypt(&b1).unwrap();
+    let mut m = alice.encrypt(b"first on the new chain").unwrap();
+    m.message_number = jump + 1;
+    let err = bob.decrypt(&m).unwrap_err();
+    assert!(err.contains("after DH step"), "{err}");
+}
+
+/// A failure inside `encrypt` after the message key is derived leaves the chain where it was:
+/// the next message carries the number its key was derived for.
+///
+/// Mutation: move `self.sending_chain_key = next_chain_key` back above the PQ steps — after the
+/// failed call Alice sends number N with the key for N+1, and Bob cannot read it.
+#[test]
+#[cfg(feature = "post-quantum")]
+fn a_failed_encrypt_does_not_split_the_chain_key_from_its_counter() {
+    let (mut alice, mut bob) = make_pq_session_pair("alice", "bob");
+    let a1 = alice.encrypt(b"a1").unwrap();
+    assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
+
+    // An epoch that has no chains makes `pq_send_key` fail after KDF_CK would have run.
+    let epoch_before = alice.current_pq_epoch;
+    let counter_before = alice.sending_chain_length;
+    alice.current_pq_epoch = 4242;
+    let err = alice.encrypt(b"never sent").unwrap_err();
+    assert!(err.contains("no send chain"), "{err}");
+    alice.current_pq_epoch = epoch_before;
+    assert_eq!(alice.sending_chain_length, counter_before);
+
+    let a2 = alice.encrypt(b"a2").unwrap();
+    assert_eq!(a2.message_number, counter_before);
+    assert_eq!(bob.decrypt(&a2).unwrap(), b"a2");
+}
