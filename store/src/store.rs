@@ -244,12 +244,15 @@ impl Store {
         Ok(rows)
     }
 
-    /// Removes the contact with its chats and their messages; `false` when there was no such row.
-    /// The chats and messages the cascade removes are announced like a direct delete, and the
-    /// reactions on those messages go with them (no foreign key holds them). Until 2026-10-20
-    /// only the contact was announced (TODO 196).
+    /// Removes the contact and everything of it: its chats and their messages (the foreign-key
+    /// cascade), the reactions on those messages, its calls, its devices, the chunks of its
+    /// messages still being reassembled and the resends queued to it. Each table is announced as
+    /// a direct delete would be. `false` when there was no such row. What stays: the dedup ids
+    /// in `processed_messages` and the server ids in `server_message_ids` — opaque ids pruned by
+    /// age, and the reason a redelivered copy is still a duplicate. Until 2026-10-20 only the
+    /// contact row went, and only the contact was announced (TODO 196).
     pub fn delete_contact(&self, id: &str) -> Result<bool> {
-        let (removed, chats, messages) = {
+        let (removed, chats, messages, calls, devices) = {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
             let chats = ids_where(&tx, "SELECT id FROM chats WHERE peer_id = ?1", [id])?;
@@ -261,15 +264,35 @@ impl Store {
                     [chat.as_str()],
                 )?);
             }
+            let calls = ids_where(&tx, "SELECT id FROM calls WHERE peer_user_id = ?1", [id])?;
+            let devices = ids_where(
+                &tx,
+                "SELECT device_id FROM peer_devices WHERE account_id = ?1",
+                [id],
+            )?;
             let removed = tx.execute("DELETE FROM contacts WHERE id = ?1", [id])?;
             delete_reactions_on(&tx, &messages)?;
+            tx.execute("DELETE FROM calls WHERE peer_user_id = ?1", [id])?;
+            tx.execute("DELETE FROM pending_resends WHERE account_id = ?1", [id])?;
+            // Chunks are keyed by the sending device; the account id is accepted too, for a
+            // client that keys them that way.
+            tx.execute("DELETE FROM pending_chunks WHERE sender_id = ?1", [id])?;
+            for device in &devices {
+                tx.execute(
+                    "DELETE FROM pending_chunks WHERE sender_id = ?1",
+                    [device.as_str()],
+                )?;
+            }
+            tx.execute("DELETE FROM peer_devices WHERE account_id = ?1", [id])?;
             tx.commit()?;
-            (removed, chats, messages)
+            (removed, chats, messages, calls, devices)
         };
         if removed > 0 {
             self.notify(Table::Contacts, vec![id.to_string()]);
             self.notify(Table::Chats, chats);
             self.notify(Table::Messages, messages);
+            self.notify(Table::Calls, calls);
+            self.notify(Table::PeerDevices, devices);
         }
         Ok(removed > 0)
     }
