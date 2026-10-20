@@ -590,20 +590,11 @@ impl Store {
     // contact writes. The preview and the unread count are written by every arriving message, from
     // whichever thread received it: a read, a change and a write back would lose one of two.
 
-    /// Moves the preview to a message unless the one shown is newer — messages arrive out of
-    /// order, and an older one must not replace a newer preview. An equal time moves it (a
-    /// message edited in place). `false`: no such chat, or the preview shown is newer.
-    pub fn advance_chat_preview(&self, id: &str, text: &str, time: i64) -> Result<bool> {
-        self.update_chat(
-            id,
-            "last_message_text = ?1, last_message_time = ?2",
-            "AND (last_message_time IS NULL OR last_message_time <= ?2)",
-            &[&text, &time],
-        )
-    }
-
-    /// Sets the preview whatever it was: recomputed from the messages left after a deletion,
-    /// which moves it back; both `None` when none are left.
+    /// Sets the preview whatever it was; both `None` when no message is left. Which message it
+    /// shows is the client's to say: the transcript's last, in the server's order. Until
+    /// 2026-10-20 there was also `advance_chat_preview`, which moved it only when a message's own
+    /// time was not older — the sender's clock — and so kept a message the server placed later
+    /// out of the list. No client called it any more.
     pub fn set_chat_preview(
         &self,
         id: &str,
