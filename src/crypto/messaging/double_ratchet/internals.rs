@@ -179,7 +179,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.pq_authentication = PqAuthentication::ReceivedProven;
             tracing::info!(
                 target: "crypto::double_ratchet",
-                session_id = %self.session_id,
+                session_id = %super::id_prefix(&self.session_id),
                 "initiator proved its KEM identity key"
             );
         }

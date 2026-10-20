@@ -257,7 +257,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         }
         // Ensure next_prekey_id is ahead of the current key id.
         if spk_id >= self.next_prekey_id {
-            self.next_prekey_id = spk_id + 1;
+            self.next_prekey_id = spk_id.saturating_add(1);
         }
         Ok(())
     }
@@ -347,7 +347,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         let signature = P::sign(signing_key, &message_to_sign).map_err(ConstructError::Crypto)?;
 
         let key_id = self.next_prekey_id;
-        self.next_prekey_id += 1;
+        self.next_prekey_id = self.next_prekey_id.saturating_add(1);
 
         let prekey_store = PrekeyStore {
             key_pair,
@@ -858,7 +858,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         );
         // Advance next_prekey_id so future rotations don't reuse an old id.
         if key_id >= self.next_prekey_id {
-            self.next_prekey_id = key_id + 1;
+            self.next_prekey_id = key_id.saturating_add(1);
         }
         Ok(())
     }

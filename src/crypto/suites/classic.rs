@@ -136,6 +136,12 @@ impl CryptoProvider for ClassicSuiteProvider {
 
         // Now consume ephemeral_secret in DH
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public_key);
+        if !shared_secret.was_contributory() {
+            // A low-order peer point makes the shared secret all zero whatever our key is.
+            return Err(CryptoError::InvalidInputError(
+                "X25519 peer key is of low order".to_string(),
+            ));
+        }
 
         Ok((
             ephemeral_public_key.to_bytes().to_vec(),
@@ -159,6 +165,12 @@ impl CryptoProvider for ClassicSuiteProvider {
         let ephemeral_public_key = KemPublicKeyDalek::from(*ct_bytes);
 
         let shared_secret = static_secret.diffie_hellman(&ephemeral_public_key);
+        if !shared_secret.was_contributory() {
+            // A low-order peer point makes the shared secret all zero whatever our key is.
+            return Err(CryptoError::InvalidInputError(
+                "X25519 peer key is of low order".to_string(),
+            ));
+        }
         Ok(shared_secret.to_bytes().to_vec())
     }
 
@@ -269,6 +281,19 @@ impl CryptoProvider for ClassicSuiteProvider {
 
 #[cfg(test)]
 mod tests {
+    /// A low-order peer point (here the all-zero one) is refused on both sides of the KEM: the
+    /// shared secret it would give is all zero whatever our key is (TODO 198).
+    ///
+    /// Mutation: drop the `was_contributory` checks — both calls succeed with a zero secret.
+    #[test]
+    fn a_low_order_peer_key_is_refused() {
+        use super::*;
+        let (sk, _) = ClassicSuiteProvider::generate_kem_keys().unwrap();
+        let zero = ClassicSuiteProvider::kem_public_key_from_bytes(vec![0u8; 32]);
+        assert!(ClassicSuiteProvider::kem_encapsulate(&zero).is_err());
+        assert!(ClassicSuiteProvider::kem_decapsulate(&sk, &[0u8; 32]).is_err());
+    }
+
     use super::*;
 
     /// The provider's secret types are what the ratchet holds in memory (root, chain and

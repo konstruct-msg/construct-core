@@ -95,12 +95,20 @@ fn gf_pow(base: u8, exp: u8) -> u8 {
 // ── Shamir Secret Sharing ─────────────────────────────────────────────────────
 
 /// A single Shamir share: a 1-based index and 32 bytes of share data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Share {
     /// 1-based share index (1..=share_count).
     pub index: u8,
     /// 32 bytes of share data.
     pub data: [u8; 32],
+}
+
+impl std::fmt::Debug for Share {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Share")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Split a 32-byte secret into `share_count` shares, requiring `threshold` to reconstruct.
@@ -427,7 +435,7 @@ pub fn decode_share(mnemonic: &str) -> Result<Share> {
 // ── Recovery bundle ───────────────────────────────────────────────────────────
 
 /// Keys and metadata packed into the encrypted recovery bundle.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryBundle {
     /// Ed25519 signing key bytes (32 bytes).
     pub device_signing_key: Vec<u8>,
@@ -437,6 +445,15 @@ pub struct RecoveryBundle {
     pub device_id: String,
     /// Unix timestamp (seconds) when the bundle was created.
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for RecoveryBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryBundle")
+            .field("device_id", &self.device_id)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Bundle encryption / decryption ───────────────────────────────────────────
@@ -871,6 +888,26 @@ mod tests {
         assert_eq!(wire[0], 0);
         let err = wire_to_share(&wire).unwrap_err();
         assert!(err.to_string().contains("index 0"), "{err}");
+    }
+
+    /// What `{:?}` shows of a share or a bundle is its shape, never the bytes (TODO 198).
+    #[test]
+    fn debug_output_carries_no_secret() {
+        let share = Share {
+            index: 3,
+            data: [0xAB; 32],
+        };
+        let shown = format!("{share:?}");
+        assert!(shown.contains("index: 3"), "{shown}");
+        assert!(!shown.contains("171") && !shown.contains("ab"), "{shown}");
+        let bundle = RecoveryBundle {
+            device_signing_key: vec![0xCD; 32],
+            device_identity_key: vec![0xEF; 32],
+            device_id: "dev".into(),
+            created_at: 1,
+        };
+        let shown = format!("{bundle:?}");
+        assert!(shown.contains("dev") && !shown.contains("205") && !shown.contains("239"));
     }
 }
 

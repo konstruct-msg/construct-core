@@ -44,11 +44,11 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             derive_shared_session_id::<P>(root_key, &local_user_id, &contact_id)
                 .map_err(|e| format!("INITIATOR: session_id derivation failed: {}", e))?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "crypto::double_ratchet",
-            contact_id = %contact_id,
+            contact_id = %super::id_prefix(&contact_id),
             root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
-            session_id = %shared_session_id,
+            session_id = %super::id_prefix(&shared_session_id),
             "INITIATOR session_id derived"
         );
 
@@ -155,10 +155,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             derive_shared_session_id::<P>(root_key, &local_user_id, &contact_id)
                 .map_err(|e| format!("RESPONDER: session_id derivation failed: {}", e))?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "crypto::double_ratchet",
             root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
-            session_id = %shared_session_id,
+            session_id = %super::id_prefix(&shared_session_id),
             "RESPONDER session_id derived"
         );
 
@@ -358,11 +358,15 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             },
         );
 
-        tracing::info!(
+        // Prefixes, at debug, as `try_aead_decrypt` logs: the session id is an AD component and
+        // the one secret standing between a forged first message and the initiator's empty
+        // receiving chain. Until 2026-10-20 all three identifiers were written whole, at info,
+        // on every message (TODO 198).
+        tracing::debug!(
             target: "crypto::double_ratchet",
-            local_user_id = %self.local_user_id,
-            contact_id = %self.contact_id,
-            session_id = %self.session_id,
+            local_user_id = %super::id_prefix(&self.local_user_id),
+            contact_id = %super::id_prefix(&self.contact_id),
+            session_id = %super::id_prefix(&self.session_id),
             msg_num = %message_number,
             dh_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&dh_public_key),
             ad_len = %associated_data.len(),

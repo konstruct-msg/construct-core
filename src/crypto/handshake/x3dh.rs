@@ -336,21 +336,27 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
 
         // DH1 = DH(IK_A, SPK_B)
         trace!(target: "crypto::x3dh", "Computing DH1 = DH(IK_A, SPK_B)");
-        let dh1 = P::kem_decapsulate(local_identity, remote_signed_prekey_public.as_ref())
-            .map_err(|e| format!("DH1 failed: {}", e))?;
+        let dh1 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(local_identity, remote_signed_prekey_public.as_ref())
+                .map_err(|e| format!("DH1 failed: {}", e))?,
+        );
 
         // DH2 = DH(EK_A, IK_B)
         trace!(target: "crypto::x3dh", "Computing DH2 = DH(EK_A, IK_B)");
-        let dh2 = P::kem_decapsulate(&ephemeral_private, remote_identity_public.as_ref())
-            .map_err(|e| format!("DH2 failed: {}", e))?;
+        let dh2 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(&ephemeral_private, remote_identity_public.as_ref())
+                .map_err(|e| format!("DH2 failed: {}", e))?,
+        );
 
         // DH3 = DH(EK_A, SPK_B)
         trace!(target: "crypto::x3dh", "Computing DH3 = DH(EK_A, SPK_B)");
-        let dh3 = P::kem_decapsulate(&ephemeral_private, remote_signed_prekey_public.as_ref())
-            .map_err(|e| format!("DH3 failed: {}", e))?;
+        let dh3 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(&ephemeral_private, remote_signed_prekey_public.as_ref())
+                .map_err(|e| format!("DH3 failed: {}", e))?,
+        );
 
         // DH4 = DH(EK_A, OPK_B) — optional, only when server provided a one-time prekey
-        let dh4_opt: Option<Vec<u8>> =
+        let dh4_opt: Option<zeroize::Zeroizing<Vec<u8>>> =
             if let Some(otpk_bytes) = &remote_bundle.one_time_prekey_public {
                 if otpk_bytes.len() != 32 {
                     return Err(format!(
@@ -360,10 +366,10 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
                 }
                 let remote_otpk = P::kem_public_key_from_bytes(otpk_bytes.clone());
                 trace!(target: "crypto::x3dh", "Computing DH4 = DH(EK_A, OPK_B)");
-                Some(
+                Some(zeroize::Zeroizing::new(
                     P::kem_decapsulate(&ephemeral_private, remote_otpk.as_ref())
                         .map_err(|e| format!("DH4 failed: {}", e))?,
-                )
+                ))
             } else {
                 trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK in bundle — fallback mode)");
                 None
@@ -476,30 +482,37 @@ impl<P: CryptoProvider> KeyAgreement<P> for X3DHProtocol<P> {
 
         // DH1 = DH(SPK_B, IK_A)
         trace!(target: "crypto::x3dh", "Computing DH1 = DH(SPK_B, IK_A)");
-        let dh1 = P::kem_decapsulate(local_signed_prekey, remote_identity.as_ref())
-            .map_err(|e| format!("DH1 failed: {}", e))?;
+        let dh1 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(local_signed_prekey, remote_identity.as_ref())
+                .map_err(|e| format!("DH1 failed: {}", e))?,
+        );
 
         // DH2 = DH(IK_B, EK_A)
         trace!(target: "crypto::x3dh", "Computing DH2 = DH(IK_B, EK_A)");
-        let dh2 = P::kem_decapsulate(local_identity, remote_ephemeral.as_ref())
-            .map_err(|e| format!("DH2 failed: {}", e))?;
+        let dh2 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(local_identity, remote_ephemeral.as_ref())
+                .map_err(|e| format!("DH2 failed: {}", e))?,
+        );
 
         // DH3 = DH(SPK_B, EK_A)
         trace!(target: "crypto::x3dh", "Computing DH3 = DH(SPK_B, EK_A)");
-        let dh3 = P::kem_decapsulate(local_signed_prekey, remote_ephemeral.as_ref())
-            .map_err(|e| format!("DH3 failed: {}", e))?;
+        let dh3 = zeroize::Zeroizing::new(
+            P::kem_decapsulate(local_signed_prekey, remote_ephemeral.as_ref())
+                .map_err(|e| format!("DH3 failed: {}", e))?,
+        );
 
         // DH4 = DH(OPK_B, EK_A) — optional, mirrors Alice's DH4
-        let dh4_opt: Option<Vec<u8>> = if let Some(otpk_priv) = local_one_time_prekey {
-            trace!(target: "crypto::x3dh", "Computing DH4 = DH(OPK_B, EK_A)");
-            Some(
-                P::kem_decapsulate(otpk_priv, remote_ephemeral.as_ref())
-                    .map_err(|e| format!("DH4 failed: {}", e))?,
-            )
-        } else {
-            trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK consumed — fallback mode)");
-            None
-        };
+        let dh4_opt: Option<zeroize::Zeroizing<Vec<u8>>> =
+            if let Some(otpk_priv) = local_one_time_prekey {
+                trace!(target: "crypto::x3dh", "Computing DH4 = DH(OPK_B, EK_A)");
+                Some(zeroize::Zeroizing::new(
+                    P::kem_decapsulate(otpk_priv, remote_ephemeral.as_ref())
+                        .map_err(|e| format!("DH4 failed: {}", e))?,
+                ))
+            } else {
+                trace!(target: "crypto::x3dh", "Skipping DH4 (no OTPK consumed — fallback mode)");
+                None
+            };
 
         let local_spk_public_prefix = P::from_private_key_to_public_key(local_signed_prekey)
             .map(|k| public_prefix(k.as_ref()))
