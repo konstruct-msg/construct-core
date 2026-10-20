@@ -1,6 +1,9 @@
 #[cfg(feature = "post-quantum")]
 use super::PqRatchetWireField;
-use super::{DoubleRatchetSession, EncryptedRatchetMessage, SuiteID};
+use super::{
+    AD_VERSION_HEADER, AD_VERSION_LEGACY, DoubleRatchetSession, EncryptedRatchetMessage,
+    SerializableSession, SuiteID,
+};
 use crate::crypto::handshake::{KeyAgreement, x3dh::X3DHProtocol};
 use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
@@ -1620,6 +1623,7 @@ fn test_ad_v2_message_is_refused() {
         pq_key_index: 0,
         pq_ratchet_field: None,
         identity_proof_ciphertext: None,
+        ad_version: AD_VERSION_LEGACY,
     };
 
     let result = bob.decrypt_with_key(&message_key, &old_msg);
@@ -2806,4 +2810,144 @@ fn test_pqr1_the_epoch_age_survives_restore() {
     alice.pq_epoch_since = 1_700_000_000;
     let restored = cfe_round_trip(&alice);
     assert_eq!(restored.pq_epoch_since, 1_700_000_000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// AD v4 — the associated data covers the whole header (TODO 192, 2026-10-20).
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Under v4 every header field the receiver acts on is under the MAC: PN, the suite, the PQ
+/// exchange field and the identity proof. A tampered one fails AEAD and leaves the session as
+/// it was, so the untouched message still reads.
+///
+/// Mutation: drop any one of the four `extend_from_slice` groups under `version >= 4` in
+/// `associated_data` — the matching case below opens the tampered message.
+#[test]
+#[cfg(feature = "post-quantum")]
+fn ad_v4_binds_previous_chain_length_suite_pq_field_and_identity_proof() {
+    let (mut alice, mut bob) = make_pq_session_pair("alice", "bob");
+    // Alice has read v4 from Bob (as far as her state says), so she seals v4.
+    alice.peer_ad_version = AD_VERSION_HEADER;
+    let warm = alice.encrypt(b"warm").unwrap();
+    assert_eq!(warm.ad_version, AD_VERSION_HEADER);
+    assert_eq!(bob.decrypt(&warm).unwrap(), b"warm");
+    assert_eq!(
+        bob.peer_ad_version, AD_VERSION_HEADER,
+        "Bob pins v4 on first read"
+    );
+
+    let genuine = alice.encrypt(b"genuine").unwrap();
+    let tampered: Vec<(&str, EncryptedRatchetMessage)> = vec![
+        ("previous_chain_length", {
+            let mut m = genuine.clone();
+            m.previous_chain_length = m.previous_chain_length.wrapping_add(1);
+            m
+        }),
+        ("suite_id", {
+            let mut m = genuine.clone();
+            m.suite_id ^= 1;
+            m
+        }),
+        ("pq_ratchet_field", {
+            let mut m = genuine.clone();
+            m.pq_ratchet_field = match m.pq_ratchet_field {
+                None => Some(PqRatchetWireField::PublicKey {
+                    epoch: 7,
+                    key: vec![7u8; 1184],
+                }),
+                Some(_) => None,
+            };
+            m
+        }),
+        ("identity_proof_ciphertext", {
+            let mut m = genuine.clone();
+            m.identity_proof_ciphertext = Some(vec![1, 2, 3]);
+            m
+        }),
+    ];
+    for (what, m) in tampered {
+        let err = bob.decrypt(&m).unwrap_err();
+        assert!(err.contains("AEAD"), "{what}: {err}");
+    }
+    assert_eq!(
+        bob.decrypt(&genuine).unwrap(),
+        b"genuine",
+        "state untouched by the refusals"
+    );
+    let b1 = bob.encrypt(b"reply").unwrap();
+    assert_eq!(b1.ad_version, AD_VERSION_HEADER, "Bob now seals v4 too");
+    assert_eq!(alice.decrypt(&b1).unwrap(), b"reply");
+}
+
+/// The peer's AD version only moves up: a v3 message is read until the first v4 one, and
+/// refused after it.
+///
+/// Mutation: drop the downgrade arm in `try_aead_decrypt` — the last v3 message opens.
+#[test]
+fn a_peer_that_has_sent_v4_may_not_send_v3_again() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    let legacy = alice.encrypt(b"v3").unwrap();
+    assert_eq!(
+        legacy.ad_version, AD_VERSION_LEGACY,
+        "phase 1: v3 by default"
+    );
+    assert_eq!(bob.decrypt(&legacy).unwrap(), b"v3");
+    assert_eq!(bob.peer_ad_version, AD_VERSION_LEGACY);
+    assert_eq!(bob.ad_send_version(), AD_VERSION_LEGACY);
+
+    alice.peer_ad_version = AD_VERSION_HEADER;
+    let v4 = alice.encrypt(b"v4").unwrap();
+    assert_eq!(bob.decrypt(&v4).unwrap(), b"v4");
+    assert_eq!(bob.peer_ad_version, AD_VERSION_HEADER);
+    assert_eq!(bob.ad_send_version(), AD_VERSION_HEADER);
+
+    alice.peer_ad_version = AD_VERSION_LEGACY;
+    let again = alice.encrypt(b"v3 again").unwrap();
+    assert_eq!(again.ad_version, AD_VERSION_LEGACY);
+    let err = bob.decrypt(&again).unwrap_err();
+    assert!(err.contains("downgrade"), "{err}");
+}
+
+/// A message that fails to open does not move the peer's version, and a v4 message that opens
+/// with the wrong key does not either: only a verified message pins.
+#[test]
+fn only_a_verified_v4_message_pins_the_peer() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    alice.peer_ad_version = AD_VERSION_HEADER;
+    let mut m = alice.encrypt(b"x").unwrap();
+    m.ciphertext[0] ^= 0xff;
+    assert!(bob.decrypt(&m).is_err());
+    assert_eq!(bob.peer_ad_version, AD_VERSION_LEGACY);
+}
+
+/// The pinned version survives both persistence paths; a blob from before the field reads as
+/// legacy.
+#[test]
+fn peer_ad_version_is_persisted() {
+    let (mut alice, mut bob) = make_session_pair("alice", "bob");
+    alice.peer_ad_version = AD_VERSION_HEADER;
+    let v4 = alice.encrypt(b"v4").unwrap();
+    bob.decrypt(&v4).unwrap();
+    assert_eq!(bob.peer_ad_version, AD_VERSION_HEADER);
+
+    let plain =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(bob.to_serializable())
+            .unwrap();
+    assert_eq!(plain.peer_ad_version, AD_VERSION_HEADER);
+
+    let cfe = bob.to_serializable().to_cfe_v1().unwrap();
+    assert_eq!(cfe.peer_ad_version, AD_VERSION_HEADER);
+    let back = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(
+        SerializableSession::from_cfe_v1(cfe).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.peer_ad_version, AD_VERSION_HEADER);
+
+    let mut old = alice.to_serializable().to_cfe_v1().unwrap();
+    old.peer_ad_version = 0;
+    let legacy = DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(
+        SerializableSession::from_cfe_v1(old).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(legacy.peer_ad_version, AD_VERSION_LEGACY);
 }

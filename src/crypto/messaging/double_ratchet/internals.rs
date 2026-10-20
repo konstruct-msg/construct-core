@@ -755,7 +755,21 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
         let message_key = &mixed?;
 
-        self.try_aead_decrypt(message_key, encrypted)
+        let plaintext = self.try_aead_decrypt(message_key, encrypted)?;
+        // Verified under this version: the peer writes it, so from now on we do too, and a lower
+        // one from it is a downgrade.
+        self.peer_ad_version = self.peer_ad_version.max(encrypted.ad_version);
+        Ok(plaintext)
+    }
+
+    /// The AD version to seal the next message with: v4 once the peer has sent v4, otherwise
+    /// `AD_SEND_DEFAULT` (see `AD_VERSION_LEGACY` for the rollout).
+    pub(super) fn ad_send_version(&self) -> u8 {
+        if self.peer_ad_version >= AD_VERSION_HEADER {
+            AD_VERSION_HEADER
+        } else {
+            AD_SEND_DEFAULT
+        }
     }
 
     /// AEAD decryption with the associated data rebuilt from the session and the header.
@@ -764,9 +778,21 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         message_key: &P::AeadKey,
         encrypted: &EncryptedRatchetMessage,
     ) -> Result<Vec<u8>, String> {
-        let ad_version = AD_VERSION;
         use super::storage::id_prefix;
         use tracing::debug;
+
+        let ad_version = encrypted.ad_version;
+        match ad_version {
+            AD_VERSION_HEADER => {}
+            AD_VERSION_LEGACY if self.peer_ad_version < AD_VERSION_HEADER => {}
+            AD_VERSION_LEGACY => {
+                return Err(format!(
+                    "AD v{} after the peer sent v{}: a downgrade, refused",
+                    AD_VERSION_LEGACY, self.peer_ad_version
+                ));
+            }
+            other => return Err(format!("unknown AD version {other}")),
+        }
 
         // Reconstruct Associated Data: must mirror encrypt() exactly.
         // Decrypt uses contact_id as sender (= local_user_id on encrypt side) and vice versa.
@@ -777,20 +803,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 &self.session_id
             )
         })?;
-        let mut associated_data = Vec::with_capacity(
-            1 + self.contact_id.len() + self.local_user_id.len() + 16 + 32 + 4 + 8,
+        let associated_data = associated_data(
+            ad_version,
+            &self.contact_id,
+            &self.local_user_id,
+            &session_id_bytes,
+            self.suite_id.is_pq_ratchet(),
+            &AdHeader::from(encrypted),
         );
-        associated_data.push(ad_version);
-        associated_data.extend_from_slice(self.contact_id.as_bytes());
-        associated_data.extend_from_slice(self.local_user_id.as_bytes());
-        associated_data.extend_from_slice(&session_id_bytes);
-        associated_data.extend_from_slice(&encrypted.dh_public_key);
-        associated_data.extend_from_slice(&encrypted.message_number.to_be_bytes());
-        if self.suite_id.is_pq_ratchet() {
-            // Mirrors encrypt(): the AD binds the PQ epoch and key index (see encrypt's doc).
-            associated_data.extend_from_slice(&encrypted.pq_message_epoch.to_be_bytes());
-            associated_data.extend_from_slice(&encrypted.pq_key_index.to_be_bytes());
-        }
 
         // Prefixes, at debug — the failure branch below is deliberately limited to lengths, and
         // this line used to write all three identifiers in full at info level. One function, one
@@ -865,4 +885,89 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     pub(super) fn bytes_to_kem_private_key(bytes: &[u8]) -> Result<P::KemPrivateKey, String> {
         Ok(P::kem_private_key_from_bytes(bytes.to_vec()))
     }
+}
+
+/// The header fields the AD binds. Borrowed from a message on the way in; built from the parts
+/// on the way out, before the message exists.
+pub(super) struct AdHeader<'a> {
+    pub(super) dh_public_key: &'a [u8; 32],
+    pub(super) message_number: u32,
+    pub(super) pq_message_epoch: u32,
+    pub(super) pq_key_index: u32,
+    pub(super) previous_chain_length: u32,
+    pub(super) suite_id: u16,
+    pub(super) pq_ratchet_field: Option<&'a PqRatchetWireField>,
+    pub(super) identity_proof_ciphertext: Option<&'a [u8]>,
+}
+
+impl<'a> From<&'a EncryptedRatchetMessage> for AdHeader<'a> {
+    fn from(m: &'a EncryptedRatchetMessage) -> Self {
+        AdHeader {
+            dh_public_key: &m.dh_public_key,
+            message_number: m.message_number,
+            pq_message_epoch: m.pq_message_epoch,
+            pq_key_index: m.pq_key_index,
+            previous_chain_length: m.previous_chain_length,
+            suite_id: m.suite_id,
+            pq_ratchet_field: m.pq_ratchet_field.as_ref(),
+            identity_proof_ciphertext: m.identity_proof_ciphertext.as_deref(),
+        }
+    }
+}
+
+/// The associated data of one message, the same bytes on both sides: `sender`/`receiver` are
+/// the sealing side's `local_user_id`/`contact_id`, which the opening side swaps.
+///
+/// v3: `version ‖ sender ‖ receiver ‖ session_id(16) ‖ dh_pub(32) ‖ msg_num(BE32)`, and for a
+/// PQ-ratchet suite `‖ pq_epoch(BE32) ‖ pq_index(BE32)`.
+/// v4: v3 `‖ previous_chain_length(BE32) ‖ suite_id(BE16) ‖ pq_field ‖ identity_proof`, where
+/// `pq_field` is `0x00` for none, `0x01 ‖ epoch(BE32) ‖ len(BE16) ‖ key` for a public key,
+/// `0x02 ‖ epoch(BE32) ‖ ek_hash(8) ‖ len(BE16) ‖ ct` for a ciphertext, and `identity_proof` is
+/// `len(BE16) ‖ bytes` (`len` 0 for none). Lengths are prefixed so no two headers share an AD.
+pub(super) fn associated_data(
+    version: u8,
+    sender: &str,
+    receiver: &str,
+    session_id_bytes: &[u8],
+    pq_ratchet_suite: bool,
+    h: &AdHeader<'_>,
+) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(1 + sender.len() + receiver.len() + 16 + 32 + 4 + 8 + 16);
+    ad.push(version);
+    ad.extend_from_slice(sender.as_bytes());
+    ad.extend_from_slice(receiver.as_bytes());
+    ad.extend_from_slice(session_id_bytes);
+    ad.extend_from_slice(h.dh_public_key);
+    ad.extend_from_slice(&h.message_number.to_be_bytes());
+    if pq_ratchet_suite {
+        // Bind the PQ epoch and key index under AEAD authentication: a tampered tag
+        // must fail the MAC itself, not merely derive a mismatched key.
+        ad.extend_from_slice(&h.pq_message_epoch.to_be_bytes());
+        ad.extend_from_slice(&h.pq_key_index.to_be_bytes());
+    }
+    if version >= AD_VERSION_HEADER {
+        ad.extend_from_slice(&h.previous_chain_length.to_be_bytes());
+        ad.extend_from_slice(&h.suite_id.to_be_bytes());
+        let len16 = |b: &[u8]| (b.len().min(u16::MAX as usize) as u16).to_be_bytes();
+        match h.pq_ratchet_field {
+            None => ad.push(0),
+            Some(PqRatchetWireField::PublicKey { epoch, key }) => {
+                ad.push(1);
+                ad.extend_from_slice(&epoch.to_be_bytes());
+                ad.extend_from_slice(&len16(key));
+                ad.extend_from_slice(key);
+            }
+            Some(PqRatchetWireField::Ciphertext { epoch, ek_hash, ct }) => {
+                ad.push(2);
+                ad.extend_from_slice(&epoch.to_be_bytes());
+                ad.extend_from_slice(ek_hash);
+                ad.extend_from_slice(&len16(ct));
+                ad.extend_from_slice(ct);
+            }
+        }
+        let proof = h.identity_proof_ciphertext.unwrap_or(&[]);
+        ad.extend_from_slice(&len16(proof));
+        ad.extend_from_slice(proof);
+    }
+    ad
 }

@@ -107,6 +107,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             contact_id,
             local_user_id,
             last_ratchet_at: unix_now(),
+            peer_ad_version: AD_VERSION_LEGACY,
             pq_authentication: PqAuthentication::Classic,
             pq_applied: Some(false),
             identity_proof: IdentityProof::None,
@@ -223,6 +224,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             contact_id: contact_id.clone(),
             local_user_id,
             last_ratchet_at: unix_now(),
+            peer_ad_version: AD_VERSION_LEGACY,
             pq_authentication: PqAuthentication::Classic,
             pq_applied: Some(false),
             identity_proof: IdentityProof::None,
@@ -314,11 +316,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             .try_into()
             .map_err(|_| "Invalid public key length")?;
 
-        // Associated Data v3: version(1B) || sender_id || receiver_id || session_id(16B) || dh_pub(32B) || msg_num(4B)
-        // v3 marks the era after session_id derivation v2 (HKDF info includes sorted user IDs).
-        // The session_id is derived from the shared X3DH root key so both sides compute the same value.
-        // PQ_RATCHET sessions additionally append pq_message_epoch(4B BE) ‖ pq_key_index(4B BE);
-        // the suite launched with this layout, so no AD version bump / fallback is involved.
+        // Associated data (`internals::associated_data` has the layout; `AD_VERSION_LEGACY` the
+        // history). The session_id is derived from the shared X3DH root key so both sides compute
+        // the same value. The header is fixed here, before the AEAD, so the AD and the message
+        // carry the same fields.
         let session_id_bytes: Vec<u8> = hex::decode(&self.session_id).map_err(|_| {
             format!(
                 "AEAD encrypt: session_id '{}' is not valid hex — session may be corrupt; \
@@ -326,21 +327,29 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
                 &self.session_id
             )
         })?;
-        let mut associated_data = Vec::with_capacity(
-            1 + self.local_user_id.len() + self.contact_id.len() + 16 + 32 + 4 + 8,
+        let ad_version = self.ad_send_version();
+        let pq_ratchet_field = self.take_outgoing_pq_field();
+        let identity_proof_ciphertext = match &self.identity_proof {
+            IdentityProof::Answered { ciphertext } => Some(ciphertext.clone()),
+            _ => None,
+        };
+        let associated_data = super::internals::associated_data(
+            ad_version,
+            &self.local_user_id,
+            &self.contact_id,
+            &session_id_bytes,
+            self.suite_id.is_pq_ratchet(),
+            &super::internals::AdHeader {
+                dh_public_key: &dh_public_key,
+                message_number,
+                pq_message_epoch,
+                pq_key_index,
+                previous_chain_length: self.previous_sending_length,
+                suite_id: self.suite_id.as_u16(),
+                pq_ratchet_field: pq_ratchet_field.as_ref(),
+                identity_proof_ciphertext: identity_proof_ciphertext.as_deref(),
+            },
         );
-        associated_data.push(AD_VERSION); // AD version (see const AD_VERSION)
-        associated_data.extend_from_slice(self.local_user_id.as_bytes());
-        associated_data.extend_from_slice(self.contact_id.as_bytes());
-        associated_data.extend_from_slice(&session_id_bytes);
-        associated_data.extend_from_slice(&dh_public_key);
-        associated_data.extend_from_slice(&message_number.to_be_bytes());
-        if self.suite_id.is_pq_ratchet() {
-            // Bind the PQ epoch and key index under AEAD authentication: a tampered tag
-            // must fail the MAC itself, not merely derive a mismatched key.
-            associated_data.extend_from_slice(&pq_message_epoch.to_be_bytes());
-            associated_data.extend_from_slice(&pq_key_index.to_be_bytes());
-        }
 
         tracing::info!(
             target: "crypto::double_ratchet",
@@ -394,11 +403,9 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             suite_id: self.suite_id.as_u16(),
             pq_message_epoch,
             pq_key_index,
-            pq_ratchet_field: self.take_outgoing_pq_field(),
-            identity_proof_ciphertext: match &self.identity_proof {
-                IdentityProof::Answered { ciphertext } => Some(ciphertext.clone()),
-                _ => None,
-            },
+            pq_ratchet_field,
+            identity_proof_ciphertext,
+            ad_version,
         })
     }
 

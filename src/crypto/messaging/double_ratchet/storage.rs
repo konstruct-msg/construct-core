@@ -54,6 +54,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: self.contact_id.clone(),
             local_user_id: self.local_user_id.clone(),
             last_ratchet_at: self.last_ratchet_at,
+            peer_ad_version: self.peer_ad_version,
             pq_authentication: self.pq_authentication.as_u8(),
             pq_applied: self.pq_applied,
             identity_proof_awaiting: self.identity_proof == IdentityProof::AwaitingAnswer,
@@ -193,6 +194,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             contact_id: data.contact_id.clone(),
             local_user_id: data.local_user_id.clone(),
             last_ratchet_at: data.last_ratchet_at,
+            peer_ad_version: data.peer_ad_version.max(AD_VERSION_LEGACY),
             pq_authentication: PqAuthentication::from_u8(data.pq_authentication),
             pq_applied: data.pq_applied,
             // Both set is not a state the ratchet produces; the answer wins, since dropping it
@@ -517,6 +519,10 @@ pub struct SerializableSession {
     /// Unix timestamp of the last DH ratchet step. Zero means unknown (old sessions).
     #[serde(default)]
     last_ratchet_at: u64,
+    /// The highest AD version the peer has sent (`DoubleRatchetSession::peer_ad_version`).
+    /// Absent (0) on older blobs: legacy.
+    #[serde(default)]
+    peer_ad_version: u8,
     /// `PqAuthentication::as_u8`; 0 (`Unknown`) for sessions recorded before it existed.
     #[serde(default)]
     pq_authentication: u8,
@@ -784,6 +790,7 @@ impl SerializableSession {
                 }),
             pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
+            peer_ad_version: self.peer_ad_version,
             pq_authentication: self.pq_authentication,
             pq_applied: self.pq_applied,
             identity_proof_awaiting: self.identity_proof_awaiting,
@@ -870,6 +877,7 @@ impl SerializableSession {
             contact_id: data.contact_id,
             local_user_id: data.local_uid,
             last_ratchet_at: data.last_ratchet_at,
+            peer_ad_version: data.peer_ad_version,
             pq_authentication: data.pq_authentication,
             pq_applied: data.pq_applied,
             identity_proof_awaiting: data.identity_proof_awaiting,

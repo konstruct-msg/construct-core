@@ -92,6 +92,8 @@ pub struct IncomingFirstMessage {
     pub kem_ciphertext: Vec<u8>,
     /// The initiator's ML-KEM-1024 identity key (1568 bytes) — pinned and answered to.
     pub kem_identity: Option<Vec<u8>>,
+    /// The AD version the sealed box was authenticated with (`DecodedWirePayload::ad_version`).
+    pub ad_version: u8,
 }
 
 impl IncomingFirstMessage {
@@ -114,6 +116,7 @@ impl IncomingFirstMessage {
             kyber_prekey_id: d.kyber_otpk_id,
             kem_ciphertext: d.kem_ciphertext.unwrap_or_default(),
             kem_identity: d.kem_identity,
+            ad_version: d.ad_version,
         })
     }
 }
@@ -140,7 +143,8 @@ impl OutgoingEncrypted {
             ),
             None => (0, 0, None, None),
         };
-        crate::wire_payload::pack(
+        crate::wire_payload::pack_message(
+            self.message.ad_version,
             &self.message.dh_public_key,
             self.message.message_number,
             otpk_id,
@@ -1351,6 +1355,7 @@ impl Orchestrator {
             pq_ratchet_field: first_message.pq_ratchet_field.clone(),
             // A first flight is the initiator's: it names a KEM identity key, it never answers one.
             identity_proof_ciphertext: None,
+            ad_version: first_message.ad_version,
         };
 
         let remote_identity =
@@ -2429,6 +2434,7 @@ impl Orchestrator {
             pq_key_index: decoded.pq_key_index,
             pq_ratchet_field: decoded.pq_ratchet_field,
             identity_proof_ciphertext: decoded.identity_proof_ciphertext,
+            ad_version: decoded.ad_version,
         };
 
         self.lifecycle

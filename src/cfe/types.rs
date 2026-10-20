@@ -324,6 +324,11 @@ pub struct CfeSessionStateV1 {
     #[serde(default)]
     pub last_ratchet_at: u64,
 
+    /// The highest AD version the peer has sent (`double_ratchet::AD_VERSION_*`); 0 on blobs
+    /// written before 2026-10-20, read as legacy (3).
+    #[serde(rename = "adv", default, skip_serializing_if = "u8_is_zero")]
+    pub peer_ad_version: u8,
+
     /// `PqAuthentication::as_u8` — whose Kyber key the PQ layer came from. Absent (0,
     /// `Unknown`) on blobs written before 2026-09-24.
     #[serde(rename = "pqa")]
@@ -679,4 +684,8 @@ pub struct CfeHybridPinV1 {
     pub device_id: String,
     #[serde(rename = "fp")]
     pub fingerprint: ByteBuf,
+}
+
+fn u8_is_zero(v: &u8) -> bool {
+    *v == 0
 }

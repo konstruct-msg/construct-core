@@ -74,9 +74,22 @@ pub use storage::{SerializableSession, SkippedKeyEntry};
 /// so it takes the DH ratchet step and fails, if it fails, on AEAD.
 pub const MESSAGE_KEY_CONSUMED: &str = "MESSAGE_KEY_CONSUMED";
 
-/// AD (Associated Data) version byte — increment here when the AD format changes.
-/// Both `encrypt` and `decrypt_with_key` must use this constant so a version
-/// mismatch surfaces as an AEAD failure rather than a silent format bug.
+/// AD (Associated Data) version byte — the first byte of the AD, so a format mismatch surfaces
+/// as an AEAD failure rather than a silent format bug. The wire names the version a message was
+/// sealed with (`wire_payload::AD_V4_FLAG`); the AD itself is never on the wire.
+///
+///   v4 — the AD covers the whole header: after the v3 fields, `previous_chain_length` (BE32),
+///        `suite_id` (BE16), the PQ-ratchet field (tag ‖ epoch ‖ len ‖ bytes) and the identity
+///        proof ciphertext (len ‖ bytes). Until 2026-10-20 those four were outside the AD and
+///        the wire has no outer MAC, so a relay could swap the PQ field — encapsulate to the
+///        initiator's public EK itself, hand the initiator an epoch the responder never gets —
+///        or move PN so the receiver kept no keys for the old chain (TODO 192).
+///
+/// Rollout. A receiver reads both versions; a sender writes `AD_SEND_DEFAULT` until it has read
+/// a v4 message from the peer, and v4 from then on (`peer_ad_version`, persisted). Once a peer
+/// has sent v4 it never sends v3 again, so a v3 message after a v4 one is refused: the version
+/// of a session's peer only moves up. The default flips to 4 once every client ships a core
+/// that reads v4; until then a v4 message to an old core is an unknown suite there.
 ///
 /// History:
 ///   v1 — original format (before the AD identity bug fix)
@@ -88,7 +101,16 @@ pub const MESSAGE_KEY_CONSUMED: &str = "MESSAGE_KEY_CONSUMED";
 /// platform seam (`SessionAddressing` on iOS) puts a **crypto device id** there, and has since
 /// 2026-08-26. v2's line here named account UUIDs until then, which was true when written and
 /// silently stopped being true — the same way the AEAD failure hint in `internals.rs` did.
-const AD_VERSION: u8 = 3;
+pub const AD_VERSION_LEGACY: u8 = 3;
+/// The AD that covers the whole header. See `AD_VERSION_LEGACY`.
+pub const AD_VERSION_HEADER: u8 = 4;
+/// What a sender writes to a peer it has not yet read a v4 message from. Phase 1 (this): 3.
+/// Phase 2, when every client reads v4: 4. Phase 3: v3 is no longer read.
+pub(super) const AD_SEND_DEFAULT: u8 = AD_VERSION_LEGACY;
+
+fn legacy_ad_version() -> u8 {
+    AD_VERSION_LEGACY
+}
 
 /// Read-only health snapshot of a `DoubleRatchetSession`.
 ///
@@ -435,6 +457,11 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     /// Updated by `perform_dh_ratchet` and set in `new_initiator_session` / `new_responder_session`.
     last_ratchet_at: u64,
 
+    /// The highest AD version a message from the peer has verified with. Starts at
+    /// `AD_VERSION_LEGACY`; moves to `AD_VERSION_HEADER` on the first v4 message and never back.
+    /// Decides what we send (`ad_send_version`) and what we still read (`try_aead_decrypt`).
+    peer_ad_version: u8,
+
     /// Whose Kyber key this session's PQ layer came from. New sessions start `Classic`; the
     /// orchestrator sets the initiator's label from its Kyber-prekey plan, and applying a
     /// contribution as responder makes it `Received`.
@@ -531,6 +558,10 @@ pub struct EncryptedRatchetMessage {
     /// rebuilds a message from components drops it.
     #[serde(default)]
     pub identity_proof_ciphertext: Option<Vec<u8>>,
+    /// The AD version the sealed box was authenticated with (`AD_VERSION_LEGACY` or
+    /// `AD_VERSION_HEADER`). Set by `encrypt`; on the way in, from the wire flag.
+    #[serde(default = "legacy_ad_version")]
+    pub ad_version: u8,
 }
 
 impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
