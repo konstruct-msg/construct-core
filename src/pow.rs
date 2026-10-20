@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 
 const POW_SALT_PREFIX: &str = "kpow2:";
 
+/// The most leading zero bits a challenge may ask for. A 32-byte hash has 256, so anything
+/// past that can never be met and the search never ended; and a search of 2^32 attempts at
+/// ~1.5 s each is a denial of service, not a challenge. The server's challenges are far below
+/// this (TODO 193, 2026-10-20).
+pub const MAX_POW_DIFFICULTY: u32 = 32;
+
+/// Why a proof of work was not computed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PowError {
+    #[error("PoW difficulty {difficulty} is past the limit {max}")]
+    DifficultyTooHigh { difficulty: u32, max: u32 },
+    #[error("Argon2id failed: {0}")]
+    Hash(String),
+}
+
 fn derive_pow_salt(challenge: &str) -> String {
     let prefix: String = challenge.chars().take(16).collect();
     format!("{}{}", POW_SALT_PREFIX, prefix)
@@ -49,13 +64,16 @@ pub trait PowProgressCallback: Send + Sync {
 /// - difficulty=8: ~256 attempts, 3-5 minutes on iPhone
 /// - difficulty=12: ~4096 attempts, 1-2 hours on iPhone
 ///
+/// # Errors
+/// `PowError::DifficultyTooHigh` for a difficulty past `MAX_POW_DIFFICULTY`, before any work.
+///
 /// # Example
 /// ```
 /// use construct_core::pow::compute_pow;
-/// let solution = compute_pow("server_challenge_xyz", 2);
+/// let solution = compute_pow("server_challenge_xyz", 2).unwrap();
 /// println!("Found solution after {} attempts", solution.nonce);
 /// ```
-pub fn compute_pow(challenge: &str, difficulty: u32) -> PowSolution {
+pub fn compute_pow(challenge: &str, difficulty: u32) -> Result<PowSolution, PowError> {
     compute_pow_with_progress(challenge, difficulty, None)
 }
 
@@ -64,7 +82,13 @@ pub fn compute_pow_with_progress(
     challenge: &str,
     difficulty: u32,
     progress_callback: Option<Box<dyn PowProgressCallback>>,
-) -> PowSolution {
+) -> Result<PowSolution, PowError> {
+    if difficulty > MAX_POW_DIFFICULTY {
+        return Err(PowError::DifficultyTooHigh {
+            difficulty,
+            max: MAX_POW_DIFFICULTY,
+        });
+    }
     // Argon2id parameters optimized for mobile devices
     // memory_cost: 32 MB (32768 KiB) - balance between security and UX
     // time_cost: 2 iterations - ~1.5 seconds per attempt on iPhone
@@ -75,13 +99,14 @@ pub fn compute_pow_with_progress(
         1,         // single thread
         Some(32),  // 32 byte output
     )
-    .expect("Invalid Argon2 parameters");
+    .map_err(|e| PowError::Hash(e.to_string()))?;
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
 
     // Derive salt from challenge prefix (kpow2:<first16>)
     let salt_string = derive_pow_salt(challenge);
-    let salt = SaltString::encode_b64(salt_string.as_bytes()).expect("Invalid salt");
+    let salt = SaltString::encode_b64(salt_string.as_bytes())
+        .map_err(|e| PowError::Hash(e.to_string()))?;
 
     const PROGRESS_INTERVAL_ATTEMPTS: u64 = 10;
     let estimated_max_attempts = estimate_max_attempts(difficulty);
@@ -95,10 +120,14 @@ pub fn compute_pow_with_progress(
         // Compute Argon2id hash
         let hash_result = argon2
             .hash_password(input.as_bytes(), &salt)
-            .expect("Argon2id hashing failed");
+            .map_err(|e| PowError::Hash(e.to_string()))?;
 
         // Extract raw hash bytes and convert to owned Vec
-        let hash_bytes: Vec<u8> = hash_result.hash.unwrap().as_bytes().to_vec();
+        let hash_bytes: Vec<u8> = hash_result
+            .hash
+            .ok_or_else(|| PowError::Hash("no hash output".to_string()))?
+            .as_bytes()
+            .to_vec();
 
         // Count leading zero bits
         let leading_zeros = count_leading_zero_bits(&hash_bytes);
@@ -118,10 +147,10 @@ pub fn compute_pow_with_progress(
             if let Some(ref callback) = progress_callback {
                 callback.on_progress(nonce, attempts, 1.0);
             }
-            return PowSolution {
+            return Ok(PowSolution {
                 nonce,
                 hash: hex::encode(&hash_bytes),
-            };
+            });
         }
 
         nonce += 1;
@@ -254,7 +283,7 @@ mod tests {
         let challenge = "test_challenge_12345";
         let difficulty = 4; // ~16 attempts, should be fast
 
-        let solution = compute_pow(challenge, difficulty);
+        let solution = compute_pow(challenge, difficulty).unwrap();
 
         // Verify solution is valid
         assert!(verify_pow(challenge, &solution, difficulty));
@@ -269,7 +298,7 @@ mod tests {
         let challenge = "test_challenge_xyz";
         let difficulty = 4;
 
-        let valid_solution = compute_pow(challenge, difficulty);
+        let valid_solution = compute_pow(challenge, difficulty).unwrap();
 
         // Create fake solution with wrong nonce
         let fake_solution = PowSolution {
@@ -284,7 +313,7 @@ mod tests {
     #[test]
     fn test_verify_pow_rejects_insufficient_difficulty() {
         let challenge = "test_challenge_abc";
-        let solution = compute_pow(challenge, 4);
+        let solution = compute_pow(challenge, 4).unwrap();
 
         // Should pass for difficulty 4
         assert!(verify_pow(challenge, &solution, 4));
@@ -314,7 +343,8 @@ mod tests {
         };
 
         let solution =
-            compute_pow_with_progress("test_challenge_progress", 4, Some(Box::new(callback)));
+            compute_pow_with_progress("test_challenge_progress", 4, Some(Box::new(callback)))
+                .unwrap();
 
         assert!(!solution.hash.is_empty());
 
@@ -341,5 +371,24 @@ mod tests {
 
         // Same input should produce same hash
         assert_eq!(hash1.to_string(), hash2.to_string());
+    }
+
+    /// A difficulty no hash can meet, or one past the limit, is refused before any work.
+    ///
+    /// Mutation: drop the `difficulty > MAX_POW_DIFFICULTY` check — the first call never
+    /// returns.
+    #[test]
+    fn a_difficulty_past_the_limit_is_refused_at_once() {
+        let started = std::time::Instant::now();
+        for difficulty in [MAX_POW_DIFFICULTY + 1, 256, 257, u32::MAX] {
+            assert_eq!(
+                compute_pow("c", difficulty).unwrap_err(),
+                PowError::DifficultyTooHigh {
+                    difficulty,
+                    max: MAX_POW_DIFFICULTY
+                }
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
