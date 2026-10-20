@@ -1930,3 +1930,90 @@ fn a_wipe_that_cannot_remove_a_file_removes_the_others_and_can_be_finished() {
     Store::remove_files(&path).unwrap();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+/// Deleting a contact takes everything of it: its calls, its devices, the chunks of its
+/// messages still being reassembled and the resends queued to it — each announced — while the
+/// rows of another contact stay.
+///
+/// Mutation: delete the contact row only — the call, the device, the chunk and the resend
+/// of `peer` survive.
+#[test]
+fn deleting_a_contact_takes_its_calls_devices_chunks_and_resends() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    store.upsert_contact(&contact("other", "Eve")).unwrap();
+    store.upsert_call(&call("c-peer", Some(100), 0)).unwrap();
+    let mut other_call = call("c-other", Some(200), 0);
+    other_call.peer_user_id = "other".into();
+    store.upsert_call(&other_call).unwrap();
+    let device = |id: &str, account: &str| PeerDevice {
+        device_id: id.into(),
+        account_id: account.into(),
+        identity_key: vec![1; 32],
+        first_seen_at: 1,
+    };
+    store
+        .record_peer_device(&device("dev-peer", "peer"))
+        .unwrap();
+    store
+        .record_peer_device(&device("dev-other", "other"))
+        .unwrap();
+    let chunk = |sender: &str| PendingChunk {
+        sender_id: sender.into(),
+        message_id: "m".into(),
+        chunk_index: 0,
+        total_chunks: 2,
+        plaintext_length: 10,
+        content_type: 0,
+        payload: vec![9],
+        envelope_id: None,
+        received_at: 1,
+    };
+    store.add_pending_chunk(&chunk("dev-peer")).unwrap();
+    store.add_pending_chunk(&chunk("dev-other")).unwrap();
+    let resend = |device: &str, account: &str| PendingResend {
+        message_id: "r".into(),
+        device_id: device.into(),
+        account_id: account.into(),
+        created_at: 1,
+        attempts: 0,
+    };
+    store.queue_resend(&resend("dev-peer", "peer")).unwrap();
+    store.queue_resend(&resend("dev-other", "other")).unwrap();
+    let changes = Arc::new(Changes::default());
+    store.set_observer(Some(changes.clone()));
+
+    assert!(store.delete_contact("peer").unwrap());
+
+    assert_eq!(
+        store
+            .calls(10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        vec!["c-other"]
+    );
+    assert!(store.peer_devices("peer").unwrap().is_empty());
+    assert_eq!(store.peer_devices("other").unwrap().len(), 1);
+    assert_eq!(store.pending_chunk_count("dev-peer", "m").unwrap(), 0);
+    assert_eq!(store.pending_chunk_count("dev-other", "m").unwrap(), 1);
+    assert_eq!(
+        store
+            .pending_resends()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.account_id)
+            .collect::<Vec<_>>(),
+        vec!["other"]
+    );
+    let seen = changes.changes.lock().unwrap().clone();
+    assert!(seen.contains(&Change {
+        table: Table::Calls,
+        ids: vec!["c-peer".into()]
+    }));
+    assert!(seen.contains(&Change {
+        table: Table::PeerDevices,
+        ids: vec!["dev-peer".into()]
+    }));
+}
