@@ -19,12 +19,11 @@ pub mod timing;
 // Re-exports
 pub use cover_traffic::{
     CoverTrafficConfig, CoverTrafficManager, EnergyMetrics, generate_dummy_message,
-    is_dummy_message,
 };
 pub use padding::{
     DEFAULT_BLOCK_SIZE, PaddingError, pad_message, pad_message_default, unpad_message,
 };
 pub use timing::{
-    TimingConfig, battery_aware_jitter, heartbeat_interval, jittered_interval, random_send_delay,
+    TimingConfig, battery_aware_jitter, jittered_interval, random_send_delay,
     recommended_send_delay,
 };

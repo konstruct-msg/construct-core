@@ -59,7 +59,6 @@ construct-core/
 │   │   ├── sealed_sender/         # sealed-sender box + sender certificates
 │   │   ├── device_copy_tag.rs     # per-message tag naming the device a copy is for
 │   │   ├── invite_crypto.rs       # contact invites with ephemeral keys
-│   │   ├── master_key.rs          # key backup / restore
 │   │   ├── recovery.rs            # BIP39 account recovery
 │   │   ├── social_recovery.rs     # Shamir social recovery (SLIP-39 word list)
 │   │   ├── key_transparency.rs    # RFC 6962-style Merkle proof verification
@@ -71,7 +70,6 @@ construct-core/
 │   ├── cfe/                       # CFE binary envelopes + record types
 │   ├── wire_payload.rs, intake.rs # message wire format and intake
 │   ├── traffic_protection/        # padding, cover-traffic and timing helpers
-│   ├── storage/                   # models persisted by master_key
 │   ├── uniffi_bindings.rs         # UniFFI FFI surface (iOS/macOS/Android)
 │   ├── construct_core.udl         # UniFFI interface definition
 │   ├── pow.rs                     # Argon2id proof-of-work

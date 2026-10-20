@@ -362,17 +362,6 @@ dictionary DecryptedMessageResult {
     bytes storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
-dictionary PrivateKeysJson {
-    string identity_secret;
-    string signing_secret;
-    string signed_prekey_secret;
-    string prekey_signature;
-    string suite_id;
-    string? identity_public_check;
-    string? verifying_key_check;
-    string? signed_prekey_public_check;
-};
-
 [Error]
 enum CryptoError {
     "InitializationFailed",
@@ -395,12 +384,6 @@ enum CryptoError {
 
 dictionary OtpkPair {
     u32 key_id;
-    bytes public_key;
-};
-
-dictionary OtpkRecord {
-    u32 key_id;
-    bytes private_key;
     bytes public_key;
 };
 
@@ -510,14 +493,6 @@ dictionary EnergyMetrics {
     u64 battery_skipped;
 };
 
-dictionary TimingConfig {
-    u64 heartbeat_interval_sec;
-    u64 heartbeat_jitter_ms;
-    u64 max_send_delay_ms;
-    boolean enabled;
-    boolean battery_aware;
-};
-
 interface TrafficProtectionManager {
     constructor(CoverTrafficConfig config);
 
@@ -612,13 +587,10 @@ namespace construct_core {
     boolean verify_recovery_signature(bytes public_key, string message, bytes signature);
 
     // Traffic Protection Functions
-    bytes generate_dummy_message(u64 size);
-    boolean is_dummy_message(bytes data);
 
     // Timing Functions
     u64 jittered_interval_ms(u64 base_ms, u64 jitter_ms);
     u64 random_send_delay_ms(u64 max_delay_ms);
-    u64 heartbeat_interval_ms(u64 base_interval_sec);
     u64 battery_aware_jitter_ms(u64 base_ms, u64 max_jitter_ms, float battery_level);
     u64 recommended_send_delay_ms(boolean is_high_priority, float battery_level);
 
@@ -669,40 +641,6 @@ namespace construct_core {
     /// Accepts both formats — Rust handles detection and migration internally.
     [Throws=CryptoError]
     OrchestratorCore create_orchestrator_core_from_keys(bytes keys_data, string my_user_id);
-
-    /// Verify that a PlatformBridge implementation correctly round-trips a
-    /// save → load through the platform secure store.
-    /// Returns true if the loaded bytes equal the saved bytes.
-    [Throws=CryptoError]
-    boolean test_platform_bridge_roundtrip(PlatformBridge bridge, string key, bytes data);
-};
-
-// ============================================================================
-// Orchestration — PlatformBridge (Phase 0)
-// ============================================================================
-
-/// Callback interface implemented by Swift / Kotlin.
-///
-/// Rust orchestration logic is I/O-free: it calls through this bridge to
-/// request platform operations (Keychain, Core Data, os_log / Logcat).
-/// Each method is synchronous from Rust's perspective.
-callback interface PlatformBridge {
-    /// Persist `data` under `key` in the platform secure store (Keychain / Keystore).
-    void save_to_secure_store(string key, bytes data);
-
-    /// Retrieve data previously saved under `key`. Returns null if absent.
-    bytes? load_from_secure_store(string key);
-
-    /// Append / upsert a JSON record in the platform data store (Core Data / Room).
-    /// `table` is a logical table name; `json` is the record payload.
-    void persist_record(string table, string json);
-
-    /// Query the platform data store. Returns a JSON-encoded result or null.
-    string? query_record(string table, string query_json);
-
-    /// Emit a log entry through the platform logging system (os_log / Logcat).
-    /// `level` ∈ {"debug", "info", "warn", "error"}.
-    void log_event(string level, string tag, string message);
 };
 
 // ============================================================================
@@ -764,9 +702,6 @@ enum InitiationDecision {
 /// What the caller knows at the moment it wants a session. Every field is something only the
 /// caller can see — the network, the outbox, the UI; the decision over them is made in the core.
 dictionary InitiationContext {
-    /// Ours and theirs in the space the session is addressed by.
-    string my_device_id;
-    string peer_device_id;
     /// We are opening a session with this device right now (bundle fetch and init).
     boolean our_init_in_flight;
     /// We hold the peer's init — received, not yet completed.
@@ -861,9 +796,6 @@ interface CfeSecureStoreSlot {
 /// Platform receives these from `handle_event()` and executes each one.
 [Enum]
 interface CfeAction {
-    DecryptMessage(string contact_id, bytes ciphertext);
-    EncryptMessage(string contact_id, bytes plaintext);
-    ArchiveSession(string contact_id);
     MessageDecrypted(string contact_id, string message_id, bytes plaintext);
     /// Open a new session with `contact_id` — a device — as INITIATOR over the one held: fetch
     /// that device's bundle and answer with `SessionBundleFetched` (or `SessionBundleUnavailable`).
@@ -888,7 +820,6 @@ interface CfeAction {
     // `open_receiving(contact_id)`. Nothing is fetched — the key comes from the sender certificate.
     OpenReceiving(string contact_id);
     SendEncryptedMessage(string to, bytes payload, string message_id, u8 content_type);
-    SendReceipt(string message_id, string status);
     /// We could not read `message_id` from `contact_id`: send `payload` to that device as a
     /// DECRYPTION_ERROR (content type 28) envelope, sealed-sender, and acknowledge the message.
     /// The core built and sealed `payload`; one per unread message.
@@ -904,7 +835,6 @@ interface CfeAction {
     NotifySessionCreated(string contact_id);
     NotifyError(string code, string message);
     ScheduleTimer(string timer_id, u64 delay_ms);
-    CancelTimer(string timer_id);
     CallSignalDecrypted(string contact_id, string message_id, bytes proto_bytes);
     /// A silent control frame other than a call signal (13, 14, 25, 26, 27, 29), named by byte 5
     /// of its KNST frame; `body` is without the header. Never a chat message: handle by
@@ -1171,7 +1101,7 @@ interface OrchestratorCore {
 
     /// Drop every piece of local orchestration state this core holds about `contact_id`:
     /// the ratchet and its previous states, the prekey counter, the PQ contribution, the init lock,
-    /// the queue, the prewarm mark and the active-chat mark.
+    /// the queue and the active-chat mark.
     ///
     /// `remove_session` removes the ratchet **and nothing else**, so all of the above outlive it
     /// and steer the next add for the same device — a contact the platform has already forgotten.
@@ -1243,7 +1173,7 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     RotatedSpkBundle rotate_signed_prekey();
 
-    /// Export the full orchestrator coordination state (init locks, prekey tracker, pins) as a
+    /// Export the full orchestrator coordination state (init locks, pins) as a
     /// CFE binary blob.
     /// Persist under CfeSecureStoreSlot::OrchestratorState.
     [Throws=CryptoError]

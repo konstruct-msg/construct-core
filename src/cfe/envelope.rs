@@ -9,13 +9,6 @@ pub const CFE_MAGIC: [u8; 2] = [0x43, 0x46]; // "CF"
 pub const CFE_VERSION: u8 = 0x01;
 pub const CFE_HEADER_LEN: usize = 16;
 
-pub const FLAG_COMPRESSED: u8 = 0x01;
-pub const FLAG_ENCRYPTED: u8 = 0x02;
-pub const FLAG_CHUNKED: u8 = 0x04;
-pub const FLAG_SIGNED: u8 = 0x08;
-
-pub const SUPPORTED_FLAGS_MASK: u8 = 0x00;
-
 /// Maximum allowed payload size (256 KiB).
 ///
 /// Plaintext is limited to 64 KiB (`MAX_MESSAGE_SIZE`). After PKCS7 padding (~66 KB) and
@@ -32,19 +25,9 @@ pub struct CfeEnvelope {
     pub payload: Vec<u8>,
 }
 
+/// The flags byte is part of the header format but no flag is defined: it is written as zero
+/// and any other value is refused on read.
 pub fn encode<T: Serialize>(msg_type: CfeMessageType, value: &T) -> Result<Vec<u8>, CfeError> {
-    encode_with_flags(msg_type, value, 0)
-}
-
-pub fn encode_with_flags<T: Serialize>(
-    msg_type: CfeMessageType,
-    value: &T,
-    flags: u8,
-) -> Result<Vec<u8>, CfeError> {
-    if flags & !SUPPORTED_FLAGS_MASK != 0 {
-        return Err(CfeError::UnsupportedFlags(flags));
-    }
-
     let payload =
         rmp_serde::to_vec_named(value).map_err(|e| CfeError::SerializeFailed(e.to_string()))?;
 
@@ -58,7 +41,7 @@ pub fn encode_with_flags<T: Serialize>(
     out.extend_from_slice(&CFE_MAGIC);
     out.push(CFE_VERSION);
     out.push(msg_type as u8);
-    out.push(flags);
+    out.push(0); // flags: none defined
     out.extend_from_slice(&[0u8; 3]); // reserved
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
@@ -108,7 +91,7 @@ pub fn parse_header(data: &[u8]) -> Result<CfeEnvelope, CfeError> {
         CfeMessageType::from_u8(msg_type_raw).ok_or(CfeError::UnknownType(msg_type_raw))?;
 
     let flags = data[4];
-    if flags & !SUPPORTED_FLAGS_MASK != 0 {
+    if flags != 0 {
         return Err(CfeError::UnsupportedFlags(flags));
     }
 

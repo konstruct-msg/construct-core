@@ -10,7 +10,7 @@
 /// The `Orchestrator` holds the full orchestration state:
 /// - `SessionLifecycleManager` (sessions current and previous, ACK, PQ)
 /// - `MessageRouter` (routing decisions)
-/// - Coordinator state: init locks, cooldowns, prewarm tracking
+/// - Coordinator state: init locks, cooldowns
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -32,10 +32,6 @@ use crate::orchestration::session_machine::{
 /// How often the GC sweep runs after its first run on launch: ACK-cache pruning, lifecycle
 /// pruning and the retirement of unanswered handshakes past their age.
 const GC_SWEEP_INTERVAL_MS: u64 = 10 * 60 * 1000;
-
-/// Minimum time between prewarm attempts for the same contact (ms).
-#[allow(dead_code)]
-const PREWARM_COOLDOWN_MS: u64 = 30_000;
 
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
@@ -213,9 +209,6 @@ pub struct Orchestrator {
     /// three views of one lifecycle, each with its own window and no owner of the sequence. See
     /// `session_machine` and `decisions/session-is-one-state-machine.md`.
     sessions: SessionMachine,
-    /// Contacts that have been pre-warmed (lower userId prewarms on first contact).
-    #[allow(dead_code)]
-    prewarm_done: HashSet<String>,
     /// A responder init burned a Kyber one-time prekey since `take_kyber_prekeys_to_persist`.
     kyber_prekeys_dirty: bool,
     /// Devices the PQXDH v2 upgrade sweep has already asked to reopen since launch.
@@ -258,7 +251,7 @@ pub struct ReceivingOpen {
 
 /// How long after `AppLaunched` the PQXDH v2 upgrade sweep runs (ms).
 ///
-/// After the prewarm sweep and the launch-time fetch of pending messages, not with them: the
+/// After the launch-time fetch of pending messages, not with them: the
 /// backlog then decrypts on the state it was written on without first being tried against the
 /// new one.
 pub const PQ_UPGRADE_SWEEP_DELAY_MS: u64 = 15_000;
@@ -297,7 +290,6 @@ impl Orchestrator {
             lifecycle: SessionLifecycleManager::new_with_clock(client, my_user_id, clock.clone()),
             router: MessageRouter::with_clock(clock.clone()),
             sessions: SessionMachine::new(clock.clone()),
-            prewarm_done: HashSet::new(),
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
             resent_after_error: HashSet::new(),
@@ -691,7 +683,6 @@ impl Orchestrator {
         self.router.forget_contact(contact_id);
         self.lifecycle.forget_contact_state(contact_id);
         self.sessions.handle(contact_id, SessionEvent::Forget);
-        self.prewarm_done.remove(contact_id);
     }
 
     pub fn ack_is_processed(&self, message_id: &str) -> crate::orchestration::AckCheckResult {
@@ -704,8 +695,7 @@ impl Orchestrator {
 
     /// Export the full orchestrator coordination state as a CFE binary blob.
     ///
-    /// Captures init locks and the
-    /// prekey tracker.  Persist under `SecureStoreSlot::OrchestratorState`.
+    /// Captures init locks, the identity pins and the envelope book.  Persist under `SecureStoreSlot::OrchestratorState`.
     pub fn export_orchestrator_state_cfe(&self) -> Result<Vec<u8>, String> {
         // Serialise only the device ids — timestamps are ephemeral, and the machine re-dates
         // what it restores (`SessionMachine::restore_opening`).
@@ -1590,34 +1580,8 @@ impl Orchestrator {
         }
     }
 
-    pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
-        self.lifecycle.export_session_json_for(contact_id)
-    }
-
     pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
         self.lifecycle.client.remove_session(contact_id)
-    }
-
-    /// Export registration bundle as CFE binary.
-    pub fn export_registration_bundle_cfe(&self) -> Result<Vec<u8>, String> {
-        let bundle = self
-            .lifecycle
-            .client
-            .key_manager()
-            .export_registration_bundle()
-            .map_err(|e| e.to_string())?;
-
-        let cfe_bundle = crate::cfe::CfeRegistrationBundleV1 {
-            version: 1,
-            identity_public: bundle.identity_public,
-            signed_prekey_public: bundle.signed_prekey_public,
-            signature: bundle.signature,
-            verifying_key: bundle.verifying_key,
-            suite_id: bundle.suite_id.as_u16() as u8,
-        };
-
-        crate::cfe::encode(crate::cfe::CfeMessageType::RegistrationBundle, &cfe_bundle)
-            .map_err(|e| e.to_string())
     }
 
     pub fn sign_bundle_bytes(&self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -2254,54 +2218,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Returns the raw bytes of our X3DH identity public key.
-    /// Used by the UI for safety-number display and key export.
-    pub fn identity_public_key_bytes(&self) -> Result<Vec<u8>, String> {
-        self.lifecycle
-            .client
-            .key_manager()
-            .identity_public_key()
-            .map(|k| <_ as AsRef<[u8]>>::as_ref(k).to_vec())
-            .map_err(|e| format!("identity key unavailable: {e}"))
-    }
-
-    pub fn export_otpks_json(&self) -> Result<String, String> {
-        #[derive(serde::Serialize)]
-        struct OtpkRecord {
-            key_id: u32,
-            private_key: Vec<u8>,
-            public_key: Vec<u8>,
-        }
-        let records: Vec<OtpkRecord> = self
-            .lifecycle
-            .client
-            .export_one_time_prekeys()
-            .into_iter()
-            .map(|(key_id, private_key, public_key)| OtpkRecord {
-                key_id,
-                private_key,
-                public_key,
-            })
-            .collect();
-        serde_json::to_string(&records).map_err(|e| e.to_string())
-    }
-
-    pub fn import_otpks_json(&mut self, json: &str) -> Result<(), String> {
-        #[derive(serde::Deserialize)]
-        struct OtpkRecord {
-            key_id: u32,
-            private_key: Vec<u8>,
-            public_key: Vec<u8>,
-        }
-        let records: Vec<OtpkRecord> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let keys: Vec<(u32, Vec<u8>, Vec<u8>)> = records
-            .into_iter()
-            .map(|r| (r.key_id, r.private_key, r.public_key))
-            .collect();
-        self.lifecycle.client.import_one_time_prekeys(keys);
-        Ok(())
-    }
-
     pub fn export_private_keys_cfe(&self) -> Result<Vec<u8>, String> {
         let payload = self.lifecycle.client.to_private_keys_cfe()?;
         crate::cfe::encode(crate::cfe::CfeMessageType::PrivateKeys, &payload)
@@ -2797,17 +2713,11 @@ impl Orchestrator {
     }
 
     fn handle_app_launched(&mut self) -> Vec<Action> {
-        // Schedule a GC and prewarm sweep on launch.
-        let mut actions = vec![
-            Action::ScheduleTimer {
-                timer_id: "gc_sweep".to_string(),
-                delay_ms: 5_000,
-            },
-            Action::ScheduleTimer {
-                timer_id: "prewarm_sweep".to_string(),
-                delay_ms: 2_000,
-            },
-        ];
+        // Schedule a GC sweep on launch.
+        let mut actions = vec![Action::ScheduleTimer {
+            timer_id: "gc_sweep".to_string(),
+            delay_ms: 5_000,
+        }];
         // Only a build that opens v2 sessions can upgrade anything: without `post-quantum` the
         // reopened session would be classical again, and the sweep would reopen it every launch.
         if cfg!(feature = "post-quantum") {
@@ -3059,8 +2969,7 @@ impl Orchestrator {
     // ── Orchestrator state persistence ────────────────────────────────────────
 
     /// Build a `SaveToSecureStore` action that persists the full
-    /// orchestrator coordination state (ACK cache, init_locks,
-    /// prekey tracker) to the platform's secure store.
+    /// orchestrator coordination state (init_locks, pins, envelope book) to the platform's secure store.
     ///
     /// Must be called after any event that mutates coordination state and does
     /// NOT already trigger a session-keyed save (e.g. NeedSessionInit,
@@ -3081,16 +2990,6 @@ impl Orchestrator {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn derive_message_id(data: &[u8], msg_num: u32) -> String {
-    // Cheap deterministic ID: sha2 not available without feature, use a hash of
-    // the first 16 bytes + message number. Good enough for deduplication.
-    let prefix: u64 = data.iter().take(16).enumerate().fold(0u64, |acc, (i, &b)| {
-        acc.wrapping_add((b as u64).wrapping_shl(i as u32 % 64))
-    });
-    format!("{}_{}", prefix, msg_num)
-}
 
 fn preview(plaintext: &[u8]) -> String {
     let s = String::from_utf8_lossy(plaintext);
@@ -3601,8 +3500,8 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Action::ScheduleTimer { .. }))
             .collect();
-        // GC and prewarm; plus the PQXDH v2 upgrade sweep where this build opens v2 sessions.
-        let expected = if cfg!(feature = "post-quantum") { 3 } else { 2 };
+        // GC; plus the PQXDH v2 upgrade sweep where this build opens v2 sessions.
+        let expected = if cfg!(feature = "post-quantum") { 2 } else { 1 };
         assert_eq!(timers.len(), expected);
     }
 
@@ -4396,8 +4295,8 @@ mod pqxdh_v2_tests {
         })
     }
 
-    /// Mutation: drop the `tie_break_role` filter from `pq_upgrade_candidates` — this reddens
-    /// (`zzz`, where this device is RESPONDER, would be reopened from both ends).
+    /// Mutation: let `pq_upgrade_candidates` return sessions that are not classical — this
+    /// reddens (the deferred and already-upgraded ones would be reopened).
     #[test]
     fn the_upgrade_sweep_reopens_only_classical_sessions() {
         let (mut zed, mut bob) = (device("zed"), device("bob"));

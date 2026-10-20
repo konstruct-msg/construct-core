@@ -11,31 +11,13 @@ pub enum CfeMessageType {
     OtpkBundle = 0x03,
     RegistrationBundle = 0x04,
     OrchestratorState = 0x05,
-    SpkRotation = 0x06,
-
-    // Storage (App data)
-    AppSettings = 0x07,
-    ContactKeyBundle = 0x08,
-
-    // Event/Action protocol (in-memory)
-    InboundEvent = 0x10,
-    OutboundActions = 0x11,
 
     // Post-Quantum
     /// The core's ML-KEM-1024 prekeys (`CfeKyberPrekeysV1`). Reserved since the start and
     /// never written before them.
     KyberPrivateKeys = 0x20,
-    KyberSessionState = 0x21,
 
-    // Calls (future)
-    CallSignal = 0x30,
-    CallKeyMaterial = 0x31,
-
-    // OpenMLS (future)
-    MlsWelcome = 0x40,
-    MlsCommit = 0x41,
-    MlsProposal = 0x42,
-    MlsKeyPackage = 0x43,
+    // OpenMLS
     /// Device-level OpenMLS storage snapshot (all groups + key package
     /// private material). See `group::MlsStore`.
     MlsStore = 0x44,
@@ -52,19 +34,7 @@ impl CfeMessageType {
             0x03 => Self::OtpkBundle,
             0x04 => Self::RegistrationBundle,
             0x05 => Self::OrchestratorState,
-            0x06 => Self::SpkRotation,
-            0x07 => Self::AppSettings,
-            0x08 => Self::ContactKeyBundle,
-            0x10 => Self::InboundEvent,
-            0x11 => Self::OutboundActions,
             0x20 => Self::KyberPrivateKeys,
-            0x21 => Self::KyberSessionState,
-            0x30 => Self::CallSignal,
-            0x31 => Self::CallKeyMaterial,
-            0x40 => Self::MlsWelcome,
-            0x41 => Self::MlsCommit,
-            0x42 => Self::MlsProposal,
-            0x43 => Self::MlsKeyPackage,
             0x44 => Self::MlsStore,
             0x7F => Self::Generic,
             _ => return None,
@@ -81,49 +51,8 @@ impl TryFrom<u8> for CfeMessageType {
 }
 
 // ============================================================================
-// Storage CFE types (0x07-0x0F range)
+// Storage CFE types
 // ============================================================================
-
-/// App settings stored in metadata
-/// msg_type = 0x07
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeAppSettingsV1 {
-    #[serde(rename = "ver")]
-    pub version: u8,
-    #[serde(rename = "notif")]
-    pub notifications_enabled: bool,
-    #[serde(rename = "theme")]
-    pub theme: String,
-    #[serde(rename = "typing")]
-    pub typing_indicator: bool,
-    #[serde(rename = "receipts")]
-    pub read_receipts: bool,
-    #[serde(rename = "sync")]
-    pub last_sync: i64,
-}
-
-impl Default for CfeAppSettingsV1 {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            notifications_enabled: true,
-            theme: "default".to_string(),
-            typing_indicator: true,
-            read_receipts: true,
-            last_sync: 0,
-        }
-    }
-}
-
-/// Contact public key bundle
-/// msg_type = 0x08
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CfeContactKeyBundleV1 {
-    #[serde(rename = "ver")]
-    pub version: u8,
-    #[serde(rename = "keys", with = "serde_bytes")]
-    pub key_bundle: Vec<u8>,
-}
 
 /// Registration bundle for sharing with contacts
 ///_msg_type = 0x04
@@ -610,7 +539,7 @@ pub struct CfeAckRecordV1 {
 /// Includes:
 /// - ACK dedup cache (in-memory processed message IDs)
 /// - Session init locks (contacts currently in session-setup)
-/// - Archive index + prekey tracker (from `SessionLifecycleManager`)
+/// - Pins and envelope book (from `SessionLifecycleManager`)
 ///
 /// Persisted on every state change that modifies ack_store, healing_queue,
 /// or init_locks.  On startup, importing this blob restores the in-memory
@@ -641,9 +570,8 @@ pub struct CfeOrchestratorStateV1 {
     // `arcs` and `arc_ts` (the core's archive of a session an END_SESSION tore down) were here
     // until 2026-09-27; END_SESSION is gone and a record keeps its previous states instead. The
     // named-map codec ignores the keys in older blobs. Do not reuse the names.
-    /// contactId → last seen OTPK ID (reinstall detection).
-    #[serde(rename = "ptk")]
-    pub prekey_tracker: Vec<(String, u32)>,
+    // `ptk` (contactId → last seen OTPK ID, reinstall detection) was here; nothing ever read it.
+    // The named-map codec ignores the key in older blobs. Do not reuse the name.
     // `skd` (devices that had signed a v1 Kyber SPK) and `prd` (devices that had advertised the
     // PQ ratchet) were here; PQXDH v2 refuses every unsigned bundle and makes the PQ-ratchet suite mandatory,
     // so neither ledger has anything left to remember. Old keys are ignored on read.

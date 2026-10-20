@@ -418,29 +418,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         })
     }
 
-    /// Экспорт публичного key bundle
-    pub fn export_public_bundle(
-        &self,
-    ) -> Result<crate::crypto::handshake::x3dh::X3DHPublicKeyBundle> {
-        let identity_public = self.identity_public_key()?.as_ref().to_vec();
-        let verifying_key = self.verifying_key()?.as_ref().to_vec();
-        let prekey = self.current_signed_prekey()?;
-
-        Ok(crate::crypto::handshake::x3dh::X3DHPublicKeyBundle {
-            identity_public,
-            signed_prekey_public: prekey.key_pair.1.as_ref().to_vec(),
-            signature: prekey.signature.clone(),
-            verifying_key,
-            suite_id: SuiteID::from_u16_unchecked(P::suite_id()), // Provider гарантирует валидный suite_id
-            one_time_prekey_public: None,
-            one_time_prekey_id: None,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        })
-    }
-
     /// Экспорт device registration bundle для device-based регистрации
     ///
     /// Возвращает X3DHRegistrationBundle, содержащий ТОЛЬКО публичные данные

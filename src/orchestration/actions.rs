@@ -28,19 +28,6 @@ pub enum SecureStoreSlot {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
-    // ── Cryptographic operations ──────────────────────────────────────────────
-    DecryptMessage {
-        contact_id: String,
-        ciphertext: Vec<u8>,
-    },
-    EncryptMessage {
-        contact_id: String,
-        plaintext: Vec<u8>,
-    },
-    ArchiveSession {
-        contact_id: String,
-    },
-
     /// Emitted when a message has been successfully decrypted.
     /// Carries the raw plaintext bytes so the platform can parse them (protobuf,
     /// plain UTF-8, or chunked-KNST binary frame) without any lossy conversion.
@@ -161,10 +148,6 @@ pub enum Action {
         /// 0 = regular E2EE message; 12 = CALL_SIGNAL.
         content_type: u8,
     },
-    SendReceipt {
-        message_id: String,
-        status: ReceiptStatus,
-    },
     /// We could not read `message_id` from `contact_id`: send `payload` to that device as a
     /// DECRYPTION_ERROR (content type 28) envelope, sealed-sender, and acknowledge the message.
     ///
@@ -225,18 +208,6 @@ pub enum Action {
         timer_id: String,
         delay_ms: u64,
     },
-    CancelTimer {
-        timer_id: String,
-    },
-}
-
-/// Delivery / read receipt status.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ReceiptStatus {
-    Sent,
-    Delivered,
-    Read,
-    Failed,
 }
 
 /// Event — входящее событие, поступающее в Rust-ядро от платформенного слоя.
@@ -382,19 +353,6 @@ mod tests {
             !s.contains("[1, 2, 3]"),
             "the payload is secret; Debug must not print it: {s}"
         );
-    }
-
-    #[test]
-    fn test_receipt_status_variants() {
-        let statuses = [
-            ReceiptStatus::Sent,
-            ReceiptStatus::Delivered,
-            ReceiptStatus::Read,
-            ReceiptStatus::Failed,
-        ];
-        for s in &statuses {
-            let _ = format!("{:?}", s); // must be Debug
-        }
     }
 
     #[test]

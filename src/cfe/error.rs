@@ -53,12 +53,6 @@ pub enum CfeError {
     #[error("Base64 decode failed: {0}")]
     Base64DecodeFailed(String),
 
-    #[error("Hex decode failed: {0}")]
-    HexDecodeFailed(String),
-
     #[error("Invalid field: {0}")]
     InvalidField(String),
-
-    #[error("Key derivation failed: {0}")]
-    KeyDerivationFailed(String),
 }

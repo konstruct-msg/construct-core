@@ -218,26 +218,6 @@ where
         )
     }
 
-    /// Variant of `from_keys` that also restores the persisted SPK key id and old SPKs.
-    pub fn from_keys_with_history(
-        identity_secret: Vec<u8>,
-        signing_secret: Vec<u8>,
-        prekey_secret: Vec<u8>,
-        prekey_signature: Vec<u8>,
-        spk_id: u32,
-        old_spks: Vec<(Vec<u8>, Vec<u8>, u32, i64)>, // (priv, sig, id, created_at)
-    ) -> Result<Self, String> {
-        Self::from_keys_with_history_and_hybrid(
-            identity_secret,
-            signing_secret,
-            prekey_secret,
-            prekey_signature,
-            spk_id,
-            old_spks,
-            None,
-        )
-    }
-
     /// Extended restore including optional hybrid signature private key (centralized in core).
     pub fn from_keys_with_history_and_hybrid(
         identity_secret: Vec<u8>,
@@ -921,11 +901,6 @@ where
         session_id
     }
 
-    /// Получить количество активных сессий
-    pub fn active_sessions_count(&self) -> usize {
-        self.sessions.len()
-    }
-
     /// Получить список контактов с активными сессиями
     pub fn active_contacts(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
@@ -939,13 +914,6 @@ where
         self.key_manager
             .rotate_signed_prekey()
             .map_err(|e| format!("Failed to rotate prekey: {:?}", e))
-    }
-
-    /// Cleanup старых skipped message keys во всех сессиях
-    pub fn cleanup_all_skipped_keys(&mut self, max_age_seconds: i64) {
-        for session in self.sessions.values_mut() {
-            session.cleanup_old_skipped_keys(max_age_seconds);
-        }
     }
 
     /// Return a read-only health report for the session with `contact_id`.
@@ -1168,7 +1136,7 @@ mod tests {
         assert!(client.is_ok());
 
         let client = client.unwrap();
-        assert_eq!(client.active_sessions_count(), 0);
+        assert_eq!(client.active_contacts().len(), 0);
     }
 
     #[test]
@@ -1205,7 +1173,7 @@ mod tests {
             .unwrap();
         assert!(!session_id.is_empty());
         assert!(alice.has_session("bob"));
-        assert_eq!(alice.active_sessions_count(), 1);
+        assert_eq!(alice.active_contacts().len(), 1);
 
         // Alice sends first message
         let plaintext1 = b"Hello Bob!";
@@ -1506,7 +1474,7 @@ mod tests {
         // Remove session
         assert!(alice.remove_session("bob"));
         assert!(!alice.has_session("bob"));
-        assert_eq!(alice.active_sessions_count(), 0);
+        assert_eq!(alice.active_contacts().len(), 0);
     }
 
     #[test]

@@ -23,8 +23,6 @@ pub const MLKEM768_PK_SIZE: usize = 1184;
 pub const MLKEM768_SK_SIZE: usize = 2400;
 /// ML-KEM-768 ciphertext size in bytes
 pub const MLKEM768_CT_SIZE: usize = 1088;
-/// ML-KEM-768 shared secret size in bytes
-pub const MLKEM768_SS_SIZE: usize = 32;
 
 /// A generated ML-KEM-768 keypair.
 #[derive(Debug, Clone)]

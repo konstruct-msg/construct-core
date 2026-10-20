@@ -4,7 +4,6 @@
 ///
 /// ```text
 /// orchestration/
-///   platform_bridge  — PlatformBridge callback trait
 ///   actions          — Action + IncomingEvent enums
 ///   clock            — Clock trait + SystemClock + MockClock (time injection)
 ///   ack_store        — ACK deduplication
@@ -25,7 +24,6 @@ pub mod decryption_error;
 pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
-pub mod platform_bridge;
 #[cfg(feature = "post-quantum")]
 pub mod pq_prekey_plan;
 pub mod receiving_init_plan;
@@ -35,12 +33,11 @@ pub mod session_lifecycle;
 pub mod session_machine;
 
 pub use ack_store::{AckCheckResult, AckStore};
-pub use actions::{Action, IncomingEvent, ReceiptStatus, SecureStoreSlot};
+pub use actions::{Action, IncomingEvent, SecureStoreSlot};
 pub use clock::{Clock, SystemClock, system_clock};
 pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation};
 pub use message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 pub use orchestrator::{Orchestrator, PeekVerdict};
-pub use platform_bridge::PlatformBridge;
 #[cfg(feature = "post-quantum")]
 pub use pq_prekey_plan::{
     KyberPrekeyOffer, PqxdhChoice, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,

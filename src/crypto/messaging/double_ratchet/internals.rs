@@ -77,11 +77,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.prekey_header.as_ref()
     }
 
-    /// Label the PQ layer of a session this device initiated (the Kyber-prekey plan's verdict).
-    pub fn set_pq_authentication(&mut self, authentication: PqAuthentication) {
-        self.pq_authentication = authentication;
-    }
-
     pub fn pq_authentication(&self) -> PqAuthentication {
         self.pq_authentication
     }

@@ -52,9 +52,6 @@ pub enum ConstructError {
 
 pub type Result<T> = std::result::Result<T, ConstructError>;
 
-// Alias для совместимости
-pub type MessengerError = ConstructError;
-
 // Для конвертации String ошибок из callback интерфейсов
 impl From<String> for ConstructError {
     fn from(error: String) -> Self {

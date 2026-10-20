@@ -3,9 +3,9 @@
 //! # Why this is here and not in a client
 //!
 //! "May I initiate?" is the same class of question as "which sessions does this operation touch":
-//! two clients must answer it compatibly or the session does not form. `tie_break_role` already
-//! settles a collision that has happened. This settles whether to walk into one — and a client
-//! that decides it locally decides it differently, silently, because the symptom is not an error.
+//! two clients must answer it compatibly or the session does not form. This settles whether to
+//! walk into a collision — and a client that decides it locally decides it differently, silently,
+//! because the symptom is not an error.
 //! It is a conversation that stops for as long as the recovery takes.
 //!
 //! # The run this is written from
@@ -26,8 +26,8 @@
 //! ```
 //!
 //! Thirty-two seconds of silence, four messages batched, seven one-time prekeys spent between the
-//! two devices. `tie_break_role` could not help: each side was **alone** when it decided, so there
-//! was no pair to rank. By the time there was, both had already spent a prekey on a session the
+//! two devices. Ranking the pair could not have helped: each side was **alone** when it decided, so
+//! there was no pair to rank. By the time there was, both had already spent a prekey on a session the
 //! other could not read.
 //!
 //! # The rule
@@ -79,11 +79,6 @@ impl InitiationDecision {
 /// decision over them is made here so that two clients make the same one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitiationContext {
-    /// Our device id, in the space the session is addressed by. Ranked against `peer_device_id`;
-    /// anything else ranks a different pair (see `tie_break_role`).
-    pub my_device_id: String,
-    /// The device we want a session with.
-    pub peer_device_id: String,
     /// We sent a `SESSION_RESET_INIT` to this device and it is neither acknowledged nor expired.
     pub our_init_in_flight: bool,
     /// We have the peer's init in hand — received, not yet completed.
@@ -120,14 +115,8 @@ pub fn plan_initiation(ctx: &InitiationContext) -> InitiationDecision {
 mod tests {
     use super::*;
 
-    /// Two distinct device ids.
-    const HIGH: &str = "ff00000000000000000000000000000f";
-    const LOW: &str = "0011111111111111111111111111111f";
-
-    fn ctx(my: &str, peer: &str) -> InitiationContext {
+    fn ctx() -> InitiationContext {
         InitiationContext {
-            my_device_id: my.to_string(),
-            peer_device_id: peer.to_string(),
             our_init_in_flight: false,
             peer_init_in_flight: false,
             have_outbound_work: false,
@@ -140,15 +129,14 @@ mod tests {
     /// old behaviour opened one anyway and collided with A thirty-three seconds later.
     #[test]
     fn a_restart_with_nothing_to_say_does_not_open_a_session() {
-        assert_eq!(plan_initiation(&ctx(LOW, HIGH)), InitiationDecision::Wait);
-        assert_eq!(plan_initiation(&ctx(HIGH, LOW)), InitiationDecision::Wait);
+        assert_eq!(plan_initiation(&ctx()), InitiationDecision::Wait);
     }
 
     /// **A at 12:30:44.** Its user typed. Waiting here would be the opposite defect — a message
     /// the user believes they sent, sitting behind a session nobody opened.
     #[test]
     fn something_to_send_opens_a_session() {
-        let mut c = ctx(LOW, HIGH);
+        let mut c = ctx();
         c.have_outbound_work = true;
         assert_eq!(plan_initiation(&c), InitiationDecision::Initiate);
     }
@@ -160,7 +148,7 @@ mod tests {
     /// already opening.
     #[test]
     fn a_second_init_is_never_started_while_ours_is_in_flight() {
-        let mut c = ctx(HIGH, LOW);
+        let mut c = ctx();
         c.our_init_in_flight = true;
         assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
 
@@ -174,65 +162,19 @@ mod tests {
 
     // ── Their handshake in hand ──────────────────────────────────────────────
 
-    /// Both sides open from the other's handshake instead of each building its own — whichever
-    /// ids they hold. Until 2026-09-27 the pair was ranked here and the higher id initiated;
-    /// a record that keeps its previous states converges without the ranking.
+    /// Both sides open from the other's handshake instead of each building its own. Until
+    /// 2026-09-27 the pair was ranked and the higher id initiated; a record that keeps its
+    /// previous states converges without the ranking.
     ///
     /// Mutation: initiate when `have_outbound_work` even with the peer's handshake in hand — the
-    /// second case reddens.
+    /// second assertion reddens.
     #[test]
-    fn the_peers_handshake_is_opened_from_whichever_side_we_are() {
-        for (me, peer) in [(HIGH, LOW), (LOW, HIGH)] {
-            let mut c = ctx(me, peer);
-            c.peer_init_in_flight = true;
-            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
-            c.have_outbound_work = true;
-            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
-        }
-    }
-
-    // ── Degenerate input ─────────────────────────────────────────────────────
-
-    /// **First contact.** The peer's device id comes out of a bundle we have not fetched yet, so
-    /// at the moment of the decision there is nothing to rank. Refusing here would mean a person
-    /// can never be written to for the first time — found by wiring the iOS caller, which reaches
-    /// this function before the fetch precisely so the fetch (and its prekey) can be skipped.
-    #[test]
-    fn a_peer_we_cannot_name_yet_is_still_written_to() {
-        for c in [ctx(HIGH, ""), ctx("", HIGH), ctx("", "")] {
-            let mut c = c;
-            c.have_outbound_work = true;
-            assert_eq!(plan_initiation(&c), InitiationDecision::Initiate);
-        }
-    }
-
-    /// Nothing to say and nobody nameable is still nothing to say.
-    #[test]
-    fn an_unnameable_device_with_no_work_is_waited_on() {
-        assert_eq!(plan_initiation(&ctx(HIGH, "")), InitiationDecision::Wait);
-        assert_eq!(plan_initiation(&ctx("", HIGH)), InitiationDecision::Wait);
-    }
-
-    /// Their init is in flight and neither id is known: nothing is ranked any more, so the answer
-    /// is the same as with ids.
-    #[test]
-    fn an_unnameable_peer_with_its_handshake_in_hand_is_opened_from() {
-        for c in [ctx(HIGH, ""), ctx("", HIGH), ctx("", "")] {
-            let mut c = c;
-            c.peer_init_in_flight = true;
-            c.have_outbound_work = true;
-            assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
-        }
-    }
-
-    /// An init of ours in flight still outranks everything, nameable or not.
-    #[test]
-    fn our_own_init_wins_even_with_no_ids() {
-        let mut c = ctx("", "");
-        c.our_init_in_flight = true;
+    fn the_peers_handshake_is_opened_from() {
+        let mut c = ctx();
         c.peer_init_in_flight = true;
+        assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
         c.have_outbound_work = true;
-        assert_eq!(plan_initiation(&c), InitiationDecision::JoinInFlight);
+        assert_eq!(plan_initiation(&c), InitiationDecision::YieldToPeer);
     }
 
     /// The wire spellings are compared across clients and printed into logs; pin them.

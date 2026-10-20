@@ -178,10 +178,6 @@ impl KyberPrekeyStore {
             .retain(|r| now.saturating_sub(r.retired_at) < SPK_RETENTION_AFTER_ROTATION_SECS);
     }
 
-    pub fn retired_spk_count(&self) -> usize {
-        self.retired_spks.len()
-    }
-
     // ── One-time prekeys ──────────────────────────────────────────────────────
 
     /// Generate `count` one-time prekeys for upload.
@@ -429,9 +425,9 @@ mod tests {
         store.commit_spk_rotation(0);
         store.begin_spk_rotation(0).unwrap();
         store.commit_spk_rotation(0);
-        assert_eq!(store.retired_spk_count(), 1);
+        assert_eq!(store.retired_spks.len(), 1);
         let restored = KyberPrekeyStore::from_cfe(&store.to_cfe(), 15 * DAY);
-        assert_eq!(restored.retired_spk_count(), 0);
+        assert_eq!(restored.retired_spks.len(), 0);
     }
 
     #[test]

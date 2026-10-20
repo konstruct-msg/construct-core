@@ -533,7 +533,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "construct-core"
-version = "0.53.1"
+version = "0.54.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -557,7 +557,6 @@ dependencies = [
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto 0.5.1",
- "pbkdf2",
  "rand 0.8.6",
  "rand_core 0.6.4",
  "rmp-serde",
@@ -2543,18 +2542,6 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
-name = "pbkdf2"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
-dependencies = [
- "digest 0.10.7",
- "hmac",
- "password-hash",
- "sha2",
-]
 
 [[package]]
 name = "pem-rfc7468"

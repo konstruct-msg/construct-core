@@ -135,42 +135,18 @@ pub fn verify_invite_signature(
     }
 }
 
-/// Derive Ed25519 verifying (public) key from identity secret key
-///
-/// This function exists to verify that a secret key matches its public key.
-/// Used for debugging signature verification issues.
-///
-/// # Arguments
-/// - `identity_secret_key`: 32-byte Ed25519 secret key
-///
-/// # Returns
-/// - 32-byte Ed25519 public key (verifying key)
-///
-/// # Errors
-/// - `InvalidKeyData` if secret key is not 32 bytes
-pub fn derive_verifying_key_from_secret(
-    identity_secret_key: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
-    // Validate secret key length
-    if identity_secret_key.len() != 32 {
-        return Err(CryptoError::InvalidKeyData);
-    }
-
-    // Convert to SigningKey
-    let secret_array: [u8; 32] = identity_secret_key
-        .try_into()
-        .map_err(|_| CryptoError::InvalidKeyData)?;
-    let signing_key = SigningKey::from_bytes(&secret_array);
-
-    // Get verifying key
-    let verifying_key = signing_key.verifying_key();
-
-    Ok(verifying_key.to_bytes().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Ed25519 public key of a 32-byte secret, for the interop vectors below.
+    fn derive_verifying_key_from_secret(sk: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let secret: [u8; 32] = sk.try_into().map_err(|_| CryptoError::InvalidKeyData)?;
+        Ok(SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes()
+            .to_vec())
+    }
 
     #[test]
     fn test_ephemeral_keypair_generation() {
