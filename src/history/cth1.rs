@@ -132,10 +132,6 @@ impl Reader {
         }
     }
 
-    pub fn is_done(&self) -> bool {
-        matches!(self.state, State::Done)
-    }
-
     fn step(&mut self, data: &mut &[u8], out: &mut Vec<Event>) -> Result<(), HistoryFailure> {
         match self.state {
             State::Preamble => {

@@ -4,7 +4,6 @@ use crate::crypto::handshake::x3dh::X3DHPublicKeyBundle;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::group::{MemberAddition, MlsError};
-pub use crate::orchestration::PlatformBridge;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -357,32 +356,6 @@ impl From<crate::crypto::kyber_prekeys::KyberPrekeyUpload> for KyberPrekeyUpload
 pub struct OtpkPair {
     pub key_id: u32,
     pub public_key: Vec<u8>,
-}
-
-/// Full OTPK record for persistence (includes private key for Keychain storage)
-#[derive(Clone, Serialize, Deserialize)]
-pub struct OtpkRecord {
-    pub key_id: u32,
-    pub private_key: Vec<u8>, // Base64-encoded private key bytes
-    pub public_key: Vec<u8>,  // Base64-encoded public key bytes
-}
-
-// Private keys for persistence (exported via UDL)
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PrivateKeysJson {
-    pub identity_secret: String,      // Base64
-    pub signing_secret: String,       // Base64
-    pub signed_prekey_secret: String, // Base64
-    pub prekey_signature: String,     // Base64
-    pub suite_id: String,
-    // Integrity fields: public keys re-derived on load and compared to catch Keychain corruption.
-    // Optional for backward compatibility with keys exported before this field was added.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_public_check: Option<String>, // Base64 of identity public key
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verifying_key_check: Option<String>, // Base64 of Ed25519 verifying key
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed_prekey_public_check: Option<String>, // Base64 of SPK public key
 }
 
 // Invite crypto types (exported via UDL)
@@ -991,7 +964,7 @@ pub fn verify_recovery_signature(public_key: Vec<u8>, message: String, signature
 
 use crate::traffic_protection::{
     CoverTrafficConfig as RustCoverTrafficConfig, CoverTrafficManager,
-    EnergyMetrics as RustEnergyMetrics, TimingConfig as RustTimingConfig,
+    EnergyMetrics as RustEnergyMetrics,
 };
 
 // UniFFI-compatible structs (must match UDL dictionaries)
@@ -1033,27 +1006,6 @@ impl From<&RustEnergyMetrics> for EnergyMetrics {
             dummies_sent: metrics.dummies_sent,
             coalesced_count: metrics.coalesced_count,
             battery_skipped: metrics.battery_skipped,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TimingConfig {
-    pub heartbeat_interval_sec: u64,
-    pub heartbeat_jitter_ms: u64,
-    pub max_send_delay_ms: u64,
-    pub enabled: bool,
-    pub battery_aware: bool,
-}
-
-impl From<TimingConfig> for RustTimingConfig {
-    fn from(config: TimingConfig) -> Self {
-        Self {
-            heartbeat_interval_sec: config.heartbeat_interval_sec,
-            heartbeat_jitter_ms: config.heartbeat_jitter_ms,
-            max_send_delay_ms: config.max_send_delay_ms,
-            enabled: config.enabled,
-            battery_aware: config.battery_aware,
         }
     }
 }
@@ -1146,16 +1098,6 @@ impl TrafficProtectionManager {
 
 // Namespace functions (exported via UDL)
 
-/// Generate a dummy message of specified size
-pub fn generate_dummy_message(size: u64) -> Vec<u8> {
-    crate::traffic_protection::generate_dummy_message(size as usize)
-}
-
-/// Check if data is a dummy message
-pub fn is_dummy_message(data: Vec<u8>) -> bool {
-    crate::traffic_protection::is_dummy_message(&data)
-}
-
 /// Generate jittered interval in milliseconds
 pub fn jittered_interval_ms(base_ms: u64, jitter_ms: u64) -> u64 {
     crate::traffic_protection::jittered_interval(base_ms, jitter_ms).as_millis() as u64
@@ -1164,11 +1106,6 @@ pub fn jittered_interval_ms(base_ms: u64, jitter_ms: u64) -> u64 {
 /// Generate random send delay in milliseconds
 pub fn random_send_delay_ms(max_delay_ms: u64) -> u64 {
     crate::traffic_protection::random_send_delay(max_delay_ms).as_millis() as u64
-}
-
-/// Generate heartbeat interval with jitter in milliseconds
-pub fn heartbeat_interval_ms(base_interval_sec: u64) -> u64 {
-    crate::traffic_protection::heartbeat_interval(base_interval_sec).as_millis() as u64
 }
 
 /// Generate battery-aware jittered interval in milliseconds
@@ -3177,11 +3114,6 @@ pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
     })
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
 /// Sign a message with an ML-DSA-65 signing seed (detached signature).
 #[cfg(feature = "post-quantum")]
 pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
@@ -3195,11 +3127,6 @@ pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, Cr
         .try_sign(&message)
         .map_err(|_| CryptoError::InvalidKeyData)?;
     Ok(sig.encode().as_slice().to_vec())
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn mldsa65_sign(_secret_key: Vec<u8>, _message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    Err(CryptoError::InitializationFailed)
 }
 
 /// Verify an ML-DSA-65 detached signature.
@@ -3224,15 +3151,6 @@ pub fn mldsa65_verify(
     Ok(pk.verify(&message, &sig).is_ok())
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn mldsa65_verify(
-    _public_key: Vec<u8>,
-    _message: Vec<u8>,
-    _signature: Vec<u8>,
-) -> Result<bool, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
 /// Generate a hybrid (Ed25519 + ML-DSA-65) signature keypair.
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> {
@@ -3246,11 +3164,6 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
     })
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
 /// Sign a message with a hybrid private key (Ed25519 + ML-DSA-65).
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
@@ -3261,11 +3174,6 @@ pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, Cr
             message: format!("Hybrid sign failed: {e}"),
         },
     )
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_sign(_private_key: Vec<u8>, _message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    Err(CryptoError::InitializationFailed)
 }
 
 /// Verify a hybrid signature (both Ed25519 and ML-DSA-65 must be valid).
@@ -3283,15 +3191,6 @@ pub fn hybrid_verify(
     }
 }
 
-#[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_verify(
-    _public_key: Vec<u8>,
-    _message: Vec<u8>,
-    _signature: Vec<u8>,
-) -> Result<bool, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
 /// Derive the hybrid public key from a hybrid private key.
 #[cfg(feature = "post-quantum")]
 pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
@@ -3301,30 +3200,6 @@ pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, C
         private_key,
     ))
     .map_err(|_e| CryptoError::InvalidKeyData)
-}
-
-#[cfg(not(feature = "post-quantum"))]
-pub fn hybrid_public_key_from_private(_private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    Err(CryptoError::InitializationFailed)
-}
-
-// ── Orchestration — Phase 0: PlatformBridge ──────────────────────────────────
-
-/// Verify that a `PlatformBridge` implementation correctly round-trips data
-/// through its secure store (save → load → compare).
-///
-/// Called from Swift integration tests to confirm that `PlatformBridgeImpl`
-/// (Keychain adapter) is wired up correctly before higher-level phases rely on it.
-///
-/// Returns `true` if the loaded bytes equal the saved bytes, `false` otherwise.
-pub fn test_platform_bridge_roundtrip(
-    bridge: Box<dyn PlatformBridge>,
-    key: String,
-    data: Vec<u8>,
-) -> Result<bool, CryptoError> {
-    bridge.save_to_secure_store(key.clone(), data.clone());
-    let loaded = bridge.load_from_secure_store(key);
-    Ok(loaded.as_deref() == Some(data.as_slice()))
 }
 
 // ── Orchestration — RustAckStore (Phase 1a) ───────────────────────────────────
@@ -4340,7 +4215,7 @@ impl OrchestratorCore {
         })
     }
 
-    /// Export the full orchestrator coordination state (init locks, prekey tracker, pins)
+    /// Export the full orchestrator coordination state (init locks, pins)
     /// as a CFE binary blob.
     ///
     /// Persist under `SecureStoreSlot::OrchestratorState` via
@@ -4535,17 +4410,6 @@ impl From<crate::orchestration::SecureStoreSlot> for CfeSecureStoreSlot {
 
 /// Typed platform action — UDL `[Enum] interface CfeAction`.
 pub enum CfeAction {
-    DecryptMessage {
-        contact_id: String,
-        ciphertext: Vec<u8>,
-    },
-    EncryptMessage {
-        contact_id: String,
-        plaintext: Vec<u8>,
-    },
-    ArchiveSession {
-        contact_id: String,
-    },
     MessageDecrypted {
         contact_id: String,
         message_id: String,
@@ -4580,10 +4444,6 @@ pub enum CfeAction {
         message_id: String,
         content_type: u8,
     },
-    SendReceipt {
-        message_id: String,
-        status: String,
-    },
     NotifyNewMessage {
         chat_id: String,
         preview: String,
@@ -4598,9 +4458,6 @@ pub enum CfeAction {
     ScheduleTimer {
         timer_id: String,
         delay_ms: u64,
-    },
-    CancelTimer {
-        timer_id: String,
     },
     CallSignalDecrypted {
         contact_id: String,
@@ -4652,23 +4509,7 @@ pub enum CfeAction {
 impl CfeAction {
     fn from_action(action: crate::orchestration::Action) -> Self {
         use crate::orchestration::Action::*;
-        use crate::orchestration::ReceiptStatus;
         match action {
-            DecryptMessage {
-                contact_id,
-                ciphertext,
-            } => Self::DecryptMessage {
-                contact_id,
-                ciphertext,
-            },
-            EncryptMessage {
-                contact_id,
-                plaintext,
-            } => Self::EncryptMessage {
-                contact_id,
-                plaintext,
-            },
-            ArchiveSession { contact_id } => Self::ArchiveSession { contact_id },
             MessageDecrypted {
                 contact_id,
                 message_id,
@@ -4705,16 +4546,6 @@ impl CfeAction {
                 message_id,
                 content_type,
             },
-            SendReceipt { message_id, status } => Self::SendReceipt {
-                message_id,
-                status: match status {
-                    ReceiptStatus::Sent => "sent",
-                    ReceiptStatus::Delivered => "delivered",
-                    ReceiptStatus::Read => "read",
-                    ReceiptStatus::Failed => "failed",
-                }
-                .to_string(),
-            },
             SendDecryptionError {
                 contact_id,
                 message_id,
@@ -4744,7 +4575,6 @@ impl CfeAction {
             NotifySessionCreated { contact_id } => Self::NotifySessionCreated { contact_id },
             NotifyError { code, message } => Self::NotifyError { code, message },
             ScheduleTimer { timer_id, delay_ms } => Self::ScheduleTimer { timer_id, delay_ms },
-            CancelTimer { timer_id } => Self::CancelTimer { timer_id },
             CallSignalDecrypted {
                 contact_id,
                 message_id,

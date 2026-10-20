@@ -58,7 +58,6 @@ pub mod knst;
 pub mod media;
 pub mod orchestration;
 pub mod pow;
-pub mod storage;
 pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;

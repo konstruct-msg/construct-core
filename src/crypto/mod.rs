@@ -60,7 +60,6 @@
 //!
 //! ### Utilities
 //! - [`keys`]: KeyManager для управления долгосрочными ключами
-//! - `master_key`: Backup/restore ключей
 
 // ============================================================================
 // Core Traits
@@ -104,8 +103,6 @@ pub(crate) mod log_fingerprint;
 /// Secret bytes: zeroed on drop, redacted in `Debug`, serde-identical to `ByteBuf`
 pub mod secret_bytes;
 pub use secret_bytes::SecretBytes;
-
-pub mod master_key;
 
 /// Invite crypto - dynamic contact invites with ephemeral keys
 pub mod invite_crypto;
@@ -160,9 +157,3 @@ pub use provider::CryptoProvider;
 // Suite ID with validation
 pub mod suite_id;
 pub use suite_id::{InvalidSuiteId, SuiteID};
-
-// Backward compatibility constants
-/// Suite ID for the classic suite
-pub const CLASSIC_SUITE_ID: u16 = 1;
-/// Suite ID for Post-Quantum hybrid suite (reserved)
-pub const PQ_HYBRID_SUITE_ID: u16 = 2;

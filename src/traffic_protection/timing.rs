@@ -16,7 +16,7 @@
 //! use std::time::Duration;
 //!
 //! // Add jitter to heartbeat
-//! let heartbeat = heartbeat_interval(30); // 30s ± 5s
+//! let heartbeat = jittered_interval(30_000, 5_000); // 30s ± 5s
 //!
 //! // Delay message sending (prevents timing correlation)
 //! let delay = random_send_delay(100); // 0-100ms
@@ -56,17 +56,6 @@ pub fn jittered_interval(base_ms: u64, jitter_ms: u64) -> Duration {
 pub fn random_send_delay(max_delay_ms: u64) -> Duration {
     let delay = rand::thread_rng().gen_range(0..=max_delay_ms);
     Duration::from_millis(delay)
-}
-
-/// Heartbeat timing with jitter
-///
-/// # Arguments
-/// * `base_interval_sec` - Base heartbeat interval in seconds
-///
-/// # Returns
-/// Jittered interval (±5 seconds)
-pub fn heartbeat_interval(base_interval_sec: u64) -> Duration {
-    jittered_interval(base_interval_sec * 1000, 5000)
 }
 
 /// Battery-aware jittered interval
@@ -174,14 +163,6 @@ mod tests {
             let delay = random_send_delay(100);
             assert!(delay.as_millis() <= 100);
         }
-    }
-
-    #[test]
-    fn test_heartbeat_interval() {
-        // Heartbeat should be base ± 5 seconds
-        let duration = heartbeat_interval(30);
-        let ms = duration.as_millis() as u64;
-        assert!((30000..=35000).contains(&ms)); // 30s-35s
     }
 
     #[test]

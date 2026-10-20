@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.53.1"
+version = "0.54.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -64,7 +64,6 @@ ed25519-dalek = { version = "2.0", features = ["std", "rand_core"] }
 curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
 aes-gcm = "0.10"
 chacha20poly1305 = { version = "0.10", features = ["std", "getrandom"] }
-pbkdf2 = { version = "0.12", features = ["simple"] }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"

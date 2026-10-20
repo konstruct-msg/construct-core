@@ -80,8 +80,6 @@ pub struct SessionLifecycleManager {
     /// Device → the states its current one replaced, newest first. Part of the device's session
     /// record: saved and loaded with the current state (`export_session_bytes_for`).
     previous: HashMap<String, Vec<PreviousState>>,
-    /// contactId → last seen OTPK ID (used to detect reinstall).
-    prekey_tracker: HashMap<String, u32>,
     /// Device → SHA-256 of the hybrid identity key it presented the first time a session to it
     /// was opened. The bundle binds that key to the device only by an Ed25519 cross-signature, so
     /// the pin is what a quantum adversary cannot get past — see `pq_prekey_plan`.
@@ -130,7 +128,6 @@ impl SessionLifecycleManager {
             client,
             ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
             previous: HashMap::new(),
-            prekey_tracker: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
             kem_identity_pins: std::collections::BTreeMap::new(),
             spk_epochs: std::collections::BTreeMap::new(),
@@ -171,7 +168,6 @@ impl SessionLifecycleManager {
         let envelopes = self.client.envelopes_mut();
         envelopes.retire_device(contact_id, now);
         envelopes.prune(now);
-        self.prekey_tracker.remove(contact_id);
         // Forgetting a contact is the person's decision to start over with it, and this is
         // local state about that contact like the rest.
         self.hybrid_identity_pins.remove(contact_id);
@@ -517,11 +513,6 @@ impl SessionLifecycleManager {
         }
     }
 
-    /// Whether anything at all is held with `contact_id` — a current state or a previous one.
-    pub fn has_record(&self, contact_id: &str) -> bool {
-        self.client.has_session(contact_id) || self.previous.contains_key(contact_id)
-    }
-
     /// Drop the previous states past `PREVIOUS_STATE_TTL_SECONDS` or beyond `MAX_PREVIOUS_STATES`.
     fn prune_previous(&mut self, contact_id: &str) {
         let now = self.clock.now_secs();
@@ -551,23 +542,11 @@ impl SessionLifecycleManager {
         self.previous.get(contact_id).map_or(0, Vec::len)
     }
 
-    pub fn track_prekey(&mut self, contact_id: &str, otpk_id: u32) {
-        self.prekey_tracker.insert(contact_id.to_string(), otpk_id);
-    }
-
-    /// `true` if `new_otpk_id` differs from the previously recorded value,
-    /// indicating the contact has reinstalled.
-    pub fn is_reinstall(&self, contact_id: &str, new_otpk_id: u32) -> bool {
-        self.prekey_tracker
-            .get(contact_id)
-            .is_some_and(|&prev| prev != new_otpk_id)
-    }
-
     // ── PQ contribution helpers ───────────────────────────────────────────────
 
     // ── State persistence ─────────────────────────────────────────────────────
 
-    /// Export the full orchestrator coordination state (prekey tracker, pins) as a CFE binary blob — msg_type 0x05.
+    /// Export the full orchestrator coordination state (pins) as a CFE binary blob — msg_type 0x05.
     ///
     /// `init_locks` is managed by `OrchestratorCore`; pass the current set here.
     /// The caller should persist the blob under `SecureStoreSlot::OrchestratorState`
@@ -598,11 +577,6 @@ impl SessionLifecycleManager {
             my_user_id: self.my_user_id.clone(),
             processed_ids: Vec::new(),
             init_locks: init_locks.iter().cloned().collect(),
-            prekey_tracker: self
-                .prekey_tracker
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect(),
             hybrid_identity_pins: self
                 .hybrid_identity_pins
                 .iter()
@@ -658,8 +632,6 @@ impl SessionLifecycleManager {
                 .collect(),
         );
 
-        // Restore the prekey tracker.
-        self.prekey_tracker = state.prekey_tracker.into_iter().collect();
         // A pin that is not 32 bytes cannot be compared with anything; dropping it re-pins on the
         // next session, which is where a device with no pin starts anyway.
         let pins = |pins: Vec<crate::cfe::CfeHybridPinV1>| {
@@ -690,17 +662,8 @@ impl SessionLifecycleManager {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    pub fn export_session_json_for(&self, contact_id: &str) -> Result<String, String> {
-        let session = self
-            .client
-            .get_session(contact_id)
-            .ok_or_else(|| format!("Session not found: {}", contact_id))?;
-        let serializable = session.messaging_session().to_serializable();
-        serde_json::to_string(&serializable).map_err(|e| format!("serialize session: {}", e))
-    }
-
     /// Export the session as a CFE binary blob (MessagePack, no JSON intermediate).
-    /// Prefer this over `export_session_json_for` wherever bytes are needed.
+    /// Prefer this to JSON wherever bytes are needed.
     pub fn export_session_bytes_for(&self, contact_id: &str) -> Result<Vec<u8>, String> {
         let previous: &[PreviousState] = self.previous.get(contact_id).map_or(&[], Vec::as_slice);
         // No current state: the newest previous one stands at the top of the record, marked
@@ -872,13 +835,10 @@ mod tests {
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
 
-    #[allow(dead_code)]
-    fn make_pair() -> (SessionLifecycleManager, SessionLifecycleManager) {
-        let alice_client = ClassicClient::<ClassicSuiteProvider>::new().expect("alice client");
-        let bob_client = ClassicClient::<ClassicSuiteProvider>::new().expect("bob client");
-        let alice = SessionLifecycleManager::new(alice_client, "alice".to_string());
-        let bob = SessionLifecycleManager::new(bob_client, "bob".to_string());
-        (alice, bob)
+    /// The pre-CFE JSON form of a session record, which `import_session_bytes` still reads.
+    fn legacy_session_json(mgr: &SessionLifecycleManager, contact_id: &str) -> String {
+        let session = mgr.client.get_session(contact_id).expect("session");
+        serde_json::to_string(&session.messaging_session().to_serializable()).unwrap()
     }
 
     /// What the platform does before restoring any session: load the orchestrator state, which
@@ -900,25 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn test_prekey_tracking() {
+    fn forget_contact_state_clears_pq_state() {
         let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
         let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        assert!(!mgr.is_reinstall("bob", 42)); // no record yet → not a reinstall
-        mgr.track_prekey("bob", 42);
-        assert!(!mgr.is_reinstall("bob", 42)); // same key → not reinstall
-        assert!(mgr.is_reinstall("bob", 99)); // different → reinstall
-    }
-
-    #[test]
-    fn forget_contact_state_clears_prekey_and_pq_state() {
-        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
-        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
-        mgr.track_prekey("bob", 42);
         mgr.pin_hybrid_identity("bob", [7; 32]);
 
         mgr.forget_contact_state("bob");
 
-        assert!(!mgr.is_reinstall("bob", 99));
         assert!(mgr.pinned_hybrid_identity("bob").is_none());
     }
 
@@ -1272,7 +1220,7 @@ mod tests {
             b"late"
         );
         assert!(!alice.has_active_session(&bob_id));
-        assert!(alice.has_record(&bob_id));
+        assert!(alice.previous_state_count(&bob_id) > 0);
     }
 
     /// Until the next send opens a state, the record is only previous states, and it must survive
@@ -1453,7 +1401,7 @@ mod tests {
     #[test]
     fn test_import_accepts_a_legacy_record_with_no_local_user_id() {
         let (alice, _bob, alice_id, bob_device_id) = make_session_pair();
-        let json = alice.export_session_json_for(&bob_device_id).unwrap();
+        let json = legacy_session_json(&alice, &bob_device_id);
 
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         value
@@ -1500,7 +1448,7 @@ mod tests {
     fn test_import_session_bytes_handles_old_json_wrapper_format() {
         // Simulate data produced by the old export_session_cfe (JSON inside CFE wrapper).
         let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
-        let json = alice.export_session_json_for(&bob_device_id).unwrap();
+        let json = legacy_session_json(&alice, &bob_device_id);
         let wrapper = crate::cfe::CfeSessionJsonWrapperV1 {
             contact_id: bob_device_id.clone(),
             json_bytes: crate::crypto::SecretBytes::from(json.into_bytes()),
@@ -1592,7 +1540,6 @@ mod tests {
                 },
             ],
             init_locks: vec![],
-            prekey_tracker: vec![],
             hybrid_identity_pins: vec![],
             kem_identity_pins: vec![],
             envelope_book: vec![],
@@ -1613,6 +1560,47 @@ mod tests {
         let re_exported =
             decode_orchestrator_state(&mgr.export_orchestrator_state_cfe(&locks).unwrap());
         assert!(re_exported.processed_ids.is_empty());
+    }
+
+    /// A blob written before 2026-10-20 carries the prekey tracker under `ptk` (and, in
+    /// general, keys this build no longer knows); the named-map codec ignores them and the rest
+    /// of the state is restored (TODO 199).
+    #[test]
+    fn an_orchestrator_state_blob_with_the_retired_ptk_key_still_imports() {
+        use crate::cfe::{CfeAckRecordV1, CfeMessageType};
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct WithPtk {
+            ver: u8,
+            uid: String,
+            acks: Vec<CfeAckRecordV1>,
+            locks: Vec<String>,
+            ptk: Vec<(String, u32)>,
+            spke: Vec<crate::cfe::CfeSpkEpochV1>,
+        }
+        let old = WithPtk {
+            ver: 1,
+            uid: "alice".to_string(),
+            acks: vec![CfeAckRecordV1 {
+                message_id: "old-msg".to_string(),
+            }],
+            locks: vec!["bob".to_string()],
+            ptk: vec![("bob".to_string(), 42)],
+            spke: vec![crate::cfe::CfeSpkEpochV1 {
+                device_id: "bob".to_string(),
+                epoch: 3,
+            }],
+        };
+        let bytes = crate::cfe::encode(CfeMessageType::OrchestratorState, &old).unwrap();
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        let locks = mgr.import_orchestrator_state_cfe(&bytes).unwrap();
+        assert!(locks.contains("bob"));
+        assert_eq!(
+            mgr.ack_store.is_processed("old-msg"),
+            crate::orchestration::AckCheckResult::InCache
+        );
+        assert_eq!(mgr.known_spk_epoch("bob"), Some(3));
     }
 
     #[test]
@@ -1637,19 +1625,6 @@ mod tests {
             "must defer to the durable store, not silently re-process"
         );
         assert_eq!(restarted.ack_store.cache_len(), 0);
-    }
-
-    #[test]
-    fn print_session_payload_sizes() {
-        let (alice, _bob, _alice_id, bob_device_id) = make_session_pair();
-        let cfe_bytes = alice.export_session_bytes_for(&bob_device_id).unwrap();
-        let json_str = alice.export_session_json_for(&bob_device_id).unwrap();
-        eprintln!("CFE bytes: {} bytes", cfe_bytes.len());
-        eprintln!("JSON bytes: {} bytes", json_str.len());
-        eprintln!(
-            "JSON/CFE ratio: {:.1}x",
-            json_str.len() as f64 / cfe_bytes.len() as f64
-        );
     }
 }
 

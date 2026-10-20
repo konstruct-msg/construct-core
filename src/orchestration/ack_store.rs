@@ -2,11 +2,12 @@
 ///
 /// Prevents processing duplicate messages by maintaining a two-level cache:
 /// 1. In-memory `HashSet` for O(1) hot-path lookups.
-/// 2. Persistence via `PlatformBridge::persist_record` / `query_record` for
+/// 2. Persistence of `(message_id, timestamp)` records by the platform
+///    (`Action::PersistAck`), restored on launch via `restore_cache`, for
 ///    cross-launch deduplication.
 ///
 /// When `is_processed` returns `NeedDbCheck`, the caller must query the
-/// platform data store and call `confirm_from_db` with the result.
+/// platform data store (`Action::CheckAckInDb`).
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub struct AckStore {
     max_age_seconds: u64,
     /// When `true` (set after `restore_cache`), cache misses return `NeedDbCheck`
     /// so the platform can catch messages that were processed between the last
-    /// snapshot and a crash. Cleared by `clear_post_restart_mode()`.
+    /// snapshot and a crash. Never cleared: staying on is the steady state (see `restore_cache`).
     post_restart_mode: bool,
     clock: Arc<dyn Clock>,
 }
@@ -90,18 +91,6 @@ impl AckStore {
         }
     }
 
-    /// Called after the platform data store confirms the record is absent.
-    /// Always returns `NotProcessed` (convenience for symmetric call-sites).
-    pub fn confirm_not_in_db(&self) -> AckCheckResult {
-        AckCheckResult::NotProcessed
-    }
-
-    /// Exit post-restart mode. Call once all in-flight `CheckAckInDb` responses
-    /// have been received, or after a fixed warm-up window.
-    pub fn clear_post_restart_mode(&mut self) {
-        self.post_restart_mode = false;
-    }
-
     // ── Mutation ──────────────────────────────────────────────────────────────
 
     /// Mark `message_id` as processed.
@@ -119,11 +108,6 @@ impl AckStore {
             message_id: message_id.to_string(),
             timestamp: now,
         }]
-    }
-
-    /// Remove the `message_id` from the in-memory cache (e.g. after a reset).
-    pub fn evict(&mut self, message_id: &str) {
-        self.cache.remove(message_id);
     }
 
     // ── Maintenance ───────────────────────────────────────────────────────────
@@ -146,16 +130,6 @@ impl AckStore {
     /// Current size of the in-memory deduplication cache.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
-    }
-
-    /// Export all in-memory message IDs.
-    ///
-    /// **Not** used for persistence — `export_orchestrator_state_cfe` writes an
-    /// empty `processed_ids` on purpose (the durable owner of dedup state is the
-    /// platform ACK store; snapshotting this cache grew the orchestrator blob
-    /// without bound). Diagnostics only.
-    pub fn snapshot_cache(&self) -> Vec<String> {
-        self.cache.iter().cloned().collect()
     }
 
     /// Restore the in-memory cache from a CFE snapshot.
@@ -226,20 +200,6 @@ mod tests {
         let actions = store.mark_processed("msg-dup");
         // Second call: already in cache → no actions returned.
         assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn test_evict_removes_from_cache() {
-        let mut store = AckStore::default();
-        store.mark_processed("msg-002");
-        store.evict("msg-002");
-        assert_eq!(store.is_processed("msg-002"), AckCheckResult::NotProcessed);
-    }
-
-    #[test]
-    fn test_confirm_not_in_db() {
-        let store = AckStore::default();
-        assert_eq!(store.confirm_not_in_db(), AckCheckResult::NotProcessed);
     }
 
     #[test]

@@ -77,23 +77,6 @@ pub fn generate_dummy_message(size: usize) -> Vec<u8> {
     rmp_serde::to_vec(&dummy).unwrap_or_else(|_| vec![0u8; size])
 }
 
-/// Check if a message is a dummy message
-///
-/// Server should call this and discard dummy messages.
-pub fn is_dummy_message(data: &[u8]) -> bool {
-    // Try to deserialize and compare marker bytes directly — no String conversion.
-    if let Ok(msg) = rmp_serde::from_slice::<DummyMessage>(data) {
-        return msg.marker == DUMMY_MARKER;
-    }
-
-    // Fallback: scan raw bytes for marker pattern.
-    if data.len() > DUMMY_MARKER.len() {
-        return data.windows(DUMMY_MARKER.len()).any(|w| w == DUMMY_MARKER);
-    }
-
-    false
-}
-
 /// Configuration for cover traffic generation
 #[derive(Debug, Clone, Copy)]
 pub struct CoverTrafficConfig {
@@ -211,6 +194,11 @@ impl CoverTrafficManager {
     pub fn should_send_dummy(&mut self) -> bool {
         // Check if active
         if !self.is_active() {
+            // Enabled but under the battery threshold: that is the skip this counter names.
+            // A disabled manager is not skipping anything.
+            if self.config.enabled {
+                self.metrics.battery_skipped += 1;
+            }
             return false;
         }
 
@@ -301,39 +289,11 @@ pub struct EnergyMetrics {
     pub battery_skipped: u64,
 }
 
-impl EnergyMetrics {
-    /// Calculate energy efficiency ratio
-    ///
-    /// Higher is better. 0.0 means all dummies sent, 1.0 means all coalesced.
-    pub fn efficiency_ratio(&self) -> f32 {
-        let total = self.dummies_sent + self.coalesced_count;
-        if total == 0 {
-            return 0.0;
-        }
-        self.coalesced_count as f32 / total as f32
-    }
-
-    /// Total messages considered (sent + skipped)
-    pub fn total_considered(&self) -> u64 {
-        self.dummies_sent + self.coalesced_count + self.battery_skipped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
-
-    #[test]
-    fn test_dummy_message_detection() {
-        let dummy = generate_dummy_message(255);
-        assert!(is_dummy_message(&dummy));
-
-        let real_msg = b"This is a real message";
-        assert!(!is_dummy_message(real_msg));
-    }
-
     #[test]
     fn test_dummy_message_size() {
         for size in [128, 255, 512, 1024] {
@@ -448,11 +408,27 @@ mod tests {
         let metrics = manager.metrics();
         assert_eq!(metrics.dummies_sent, 3);
 
-        // Test efficiency ratio
+        // A real message just went out: the next dummy is coalesced
         manager.record_real_message_sent();
-        assert!(!manager.should_send_dummy()); // Coalesced
-        let efficiency = manager.metrics().efficiency_ratio();
-        assert!(efficiency > 0.0);
+        assert!(!manager.should_send_dummy());
+        assert_eq!(manager.metrics().coalesced_count, 1);
+    }
+
+    #[test]
+    fn test_low_battery_is_counted_as_skipped() {
+        let config = CoverTrafficConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut manager = CoverTrafficManager::new(config);
+        manager.update_battery_level(0.0);
+        assert!(!manager.should_send_dummy());
+        assert_eq!(manager.metrics().battery_skipped, 1);
+
+        // Disabled is not a battery skip
+        let mut off = CoverTrafficManager::new(CoverTrafficConfig::default());
+        assert!(!off.should_send_dummy());
+        assert_eq!(off.metrics().battery_skipped, 0);
     }
 
     #[test]

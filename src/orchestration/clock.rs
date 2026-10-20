@@ -65,12 +65,6 @@ impl Clock for MockClock {
     }
 }
 
-/// Convenience: wrap a `MockClock` in an `Arc<dyn Clock>`.
-#[cfg(test)]
-pub fn mock_clock(initial_ms: u64) -> Arc<dyn Clock> {
-    Arc::new(MockClock::new(initial_ms))
-}
-
 /// Convenience: create a `SystemClock` wrapped in `Arc<dyn Clock>`.
 pub fn system_clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)

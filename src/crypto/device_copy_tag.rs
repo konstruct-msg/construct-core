@@ -69,13 +69,9 @@ const PAIR_SECRET_SALT: &[u8] = b"ConstructSSTAG-v1";
 /// Bytes of MAC kept, before hex encoding.
 const TAG_BYTES: usize = 8;
 
-/// Hex characters in a tag: 16.
+/// Hex characters in a tag: 16. Not 8: that was the length of the form this replaced
+/// (`device_id[0..8]`), still read from senders at or below 0.18.0; the two are told apart by length.
 pub const TAG_HEX_LEN: usize = TAG_BYTES * 2;
-
-/// Hex characters in the form this replaced (`device_id[0..8]`), still read from senders at or
-/// below 0.18.0. The two forms are told apart by length alone, which is why the new one is not
-/// also 8.
-pub const LEGACY_TAG_HEX_LEN: usize = 8;
 
 fn as_key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CryptoError> {
     bytes.try_into().map_err(|_| {

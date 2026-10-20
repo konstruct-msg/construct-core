@@ -19,7 +19,7 @@
 use bip39::Mnemonic;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 
 use crate::utils::error::{ConstructError, Result};
 
@@ -121,17 +121,6 @@ pub fn verify_recovery_signature(
     };
     let sig = Signature::from_bytes(signature);
     verifying_key.verify(message.as_bytes(), &sig).is_ok()
-}
-
-/// Compute a short fingerprint of a public key for UI display.
-/// Format: first 8 bytes of SHA-256(pubkey) as "A1B2 C3D4 E5F6 G7H8".
-pub fn compute_key_fingerprint(public_key: &[u8]) -> String {
-    let hash = Sha256::digest(public_key);
-    hash[..8]
-        .chunks(2)
-        .map(|pair| format!("{:02X}{:02X}", pair[0], pair[1]))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Compute a Safety Number for two Construct devices, or `None` when either id cannot be read.
@@ -325,16 +314,6 @@ mod tests {
             "wrong_message",
             &sig
         ));
-    }
-
-    #[test]
-    fn test_fingerprint_format() {
-        let seed = mnemonic_to_seed(TEST_PHRASE).unwrap();
-        let kp = derive_recovery_keypair(&seed).unwrap();
-        let fp = compute_key_fingerprint(&kp.public_key);
-        // Format: "XXXX XXXX XXXX XXXX" = 4 groups of 4 hex chars separated by spaces
-        assert_eq!(fp.len(), 19);
-        assert_eq!(fp.chars().filter(|c| *c == ' ').count(), 3);
     }
 
     #[test]

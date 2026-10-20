@@ -79,19 +79,6 @@ fn gf_div(a: u8, b: u8) -> u8 {
     GF_EXP[(diff % 255) as usize]
 }
 
-// Exposed for completeness / tests; not used in the hot path.
-#[allow(dead_code)]
-fn gf_pow(base: u8, exp: u8) -> u8 {
-    if base == 0 {
-        return 0;
-    }
-    if exp == 0 {
-        return 1;
-    }
-    let log_base = GF_LOG[base as usize] as u32;
-    GF_EXP[((log_base * exp as u32) % 255) as usize]
-}
-
 // ── Shamir Secret Sharing ─────────────────────────────────────────────────────
 
 /// A single Shamir share: a 1-based index and 32 bytes of share data.
@@ -578,16 +565,6 @@ mod tests {
                 assert_eq!(gf_div(product, b), a, "roundtrip failed for a={a}, b={b}");
             }
         }
-    }
-
-    #[test]
-    fn gf_pow_basic() {
-        assert_eq!(gf_pow(2, 0), 1);
-        assert_eq!(gf_pow(2, 1), 2);
-        // 2^8 in GF(256) with poly 0x11b: (2^7 = 128) * 2 → 256 XOR 27 = 27, but
-        // for the generator-3 tables we verify via gf_mul consistency instead.
-        assert_eq!(gf_mul(gf_pow(2, 4), gf_pow(2, 4)), gf_pow(2, 8));
-        assert_eq!(gf_pow(0, 5), 0);
     }
 
     // ── Shamir Secret Sharing ──────────────────────────────────────────────

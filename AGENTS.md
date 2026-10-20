@@ -4,7 +4,7 @@
 
 ## Architecture & Core Concepts
 
-- **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. `PlatformBridge` is exported over UniFFI but the orchestrator does not call it; logging goes through `tracing`.
+- **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. Logging goes through `tracing`.
 - **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
 - **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from **PQXDH v2** — an ML-KEM-1024 secret in the session's initial key, mandatory, with Kyber keys owned by the core (`crypto::kyber_prekeys`, `orchestration::pq_prekey_plan`) — and the mandatory suite-3 sparse ML-KEM-768 ratchet, not from swapping the provider.
 - **CFE (Construct Format Envelope)**: A custom binary format — 16-byte header (magic, version, type, flags, payload length, CRC32) around a MessagePack payload (`rmp_serde::to_vec_named`) — used for state persistence and migration from legacy JSON formats.
@@ -72,7 +72,7 @@ that must then also decide *which* of them to act on has been handed a job this 
 done, and the next client will do it differently.
 
 Before adding an API, check it is not already there under another name. `derive_device_id`,
-`tie_break_role`, `get_all_session_contact_ids` and `get_session_health` all exist, and each has
+`get_all_session_contact_ids` and `get_session_health` all exist, and each has
 been reimplemented or ignored client-side at least once.
 
 ### 4. Serialization
