@@ -49,6 +49,7 @@ pub use receiving_init_plan::{ReceivingInitCarrier, ReceivingInitKind, receiving
 pub use reorder_stats::ReorderStats;
 pub use send_plan::{DeliveryAudience, DeliveryTarget, plan_send};
 pub use session_lifecycle::{DecryptResult, SessionLifecycleManager};
+pub use session_lifecycle::{SPK_EPOCH_REGRESSED, SpkEpochRegressed};
 pub use session_machine::{
     Effect as SessionEffect, Event as SessionEvent, OPENING_TTL_MS, Phase, SessionMachine,
 };

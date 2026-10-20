@@ -730,6 +730,13 @@ impl Orchestrator {
     ) -> Result<String, String> {
         use crate::crypto::messaging::double_ratchet::PrekeyHeader;
 
+        // Before anything is spent on it: a bundle that goes back behind what this device has
+        // admitted from the peer is a replay, whoever asked for the open (TODO 176).
+        let spk_epoch = public_bundle.spk_rotation_epoch;
+        if let Some(regressed) = self.lifecycle.spk_epoch_regression(contact_id, spk_epoch) {
+            return Err(regressed.to_string());
+        }
+
         let remote_identity =
             ClassicSuiteProvider::kem_public_key_from_bytes(public_bundle.identity_public.clone());
         let one_time_prekey_id = public_bundle.one_time_prekey_id.unwrap_or(0);
@@ -912,6 +919,7 @@ impl Orchestrator {
                 filed.handshake_at,
             );
         }
+        self.lifecycle.note_spk_epoch(contact_id, spk_epoch);
         tracing::info!(
             target: "crypto::orchestrator",
             contact_id = %contact_id,
@@ -919,6 +927,17 @@ impl Orchestrator {
             "session opened (PQXDH v2 initiator)"
         );
         Ok(contact_id.to_string())
+    }
+
+    /// Whether a bundle of `contact_id` with SPK rotation epoch `epoch` would be refused as a
+    /// replay. What the FFI asks before an open, to answer with the typed error; the open itself
+    /// refuses the same bundle (`init_session_with_bundle`).
+    pub fn spk_epoch_regression(
+        &self,
+        contact_id: &str,
+        epoch: u32,
+    ) -> Option<crate::orchestration::SpkEpochRegressed> {
+        self.lifecycle.spk_epoch_regression(contact_id, epoch)
     }
 
     /// Open a session to `contact_id` from its fetched bundle, **replacing** the one held, but
@@ -6353,5 +6372,96 @@ mod pqxdh_v2_tests {
         deliver(&mut bob, &alice_id, "m0", msg0.clone(), 0);
         deliver(&mut bob, &alice_id, "m0", msg0, 0);
         assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
+    }
+
+    // ── SPK rotation epoch, per device (TODO 176) ───────────────────────────────────
+
+    /// A bundle whose SPK rotation epoch goes back behind what this device admitted from the
+    /// same peer device is a replay and opens nothing; equal or higher opens, 0 claims nothing,
+    /// and another device of the peer is counted on its own.
+    ///
+    /// Mutation: drop the `spk_epoch_regression` check at the top of `init_session_with_bundle`
+    /// — the epoch-4 reopen succeeds.
+    #[test]
+    fn a_bundle_whose_spk_epoch_went_backwards_is_refused_per_device() {
+        let (mut alice, _) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (mut carol, carol_id) = named_device();
+        let bundle = |peer: &mut Orchestrator, epoch: u32| {
+            let (mut x3dh, kyber) = bundle_of(peer, true);
+            x3dh.spk_rotation_epoch = epoch;
+            (x3dh, kyber)
+        };
+
+        let (x3dh, kyber) = bundle(&mut bob, 5);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        assert_eq!(alice.lifecycle.known_spk_epoch(&bob_id), Some(5));
+
+        let (x3dh, kyber) = bundle(&mut bob, 4);
+        let err = alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap_err();
+        assert!(
+            err.starts_with(crate::orchestration::SPK_EPOCH_REGRESSED),
+            "{err}"
+        );
+        assert!(alice.has_active_session(&bob_id), "the held session stays");
+        assert_eq!(
+            alice.spk_epoch_regression(&bob_id, 4),
+            Some(crate::orchestration::SpkEpochRegressed {
+                received: 4,
+                known: 5
+            })
+        );
+
+        for epoch in [5, 0, 7] {
+            let (x3dh, kyber) = bundle(&mut bob, epoch);
+            alice
+                .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+                .unwrap_or_else(|e| panic!("epoch {epoch}: {e}"));
+        }
+        assert_eq!(
+            alice.lifecycle.known_spk_epoch(&bob_id),
+            Some(7),
+            "0 lowers nothing"
+        );
+
+        let (x3dh, kyber) = bundle(&mut carol, 1);
+        alice
+            .init_session_with_bundle(&carol_id, x3dh, kyber, false)
+            .expect("another device of the peer has its own counter");
+    }
+
+    /// The counter is state about the peer device: it survives a restart and a session reset,
+    /// and leaves with the contact.
+    ///
+    /// Mutation: drop `spk_epochs` from the orchestrator-state export — the restarted device
+    /// admits epoch 4.
+    #[test]
+    fn the_known_spk_epoch_survives_a_restart_and_a_reset_and_leaves_with_the_contact() {
+        let (mut alice, _) = named_device();
+        let (mut bob, bob_id) = named_device();
+        let (mut x3dh, kyber) = bundle_of(&mut bob, true);
+        x3dh.spk_rotation_epoch = 5;
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+
+        let state = alice.export_orchestrator_state_cfe().unwrap();
+        let (mut restarted, _) = named_device();
+        restarted.import_orchestrator_state_cfe(&state).unwrap();
+        assert_eq!(restarted.lifecycle.known_spk_epoch(&bob_id), Some(5));
+
+        assert!(alice.remove_session_by_contact(&bob_id));
+        assert!(
+            alice.spk_epoch_regression(&bob_id, 4).is_some(),
+            "a reset keeps it"
+        );
+
+        alice.forget_contact_state(&bob_id);
+        assert_eq!(alice.lifecycle.known_spk_epoch(&bob_id), None);
+        assert!(alice.spk_epoch_regression(&bob_id, 4).is_none());
     }
 }

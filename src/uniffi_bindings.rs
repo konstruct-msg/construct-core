@@ -65,6 +65,12 @@ pub enum CryptoError {
     /// is started. Registration cannot proceed against that server.
     #[error("PoW difficulty {difficulty} is past the limit {max}")]
     PowDifficultyTooHigh { difficulty: u32, max: u32 },
+
+    /// The bundle's SPK rotation epoch is below the one this device already admitted from the
+    /// same peer device: an old bundle served again. Nothing was opened. Per device, kept across
+    /// a session reset, cleared by `forget_contact_state` (TODO 176).
+    #[error("Peer SPK rotation epoch {received} is below the {known} already admitted")]
+    PeerSpkEpochRegressed { received: u32, known: u32 },
 }
 
 impl From<crate::pow::PowError> for CryptoError {
@@ -2359,6 +2365,53 @@ mod tests {
     /// components carry the handshake; the responder opens the session from them, burns the key
     /// and hands back the prekeys to persist.
     #[cfg(feature = "post-quantum")]
+    /// A replayed bundle is a typed refusal over the FFI, with both epochs in it, and the held
+    /// session stays (TODO 176).
+    ///
+    /// Mutation: map the orchestrator's refusal to `SessionInitializationFailed` instead — the
+    /// client is back to parsing text.
+    #[test]
+    #[cfg(feature = "post-quantum")]
+    fn a_replayed_bundle_is_a_typed_refusal_with_both_epochs() {
+        let alice = make_orchestrator("alice_user_id");
+        alice.ensure_hybrid_signature_key().unwrap();
+        let bob = make_orchestrator("bob_user_id");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut bundle = pq_bundle(&bob);
+        bundle.suite_id = 1;
+        bundle.spk_uploaded_at = now;
+        bundle.kyber_spk_uploaded_at = now;
+        bundle.kyber_spk_rotation_epoch = 5;
+        bundle.spk_rotation_epoch = 9;
+        alice
+            .init_session("bob_user_id".to_string(), bundle.clone())
+            .unwrap();
+
+        bundle.spk_rotation_epoch = 8;
+        let err = alice
+            .reopen_session("bob_user_id".to_string(), bundle.clone())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CryptoError::PeerSpkEpochRegressed {
+                    received: 8,
+                    known: 9
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(alice.has_session("bob_user_id".to_string()));
+
+        bundle.spk_rotation_epoch = 9;
+        alice
+            .reopen_session("bob_user_id".to_string(), bundle)
+            .unwrap();
+    }
+
     /// `reopen_session` is the answer to `OpenSession` with or without a session held, and a
     /// refused reopen leaves the held session in place (the upgrade sweep meeting an old build).
     #[test]
@@ -3970,6 +4023,17 @@ impl OrchestratorCore {
                 return Err(e);
             }
         };
+        if let Some(regressed) =
+            orch.spk_epoch_regression(&contact_id, public_bundle.spk_rotation_epoch)
+        {
+            if replace {
+                orch.reopen_refused(&contact_id);
+            }
+            return Err(CryptoError::PeerSpkEpochRegressed {
+                received: regressed.received,
+                known: regressed.known,
+            });
+        }
         let open = if replace {
             crate::orchestration::orchestrator::Orchestrator::reopen_session_with_bundle
         } else {

@@ -658,6 +658,10 @@ pub struct CfeOrchestratorStateV1 {
     /// (`crypto::sealed_sender::book`). Absent in blobs older than construct-core 0.26.
     #[serde(rename = "env", default, skip_serializing_if = "Vec::is_empty")]
     pub envelope_book: Vec<CfeEnvelopeEntryV1>,
+    /// Device → the highest SPK rotation epoch a bundle of that device has been admitted with
+    /// (`SessionLifecycleManager::spk_epochs`). Absent before construct-core 0.53.
+    #[serde(rename = "spke", default, skip_serializing_if = "Vec::is_empty")]
+    pub spk_epochs: Vec<CfeSpkEpochV1>,
 }
 
 /// One envelope book entry. `keys` = send `env ‖ tag` ‖ recv `env ‖ tag` (128 bytes).
@@ -675,6 +679,15 @@ pub struct CfeEnvelopeEntryV1 {
     /// ciphertext ‖ key ‖ BE64(handshake time) (72 bytes). Absent before construct-core 0.27.
     #[serde(rename = "ff", default, skip_serializing_if = "Option::is_none")]
     pub first_flight: Option<SecretBytes>,
+}
+
+/// The highest SPK rotation epoch admitted from one device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeSpkEpochV1 {
+    #[serde(rename = "d")]
+    pub device_id: String,
+    #[serde(rename = "e")]
+    pub epoch: u32,
 }
 
 /// A pinned hybrid identity key.
