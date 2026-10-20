@@ -159,9 +159,17 @@ pub fn combine_shares(shares: &[Share]) -> Result<[u8; 32]> {
         ));
     }
 
-    // Reject duplicate indices.
+    // Reject index 0 and duplicate indices. The secret is f(0): a share claiming x = 0 has
+    // Lagrange weight 1 and gives every other share weight 0, so whatever it carries would be
+    // "recovered" whole, with the real shares ignored. The checksum is unkeyed, so anyone can
+    // mint such a share; refusing it here is the only thing that stops it (TODO 194).
     let mut seen = [false; 256];
     for s in shares {
+        if s.index == 0 {
+            return Err(ConstructError::InvalidInput(
+                "share index 0 is the secret's own point, not a share".into(),
+            ));
+        }
         if seen[s.index as usize] {
             return Err(ConstructError::InvalidInput(
                 "duplicate share index detected".into(),
@@ -339,6 +347,11 @@ fn wire_to_share(buf: &[u8; 35]) -> Result<Share> {
     if buf[33] != hash[0] || buf[34] != hash[1] {
         return Err(ConstructError::InvalidInput(
             "share checksum mismatch — corrupted or wrong mnemonic".into(),
+        ));
+    }
+    if buf[0] == 0 {
+        return Err(ConstructError::InvalidInput(
+            "share index 0 is the secret's own point, not a share".into(),
         ));
     }
     let mut data = [0u8; 32];
@@ -824,6 +837,40 @@ mod tests {
                 }
             }
         }
+    }
+    // ── Audit 2026-10-20: a share at x = 0 (TODO 194) ──────────────────────
+
+    /// A share claiming index 0 is refused at combination. Without the refusal the result is
+    /// that share's data verbatim, whatever the real shares say.
+    ///
+    /// Mutation: drop the `s.index == 0` check in `combine_shares` — the second assertion
+    /// reddens with the forged bytes "recovered".
+    #[test]
+    fn a_share_at_index_zero_is_refused_not_recovered() {
+        let secret = [9u8; 32];
+        let shares = split_secret(&secret, 2, 3).unwrap();
+        let forged = Share {
+            index: 0,
+            data: [0xEEu8; 32],
+        };
+        let err = combine_shares(&[forged.clone(), shares[0].clone()]).unwrap_err();
+        assert!(err.to_string().contains("index 0"), "{err}");
+        let err = combine_shares(&[shares[1].clone(), forged, shares[2].clone()]).unwrap_err();
+        assert!(err.to_string().contains("index 0"), "{err}");
+    }
+
+    /// The same share as words: the checksum is unkeyed, so the words decode fine; the index
+    /// is what is refused.
+    #[test]
+    fn a_mnemonic_at_index_zero_is_refused() {
+        let forged = Share {
+            index: 0,
+            data: [0xEEu8; 32],
+        };
+        let wire = share_to_wire(&forged);
+        assert_eq!(wire[0], 0);
+        let err = wire_to_share(&wire).unwrap_err();
+        assert!(err.to_string().contains("index 0"), "{err}");
     }
 }
 
