@@ -40,6 +40,7 @@
 
 use crate::crypto::SecretBytes;
 use crate::crypto::provider::CryptoProvider;
+use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::error::CryptoError;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key as AeadKeyChacha, KeyInit, Nonce,
@@ -233,15 +234,10 @@ impl CryptoProvider for HybridSuiteProvider {
     type SignaturePrivateKey = crate::crypto::SecretBytes;
     type AeadKey = crate::crypto::SecretBytes;
 
-    // ── KEM: X25519 (identical to ClassicSuiteProvider) ───────────────────────
+    // ── KEM: X25519 — the classic provider's, by delegation, so there is one copy ──────────
 
     fn generate_kem_keys() -> Result<(Self::KemPrivateKey, Self::KemPublicKey), CryptoError> {
-        let private_key = StaticSecret::random_from_rng(OsRng);
-        let public_key = KemPublicKeyDalek::from(&private_key);
-        Ok((
-            SecretBytes::from_slice(&private_key.to_bytes()),
-            public_key.to_bytes().to_vec(),
-        ))
+        ClassicSuiteProvider::generate_kem_keys()
     }
 
     fn from_private_key_to_public_key(
@@ -259,11 +255,11 @@ impl CryptoProvider for HybridSuiteProvider {
     }
 
     fn kem_private_key_from_bytes(bytes: Vec<u8>) -> Self::KemPrivateKey {
-        bytes.into()
+        ClassicSuiteProvider::kem_private_key_from_bytes(bytes)
     }
 
     fn aead_key_from_bytes(bytes: Vec<u8>) -> Self::AeadKey {
-        bytes.into()
+        ClassicSuiteProvider::aead_key_from_bytes(bytes)
     }
 
     // ── Signature key helpers ─────────────────────────────────────────────────
@@ -273,7 +269,7 @@ impl CryptoProvider for HybridSuiteProvider {
     }
 
     fn signature_private_key_from_bytes(bytes: Vec<u8>) -> Self::SignaturePrivateKey {
-        bytes.into()
+        ClassicSuiteProvider::signature_private_key_from_bytes(bytes)
     }
 
     fn generate_signature_keys()
@@ -467,7 +463,7 @@ impl CryptoProvider for HybridSuiteProvider {
             .map_err(|e| CryptoError::AeadDecryptionError(e.to_string()))
     }
 
-    // ── KDF: HKDF-SHA256 (identical to Classic) ───────────────────────────────
+    // ── KDF: HKDF-SHA256 — the classic provider's ─────────────────────────────
 
     fn hkdf_derive_key(
         salt: &[u8],
@@ -475,11 +471,7 @@ impl CryptoProvider for HybridSuiteProvider {
         info: &[u8],
         len: usize,
     ) -> Result<Vec<u8>, CryptoError> {
-        let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
-        let mut okm = vec![0u8; len];
-        hkdf.expand(info, &mut okm)
-            .map_err(|e| CryptoError::KeyDerivationError(e.to_string()))?;
-        Ok(okm)
+        ClassicSuiteProvider::hkdf_derive_key(salt, ikm, info, len)
     }
 
     fn kdf_rk(
@@ -508,13 +500,11 @@ impl CryptoProvider for HybridSuiteProvider {
     }
 
     fn generate_nonce(len: usize) -> Result<Vec<u8>, CryptoError> {
-        let mut nonce_bytes = vec![0u8; len];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        Ok(nonce_bytes)
+        ClassicSuiteProvider::generate_nonce(len)
     }
 
     fn suite_id() -> u16 {
-        2
+        crate::crypto::suite_id::SuiteID::PQ_HYBRID.as_u16()
     }
 }
 

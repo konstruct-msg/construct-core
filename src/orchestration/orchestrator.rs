@@ -2504,12 +2504,21 @@ impl Orchestrator {
             }
         };
 
-        let mut actions = Vec::new();
-        // SAFETY ORDER: persist updated DR state BEFORE sending.
-        // If we sent first and then crashed before saving, the chain would advance on the
-        // remote side (via decryption) while our local state stays stale — breaking the
-        // session.  Saving first means a crash-before-send results in a locally-advanced
-        // but unsent message, which is recoverable (resend).
+        self.save_then_send(contact_id, message_id, payload, content_type)
+    }
+
+    /// The save of the advanced ratchet state, then the send — in that order. Sent first and
+    /// crashed before the save, the peer's chain would advance on decryption while this side's
+    /// stays stale, and the session is broken; saved first and crashed before the send, the
+    /// message is advanced-but-unsent, which a resend recovers.
+    fn save_then_send(
+        &self,
+        contact_id: String,
+        message_id: String,
+        payload: Vec<u8>,
+        content_type: u8,
+    ) -> Vec<Action> {
+        let mut actions = Vec::with_capacity(2);
         if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
             actions.push(Action::SaveToSecureStore {
                 slot: SecureStoreSlot::Session {
@@ -2538,25 +2547,12 @@ impl Orchestrator {
         proto_bytes: Vec<u8>,
     ) -> Vec<Action> {
         match self.encrypt_bytes_for(&contact_id, &proto_bytes) {
-            Ok(payload) => {
-                let mut actions = Vec::new();
-                // SAFETY ORDER: save before send (same rationale as handle_outgoing_message).
-                if let Ok(session_bytes) = self.lifecycle.export_session_bytes_for(&contact_id) {
-                    actions.push(Action::SaveToSecureStore {
-                        slot: SecureStoreSlot::Session {
-                            contact_id: contact_id.clone(),
-                        },
-                        data: session_bytes.into(),
-                    });
-                }
-                actions.push(Action::SendEncryptedMessage {
-                    to: contact_id,
-                    payload,
-                    message_id,
-                    content_type: 12,
-                });
-                actions
-            }
+            Ok(payload) => self.save_then_send(
+                contact_id,
+                message_id,
+                payload,
+                crate::knst::CONTENT_TYPE_CALL_SIGNAL,
+            ),
             Err(e) => vec![Action::NotifyError {
                 code: "CALL_SIGNAL_ENCRYPT_FAILED".to_string(),
                 message: e,
@@ -3076,7 +3072,8 @@ enum DecryptedKind {
     ControlFrame(u8),
     /// A call signal whose envelope names it; the payload is the signal itself.
     UnframedCallSignal,
-    /// A message, announced unless it is content type 13 or 14.
+    /// A message, announced unless its envelope's content type is in the silent set
+    /// (`knst::SILENT_CONTROL_TYPES`): the one table, whether the type came framed or not.
     Message { announced: bool },
 }
 
@@ -3092,7 +3089,7 @@ fn decrypted_kind(plaintext: &[u8], content_type: u8) -> DecryptedKind {
             DecryptedKind::UnframedCallSignal
         }
         _ => DecryptedKind::Message {
-            announced: content_type != 13 && content_type != 14,
+            announced: !crate::knst::is_silent_control(content_type),
         },
     }
 }
@@ -3112,6 +3109,29 @@ fn take_frame_body(plaintext: &mut Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unframed payload whose envelope names a silent control type is not announced — every
+    /// type of the silent table, not only 13 and 14, which were the two the rule used to name.
+    #[test]
+    fn an_unframed_payload_of_any_silent_type_is_not_announced() {
+        for content_type in crate::knst::SILENT_CONTROL_TYPES {
+            if content_type == crate::knst::CONTENT_TYPE_CALL_SIGNAL {
+                continue; // has its own kind
+            }
+            assert_eq!(
+                decrypted_kind(b"body", content_type),
+                DecryptedKind::Message { announced: false },
+                "{content_type}"
+            );
+        }
+        for content_type in [0u8, 1, 2, 11, 15, 24, 28, 31] {
+            assert_eq!(
+                decrypted_kind(b"body", content_type),
+                DecryptedKind::Message { announced: true },
+                "{content_type}"
+            );
+        }
+    }
     use crate::crypto::client_api::ClassicClient;
     use crate::crypto::suites::classic::ClassicSuiteProvider;
 
@@ -3169,6 +3189,7 @@ mod tests {
     fn the_peek_and_the_receive_path_agree() {
         for (plaintext, content_type) in [
             (b"hello".to_vec(), SEALED),
+            (b"typing".to_vec(), 30),
             (control_frame(14, b"receipt"), SEALED),
             (control_frame(12, SIGNAL), SEALED),
             (b"heartbeat".to_vec(), 13),

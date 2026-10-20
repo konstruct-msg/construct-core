@@ -51,11 +51,7 @@ fn derive_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
     key
 }
 
-fn as_key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CryptoError> {
-    bytes.try_into().map_err(|_| {
-        CryptoError::InvalidInputError(format!("{what} must be 32 bytes, got {}", bytes.len()))
-    })
-}
+use crate::crypto::as_key32;
 
 /// Seal arbitrary bytes to an X25519 public key, anonymously.
 ///

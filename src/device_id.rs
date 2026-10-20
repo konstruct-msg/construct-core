@@ -30,19 +30,18 @@ use sha2::{Digest, Sha256};
 /// assert_eq!(device_id.len(), 32); // 16 bytes * 2 hex chars
 /// ```
 pub fn derive_device_id(identity_public_key: &[u8]) -> String {
-    // Compute SHA256 hash of public key
+    // Encode as lowercase hex (32 characters)
+    hex::encode(derive_device_id_bytes(identity_public_key))
+}
+
+/// The 16 raw bytes behind `derive_device_id`: `SHA256(identity_public)[0..16]`. 128 bits is
+/// enough — 2^64 devices for a 50 % collision chance — and it is what the history-transfer
+/// frames carry in binary.
+pub fn derive_device_id_bytes(identity_public_key: &[u8]) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(identity_public_key);
     let hash = hasher.finalize();
-
-    // Take first 16 bytes (128 bits)
-    // This provides adequate collision resistance:
-    // - 2^64 devices needed for 50% collision probability
-    // - Far exceeds any realistic deployment scale
-    let device_id_bytes = &hash[0..16];
-
-    // Encode as lowercase hex (32 characters)
-    hex::encode(device_id_bytes)
+    hash[0..16].try_into().expect("16 of 32 bytes")
 }
 
 /// Format device ID for federated identifier
@@ -94,6 +93,15 @@ pub fn parse_federated_id(federated_id: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hex_id_is_the_raw_bytes_encoded() {
+        let pk = [0x5au8; 32];
+        assert_eq!(
+            derive_device_id(&pk),
+            hex::encode(derive_device_id_bytes(&pk))
+        );
+    }
 
     #[test]
     fn test_derive_device_id_deterministic() {

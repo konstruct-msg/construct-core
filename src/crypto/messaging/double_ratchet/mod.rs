@@ -49,7 +49,6 @@ use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 mod internals;
@@ -291,11 +290,9 @@ pub enum PqRatchetWireField {
 /// epoch *secrets* of suite 3, each of which derived every key of its epoch (PQR-2, PQR-4).
 pub(super) const PQ_CHAIN_RETENTION: usize = 2;
 
+/// Seconds since the epoch, the one clock of the crate (`utils::time::now`).
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::utils::time::now()
 }
 
 /// Derive a shared session identifier from the X3DH root key and the two user IDs.

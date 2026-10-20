@@ -13,9 +13,9 @@
 //! - Encapsulation (sender side of handshake)
 //! - Decapsulation (receiver side of handshake)
 //!
-//! These are exposed via UniFFI to Swift. Swift orchestrates the PQXDH handshake
-//! and calls `ClassicCryptoCore::apply_pq_contribution` to mix the KEM shared
-//! secret into the existing Double Ratchet session root key.
+//! The handshake itself is the core's (`handshake::pqxdh`, driven by the orchestrator); the
+//! encapsulate/decapsulate primitives are exported over UniFFI for history transfer, which seals
+//! to a peer's Kyber SPK on its own.
 
 /// ML-KEM-768 public key size in bytes (NIST FIPS 203)
 pub const MLKEM768_PK_SIZE: usize = 1184;

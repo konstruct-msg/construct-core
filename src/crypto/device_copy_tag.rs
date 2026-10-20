@@ -73,11 +73,7 @@ const TAG_BYTES: usize = 8;
 /// (`device_id[0..8]`), still read from senders at or below 0.18.0; the two are told apart by length.
 pub const TAG_HEX_LEN: usize = TAG_BYTES * 2;
 
-fn as_key32(bytes: &[u8], what: &str) -> Result<[u8; 32], CryptoError> {
-    bytes.try_into().map_err(|_| {
-        CryptoError::InvalidInputError(format!("{what} must be 32 bytes, got {}", bytes.len()))
-    })
-}
+use crate::crypto::as_key32;
 
 /// The secret shared by two devices.
 ///

@@ -25,8 +25,6 @@
 //! `kem_ct` is ML-KEM-1024 since PQXDH v2 (the spec's layout still says ML-KEM-768 / 1088); the
 //! version bytes did not change, and every frame is length-checked exactly.
 
-use sha2::{Digest, Sha256};
-
 use super::{HistoryFailure, ct_eq};
 
 pub const PREFIX_LEN: usize = 4 + 1 + 32 + 1 + 8;
@@ -62,13 +60,9 @@ pub mod transfer_type {
     pub const HISTORY_SKIPPED: u8 = 0x03;
 }
 
-/// A device's raw 16-byte id: `SHA256(identity_public)[0..16]` — the bytes behind the hex
-/// `derive_device_id` returns.
-pub fn device_id_raw(identity_public: &[u8]) -> [u8; 16] {
-    Sha256::digest(identity_public)[..16]
-        .try_into()
-        .expect("16 of 32 bytes")
-}
+/// A device's raw 16-byte id — `device_id::derive_device_id_bytes`, under the name the
+/// history module has used since its frames were written.
+pub use crate::device_id::derive_device_id_bytes as device_id_raw;
 
 /// The 46 bytes both CTT1 versions begin with, read before deciding how much more to read.
 #[derive(Debug, Clone, PartialEq, Eq)]

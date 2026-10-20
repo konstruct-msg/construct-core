@@ -2951,3 +2951,20 @@ fn peer_ad_version_is_persisted() {
     .unwrap();
     assert_eq!(legacy.peer_ad_version, AD_VERSION_LEGACY);
 }
+
+/// A session record whose `ver` is one this core does not write is refused, not read as v1
+/// with whatever fields happen to match.
+#[test]
+fn a_session_blob_of_a_later_version_is_refused_not_misread() {
+    let (alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000000f1",
+        "bbbbbbbb-0000-4000-8000-0000000000f2",
+    );
+    let mut cfe = alice.to_serializable().to_cfe_v1().unwrap();
+    assert_eq!(cfe.ver, 1);
+    cfe.ver = 2;
+    match super::SerializableSession::from_cfe_v1(cfe) {
+        Err(err) => assert!(err.contains("version 2"), "{err}"),
+        Ok(_) => panic!("a version-2 record was read as v1"),
+    }
+}

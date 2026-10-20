@@ -17,9 +17,6 @@ pub struct Config {
     /// Длина nonce для ChaCha20Poly1305 (в байтах)
     pub chacha_nonce_length: usize,
 
-    /// ID классического криптографического набора (Classic Suite)
-    pub classic_suite_id: u16,
-
     // ============================================
     // DOUBLE RATCHET ПАРАМЕТРЫ
     // ============================================
@@ -61,7 +58,6 @@ impl Default for Config {
         Self {
             // Криптография
             chacha_nonce_length: 12,
-            classic_suite_id: 1,
 
             // Double Ratchet
             max_skipped_messages: 1000,
@@ -107,6 +103,5 @@ mod tests {
         assert_eq!(config.max_skipped_messages, 1000);
         assert_eq!(config.pq_ratchet_interval, 16);
         assert_eq!(config.chacha_nonce_length, 12);
-        assert_eq!(config.classic_suite_id, 1);
     }
 }
