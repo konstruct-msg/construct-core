@@ -301,13 +301,20 @@ impl SenderCertificate {
         trust: &ServerTrust,
         now_secs: i64,
     ) -> Result<&[u8], SenderRefusal> {
-        self.check_signature(trust, now_secs)?;
+        // `Expired` is a verdict on a certificate that passed everything else, so a platform may
+        // pin its key: the signing key's delegation can lapse too (the ring says `Expired` then,
+        // after the signature), and that verdict waits for the device check like our own.
+        let lapsed = match self.check_signature(trust, now_secs) {
+            Ok(()) => false,
+            Err(SenderRefusal::Expired) => true,
+            Err(e) => return Err(e),
+        };
         if self.identity_key.len() != 32
             || crate::device_id::derive_device_id(&self.identity_key) != self.device_id
         {
             return Err(SenderRefusal::DeviceMismatch);
         }
-        if self.expires_at.saturating_add(MAX_DELIVERY_AGE_SECS) <= now_secs {
+        if lapsed || self.expires_at.saturating_add(MAX_DELIVERY_AGE_SECS) <= now_secs {
             return Err(SenderRefusal::Expired);
         }
         Ok(&self.identity_key)
@@ -940,6 +947,49 @@ mod tests {
                 ring: ServerKeyRing::new(vec![]),
             };
             assert!(cert.identity_for_opening(&trust, NOW).is_ok());
+        }
+
+        /// Under a lapsed delegation, `Expired` still comes after the signature and the device:
+        /// forged bytes are `BadSignature`, a key of another device is `DeviceMismatch`, and only
+        /// a certificate that passed both is `Expired` — the one a platform may pin from.
+        ///
+        /// Mutation: return the ring's `Expired` from `identity_for_opening` before the device
+        /// check — the mismatched certificate reads `Expired`.
+        #[test]
+        fn a_lapsed_delegation_is_judged_after_the_signature_and_the_device() {
+            let f = fixture();
+            let cert = hybrid_cert(&f);
+            let lapsed = NOW
+                + 89 * DAY
+                + crate::crypto::server_trust::SENDER_CERT_MAX_LIFETIME_SECS
+                + MAX_DELIVERY_AGE_SECS
+                + 1;
+            assert_eq!(cert.verdict(&f.trust, lapsed), CertificateVerdict::Expired);
+
+            let mut forged = cert.clone();
+            forged.server_signature_hybrid[70] ^= 1;
+            assert_eq!(
+                forged.verdict(&f.trust, lapsed),
+                CertificateVerdict::BadSignature
+            );
+
+            let mut other_device = cert.clone();
+            other_device.device_id = "0".repeat(32);
+            let body = sender_cert_body(
+                &other_device.user_id,
+                &other_device.domain,
+                &other_device.identity_key,
+                &other_device.device_id,
+                other_device.issued_at,
+                other_device.expires_at,
+            )
+            .unwrap();
+            other_device.server_signature_hybrid =
+                sign_as_server(Purpose::SenderCert, &f.key.0, &f.key.1, &body).unwrap();
+            assert_eq!(
+                other_device.identity_for_opening(&f.trust, lapsed),
+                Err(SenderRefusal::DeviceMismatch)
+            );
         }
 
         #[test]
