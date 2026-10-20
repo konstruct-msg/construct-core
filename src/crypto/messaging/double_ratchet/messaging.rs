@@ -278,6 +278,13 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             format!("Padding failed: {}", e)
         })?;
 
+        // PQ-ratchet suite: hybridize the DR message key with the next key of the current
+        // epoch's send chain, and name both (epoch, index) so the receiver takes the same key
+        // (see pq_send_key, mix_pq_message_key).
+        // PQR-1 first: an epoch past its age gets a proposal on this very message.
+        self.maybe_start_pq_exchange_by_age()?;
+        let (pq_message_epoch, pq_key_index, mut pq_key) = self.pq_send_key()?;
+
         let (message_key, next_chain_key) = P::kdf_ck(&self.sending_chain_key).map_err(|e| {
             tracing::error!(
                 target: "crypto::double_ratchet",
@@ -286,25 +293,25 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             );
             format!("KDF (CK) failed: {}", e)
         })?;
-        self.sending_chain_key = next_chain_key;
-
-        // PQ-ratchet suite: hybridize the DR message key with the next key of the current
-        // epoch's send chain, and name both (epoch, index) so the receiver takes the same key
-        // (see pq_send_key, mix_pq_message_key).
-        // PQR-1 first: an epoch past its age gets a proposal on this very message.
-        self.maybe_start_pq_exchange_by_age()?;
-        let (pq_message_epoch, pq_key_index, mut pq_key) = self.pq_send_key()?;
         let mixed = Self::mix_pq_message_key(&message_key, pq_key.as_deref());
         if let Some(k) = pq_key.as_mut() {
             k.zeroize();
         }
         let message_key = mixed?;
-
-        let message_number = self.sending_chain_length;
-        self.sending_chain_length = self
+        let next_number = self
             .sending_chain_length
             .checked_add(1)
             .ok_or("sending_chain_length overflow: session has exceeded u32::MAX messages")?;
+
+        // The chain key and the counter move together, and only once nothing before the AEAD can
+        // fail any more. Until 2026-10-20 the key moved before the PQ steps and the counter after
+        // them, so a failure between left the next message numbered N with the key for N+1 — the
+        // peer derives key N and nothing on the chain reads again until the next DH turn
+        // (TODO 191). A failure after this point leaves a gap in both, which the peer skips like
+        // any lost message.
+        self.sending_chain_key = next_chain_key;
+        let message_number = self.sending_chain_length;
+        self.sending_chain_length = next_number;
 
         // Generate nonce - use configured nonce length for ChaCha20Poly1305
         let nonce = P::generate_nonce(Config::global().chacha_nonce_length)
@@ -537,25 +544,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             "Decrypting message"
         );
 
-        // CPU DoS guard: reject messages whose sequence number would force the chain
-        // to advance by more than max_message_jump steps before hitting the skipped-key
-        // memory limit.  Without this, an attacker can send msg_num = 1_000_000 and
-        // cause O(N) HKDF work in the tight while-loop below.
-        let max_jump = Config::global().max_message_jump;
-        if encrypted.message_number > self.receiving_chain_length.saturating_add(max_jump) {
-            return Err(format!(
-                "Message number jump too large: {} -> {} (limit +{})",
-                self.receiving_chain_length, encrypted.message_number, max_jump
-            ));
-        }
-        // Same bound for the previous-chain skip loop (previous_chain_length).
-        if encrypted.previous_chain_length > self.receiving_chain_length.saturating_add(max_jump) {
-            return Err(format!(
-                "Previous chain length jump too large: {} -> {} (limit +{})",
-                self.receiving_chain_length, encrypted.previous_chain_length, max_jump
-            ));
-        }
-
         // Convert DH public key from message
         let remote_dh_public = Self::bytes_to_kem_public_key(&encrypted.dh_public_key)?;
 
@@ -596,6 +584,65 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             identity_proof: self.identity_proof.clone(),
             pq_authentication: self.pq_authentication,
         });
+
+        // 1. TrySkippedMessageKeys (Signal DR spec §3.5) — before any step. A message from a chain
+        // the ratchet has already moved past still names that chain's DH key, so it also reads as
+        // "needs a ratchet": stepping on it from the current root would overwrite the live state
+        // with keys the peer never derived, and the stored key would then decrypt the message, so
+        // the corruption would be committed. Until 2026-10-20 the step came first, and any
+        // reordering across a DH turn ended the session (TODO 189).
+        let skipped_slot = (encrypted.dh_public_key.to_vec(), encrypted.message_number);
+        if let Some(key) = self.skipped_message_keys.remove(&skipped_slot) {
+            self.skipped_key_timestamps.remove(&skipped_slot);
+            trace!(
+                target: "crypto::double_ratchet",
+                msg_num = %encrypted.message_number,
+                "Found skipped message key"
+            );
+            let recv_len_before = self.receiving_chain_length;
+            let plaintext = self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
+                self.restore_snapshot(snapshot);
+            })?;
+            // Counter invariant: an out-of-order message decrypted from a stored skipped key must
+            // NOT advance the live receiving chain — that key belongs to an earlier position.
+            debug_assert_eq!(
+                self.receiving_chain_length, recv_len_before,
+                "decrypting a skipped (out-of-order) message must not advance the receiving chain"
+            );
+            self.commit_pq_post_decrypt(encrypted);
+            return Ok(plaintext);
+        }
+
+        // 2. CPU DoS guards: reject a message whose numbers would make the chain-advance loops
+        // below do more than `max_message_jump` HKDF steps before the skipped-key memory limit
+        // stops them. Without this an attacker sends msg_num = 1_000_000 for O(N) work.
+        let max_jump = Config::global().max_message_jump;
+        if needs_ratchet {
+            // After the step the receiving chain restarts at 0: the jump is the number itself.
+            if encrypted.message_number > max_jump {
+                return Err(format!(
+                    "Message number jump too large after DH step: {} (limit {})",
+                    encrypted.message_number, max_jump
+                ));
+            }
+            // The skip loop walks the old chain from where it stands up to PN. The bound belongs
+            // here only: PN is constant for the sender's whole chain, so checked on every message
+            // against a chain that had restarted at 0 it refused everything after a chain longer
+            // than `max_jump` (TODO 190, 2026-10-20).
+            if encrypted.previous_chain_length
+                > self.receiving_chain_length.saturating_add(max_jump)
+            {
+                return Err(format!(
+                    "Previous chain length jump too large: {} -> {} (limit +{})",
+                    self.receiving_chain_length, encrypted.previous_chain_length, max_jump
+                ));
+            }
+        } else if encrypted.message_number > self.receiving_chain_length.saturating_add(max_jump) {
+            return Err(format!(
+                "Message number jump too large: {} -> {} (limit +{})",
+                self.receiving_chain_length, encrypted.message_number, max_jump
+            ));
+        }
 
         if needs_ratchet {
             // SkipMessageKeys (Signal DR spec §3.5): save remaining keys from the
@@ -640,33 +687,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 .inspect_err(|_e| {
                     self.restore_snapshot(snapshot.clone());
                 })?;
-        }
-
-        // Try to find skipped message key (keyed by remote DH chain + message number)
-        if let Some(key) = self
-            .skipped_message_keys
-            .remove(&(encrypted.dh_public_key.to_vec(), encrypted.message_number))
-        {
-            trace!(
-                target: "crypto::double_ratchet",
-                msg_num = %encrypted.message_number,
-                "Found skipped message key"
-            );
-            let recv_len_before = self.receiving_chain_length;
-            let plaintext = self.decrypt_with_key(&key, encrypted).inspect_err(|_e| {
-                self.restore_snapshot(snapshot);
-            })?;
-            // Counter invariant: an out-of-order message decrypted from a stored skipped key must
-            // NOT advance the live receiving chain — that key belongs to an earlier position.
-            debug_assert_eq!(
-                self.receiving_chain_length, recv_len_before,
-                "decrypting a skipped (out-of-order) message must not advance the receiving chain"
-            );
-            self.commit_pq_post_decrypt(encrypted);
-            if needs_ratchet {
-                self.complete_identity_proof();
-            }
-            return Ok(plaintext);
         }
 
         // Derive keys until we reach the message number

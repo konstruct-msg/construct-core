@@ -57,15 +57,21 @@ fn bytes32_to_hex(b: &[u8; 32]) -> String {
 // RFC 6962 §2.1  Merkle Tree Hash (MTH)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Largest power of 2 strictly less than `n` (n >= 2).
+/// The most hashes an inclusion proof can carry: one per level of a tree of at most 2^64
+/// leaves. A consistency proof carries at most two per level. A longer proof is not a proof,
+/// and bounding it here bounds the recursion below on a server-supplied length.
+pub const MAX_PROOF_DEPTH: usize = 64;
+
+/// Largest power of 2 strictly less than `n` (n >= 2); 0 for `n < 2`.
 /// This is the RFC 6962 split point: left subtree has `k` leaves, right has `n-k`.
+///
+/// Closed form on purpose: the loop `while k < n { k <<= 1 }` it replaced shifted `k` to 0 for
+/// `n > 2^63` and never ended — `tree_size` is the server's number (TODO 193, 2026-10-20).
 fn split(n: usize) -> usize {
-    debug_assert!(n >= 2);
-    let mut k = 1usize;
-    while k < n {
-        k <<= 1;
+    if n < 2 {
+        return 0;
     }
-    k >> 1
+    1usize << (usize::BITS - 1 - (n - 1).leading_zeros())
 }
 
 /// Compute the Merkle Tree Hash for a slice of leaf hashes.
@@ -102,11 +108,14 @@ fn verify_inclusion_inner(
     tree_size: u64,
     root_hash: &[u8; 32],
 ) -> bool {
-    if tree_size == 0 || leaf_index >= tree_size {
+    if tree_size == 0 || leaf_index >= tree_size || proof.len() > MAX_PROOF_DEPTH {
         return false;
     }
-    inclusion_reconstruct(leaf_hash, proof, leaf_index as usize, tree_size as usize)
-        == Some(*root_hash)
+    // A size this machine cannot index is not a tree this machine can check.
+    let (Ok(index), Ok(size)) = (usize::try_from(leaf_index), usize::try_from(tree_size)) else {
+        return false;
+    };
+    inclusion_reconstruct(leaf_hash, proof, index, size) == Some(*root_hash)
 }
 
 /// Recursively reconstruct the root hash from an inclusion proof.
@@ -125,6 +134,10 @@ fn inclusion_reconstruct(
         } else {
             None
         };
+    }
+    if size < 2 {
+        // A one-leaf tree has no siblings: a proof with hashes left over is not its proof.
+        return None;
     }
     let k = split(size);
     let sibling = proof[proof.len() - 1];
@@ -153,7 +166,7 @@ fn verify_consistency_inner(
     new_size: u64,
     proof: &[[u8; 32]],
 ) -> bool {
-    if old_size > new_size {
+    if old_size > new_size || proof.len() > 2 * MAX_PROOF_DEPTH {
         return false;
     }
     if old_size == new_size {
@@ -162,7 +175,11 @@ fn verify_consistency_inner(
     if old_size == 0 {
         return proof.is_empty();
     }
-    match consistency_reconstruct(old_root, old_size as usize, new_size as usize, true, proof) {
+    let (Ok(old_size), Ok(new_size)) = (usize::try_from(old_size), usize::try_from(new_size))
+    else {
+        return false;
+    };
+    match consistency_reconstruct(old_root, old_size, new_size, true, proof) {
         Some((r_old, r_new)) => r_old == *old_root && r_new == *new_root,
         None => false,
     }
@@ -620,6 +637,77 @@ mod tests {
                 make_leaf(&format!("device-{}", i), &key)
             })
             .collect()
+    }
+
+    // ── Audit 2026-10-20: the server's numbers bound the work (TODO 193) ────────
+
+    /// `split` in closed form agrees with its loop definition wherever the loop terminates.
+    #[test]
+    fn split_matches_the_loop_definition() {
+        fn by_loop(n: usize) -> usize {
+            let mut k = 1usize;
+            while k < n {
+                k <<= 1;
+            }
+            k >> 1
+        }
+        for n in 2..=4096usize {
+            assert_eq!(split(n), by_loop(n), "n={n}");
+        }
+        for n in [1usize << 40, (1 << 40) + 1, (1 << 62) + 7, 1 << 63] {
+            assert_eq!(split(n), by_loop(n), "n={n}");
+        }
+        assert_eq!(split(0), 0);
+        assert_eq!(split(1), 0);
+        assert_eq!(split((1usize << 63) + 1), 1 << 63);
+        assert_eq!(split(usize::MAX), 1 << 63);
+    }
+
+    /// A proof against a tree past 2^63 leaves is refused at once.
+    ///
+    /// Mutation: restore the loop in `split` — this test never finishes.
+    #[test]
+    fn a_tree_size_past_two_to_the_63_is_refused_at_once() {
+        let leaf = [1u8; 32];
+        let root = [2u8; 32];
+        let started = std::time::Instant::now();
+        for size in [u64::MAX, (1u64 << 63) + 1, 1u64 << 63] {
+            assert!(!verify_inclusion_inner(&leaf, &[[3u8; 32]], 0, size, &root));
+            assert!(!verify_inclusion_inner(
+                &leaf,
+                &[[3u8; 32]],
+                size - 1,
+                size,
+                &root
+            ));
+            assert!(!verify_consistency_inner(
+                &leaf,
+                1,
+                &root,
+                size,
+                &[[3u8; 32]]
+            ));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A proof deeper than a 2^64-leaf tree, or with hashes left over for a one-leaf tree, is
+    /// not a proof.
+    #[test]
+    fn an_overlong_proof_is_refused() {
+        let leaf = [1u8; 32];
+        let too_deep = vec![[3u8; 32]; MAX_PROOF_DEPTH + 1];
+        assert!(!verify_inclusion_inner(
+            &leaf,
+            &too_deep,
+            0,
+            u64::MAX / 2,
+            &leaf
+        ));
+        assert!(verify_inclusion_inner(&leaf, &[], 0, 1, &leaf));
+        assert!(!verify_inclusion_inner(&leaf, &[[3u8; 32]], 0, 1, &leaf));
+        let too_long = vec![[3u8; 32]; 2 * MAX_PROOF_DEPTH + 1];
+        assert!(!verify_consistency_inner(&leaf, 1, &leaf, 4, &too_long));
     }
 
     #[test]
