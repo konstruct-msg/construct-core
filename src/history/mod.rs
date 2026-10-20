@@ -129,7 +129,6 @@ pub(crate) mod vectors {
     }
 
     /// The fixed test keys the crypto vectors were made with (`$keys`).
-    #[cfg(feature = "post-quantum")]
     pub fn keys() -> serde_json::Value {
         root()["$keys"].clone()
     }

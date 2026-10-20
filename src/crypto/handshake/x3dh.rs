@@ -148,7 +148,7 @@ pub struct X3DHProtocol<P: CryptoProvider> {
     _phantom: PhantomData<P>,
 }
 
-/// HKDF info of the classical X3DH root key (builds without `post-quantum`).
+/// HKDF info of the classical X3DH root key: a pre-v2 first message, read on the responder's side.
 const X3DH_ROOT_INFO_CLASSIC: &[u8] = b"Construct-X3DH-RootKey-v1";
 /// HKDF info prefix of the PQXDH root key; followed by SHA-256 of the Kyber key, the ciphertext
 /// and the initiator's KEM identity key. v2 carried the first two only; v3 added the third, and a

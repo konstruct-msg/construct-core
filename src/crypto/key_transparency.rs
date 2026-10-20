@@ -326,7 +326,6 @@ pub fn verify_proof(
         return KtVerdict::InclusionProofInvalid;
     }
 
-    #[cfg(feature = "post-quantum")]
     if trust.ring.has_roots() {
         use crate::crypto::server_trust::{
             HYBRID_REQUIRED, Kid, Purpose, TrustError, kt_head_body,
@@ -356,8 +355,6 @@ pub fn verify_proof(
             return KtVerdict::SignatureInvalid;
         }
     }
-    #[cfg(not(feature = "post-quantum"))]
-    let _ = (head, now_secs);
 
     if trust.legacy_keys.is_empty() {
         return KtVerdict::Unavailable;
@@ -740,7 +737,6 @@ mod tests {
             );
         }
 
-        #[cfg(feature = "post-quantum")]
         mod delegated_head {
             use super::*;
             use crate::crypto::server_trust::{

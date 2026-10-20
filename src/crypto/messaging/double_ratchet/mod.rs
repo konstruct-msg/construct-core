@@ -350,7 +350,7 @@ pub struct PrekeyHeader {
     /// X25519 one-time prekey of the responder (0 = none).
     pub one_time_prekey_id: u32,
     /// The responder's Kyber prekey the ciphertext is for (SPK ids from 1, one-time from
-    /// 1 000 000); 0 = no ML-KEM (a build without `post-quantum`).
+    /// 1 000 000); 0 = no ML-KEM (a pre-v2 first message).
     pub kyber_prekey_id: u32,
     /// ML-KEM-1024 ciphertext (1568 bytes); empty when `kyber_prekey_id == 0`.
     pub kem_ciphertext: Vec<u8>,
@@ -369,8 +369,7 @@ pub struct PrekeyHeader {
 /// `PqAuthentication::ReceivedProven`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum IdentityProof {
-    /// Nothing pending: a session recorded before this existed, a proof completed, or a build
-    /// without `post-quantum`.
+    /// Nothing pending: a session recorded before this existed, or a proof completed.
     #[default]
     None,
     /// INITIATOR: the first receiving ratchet step must mix the secret the responder's

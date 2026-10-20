@@ -34,7 +34,6 @@ fn bundle_fields_to_binary(fields: RegistrationBundleFields) -> BinaryKeyBundle 
 /// `core`'s bundle as the key service serves it after PQXDH v2: the X3DH part plus a signed
 /// Kyber SPK (committed here if the core has none) and the hybrid identity key bound to the
 /// Ed25519 identity. PQ is mandatory, so this is what every session needs.
-#[cfg(feature = "post-quantum")]
 fn pq_bundle(core: &OrchestratorCore) -> BinaryKeyBundle {
     let hybrid = core.ensure_hybrid_signature_key().unwrap();
     let spk = match core.current_kyber_spk_upload().unwrap() {
@@ -230,7 +229,6 @@ fn a_copy_tag_is_recognised_by_the_device_it_names_and_by_no_sibling() {
 
 /// The receiver's channel key is the schedule the sender computes from public keys alone —
 /// the Swift `TransferCrypto.deriveChannelKey(salt: .file)` it replaces.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn the_history_file_channel_key_is_the_one_the_sender_derives() {
     use hkdf::Hkdf;
@@ -278,7 +276,6 @@ fn the_history_file_channel_key_is_the_one_the_sender_derives() {
 }
 
 /// The directory entry a device publishes, as `HistoryPeerKeys`.
-#[cfg(feature = "post-quantum")]
 fn history_peer(core: &OrchestratorCore) -> HistoryPeerKeys {
     core_spk(core);
     let spk = core.current_kyber_spk_upload().unwrap().unwrap();
@@ -293,7 +290,6 @@ fn history_peer(core: &OrchestratorCore) -> HistoryPeerKeys {
     }
 }
 
-#[cfg(feature = "post-quantum")]
 fn history_known(peer: &HistoryPeerKeys) -> HistoryKnownKeys {
     HistoryKnownKeys {
         identity_public: peer.identity_public.clone(),
@@ -302,7 +298,6 @@ fn history_known(peer: &HistoryPeerKeys) -> HistoryKnownKeys {
 }
 
 /// A platform's read loop: exactly `need()` bytes at a time from `stream`.
-#[cfg(feature = "post-quantum")]
 fn history_pump(
     receiver: &HistoryReceiver,
     stream: &[u8],
@@ -326,7 +321,6 @@ fn history_pump(
 /// Two real cores, the whole nearby exchange through the exported surface: opening, the
 /// directory keys, the reply, a transcript and a blob. What the new device's core signs and
 /// decapsulates with never leaves it.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn two_cores_move_history_over_the_local_network() {
     let (old, old_id) = named_core();
@@ -397,7 +391,6 @@ fn two_cores_move_history_over_the_local_network() {
 
 /// A file for the new device opens there and nowhere else: a third device of the account
 /// fails the recipient check, before any secret is touched.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn a_history_file_opens_only_on_the_device_it_was_made_for() {
     let (old, _) = named_core();
@@ -442,7 +435,6 @@ fn a_history_file_opens_only_on_the_device_it_was_made_for() {
     assert_eq!(open(&third), Err(HistoryError::IdentityMismatch));
 }
 
-#[cfg(feature = "post-quantum")]
 fn core_spk(core: &OrchestratorCore) {
     if core.current_kyber_spk_upload().unwrap().is_none() {
         core.begin_kyber_spk_rotation().unwrap();
@@ -782,14 +774,12 @@ fn test_degraded_session_encrypts_and_decrypts() {
 /// timestamps. PQXDH v2 opens a PQ-ratchet session on the one-time Kyber key; the first message's
 /// components carry the handshake; the responder opens the session from them, burns the key
 /// and hands back the prekeys to persist.
-#[cfg(feature = "post-quantum")]
 /// A replayed bundle is a typed refusal over the FFI, with both epochs in it, and the held
 /// session stays (TODO 176).
 ///
 /// Mutation: map the orchestrator's refusal to `SessionInitializationFailed` instead — the
 /// client is back to parsing text.
 #[test]
-#[cfg(feature = "post-quantum")]
 fn a_replayed_bundle_is_a_typed_refusal_with_both_epochs() {
     let alice = make_orchestrator("alice_user_id");
     alice.ensure_hybrid_signature_key().unwrap();
@@ -1011,7 +1001,6 @@ fn test_responder_refuses_before_the_server_keys_are_set() {
 /// `"All 1 prekey(s) failed. AEAD decryption failed"`. The pure-core
 /// `test_client_negotiates_pq_ratchet_from_bundle_capability` cannot catch this: it hands the
 /// full struct straight across, bypassing this boundary (which is why the bug shipped).
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_pq_ratchet_first_message_survives_uniffi_wire() {
     use crate::crypto::SuiteID;
@@ -1044,7 +1033,6 @@ fn test_pq_ratchet_first_message_survives_uniffi_wire() {
 /// Variant-2 guard: every field must survive the core's packer → `wire_payload_unpack`, the
 /// one reader the platforms call, instead of each SDK re-implementing the byte layout (the
 /// original wire-drop). If the reader ever loses a field, this fails.
-#[cfg(feature = "post-quantum")]
 #[test]
 fn test_wire_payload_pack_roundtrip_pq_ratchet() {
     use crate::crypto::messaging::double_ratchet::PqRatchetWireField;

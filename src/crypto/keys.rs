@@ -39,7 +39,6 @@ const _: () = assert!(
 );
 
 /// HKDF info of the KEM identity seed (`KeyManager::kem_identity_seed`).
-#[cfg(feature = "post-quantum")]
 const KEM_IDENTITY_SEED_INFO: &[u8] = b"Construct-KEM-identity-v1";
 
 /// Build prologue for X3DH signature (как в Noise Protocol)
@@ -161,7 +160,6 @@ pub struct KeyManager<P: CryptoProvider> {
     /// Счетчик для OTPK key_id (separate range: starts at 1_000_000 to avoid collisions)
     next_otpk_id: u32,
 
-    #[cfg(feature = "post-quantum")]
     /// Independent hybrid PQ signature private key (Ed25519+ML-DSA-65, 2016 bytes raw).
     /// Owned here for centralization: all long-term crypto keys live inside the core.
     /// Lazily initialized on first ensure_hybrid; not part of the main suite signing_key.
@@ -185,7 +183,6 @@ impl<P: CryptoProvider> KeyManager<P> {
             one_time_prekeys: HashMap::new(),
             next_prekey_id: 1,
             next_otpk_id: 1_000_000,
-            #[cfg(feature = "post-quantum")]
             hybrid_sig_priv: None,
             kyber_prekeys: Default::default(),
             _phantom: PhantomData,
@@ -461,7 +458,6 @@ impl<P: CryptoProvider> KeyManager<P> {
     // The key is independent of the main (classic) signing_key. It is lazily
     // created on first use and persisted as part of CFE private keys.
     // All hybrid signing now goes through the core (no external keychain blobs).
-    // Gated behind post-quantum feature (same as the hybrid module).
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Domain separation for X3DH pre-key signatures (both classic Ed25519 and hybrid).
@@ -496,7 +492,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         msg
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Ensure a hybrid signature keypair exists. If absent, generate using the
     /// fixed hybrid suite (same as the free hybridSignatureKeygen primitive) and
     /// store. Returns the public key (1984 B).
@@ -517,7 +512,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         .map_err(ConstructError::Crypto)
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Return the hybrid public key if one has been ensured/generated, else None.
     pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
         self.hybrid_sig_priv.as_ref().and_then(|p| {
@@ -525,7 +519,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         })
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Sign with the hybrid key (if present). Returns 3373 B hybrid signature.
     /// The caller must have called ensure first (or this returns error).
     pub fn sign_hybrid(&self, message: &[u8]) -> Result<Vec<u8>> {
@@ -538,7 +531,6 @@ impl<P: CryptoProvider> KeyManager<P> {
             .map_err(ConstructError::Crypto)
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Ensure the hybrid key (if needed) and return a hybrid signature over the
     /// standard X3DH prekey sign-message for the given suite and public key.
     ///
@@ -549,7 +541,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         self.sign_hybrid(&msg)
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Import a previously generated hybrid sig private key (from CFE restore).
     pub fn set_hybrid_signature_private(&mut self, priv_bytes: Vec<u8>) -> Result<()> {
         // Validate size early.
@@ -566,13 +557,11 @@ impl<P: CryptoProvider> KeyManager<P> {
         Ok(())
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Export the hybrid sig private (if any) for CFE persistence.
     pub fn hybrid_signature_private_bytes(&self) -> Option<crate::crypto::SecretBytes> {
         self.hybrid_sig_priv.clone()
     }
 
-    #[cfg(feature = "post-quantum")]
     /// The seed of this device's ML-KEM-1024 identity key: the key its first flight names and a
     /// responder answers to, which is how the responder learns — post-quantum — that the initiator
     /// is who the first flight claims (decisions/responder-authenticates-initiator-by-kem.md).
@@ -607,7 +596,6 @@ impl<P: CryptoProvider> KeyManager<P> {
         Ok(crate::crypto::SecretBytes::from(seed))
     }
 
-    #[cfg(feature = "post-quantum")]
     /// This device's ML-KEM-1024 identity public key (1568 bytes); see `kem_identity_seed`.
     pub fn kem_identity_public(&self) -> Result<Vec<u8>> {
         let seed = self.kem_identity_seed()?;
@@ -615,7 +603,6 @@ impl<P: CryptoProvider> KeyManager<P> {
             .map_err(|e| ConstructError::Crypto(crate::error::CryptoError::Other(e)))
     }
 
-    #[cfg(feature = "post-quantum")]
     /// Decapsulate a responder's answer to this device's KEM identity key. A ciphertext for
     /// another key does not fail here (ML-KEM implicit rejection); it fails as the AEAD after it.
     pub fn kem_identity_decapsulate(
@@ -761,36 +748,6 @@ impl<P: CryptoProvider> KeyManager<P> {
     }
 
     // Non-pq stubs (no-op / None) so call sites in export/import don't need per-cfg.
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn ensure_hybrid_signature_key(&mut self) -> Result<Vec<u8>> {
-        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
-            "hybrid signatures require post-quantum feature".into(),
-        )))
-    }
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn hybrid_signature_public_key(&self) -> Option<Vec<u8>> {
-        None
-    }
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn sign_hybrid(&self, _message: &[u8]) -> Result<Vec<u8>> {
-        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
-            "hybrid signatures require post-quantum feature".into(),
-        )))
-    }
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn sign_hybrid_prekey(&mut self, _suite_id: u8, _public_key: &[u8]) -> Result<Vec<u8>> {
-        Err(ConstructError::Crypto(crate::error::CryptoError::Other(
-            "hybrid signatures require post-quantum feature".into(),
-        )))
-    }
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn set_hybrid_signature_private(&mut self, _priv_bytes: Vec<u8>) -> Result<()> {
-        Ok(())
-    }
-    #[cfg(not(feature = "post-quantum"))]
-    pub fn hybrid_signature_private_bytes(&self) -> Option<crate::crypto::SecretBytes> {
-        None
-    }
 
     /// Количество сохраненных старых prekeys
     pub fn old_prekeys_count(&self) -> usize {
@@ -1092,7 +1049,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "post-quantum")]
     mod kyber_prekeys {
         use crate::crypto::keys::KeyManager;
         use crate::crypto::kyber_prekey_auth::{

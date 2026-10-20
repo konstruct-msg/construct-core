@@ -58,23 +58,12 @@ use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use std::marker::PhantomData;
 
-/// Whether this build runs `SuiteID::PQ_RATCHET` (suite 4) sessions — the sparse continuous PQ
-/// ratchet needs the ML-KEM-768 primitives behind `post-quantum`.
-///
-/// The PQ-ratchet suite is mandatory where it exists (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`):
-/// an initiator with `post-quantum` always negotiates it, and there is no capability flag to read
-/// or to strip — the unsigned `supports_pq_ratchet` bundle flag and its downgrade ledger are gone.
-pub const fn local_supports_pq_ratchet() -> bool {
-    cfg!(feature = "post-quantum")
-}
-
-/// The suite a session this build initiates runs: the PQ-ratchet suite with `post-quantum`, classic without.
+/// The suite a session this core initiates runs: the sparse continuous PQ ratchet, always. It is
+/// mandatory (construct-docs `decisions/pqxdh-v2-mandatory-pq-cutover.md`): there is no
+/// capability flag to read or to strip — the unsigned `supports_pq_ratchet` bundle flag and its
+/// downgrade ledger are gone — and since 0.56.0 no build without ML-KEM either (TODO 203).
 fn negotiated_initiator_suite() -> SuiteID {
-    if local_supports_pq_ratchet() {
-        SuiteID::PQ_RATCHET
-    } else {
-        SuiteID::CLASSIC
-    }
+    SuiteID::PQ_RATCHET
 }
 
 /// High-level Session для обмена сообщениями с одним контактом

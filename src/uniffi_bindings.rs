@@ -1629,7 +1629,6 @@ pub struct HybridSignatureKeyPair {
 }
 
 /// Generate an ML-DSA-65 keypair (RustCrypto ml-dsa, seed-based).
-#[cfg(feature = "post-quantum")]
 pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
     use ml_dsa::{B32, Keypair as _, MlDsa65, SigningKey as MlDsaSigningKey};
     use rand_core::RngCore;
@@ -1646,7 +1645,6 @@ pub fn mldsa65_keygen() -> Result<MLDSAKeyPair, CryptoError> {
 }
 
 /// Sign a message with an ML-DSA-65 signing seed (detached signature).
-#[cfg(feature = "post-quantum")]
 pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use ml_dsa::{B32, MlDsa65, Signer as _, SigningKey as MlDsaSigningKey};
     let seed: [u8; 32] = secret_key
@@ -1661,7 +1659,6 @@ pub fn mldsa65_sign(secret_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, Cr
 }
 
 /// Verify an ML-DSA-65 detached signature.
-#[cfg(feature = "post-quantum")]
 pub fn mldsa65_verify(
     public_key: Vec<u8>,
     message: Vec<u8>,
@@ -1683,7 +1680,6 @@ pub fn mldsa65_verify(
 }
 
 /// Generate a hybrid (Ed25519 + ML-DSA-65) signature keypair.
-#[cfg(feature = "post-quantum")]
 pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
@@ -1696,7 +1692,6 @@ pub fn hybrid_signature_keygen() -> Result<HybridSignatureKeyPair, CryptoError> 
 }
 
 /// Sign a message with a hybrid private key (Ed25519 + ML-DSA-65).
-#[cfg(feature = "post-quantum")]
 pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
@@ -1708,7 +1703,6 @@ pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, Cr
 }
 
 /// Verify a hybrid signature (both Ed25519 and ML-DSA-65 must be valid).
-#[cfg(feature = "post-quantum")]
 pub fn hybrid_verify(
     public_key: Vec<u8>,
     message: Vec<u8>,
@@ -1723,7 +1717,6 @@ pub fn hybrid_verify(
 }
 
 /// Derive the hybrid public key from a hybrid private key.
-#[cfg(feature = "post-quantum")]
 pub fn hybrid_public_key_from_private(private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;

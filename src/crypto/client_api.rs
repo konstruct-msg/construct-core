@@ -1323,10 +1323,9 @@ mod tests {
         );
     }
 
-    /// The PQ-ratchet suite is mandatory with `post-quantum`: every session is the PQ-ratchet suite end-to-end (initiator
+    /// The PQ-ratchet suite is mandatory: every session is the PQ-ratchet suite end-to-end (initiator
     /// tags it on the wire, the responder adopts it from the first message and interops).
     /// There is no capability flag to read.
-    #[cfg(feature = "post-quantum")]
     #[test]
     fn test_client_negotiates_pq_ratchet_from_bundle_capability() {
         let mut alice = TestClient::new().unwrap();
@@ -1399,40 +1398,6 @@ mod tests {
                 .unwrap(),
             b"pq hi back"
         );
-    }
-
-    /// Without `post-quantum` there is no PQ-ratchet suite to negotiate: the session is classic.
-    #[cfg(not(feature = "post-quantum"))]
-    #[test]
-    fn test_client_without_post_quantum_stays_classic() {
-        let mut alice = TestClient::new().unwrap();
-        let bob = TestClient::new().unwrap();
-        alice.set_local_user_id("alice".to_string());
-
-        let bob_identity_priv = bob.key_manager.identity_secret_key().unwrap();
-        let bob_identity_pub =
-            ClassicSuiteProvider::from_private_key_to_public_key(bob_identity_priv).unwrap();
-        let bob_prekey = bob.key_manager.current_signed_prekey().unwrap();
-        let bob_bundle = X3DHPublicKeyBundle {
-            identity_public: bob_identity_pub.clone(),
-            signed_prekey_public: bob_prekey.key_pair.1.clone(),
-            signature: bob_prekey.signature.clone(),
-            verifying_key: bob.key_manager.verifying_key().unwrap().to_vec(),
-            suite_id: SuiteID::CLASSIC,
-            one_time_prekey_public: None,
-            one_time_prekey_id: None,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        };
-
-        alice
-            .init_session("bob", &bob_bundle, &bob_identity_pub, 0)
-            .unwrap();
-        let encrypted = alice.encrypt_message("bob", b"classic hello").unwrap();
-        assert_eq!(encrypted.suite_id, SuiteID::CLASSIC.as_u16());
-        assert_eq!(encrypted.pq_message_epoch, 0);
     }
 
     #[test]

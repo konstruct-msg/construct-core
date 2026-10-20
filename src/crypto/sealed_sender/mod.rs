@@ -233,12 +233,11 @@ pub struct SenderCertificate {
 ///
 /// - `legacy_keys`: the Ed25519 keys the platform hands over — the well-known key and its pins.
 ///   Whoever holds the server chooses the well-known key; that is what the delegated keys end.
-/// - `ring` (post-quantum builds): the roots pinned in this build and the delegations admitted
+/// - `ring`: the roots pinned in this build and the delegations admitted
 ///   under them (`crypto::server_trust`, decisions/server-keys-rooted-offline-and-hybrid.md).
 #[derive(Debug, Clone, Default)]
 pub struct ServerTrust {
     pub legacy_keys: Vec<Vec<u8>>,
-    #[cfg(feature = "post-quantum")]
     pub ring: crate::crypto::server_trust::ServerKeyRing,
 }
 
@@ -247,7 +246,6 @@ impl ServerTrust {
     pub fn pinned() -> Self {
         Self {
             legacy_keys: Vec::new(),
-            #[cfg(feature = "post-quantum")]
             ring: crate::crypto::server_trust::ServerKeyRing::pinned(),
         }
     }
@@ -259,14 +257,8 @@ impl ServerTrust {
         trust
     }
 
-    #[cfg(feature = "post-quantum")]
     fn has_roots(&self) -> bool {
         self.ring.has_roots()
-    }
-
-    #[cfg(not(feature = "post-quantum"))]
-    fn has_roots(&self) -> bool {
-        false
     }
 }
 
@@ -324,10 +316,7 @@ impl SenderCertificate {
     /// that do not sign hybrid yet. Without roots (a build before the ceremony) the hybrid
     /// signature cannot be checked and Ed25519 decides.
     fn check_signature(&self, trust: &ServerTrust, now_secs: i64) -> Result<(), SenderRefusal> {
-        #[cfg(not(feature = "post-quantum"))]
-        let _ = now_secs;
         if trust.has_roots() {
-            #[cfg(feature = "post-quantum")]
             {
                 if !self.server_signature_hybrid.is_empty() {
                     return self.check_hybrid(&trust.ring, now_secs);
@@ -359,7 +348,6 @@ impl SenderCertificate {
         }
     }
 
-    #[cfg(feature = "post-quantum")]
     fn check_hybrid(
         &self,
         ring: &crate::crypto::server_trust::ServerKeyRing,
@@ -805,7 +793,6 @@ mod tests {
 
     // ── The delegated hybrid signature (decisions/server-keys-rooted-offline-and-hybrid.md) ──
 
-    #[cfg(feature = "post-quantum")]
     mod hybrid {
         use super::*;
         use crate::crypto::server_trust::{

@@ -72,7 +72,6 @@ fn ephemeral() -> (x25519_dalek::StaticSecret, [u8; 32]) {
     (secret, public)
 }
 
-#[cfg(feature = "post-quantum")]
 fn encapsulate(kyber_public: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), HistoryFailure> {
     let enc = crate::crypto::pq_x3dh::mlkem1024_encapsulate(kyber_public)
         .map_err(|_| HistoryFailure::NoHybridKey)?;
@@ -80,11 +79,6 @@ fn encapsulate(kyber_public: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), His
         enc.ciphertext,
         Zeroizing::new(enc.shared_secret.as_ref().to_vec()),
     ))
-}
-
-#[cfg(not(feature = "post-quantum"))]
-fn encapsulate(_: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), HistoryFailure> {
-    Err(HistoryFailure::NoHybridKey)
 }
 
 // ── Sender ────────────────────────────────────────────────────────────────────
@@ -661,7 +655,7 @@ impl DeviceKeys for crate::orchestration::Orchestrator {
     }
 }
 
-#[cfg(all(test, feature = "post-quantum"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::record_type;

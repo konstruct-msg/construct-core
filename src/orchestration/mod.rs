@@ -24,7 +24,6 @@ pub mod decryption_error;
 pub mod initiation_plan;
 pub mod message_router;
 pub mod orchestrator;
-#[cfg(feature = "post-quantum")]
 pub mod pq_prekey_plan;
 pub mod receiving_init_plan;
 pub mod reorder_stats;
@@ -38,7 +37,6 @@ pub use clock::{Clock, SystemClock, system_clock};
 pub use initiation_plan::{InitiationContext, InitiationDecision, plan_initiation};
 pub use message_router::{IncomingMessage, MessageRouter, RoutingDecision};
 pub use orchestrator::{Orchestrator, PeekVerdict};
-#[cfg(feature = "post-quantum")]
 pub use pq_prekey_plan::{
     KyberPrekeyOffer, PqxdhChoice, PqxdhContext, PqxdhOffer, PqxdhRefusal, plan_pqxdh,
 };

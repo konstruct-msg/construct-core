@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.55.0"
+version = "0.56.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -31,17 +31,16 @@ default = []
 # the build command (iOS release and Android CI passed it; CI's iOS/mac checks and the UniFFI
 # test run did not, so the configuration that ships was not the one tested). `lib.rs` has a
 # `compile_error!` for a platform feature without it, should this list ever lose it.
-ios = ["post-quantum", "uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+ios = ["uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-veil TLS proxy
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["post-quantum", "uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+mac = ["uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # android = UniFFI JNI bindings (Kotlin) + construct-veil transport
-android = ["post-quantum", "uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
-post-quantum = [
-    "dep:ml-kem",
-    "dep:getrandom_pq",
-    "dep:ml-dsa",
-]
+android = ["uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+# ML-KEM and ML-DSA are unconditional since 0.56.0 (TODO 203): every build opens PQXDH v2 and
+# suite-4 sessions, and there is no classical-only core to build. The feature stays as an empty
+# alias for one release so `--features post-quantum` in scripts and docs keeps working.
+post-quantum = []
 
 [dependencies]
 # Сериализация
@@ -74,12 +73,12 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1.0", features = ["zeroize_derive"] }
 
 # Post-Quantum (optional) - ML-KEM and ML-DSA (NIST standardized names)
-ml-kem = { version = "0.3.0", optional = true }
-getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"], optional = true }
+ml-kem = "0.3.0"
+getrandom_pq = { package = "getrandom", version = "0.4", features = ["sys_rng"] }
 # RustCrypto `ml-dsa` (maintained) — replaced the archived PQClean-based
 # pqcrypto-mldsa/pqcrypto-traits (RUSTSEC-2026-0162/0166). Seed-based secret-key
 # storage; pins the SAME impl as construct-server for byte-level signature interop.
-ml-dsa = { version = "0.1.1", optional = true }
+ml-dsa = "0.1.1"
 
 # MLS (Messaging Layer Security) — group chat protocol (RFC 9420)
 # Feature-gated: mls + group-conversation. Pulls in ~15 additional crates.
@@ -125,12 +124,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # The offline root of the server keys — construct-docs manuals&instructions/server-root-key-ceremony.md
 [[bin]]
 name = "konstruct-root"
-required-features = ["post-quantum"]
 
 # Two devices in one process, no server: the core's event/action loop end to end (a reading aid).
 [[example]]
 name = "two_devices"
-required-features = ["post-quantum"]
 
 [[bench]]
 name = "crypto_bench"

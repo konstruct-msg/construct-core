@@ -17,8 +17,7 @@ per platform. It provides:
   initial key, so every message, the first included, depends on both (see
   [Cryptography](#cryptography)). Post-quantum is mandatory for new sessions.
 - **Double Ratchet** for forward secrecy & post-compromise security, with a sparse continuous
-  **ML-KEM-768 ratchet** that gives every message its own post-quantum key (suite 4, mandatory
-  with `post-quantum`)
+  **ML-KEM-768 ratchet** that gives every message its own post-quantum key (suite 4, mandatory)
 - **Hybrid signatures** — Ed25519 + ML-DSA-65 (FIPS 204) primitives
 - **MLS (RFC 9420)** group primitives via `openmls` (`ios` / `mac` / `android` features)
 - **Account recovery** — BIP39 mnemonic, and social recovery by Shamir secret sharing over
@@ -159,7 +158,7 @@ Names follow NIST FIPS; informal names in parens.
 | 1 | `CLASSIC` | The table above. |
 | 2 | `PQ_HYBRID` | **Reserved.** No session negotiates it; the hybrid-signature primitives below live under this name. |
 | 3 | — | **Retired** in 0.24.0: the epoch-granular PQ ratchet, one ML-KEM-768 epoch secret mixed into every message of its epoch. Refused on the wire and on restore; the next send opens a suite-4 session. |
-| 4 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages, and each completed epoch's secret seeds one symmetric chain per direction, stepped **per message** — the post-quantum half has per-message forward secrecy like the classical one. New epochs every `pq_ratchet_interval` DH turns or 7 days. **Every session a `post-quantum` build opens** — there is no capability flag to read or strip (the unsigned `supports_pq_ratchet` was the downgrade). A responder refuses a first message on another suite. |
+| 4 | `PQ_RATCHET` | Classic Double Ratchet + a sparse continuous **ML-KEM-768** ratchet: a fresh KEM exchange rides on ordinary messages, and each completed epoch's secret seeds one symmetric chain per direction, stepped **per message** — the post-quantum half has per-message forward secrecy like the classical one. New epochs every `pq_ratchet_interval` DH turns or 7 days. **Every session this core opens** — there is no capability flag to read or strip (the unsigned `supports_pq_ratchet` was the downgrade). A responder refuses a first message on another suite. |
 
 ### PQXDH v2 — ML-KEM-1024 in the initial key
 
@@ -204,8 +203,7 @@ kept 14 days (one constant for classic and Kyber).
 `pq_authentication` whose key it was (`Authenticated` for the initiator, `Received` for the
 responder of a v2 session). Anything a person is told about "PQ" is built from those two.
 
-A build without `post-quantum` has no Kyber keys and opens classical X3DH sessions; it cannot
-talk to platform builds, which always have it.
+Every build has Kyber keys and opens PQXDH v2 sessions; there is no classical-only core.
 
 ### Hybrid signatures
 
@@ -238,19 +236,19 @@ server can drop them — they hide patterns from a network observer, not from th
 | `ios`           | iOS/macOS bindings via UniFFI (+ VEIL transport, MLS)          |
 | `mac`           | Native macOS build (same surface as `ios`)                     |
 | `android`       | Android JNI/Kotlin bindings via UniFFI                         |
-| `post-quantum`  | ML-KEM-1024 (PQXDH v2), ML-KEM-768 (suite-4 ratchet), ML-DSA-65 |
+| `post-quantum`  | Empty alias, kept one release: ML-KEM-1024 (PQXDH v2), ML-KEM-768 (suite-4 ratchet) and ML-DSA-65 are unconditional since 0.56.0 |
 
-`default = []` — opt into a platform/feature set explicitly. The `ios`/`mac`/`android`
-features pull in `post-quantum`, `construct-veil` and `openmls`: a platform library always has
-ML-KEM (a platform feature without `post-quantum` is a `compile_error!`). A build with no
-platform feature and no `post-quantum` is classic-only and negotiates `CLASSIC` with everyone. `construct-veil` is a git dependency pinned
-by commit (`rev` in `Cargo.toml`) — no sibling checkout is needed for any build.
+`default = []` — the core itself, with every cryptographic primitive; a platform feature adds the
+bindings, `construct-veil` and `openmls`. There is no classical-only build: until 0.56.0 a build
+without `post-quantum` negotiated `CLASSIC` with everyone and nothing said so (TODO 203).
+`construct-veil` is a git dependency pinned by commit (`rev` in `Cargo.toml`) — no sibling
+checkout is needed for any build.
 
 ## Testing
 
 ```bash
 # Core crypto, including the PQ suites
-cargo test --features post-quantum
+cargo test
 
 # The exported UniFFI surface (compiled only with a platform feature)
 cargo test --features mac
@@ -289,7 +287,7 @@ After clone, point git at the tracked hooks (local config, not copied by clone):
 git config core.hooksPath .githooks
 ```
 
-`pre-push` runs the same first steps as the Linux `Lint + Tests` job: `cargo fmt --all -- --check`, then clippy default and clippy `--features post-quantum`, both `-D warnings`. Bypass with `git push --no-verify` or skip clippy with `SKIP_CLIPPY=1`.
+`pre-push` runs the same first steps as the Linux `Lint + Tests` job: `cargo fmt --all -- --check`, then clippy default `-D warnings`. Bypass with `git push --no-verify` or skip clippy with `SKIP_CLIPPY=1`.
 
 ## License
 

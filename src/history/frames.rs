@@ -414,17 +414,11 @@ fn check_pin(identity: &[u8], hybrid: &[u8], pin: &Pin) -> Result<(), HistoryFai
     }
 }
 
-#[cfg(feature = "post-quantum")]
 fn check_signature(hybrid: &[u8], message: &[u8], signature: &[u8]) -> Result<(), HistoryFailure> {
     use crate::crypto::provider::CryptoProvider;
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
     HybridSuiteProvider::verify(&hybrid.to_vec(), message, signature)
         .map_err(|_| HistoryFailure::SignatureInvalid)
-}
-
-#[cfg(not(feature = "post-quantum"))]
-fn check_signature(_: &[u8], _: &[u8], _: &[u8]) -> Result<(), HistoryFailure> {
-    Err(HistoryFailure::SignatureInvalid)
 }
 
 /// The receiver's check of an opening: ids, Kyber key id, known keys, QR pin, signature.
@@ -494,7 +488,7 @@ pub fn verify_cthf(
     check_signature(&known.hybrid_public, &h.signed_message(), &h.signature)
 }
 
-#[cfg(all(test, feature = "post-quantum"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::vectors;

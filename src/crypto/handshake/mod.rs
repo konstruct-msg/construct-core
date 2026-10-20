@@ -50,7 +50,8 @@ pub struct InitiatorState<P: CryptoProvider> {
 /// With it, the root key is `HKDF(0xFF×32, DH1‖DH2‖DH3[‖DH4]‖SS, "Construct-PQXDH-RootKey-v2" ‖
 /// SHA-256(kyber_public) ‖ SHA-256(kem_ciphertext))`: every key of the session, the first message's
 /// included, depends on X25519 *and* ML-KEM. Without it (`None`) the derivation is classical X3DH —
-/// only builds without `post-quantum` do that. construct-docs `cryptocore/PQXDH_V2_DESIGN.md` §5.1.
+/// the responder's path for a pre-v2 first message only; no build initiates one.
+/// construct-docs `cryptocore/PQXDH_V2_DESIGN.md` §5.1.
 #[derive(Clone, Copy)]
 pub struct PqxdhInput<'a> {
     /// The 32-byte ML-KEM-1024 shared secret.

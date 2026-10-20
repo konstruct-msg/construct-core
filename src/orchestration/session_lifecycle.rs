@@ -419,7 +419,6 @@ impl SessionLifecycleManager {
         self.reorder_stats
     }
 
-    #[cfg(feature = "post-quantum")]
     fn identity_answer_secret(
         &self,
         msg: &EncryptedRatchetMessage,
@@ -433,14 +432,6 @@ impl SessionLifecycleManager {
                     .map_err(|e| e.to_string())
             })
             .transpose()
-    }
-
-    #[cfg(not(feature = "post-quantum"))]
-    fn identity_answer_secret(
-        &self,
-        _msg: &EncryptedRatchetMessage,
-    ) -> Result<Option<crate::crypto::SecretBytes>, String> {
-        Ok(None)
     }
 
     /// Make `session` the current state with `contact_id`; the state it replaces, if any, becomes
@@ -1048,7 +1039,6 @@ mod tests {
     /// last of its epoch left nothing and is counted as lost to eviction.
     ///
     /// Mutation: drop either `record_*` call in `decrypt_ratchet_message` — this reddens.
-    #[cfg(feature = "post-quantum")]
     #[test]
     fn reorder_stats_count_late_epochs_and_evictions() {
         let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();

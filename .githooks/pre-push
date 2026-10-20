@@ -5,7 +5,7 @@
 # В construct-server три деплоя подряд упали на `cargo fmt --all -- --check`
 # (2026-08-13): локально всё собиралось — `cargo check` не смотрит на
 # форматирование. Тот же риск здесь: Linux job `Lint + Tests` начинает с
-# проверки Cargo.lock, fmt и проверки логов на ключевой материал, потом двумя clippy
+# проверки Cargo.lock, fmt и проверки логов на ключевой материал, потом clippy
 # (default + post-quantum) с `-D warnings`.
 #
 # Порядок совпадает с `.github/workflows/ci.yml` job `test`. Хук ценен
@@ -42,16 +42,12 @@ fi
 
 # Clippy идёт последним и только если fmt прошёл: он самый долгий
 # (минуты на холодном target), и ждать его ради ошибки форматирования незачем.
-# Два вызова — как в CI. Не `--all-features`: это тянет ios/mac/android и
-# construct-veil, а Linux lint job этого не гоняет.
+# Один вызов — как в CI (default и есть PQ с 0.56.0). Не `--all-features`: это
+# тянет ios/mac/android и construct-veil, а Linux lint job этого не гоняет.
 # Пропускается через SKIP_CLIPPY=1, когда правка заведомо не касается Rust.
 if [ "$fail" -eq 0 ] && [ "${SKIP_CLIPPY:-0}" != "1" ]; then
     printf '\n[pre-push] clippy default -D warnings (SKIP_CLIPPY=1 чтобы пропустить)\n'
     cargo clippy --all-targets -- -D warnings || fail=1
-    if [ "$fail" -eq 0 ]; then
-        printf '\n[pre-push] clippy post-quantum -D warnings\n'
-        cargo clippy --all-targets --features post-quantum -- -D warnings || fail=1
-    fi
 fi
 
 if [ "$fail" -ne 0 ]; then
