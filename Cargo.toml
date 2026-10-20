@@ -127,6 +127,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "konstruct-root"
 required-features = ["post-quantum"]
 
+# Two devices in one process, no server: the core's event/action loop end to end (a reading aid).
+[[example]]
+name = "two_devices"
+required-features = ["post-quantum"]
+
 [[bench]]
 name = "crypto_bench"
 harness = false
