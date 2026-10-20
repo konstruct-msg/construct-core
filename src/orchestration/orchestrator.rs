@@ -29,6 +29,10 @@ use crate::orchestration::session_machine::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+/// How often the GC sweep runs after its first run on launch: ACK-cache pruning, lifecycle
+/// pruning and the retirement of unanswered handshakes past their age.
+const GC_SWEEP_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
 /// Minimum time between prewarm attempts for the same contact (ms).
 #[allow(dead_code)]
 const PREWARM_COOLDOWN_MS: u64 = 30_000;
@@ -632,11 +636,22 @@ impl Orchestrator {
         self.lifecycle.retire_current(contact_id)
     }
 
-    /// `retire_stale_handshake` for every device with a current state (the GC sweep).
-    fn retire_stale_handshakes(&mut self) {
+    /// `retire_stale_handshake` for every device with a current state (the GC sweep), and the
+    /// save of each record it changed — a retirement that stays in memory comes back as the
+    /// current state after a restart.
+    fn retire_stale_handshakes(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
         for contact_id in self.lifecycle.client.active_contacts() {
-            self.retire_stale_handshake(&contact_id);
+            if self.retire_stale_handshake(&contact_id)
+                && let Ok(bytes) = self.lifecycle.export_session_bytes_for(&contact_id)
+            {
+                actions.push(Action::SaveToSecureStore {
+                    slot: SecureStoreSlot::Session { contact_id },
+                    data: bytes.into(),
+                });
+            }
         }
+        actions
     }
 
     pub fn pending_message_count(&self, contact_id: &str) -> usize {
@@ -1304,10 +1319,25 @@ impl Orchestrator {
     /// The Kyber prekeys to persist (`export_kyber_prekeys_cfe`) if a responder init burned a
     /// one-time key since the last call; `None` otherwise.
     pub fn take_kyber_prekeys_to_persist(&mut self) -> Option<Vec<u8>> {
-        if !std::mem::take(&mut self.kyber_prekeys_dirty) {
+        if !self.kyber_prekeys_dirty {
             return None;
         }
-        self.export_kyber_prekeys_cfe().ok()
+        // The flag clears only with the bytes in hand: cleared first, a failed export would have
+        // left a burned one-time key reusable after a restart (TODO 195).
+        match self.export_kyber_prekeys_cfe() {
+            Ok(bytes) => {
+                self.kyber_prekeys_dirty = false;
+                Some(bytes)
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "orchestration",
+                    error = %e,
+                    "Kyber prekeys export failed — the burn stays unpersisted until the next take"
+                );
+                None
+            }
+        }
     }
 
     /// RESPONDER init of `first_message` against `remote_identity` — the key a checked sender
@@ -2496,16 +2526,11 @@ impl Orchestrator {
         let mut actions = Vec::new();
 
         let decision = self.router.route_message(&mut self.lifecycle, &incoming);
-        let needs_state_save = matches!(
-            &decision,
-            // Decrypted: ack_store.mark_processed() mutates the ACK cache — persist it
-            // so the L1 in-memory dedup survives a restart (without this, every
-            // message received since the last orchestrator_state save would hit L2 DB
-            // on restart, creating duplicate-processing risk before the DB check fires).
-            RoutingDecision::Decrypted { .. }
-                | RoutingDecision::NeedSessionInit { .. }
-                | RoutingDecision::DecryptionErrorNeeded { .. }
-        );
+        // Decrypted: ack_store.mark_processed() mutates the ACK cache — persist it so the L1
+        // in-memory dedup survives a restart (without this, every message received since the
+        // last orchestrator_state save would hit L2 DB on restart, creating duplicate-processing
+        // risk before the DB check fires).
+        let needs_state_save = Self::decision_mutates_coordination_state(&decision);
         actions.extend(self.decision_to_actions(decision, &from));
         // Persist coordination state (ACK cache, init_locks) for
         // paths that don't already trigger a session-keyed save on the Swift side.
@@ -2612,17 +2637,12 @@ impl Orchestrator {
         contact_id: String,
         session_data: Vec<u8>,
     ) -> Vec<Action> {
-        // Releases the `Opening` phase and voids any teardown owed from before this session was
-        // built — sending it would tear down the session that just replaced the broken one.
-        //
-        self.sessions
-            .handle(&contact_id, SessionEvent::OpenFinished);
-
         let mut actions: Vec<Action> = Vec::new();
 
         // Import the newly created session from CFE binary (or JSON legacy fallback).
         // If import fails, emit an error action and abort — do not drain the queue
-        // or notify the platform of a session that was never actually created.
+        // or notify the platform of a session that was never actually created. The phase is
+        // settled by what the import says: nothing opened is `OpenFailed`, not `OpenFinished`.
         if !session_data.is_empty()
             && let Err(e) = self
                 .lifecycle
@@ -2634,12 +2654,18 @@ impl Orchestrator {
                 error = %e,
                 "SessionInitCompleted: import_session_bytes failed — aborting session init"
             );
+            self.sessions.handle(&contact_id, SessionEvent::OpenFailed);
             actions.push(Action::NotifyError {
                 code: "session_import_failed".to_string(),
                 message: format!("contact={}: {}", contact_id, e),
             });
             return actions;
         }
+
+        // Releases the `Opening` phase and voids any teardown owed from before this session was
+        // built — sending it would tear down the session that just replaced the broken one.
+        self.sessions
+            .handle(&contact_id, SessionEvent::OpenFinished);
 
         actions.extend(self.after_session_opened(&contact_id));
         actions
@@ -2648,8 +2674,8 @@ impl Orchestrator {
     /// Everything a session that now exists settles: the save, the queue behind it, the notice.
     ///
     /// Shared by the platform's `SessionInitCompleted`, `open_receiving` and the answer to
-    /// `OpenSession` (`SessionBundleFetched`). The machine's phase is settled by the caller before
-    /// the import, as the import can fail.
+    /// `OpenSession` (`SessionBundleFetched`). The machine's phase is settled by the caller, after
+    /// the import — which can fail, and then it is `OpenFailed` — and before this.
     fn after_session_opened(&mut self, contact_id: &str) -> Vec<Action> {
         let mut actions = Vec::new();
         if let Ok(bytes) = self.lifecycle.export_session_bytes_for(contact_id) {
@@ -2681,7 +2707,25 @@ impl Orchestrator {
         let decision =
             self.router
                 .resume_after_ack_check(&message_id, is_processed, &mut self.lifecycle);
-        self.decision_to_actions(decision, "")
+        let needs_state_save = Self::decision_mutates_coordination_state(&decision);
+        let mut actions = self.decision_to_actions(decision, "");
+        if needs_state_save && let Some(save_action) = self.orchestrator_state_action() {
+            actions.push(save_action);
+        }
+        actions
+    }
+
+    /// Whether acting on `decision` changes what `orchestrator_state_action` persists — the ACK
+    /// cache (`mark_processed`) or the init locks — on a path with no session-keyed save of its
+    /// own. One answer for `MessageReceived` and `AckDbResult`: until 2026-10-20 the second had
+    /// none, and a message that went through the DB check left its ack in memory only (TODO 195).
+    fn decision_mutates_coordination_state(decision: &RoutingDecision) -> bool {
+        matches!(
+            decision,
+            RoutingDecision::Decrypted { .. }
+                | RoutingDecision::NeedSessionInit { .. }
+                | RoutingDecision::DecryptionErrorNeeded { .. }
+        )
     }
 
     /// The platform's answer to `OpenSession`: reopen from the bundle, and settle everything the
@@ -2824,9 +2868,15 @@ impl Orchestrator {
     fn handle_timer_fired(&mut self, timer_id: String) -> Vec<Action> {
         match timer_id.as_str() {
             "gc_sweep" => {
-                let actions = self.lifecycle.ack_store.prune_expired();
+                let mut actions = self.lifecycle.ack_store.prune_expired();
                 self.sessions.prune_expired();
-                self.retire_stale_handshakes();
+                actions.extend(self.retire_stale_handshakes());
+                // Re-armed here: until 2026-10-20 the sweep ran once per launch or reconnect
+                // and never again in a long-lived process (TODO 195).
+                actions.push(Action::ScheduleTimer {
+                    timer_id: "gc_sweep".to_string(),
+                    delay_ms: GC_SWEEP_INTERVAL_MS,
+                });
                 actions
             }
             "pq_upgrade_sweep" if cfg!(feature = "post-quantum") => self.pq_upgrade_sweep(),
@@ -2858,9 +2908,16 @@ impl Orchestrator {
         };
         let decision = self.router.route_message(&mut self.lifecycle, &msg);
         match decision {
-            RoutingDecision::Decrypted { .. } => {
-                // Heartbeat decrypted successfully — session is healthy, no action needed.
-                vec![]
+            RoutingDecision::Decrypted { actions, .. } => {
+                // Read: the session is healthy and nothing is shown. The ratchet moved, though,
+                // and the id is now in the ACK cache: the save and the ack are the same as for
+                // any message. Until 2026-10-20 both were dropped here, so a heartbeat advanced
+                // the chain in memory only (TODO 195).
+                let mut all = actions;
+                if let Some(save) = self.orchestrator_state_action() {
+                    all.push(save);
+                }
+                all
             }
             other => self.decision_to_actions(other, &contact_id),
         }
@@ -2954,8 +3011,13 @@ impl Orchestrator {
                     None => Vec::new(),
                 }
             }
-            RoutingDecision::Duplicate { message_id } => {
-                vec![Action::DuplicateDropped { message_id }]
+            RoutingDecision::Duplicate {
+                message_id,
+                actions,
+            } => {
+                let mut all = actions;
+                all.push(Action::DuplicateDropped { message_id });
+                all
             }
             RoutingDecision::PendingAckCheck { message_id } => {
                 vec![Action::CheckAckInDb { message_id }]
@@ -6353,5 +6415,174 @@ mod pqxdh_v2_tests {
         deliver(&mut bob, &alice_id, "m0", msg0.clone(), 0);
         deliver(&mut bob, &alice_id, "m0", msg0, 0);
         assert_eq!(bob.router.pending_messages(&alice_id).len(), 1);
+    }
+
+    // ── Audit 2026-10-20: what a path forgot to save or record (TODO 195) ────────────
+
+    fn session_save_for(actions: &[Action], contact_id: &str) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::SaveToSecureStore { slot: SecureStoreSlot::Session { contact_id: c }, .. } if c == contact_id)
+        })
+    }
+
+    fn state_save(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SaveToSecureStore {
+                    slot: SecureStoreSlot::OrchestratorState,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn persist_ack_for(actions: &[Action], id: &str) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistAck { message_id, .. } if message_id == id))
+    }
+
+    fn rearms_gc(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::ScheduleTimer { timer_id, delay_ms }
+                if timer_id == "gc_sweep" && *delay_ms == GC_SWEEP_INTERVAL_MS)
+        })
+    }
+
+    /// A heartbeat moves the ratchet and records its id like any message; only the showing is
+    /// skipped. What it moved is saved.
+    ///
+    /// Mutation: return `vec![]` from the heartbeat's `Decrypted` arm — this reddens.
+    #[test]
+    fn a_heartbeat_that_decrypts_saves_the_session_and_records_the_ack() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let hb = alice.encrypt_bytes_for(&bob_id, b"hb").unwrap();
+        let actions = bob.handle_event(IncomingEvent::HeartbeatReceived {
+            contact_id: alice_id.clone(),
+            message_id: "hb-1".to_string(),
+            data: hb,
+        });
+        assert!(session_save_for(&actions, &alice_id), "{actions:?}");
+        assert!(persist_ack_for(&actions, "hb-1"), "{actions:?}");
+        assert!(state_save(&actions), "{actions:?}");
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::MessageDecrypted { .. } | Action::NotifyNewMessage { .. }
+            )),
+            "a heartbeat is not shown: {actions:?}"
+        );
+
+        let next = alice.encrypt_bytes_for(&bob_id, b"after").unwrap();
+        let actions = deliver(&mut bob, &alice_id, "m-after", next, 0);
+        assert_eq!(
+            decrypted(&actions),
+            vec![("m-after".to_string(), b"after".to_vec())]
+        );
+    }
+
+    /// The sweep saves every record it retires, and arms the next sweep.
+    ///
+    /// Mutation: drop the save in `retire_stale_handshakes`, or the `ScheduleTimer` in the
+    /// `gc_sweep` arm — this reddens.
+    #[test]
+    fn the_gc_sweep_saves_what_it_retires_and_rearms_itself() {
+        use crate::crypto::keys::MAX_UNANSWERED_HANDSHAKE_AGE_SECS;
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000));
+        let (mut alice, _) = clocked_device(clock.clone());
+        let (mut bob, bob_id) = named_device();
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+
+        clock.advance_ms(MAX_UNANSWERED_HANDSHAKE_AGE_SECS * 1000);
+        let actions = alice.handle_event(IncomingEvent::TimerFired {
+            timer_id: "gc_sweep".to_string(),
+        });
+        assert!(!alice.has_active_session(&bob_id));
+        assert!(session_save_for(&actions, &bob_id), "{actions:?}");
+        assert!(rearms_gc(&actions), "{actions:?}");
+
+        let actions = alice.handle_event(IncomingEvent::TimerFired {
+            timer_id: "gc_sweep".to_string(),
+        });
+        assert!(
+            !session_save_for(&actions, &bob_id),
+            "nothing retired, nothing saved: {actions:?}"
+        );
+        assert!(rearms_gc(&actions), "{actions:?}");
+    }
+
+    /// A copy of a read message under a new id is a duplicate by its consumed key; the id is
+    /// recorded in both ACK stores so the next copy stops at the cache.
+    ///
+    /// Mutation: `let _ =` the `mark_processed` in the router's consumed-key arm — this reddens.
+    #[test]
+    fn a_copy_under_a_new_id_of_a_read_message_records_its_ack() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+
+        let m = alice.encrypt_bytes_for(&bob_id, b"once").unwrap();
+        let first = deliver(&mut bob, &alice_id, "m-1", m.clone(), 0);
+        assert_eq!(decrypted(&first).len(), 1);
+        let again = deliver(&mut bob, &alice_id, "m-1-copy", m, 0);
+        assert!(
+            again.iter().any(
+                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "m-1-copy")
+            ),
+            "{again:?}"
+        );
+        assert!(persist_ack_for(&again, "m-1-copy"), "{again:?}");
+    }
+
+    /// A message cleared by the platform's DB check is recorded in the ACK cache, and the cache is
+    /// saved — as it is when the message never needed the check.
+    ///
+    /// Mutation: drop the state save in `handle_ack_db_result` — this reddens.
+    #[test]
+    fn a_message_cleared_by_the_db_check_saves_the_orchestrator_state() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        bob.lifecycle.ack_store.restore_cache(Vec::new()); // post-restart: misses ask the DB
+
+        let m = alice.encrypt_bytes_for(&bob_id, b"x").unwrap();
+        let held = deliver(&mut bob, &alice_id, "m-db", m, 0);
+        assert!(
+            held.iter()
+                .any(|a| matches!(a, Action::CheckAckInDb { message_id } if message_id == "m-db")),
+            "{held:?}"
+        );
+        let actions = bob.handle_event(IncomingEvent::AckDbResult {
+            message_id: "m-db".to_string(),
+            is_processed: false,
+        });
+        assert_eq!(
+            decrypted(&actions),
+            vec![("m-db".to_string(), b"x".to_vec())]
+        );
+        assert!(state_save(&actions), "{actions:?}");
+    }
+
+    /// The Kyber burn is handed over once, and only with the bytes: a take that cannot export
+    /// keeps the flag.
+    #[test]
+    #[cfg(feature = "post-quantum")]
+    fn the_kyber_burn_is_taken_once_the_bytes_exist() {
+        let (mut o, _) = named_device();
+        assert!(
+            o.take_kyber_prekeys_to_persist().is_none(),
+            "nothing burned"
+        );
+        o.kyber_prekeys_dirty = true;
+        assert!(o.take_kyber_prekeys_to_persist().is_some());
+        assert!(!o.kyber_prekeys_dirty);
+        assert!(o.take_kyber_prekeys_to_persist().is_none(), "taken once");
     }
 }
