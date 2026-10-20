@@ -1804,3 +1804,129 @@ fn the_call_log_is_cleared_at_once_and_the_change_is_told() {
     assert_eq!(changes[0].table, Table::Calls);
     assert_eq!(changes[0].ids, vec!["a", "b", "c"]);
 }
+
+// MARK: - Audit 2026-10-20 (TODO 196)
+
+fn reaction_on(target: &str, reactor: &str) -> Reaction {
+    Reaction {
+        target_message_id: target.into(),
+        reactor_user_id: reactor.into(),
+        emoji: "👍".into(),
+        timestamp_ms: 1,
+        received_at: Some(1),
+    }
+}
+
+/// Deleting a contact removes its chats and their messages by cascade; each is announced as a
+/// direct delete would be, and the reactions on those messages (held by no foreign key) go too.
+///
+/// Mutation: notify `Contacts` only — the chat list and the transcript are never told.
+#[test]
+fn deleting_a_contact_tells_its_chats_and_messages_and_drops_their_reactions() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    store
+        .insert_message(&message("m1", "c1", "k1", b"one"), None)
+        .unwrap();
+    store
+        .insert_message(&message("M2", "c1", "k2", b"two"), None)
+        .unwrap();
+    store.upsert_reaction(&reaction_on("m1", "bob")).unwrap();
+    store.upsert_reaction(&reaction_on("m2", "bob")).unwrap();
+    let changes = Arc::new(Changes::default());
+    store.set_observer(Some(changes.clone()));
+
+    assert!(store.delete_contact("peer").unwrap());
+
+    let seen = changes.changes.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            Change {
+                table: Table::Contacts,
+                ids: vec!["peer".into()]
+            },
+            Change {
+                table: Table::Chats,
+                ids: vec!["c1".into()]
+            },
+            Change {
+                table: Table::Messages,
+                ids: vec!["m1".into(), "M2".into()]
+            },
+        ]
+    );
+    assert!(store.chats().unwrap().is_empty());
+    assert!(store.reactions("m1").unwrap().is_empty());
+    assert!(
+        store.reactions("m2").unwrap().is_empty(),
+        "whichever case it was stored in"
+    );
+}
+
+/// The same for a chat and for one message.
+#[test]
+fn deleting_a_chat_or_a_message_drops_the_reactions_on_it() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    store.upsert_contact(&contact("peer2", "Eve")).unwrap();
+    store
+        .upsert_chat(&chat("c2", "peer2", Some(2), false))
+        .unwrap();
+    store
+        .insert_message(&message("m1", "c1", "k1", b""), None)
+        .unwrap();
+    store
+        .insert_message(&message("m2", "c2", "k1", b""), None)
+        .unwrap();
+    store.upsert_reaction(&reaction_on("m1", "bob")).unwrap();
+    store.upsert_reaction(&reaction_on("m2", "bob")).unwrap();
+    let changes = Arc::new(Changes::default());
+    store.set_observer(Some(changes.clone()));
+
+    store.delete_message("m1").unwrap();
+    assert!(store.reactions("m1").unwrap().is_empty());
+
+    store.delete_chat("c2").unwrap();
+    assert!(store.reactions("m2").unwrap().is_empty());
+    let seen = changes.changes.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            Change {
+                table: Table::Messages,
+                ids: vec!["m1".into()]
+            },
+            Change {
+                table: Table::Chats,
+                ids: vec!["c2".into()]
+            },
+            Change {
+                table: Table::Messages,
+                ids: vec!["m2".into()]
+            },
+        ]
+    );
+}
+
+/// A wipe that could not remove every file still removed the ones it could, and names the
+/// error; `remove_files` finishes the job.
+#[test]
+fn a_wipe_that_cannot_remove_a_file_removes_the_others_and_can_be_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.db");
+    let store = Store::open(&path, &KEY).unwrap();
+    with_chat(&store);
+    // A directory where the rollback journal would be: `remove_file` refuses it.
+    let blocker = dir.path().join("w.db-journal");
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::write(blocker.join("x"), b"x").unwrap();
+
+    assert!(store.wipe().is_err());
+    assert!(!path.exists(), "the database itself is gone");
+    assert!(blocker.exists());
+
+    std::fs::remove_dir_all(&blocker).unwrap();
+    Store::remove_files(&path).unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
