@@ -165,22 +165,32 @@ impl ServerKeyRing {
         !self.roots.is_empty()
     }
 
-    /// Admit a delegation if a pinned root signed it. A delegation already admitted is kept once.
+    /// Admit a delegation if a pinned root signed it. One already admitted — the same key,
+    /// purpose and window — is kept once. A renewal (the same key, another window) is kept beside
+    /// the first, and `verify` takes the window that holds the signature's date. Until 2026-10-20
+    /// a renewal was dropped as "already admitted", so a key expired on its first window however
+    /// many times the root extended it (TODO 197).
     pub fn admit(&mut self, encoded: &[u8]) -> Result<Kid, TrustError> {
         let delegation = Delegation::decode(encoded)?;
         verify_rooted(&delegation, &self.roots)?;
         let kid = delegation.kid();
-        if !self
-            .keys
-            .iter()
-            .any(|k| k.kid() == kid && k.purpose == delegation.purpose)
-        {
+        if !self.keys.iter().any(|k| {
+            k.kid() == kid
+                && k.purpose == delegation.purpose
+                && k.not_before == delegation.not_before
+                && k.not_after == delegation.not_after
+        }) {
             self.keys.push(delegation);
         }
         Ok(kid)
     }
 
     /// Whether the key `kid` names signed `body` for `purpose` at `signed_at`, as seen at `now`.
+    ///
+    /// The signature is checked before the window and the age: `OutsideWindow` and `Expired` are
+    /// verdicts on a signature the key made, and a caller may act on `Expired` (pin the key of a
+    /// certificate that was good when written). Until 2026-10-20 `Expired` came first, so any
+    /// bytes under the kid of a lapsed delegation were "expired", not "forged" (TODO 197).
     pub fn verify(
         &self,
         purpose: Purpose,
@@ -190,24 +200,34 @@ impl ServerKeyRing {
         signed_at: i64,
         now: i64,
     ) -> Result<(), TrustError> {
-        let mut named = self.keys.iter().filter(|k| &k.kid() == kid).peekable();
-        if named.peek().is_none() {
+        let named: Vec<&Delegation> = self.keys.iter().filter(|k| &k.kid() == kid).collect();
+        if named.is_empty() {
             return Err(TrustError::UnknownKey);
         }
-        let key = named
-            .find(|k| k.purpose == purpose)
-            .ok_or(TrustError::WrongPurpose)?;
-        if signed_at < key.not_before || signed_at > key.not_after {
+        let for_purpose: Vec<&Delegation> =
+            named.into_iter().filter(|k| k.purpose == purpose).collect();
+        let Some(key) = for_purpose.first() else {
+            return Err(TrustError::WrongPurpose);
+        };
+        // One key under the kid, whatever its windows: the kid is the key.
+        let message = server_signable(purpose, kid, body);
+        HybridSuiteProvider::verify(&key.public_key, &message, signature)
+            .map_err(|_| TrustError::BadSignature)?;
+        // The window that holds the date; the latest to close, when several do.
+        let Some(not_after) = for_purpose
+            .iter()
+            .filter(|k| signed_at >= k.not_before && signed_at <= k.not_after)
+            .map(|k| k.not_after)
+            .max()
+        else {
             return Err(TrustError::OutsideWindow);
-        }
+        };
         if let Some(grace) = purpose.grace_secs()
-            && now > key.not_after.saturating_add(grace)
+            && now > not_after.saturating_add(grace)
         {
             return Err(TrustError::Expired);
         }
-        let message = server_signable(purpose, kid, body);
-        HybridSuiteProvider::verify(&key.public_key, &message, signature)
-            .map_err(|_| TrustError::BadSignature)
+        Ok(())
     }
 }
 
@@ -411,6 +431,91 @@ mod tests {
             s.ring
                 .verify(Purpose::SenderCert, &s.kid, &body, &sig, closed, last + 1),
             Err(TrustError::Expired)
+        );
+    }
+
+    /// Any bytes under a lapsed delegation's kid are forged, not expired; the window and the age
+    /// are judged on a signature the key made.
+    ///
+    /// Mutation: move the signature check back after the window checks — the first assertion
+    /// gets `Expired` and the third `OutsideWindow`.
+    #[test]
+    fn a_bad_signature_is_a_bad_signature_whatever_the_window_says() {
+        let s = setup(Purpose::SenderCert);
+        let body = cert_body();
+        let closed = T0 + 90 * DAY;
+        let long_after = closed + 365 * DAY;
+        let garbage = vec![0u8; 64];
+        let verdict = |sig: &[u8], at: i64, now: i64| {
+            s.ring
+                .verify(Purpose::SenderCert, &s.kid, &body, sig, at, now)
+        };
+        assert_eq!(
+            verdict(&garbage, closed, long_after),
+            Err(TrustError::BadSignature)
+        );
+        assert_eq!(
+            verdict(&garbage, T0 - 1, T0 - 1),
+            Err(TrustError::BadSignature)
+        );
+        let sig = sign_as_server(Purpose::SenderCert, &s.server_sk, &s.server_pk, &body).unwrap();
+        assert_eq!(verdict(&sig, closed, long_after), Err(TrustError::Expired));
+        assert_eq!(
+            verdict(&sig, T0 - 1, T0 - 1),
+            Err(TrustError::OutsideWindow)
+        );
+    }
+
+    /// A root that extends a key's window is heard: the renewal is admitted beside the first
+    /// delegation, a signature dated in either window verifies, and the age is judged by the
+    /// window that held the date.
+    ///
+    /// Mutation: refuse a second delegation of an admitted key in `admit` — the signature dated
+    /// in the renewed window is `OutsideWindow`.
+    #[test]
+    fn a_renewed_delegation_extends_the_keys_window() {
+        let (root_sk, root_pk) = key(1);
+        let (server_sk, server_pk) = key(10);
+        let first =
+            issue_delegation(&root_sk, Purpose::SenderCert, T0, T0 + 90 * DAY, &server_pk).unwrap();
+        let renewal = issue_delegation(
+            &root_sk,
+            Purpose::SenderCert,
+            T0 + 60 * DAY,
+            T0 + 180 * DAY,
+            &server_pk,
+        )
+        .unwrap();
+        let mut ring = ServerKeyRing::new(vec![root_pk]);
+        let kid = ring.admit(&first.encode()).unwrap();
+        assert_eq!(ring.admit(&renewal.encode()).unwrap(), kid);
+        assert_eq!(
+            ring.admit(&renewal.encode()).unwrap(),
+            kid,
+            "the same one, once"
+        );
+        assert_eq!(ring.keys.len(), 2);
+
+        let body = cert_body();
+        let sig = sign_as_server(Purpose::SenderCert, &server_sk, &server_pk, &body).unwrap();
+        let verdict =
+            |at: i64, now: i64| ring.verify(Purpose::SenderCert, &kid, &body, &sig, at, now);
+        assert_eq!(verdict(T0 + 120 * DAY, T0 + 120 * DAY), Ok(()));
+        assert_eq!(
+            verdict(T0 + 181 * DAY, T0 + 181 * DAY),
+            Err(TrustError::OutsideWindow)
+        );
+        let grace = SENDER_CERT_MAX_LIFETIME_SECS + MAX_DELIVERY_AGE_SECS;
+        let past_first = T0 + 90 * DAY + grace + 1;
+        assert_eq!(
+            verdict(T0 + 30 * DAY, past_first),
+            Err(TrustError::Expired),
+            "dated in the first window only: that window's close counts"
+        );
+        assert_eq!(
+            verdict(T0 + 70 * DAY, past_first),
+            Ok(()),
+            "dated in both: the later close counts"
         );
     }
 
