@@ -69,7 +69,7 @@ construct-core/
 │   ├── group/                     # MLS (RFC 9420) group state store
 │   ├── cfe/                       # CFE binary envelopes + record types
 │   ├── wire_payload.rs, intake.rs # message wire format and intake
-│   ├── traffic_protection/        # padding, cover-traffic and timing helpers
+│   ├── traffic_protection/        # padding and send-delay timing (cover traffic retired in 0.55.0)
 │   ├── uniffi_bindings.rs         # UniFFI FFI surface (iOS/macOS/Android)
 │   ├── construct_core.udl         # UniFFI interface definition
 │   ├── pow.rs                     # Argon2id proof-of-work

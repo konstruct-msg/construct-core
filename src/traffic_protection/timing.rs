@@ -15,34 +15,13 @@
 //! use construct_core::traffic_protection::timing::*;
 //! use std::time::Duration;
 //!
-//! // Add jitter to heartbeat
-//! let heartbeat = jittered_interval(30_000, 5_000); // 30s + 0..5s (jitter is only ever added)
-//!
 //! // Delay message sending (prevents timing correlation)
 //! let delay = random_send_delay(100); // 0-100ms
 //! // ... sleep(delay) then send ...
-//!
-//! // Battery-aware jitter
-//! let battery_level = 0.3; // 30%
-//! let jitter = battery_aware_jitter(1000, 500, battery_level); // Reduced jitter
 //! ```
 
 use rand::Rng;
 use std::time::Duration;
-
-/// Generate a jittered interval
-///
-/// # Arguments
-/// * `base_ms` - Base interval in milliseconds
-/// * `jitter_ms` - Maximum random jitter to add
-///
-/// # Returns
-/// Duration with random jitter added — `base_ms + [0, jitter_ms]`, never below `base_ms`.
-/// Saturates at `u64::MAX` ms instead of overflowing.
-pub fn jittered_interval(base_ms: u64, jitter_ms: u64) -> Duration {
-    let jitter = rand::thread_rng().gen_range(0..=jitter_ms);
-    Duration::from_millis(base_ms.saturating_add(jitter))
-}
 
 /// Generate a random delay before sending a message
 ///
@@ -57,35 +36,6 @@ pub fn jittered_interval(base_ms: u64, jitter_ms: u64) -> Duration {
 pub fn random_send_delay(max_delay_ms: u64) -> Duration {
     let delay = rand::thread_rng().gen_range(0..=max_delay_ms);
     Duration::from_millis(delay)
-}
-
-/// Battery-aware jittered interval
-///
-/// Reduces jitter when battery is low to save energy (fewer random number generations,
-/// less variance in timers).
-///
-/// # Arguments
-/// * `base_ms` - Base interval in milliseconds
-/// * `max_jitter_ms` - Maximum jitter when battery is full
-/// * `battery_level` - Current battery level (0.0-1.0)
-///
-/// # Returns
-/// Duration with battery-scaled jitter added
-///
-/// # Energy Optimization
-/// When battery is low (<20%), jitter is reduced by 50% to minimize CPU wake-up variance.
-pub fn battery_aware_jitter(base_ms: u64, max_jitter_ms: u64, battery_level: f32) -> Duration {
-    // Scale jitter based on battery level
-    let jitter_scale = if battery_level < 0.2 {
-        0.5 // Reduce jitter by 50% when battery low
-    } else if battery_level < 0.5 {
-        0.75 // Reduce by 25% when battery medium
-    } else {
-        1.0 // Full jitter when battery high
-    };
-
-    let effective_jitter_ms = (max_jitter_ms as f32 * jitter_scale) as u64;
-    jittered_interval(base_ms, effective_jitter_ms)
 }
 
 /// Calculate recommended send delay based on message priority and battery
@@ -119,15 +69,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_jittered_interval_range() {
-        for _ in 0..100 {
-            let duration = jittered_interval(1000, 500);
-            let ms = duration.as_millis() as u64;
-            assert!((1000..=1500).contains(&ms));
-        }
-    }
-
-    #[test]
     fn test_random_delay_range() {
         for _ in 0..100 {
             let delay = random_send_delay(100);
@@ -136,33 +77,9 @@ mod tests {
     }
 
     #[test]
-    fn test_battery_aware_jitter_full_battery() {
-        // Full battery should have full jitter
-        let duration = battery_aware_jitter(1000, 500, 1.0);
-        let ms = duration.as_millis() as u64;
-        assert!((1000..=1500).contains(&ms));
-    }
-
-    #[test]
-    fn test_battery_aware_jitter_low_battery() {
-        // Low battery should have reduced jitter (50%)
-        for _ in 0..20 {
-            let duration = battery_aware_jitter(1000, 500, 0.1);
-            let ms = duration.as_millis() as u64;
-            // 50% of 500ms = 250ms, so range is 1000-1250
-            assert!((1000..=1250).contains(&ms));
-        }
-    }
-
-    #[test]
-    fn test_battery_aware_jitter_medium_battery() {
-        // Medium battery should have 75% jitter
-        for _ in 0..20 {
-            let duration = battery_aware_jitter(1000, 400, 0.4);
-            let ms = duration.as_millis() as u64;
-            // 75% of 400ms = 300ms, so range is 1000-1300
-            assert!((1000..=1300).contains(&ms));
-        }
+    fn a_send_delay_near_the_top_of_u64_does_not_overflow() {
+        let delay = random_send_delay(u64::MAX);
+        assert!(delay.as_millis() <= u64::MAX as u128);
     }
 
     #[test]
@@ -184,11 +101,5 @@ mod tests {
         // Normal case should have moderate delay
         let delay = recommended_send_delay(false, 0.8);
         assert!(delay.as_millis() <= 100);
-    }
-
-    #[test]
-    fn a_jittered_interval_near_the_top_of_u64_saturates_instead_of_overflowing() {
-        let duration = jittered_interval(u64::MAX - 1, 10);
-        assert_eq!(duration, Duration::from_millis(u64::MAX));
     }
 }

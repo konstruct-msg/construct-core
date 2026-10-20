@@ -1,28 +1,18 @@
-//! Traffic Protection module
+//! Traffic protection: what is left of it.
 //!
-//! Implements countermeasures against traffic analysis:
-//! - Message padding (hide message length)
-//! - Cover traffic (hide communication patterns)
-//! - Timing jitter (hide timing patterns)
+//! - `padding`: every ratchet plaintext is padded to 255-byte blocks before encryption, so the
+//!   ciphertext length hides the message length within a block.
+//! - `timing`: a small random delay before a send, so composing and sending do not correlate
+//!   to the millisecond.
 //!
-//! ## Energy Efficiency
-//!
-//! This module is designed with mobile battery life as a priority:
-//! - Padding: Zero overhead (only during encryption/decryption)
-//! - Cover traffic: Battery-aware with adaptive intervals
-//! - Timing jitter: Minimal CPU wake-ups
+//! Cover traffic (`cover_traffic`, `TrafficProtectionManager` over UniFFI) was retired in
+//! 0.55.0: dummies cost network and battery, and no client ever sent one — iOS generated and
+//! discarded them for want of a transport. `construct-docs/decisions/cover-traffic-retired.md`.
 
-pub mod cover_traffic;
 pub mod padding;
 pub mod timing;
 
-// Re-exports
-pub use cover_traffic::{
-    CoverTrafficConfig, CoverTrafficManager, EnergyMetrics, generate_dummy_message,
-};
 pub use padding::{
     DEFAULT_BLOCK_SIZE, PaddingError, pad_message, pad_message_default, unpad_message,
 };
-pub use timing::{
-    battery_aware_jitter, jittered_interval, random_send_delay, recommended_send_delay,
-};
+pub use timing::{random_send_delay, recommended_send_delay};
