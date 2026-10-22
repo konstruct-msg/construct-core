@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.56.0"
+version = "0.57.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -31,12 +31,12 @@ default = []
 # the build command (iOS release and Android CI passed it; CI's iOS/mac checks and the UniFFI
 # test run did not, so the configuration that ships was not the one tested). `lib.rs` has a
 # `compile_error!` for a platform feature without it, should this list ever lose it.
-ios = ["uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
-# mac = same capabilities as ios — UniFFI Swift bindings + construct-veil TLS proxy
+ios = ["uniffi", "dep:construct-store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+# mac = same capabilities as ios — UniFFI Swift bindings + construct-veil (veil-front)
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["uniffi", "dep:construct-store", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+mac = ["uniffi", "dep:construct-store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # android = UniFFI JNI bindings (Kotlin) + construct-veil transport
-android = ["uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "construct-veil?/tls", "construct-veil?/utls", "construct-veil?/webtunnel", "construct-veil?/coordinator", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+android = ["uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # ML-KEM and ML-DSA are unconditional since 0.56.0 (TODO 203): every build opens PQXDH v2 and
 # suite-4 sessions, and there is no classical-only core to build. The feature stays as an empty
 # alias for one release so `--features post-quantum` in scripts and docs keeps working.
@@ -95,7 +95,8 @@ openmls_basic_credential = { version = "0.5", optional = true }
 # from the build. Resolver 2 keeps build-dependency features out of normal dependencies.
 uniffi = { version = "0.30", optional = true }
 
-# Traffic obfuscation — VEIL (obfs4 + WebTunnel pluggable transports)
+# Traffic obfuscation — VEIL (veil-front). Its `ffi` feature brings the coordinator and the
+# uTLS profiles; obfs4 and WebTunnel were removed from construct-veil on 2026-10-22.
 #
 # Pinned by commit, not `path = "../construct-veil"`. A path dependency made every build —
 # default features included, since cargo reads optional manifests to resolve — fail without a
@@ -109,7 +110,7 @@ uniffi = { version = "0.30", optional = true }
 construct-store = { path = "store", optional = true }
 # The bytes of a server signature, shared with construct-server and the root tool.
 construct-server-trust = { path = "server-trust" }
-construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "c3330a45927fbe39c4661d0cfa45aecfff984eb8", features = ["ffi"], optional = true }
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "d864bb54f29a75618af0c914c0a8e47ad6c014c5", features = ["ffi"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
