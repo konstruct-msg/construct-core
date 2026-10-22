@@ -18,8 +18,8 @@
 - **Benchmarks**: `cargo bench --bench crypto_bench`
 - **Walkthrough**: `cargo run --example two_devices` — two devices and a
   toy server in one process; prints every event the app feeds the core and every action the
-  core returns, from registration to the fourth message. Read `examples/two_devices.rs` first
-  when learning how the core is driven.
+  core returns: registration, the first messages, a restart from the Keychain, redelivered and
+  late messages. Read `examples/two_devices.rs` first when learning how the core is driven.
 - **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
 
 ### Feature Flags
