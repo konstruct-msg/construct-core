@@ -76,6 +76,17 @@ ignore = [
     # Tracking: decisions/cargo-audit-not-compiled-advisories.md
     "RUSTSEC-2026-0212",
 
+    # RUSTSEC-2026-0330 / RUSTSEC-2026-0331: libcrux-kem 0.0.7 — panics on a short
+    # hybrid key or seed. NOT COMPILED, same reason as RUSTSEC-2026-0124: the only
+    # edge is hpke-rs-libcrux 0.6.1, the libcrux HPKE backend openmls_rust_crypto
+    # does not enable.
+    # Verified 2026-10-22: `cargo tree -i libcrux-kem --all-features --target all`
+    #   → "nothing to print".
+    # REMOVE THESE IGNORES together with RUSTSEC-2026-0124 (same upstream trigger).
+    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+
     # RUSTSEC-2023-0071: rsa 0.9.10 — Marvin timing sidechannel (MEDIUM, no fixed
     # upgrade available). NOT COMPILED into our library: it arrives only via
     # sqlx-mysql, an optional sqlx driver. construct-veil enables sqlx with the
