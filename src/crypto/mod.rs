@@ -122,6 +122,9 @@ pub mod sealed_sender;
 /// Per-message tag naming which device a copy is for, readable only by the two devices
 pub mod device_copy_tag;
 
+/// Devices of one account vouch for each other: certificate, link evidence, verdicts
+pub mod device_certificate;
+
 /// Server keys rooted offline: delegations from a pinned hybrid root, labelled server signatures
 pub mod server_trust;
 

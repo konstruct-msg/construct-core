@@ -2004,6 +2004,67 @@ impl Orchestrator {
             .map_err(|e| e.to_string())
     }
 
+    /// Vouch for a device being linked to this account (`crypto::device_certificate`). Refused
+    /// unless `evidence` — what the link QR carried — names exactly these keys.
+    pub fn issue_device_certificate(
+        &self,
+        subject: &crate::crypto::device_certificate::DeviceKeys<'_>,
+        evidence: &crate::crypto::device_certificate::LinkEvidence<'_>,
+    ) -> Result<Vec<u8>, crate::crypto::device_certificate::CertError> {
+        use crate::crypto::device_certificate::{CertError, issue};
+        let km = self.lifecycle.client.key_manager();
+        let identity = km
+            .identity_public_key()
+            .map_err(|_| CertError::SigningFailed)?;
+        let hybrid = km
+            .hybrid_signature_public_key()
+            .ok_or(CertError::SigningFailed)?;
+        issue(
+            identity,
+            &hybrid,
+            subject,
+            evidence,
+            self.lifecycle.now_secs(),
+            |message| km.sign_hybrid(message).ok(),
+        )
+    }
+
+    /// Flow A, on the new device: the answer to the secret in the old device's QR, over this
+    /// device's own keys.
+    pub fn device_link_key_proof(
+        &self,
+        secret: &[u8],
+    ) -> Result<[u8; 32], crate::crypto::device_certificate::CertError> {
+        use crate::crypto::device_certificate::{CertError, link_key_proof};
+        let km = self.lifecycle.client.key_manager();
+        let identity = km
+            .identity_public_key()
+            .map_err(|_| CertError::KeysMalformed)?;
+        let hybrid = km
+            .hybrid_signature_public_key()
+            .ok_or(CertError::KeysMalformed)?;
+        link_key_proof(secret, identity, &hybrid)
+    }
+
+    /// Verdicts for the devices the server lists for one account, given the ids of the devices
+    /// of that account the platform already trusts. Each trusted device is held to the hybrid key
+    /// this core pinned for it, when a session to it was ever opened.
+    pub fn judge_peer_devices(
+        &self,
+        trusted_device_ids: &[String],
+        offered: &[crate::crypto::device_certificate::OfferedDevice<'_>],
+    ) -> Vec<crate::crypto::device_certificate::DeviceVerdict> {
+        use crate::crypto::device_certificate::{TrustedDevice, judge};
+        let trusted: Vec<TrustedDevice> = trusted_device_ids
+            .iter()
+            .map(|id| TrustedDevice {
+                device_id: id.clone(),
+                hybrid_pin: self.lifecycle.pinned_hybrid_identity(id).copied(),
+            })
+            .collect();
+        judge(&trusted, offered)
+    }
+
     /// Build the canonical X3DH prekey signature message (used for both
     /// classic Ed25519 and hybrid ML-DSA signatures).
     pub fn build_x3dh_sign_message(suite_id: u8, public_key: &[u8]) -> Vec<u8> {
