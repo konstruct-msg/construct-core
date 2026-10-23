@@ -884,6 +884,21 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     bytes sign_hybrid(bytes message);
 
+    // ── Device certificates (decisions/devices-of-an-account-sign-each-other.md) ──
+    /// Vouch for a device being linked to this account. Refused (`EvidenceMismatch`) unless the
+    /// evidence from the link QR names exactly these keys: keys the server alone vouches for are
+    /// never signed.
+    [Throws=DeviceCertError]
+    bytes issue_device_certificate(DeviceCertKeys subject, DeviceLinkEvidence evidence);
+
+    /// Flow A, on the new device: the answer to the secret in the old device's QR.
+    [Throws=DeviceCertError]
+    bytes device_link_key_proof(bytes secret);
+
+    /// One verdict per offered device, in order. `trusted_device_ids`: the devices of the same
+    /// account this client already trusts; `offered`: what the server lists for it now.
+    sequence<PeerDeviceVerdict> judge_peer_devices(sequence<string> trusted_device_ids, sequence<OfferedPeerDevice> offered);
+
     // ── Operations with this device's own keys ───────────────────────────────
     // The platform asks for the operation, never for the key. Each replaced a platform reading
     // the secret out (`get_signing_key_bytes`, `get_identity_key_bytes`, a Keychain copy) and
@@ -1279,6 +1294,59 @@ namespace construct_core {
     string history_discovery_tag(string user_id_dashed, string device_id_hex);
     string history_discovery_instance_name(string tag);
     bytes history_qr_fingerprint(bytes identity_public, bytes hybrid_public);
+    /// Flow A: the 32-byte secret for the old device's link QR. Never sent to the server.
+    bytes new_device_link_secret();
+};
+
+// ── Device certificates ──────────────────────────────────────────────────────
+
+/// A device's public keys as its bundle presents them; `hybrid_binding` is the Ed25519 signature
+/// binding `hybrid_public` to `verifying_key`.
+dictionary DeviceCertKeys {
+    bytes identity_public;
+    bytes verifying_key;
+    bytes hybrid_public;
+    bytes hybrid_binding;
+};
+
+/// What the link QR showed about the new device.
+[Enum]
+interface DeviceLinkEvidence {
+    /// Flow B: the new device's QR carried `history_qr_fingerprint(identity, hybrid)`.
+    QrFingerprint(bytes fingerprint);
+    /// Flow A: our QR carried `secret`; the new device answered with `proof`.
+    QrSecret(bytes secret, bytes proof);
+};
+
+dictionary OfferedPeerDevice {
+    string device_id;
+    DeviceCertKeys keys;
+    bytes? certificate;
+};
+
+[Enum]
+interface PeerDeviceVerdict {
+    /// Already trusted, same hybrid key.
+    Pinned();
+    /// Nothing of this account was trusted yet: trusted on first use.
+    FirstOfAccount();
+    /// Signed by a trusted device of the account, directly or through a chain.
+    Vouched(string by);
+    /// Signed by no trusted device: the alarm.
+    Unvouched();
+    /// Trusted before, now another hybrid key under the same id.
+    KeyChanged();
+    /// The bundle does not hold together.
+    Invalid();
+};
+
+[Error]
+enum DeviceCertError {
+    "KeysMalformed",
+    "BindingInvalid",
+    "EvidenceMismatch",
+    "SignerIsSubject",
+    "SigningFailed",
 };
 
 // ── ConstructPrivacyPass ──────────────────────────────────────────────────────

@@ -1274,6 +1274,97 @@ pub fn history_qr_fingerprint(identity_public: Vec<u8>, hybrid_public: Vec<u8>) 
 }
 
 // ============================================================================
+// Device certificates — construct-docs/decisions/devices-of-an-account-sign-each-other.md
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DeviceCertError {
+    #[error("keys_malformed")]
+    KeysMalformed,
+    #[error("binding_invalid")]
+    BindingInvalid,
+    #[error("evidence_mismatch")]
+    EvidenceMismatch,
+    #[error("signer_is_subject")]
+    SignerIsSubject,
+    #[error("signing_failed")]
+    SigningFailed,
+}
+
+impl From<crate::crypto::device_certificate::CertError> for DeviceCertError {
+    fn from(e: crate::crypto::device_certificate::CertError) -> Self {
+        use crate::crypto::device_certificate::CertError as E;
+        match e {
+            E::KeysMalformed => Self::KeysMalformed,
+            E::BindingInvalid => Self::BindingInvalid,
+            E::EvidenceMismatch => Self::EvidenceMismatch,
+            E::SignerIsSubject => Self::SignerIsSubject,
+            E::SigningFailed => Self::SigningFailed,
+        }
+    }
+}
+
+/// A device's public keys as its bundle presents them.
+pub struct DeviceCertKeys {
+    pub identity_public: Vec<u8>,
+    pub verifying_key: Vec<u8>,
+    pub hybrid_public: Vec<u8>,
+    pub hybrid_binding: Vec<u8>,
+}
+
+impl DeviceCertKeys {
+    fn view(&self) -> crate::crypto::device_certificate::DeviceKeys<'_> {
+        crate::crypto::device_certificate::DeviceKeys {
+            identity_public: &self.identity_public,
+            verifying_key: &self.verifying_key,
+            hybrid_public: &self.hybrid_public,
+            hybrid_binding: &self.hybrid_binding,
+        }
+    }
+}
+
+pub enum DeviceLinkEvidence {
+    QrFingerprint { fingerprint: Vec<u8> },
+    QrSecret { secret: Vec<u8>, proof: Vec<u8> },
+}
+
+pub struct OfferedPeerDevice {
+    pub device_id: String,
+    pub keys: DeviceCertKeys,
+    pub certificate: Option<Vec<u8>>,
+}
+
+pub enum PeerDeviceVerdict {
+    Pinned,
+    FirstOfAccount,
+    Vouched { by: String },
+    Unvouched,
+    KeyChanged,
+    Invalid,
+}
+
+impl From<crate::crypto::device_certificate::DeviceVerdict> for PeerDeviceVerdict {
+    fn from(v: crate::crypto::device_certificate::DeviceVerdict) -> Self {
+        use crate::crypto::device_certificate::DeviceVerdict as V;
+        match v {
+            V::Pinned => Self::Pinned,
+            V::FirstOfAccount => Self::FirstOfAccount,
+            V::Vouched { by } => Self::Vouched { by },
+            V::Unvouched => Self::Unvouched,
+            V::KeyChanged => Self::KeyChanged,
+            V::Invalid => Self::Invalid,
+        }
+    }
+}
+
+/// Flow A: the secret the old device puts in its link QR. Never sent to the server.
+pub fn new_device_link_secret() -> Vec<u8> {
+    let mut secret = vec![0u8; crate::crypto::device_certificate::LINK_SECRET_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    secret
+}
+
+// ============================================================================
 // MLS Group Chat (RFC 9420) — device-level MlsStore
 // ============================================================================
 
@@ -2161,6 +2252,51 @@ impl OrchestratorCore {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.sign_hybrid(&message)
             .map_err(|_| CryptoError::InitializationFailed)
+    }
+
+    // ── Device certificates ──────────────────────────────────────────────────
+
+    pub fn issue_device_certificate(
+        &self,
+        subject: DeviceCertKeys,
+        evidence: DeviceLinkEvidence,
+    ) -> Result<Vec<u8>, DeviceCertError> {
+        use crate::crypto::device_certificate::LinkEvidence;
+        let evidence = match &evidence {
+            DeviceLinkEvidence::QrFingerprint { fingerprint } => {
+                LinkEvidence::QrFingerprint(fingerprint)
+            }
+            DeviceLinkEvidence::QrSecret { secret, proof } => {
+                LinkEvidence::QrSecret { secret, proof }
+            }
+        };
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(orch.issue_device_certificate(&subject.view(), &evidence)?)
+    }
+
+    pub fn device_link_key_proof(&self, secret: Vec<u8>) -> Result<Vec<u8>, DeviceCertError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(orch.device_link_key_proof(&secret)?.to_vec())
+    }
+
+    pub fn judge_peer_devices(
+        &self,
+        trusted_device_ids: Vec<String>,
+        offered: Vec<OfferedPeerDevice>,
+    ) -> Vec<PeerDeviceVerdict> {
+        let views: Vec<crate::crypto::device_certificate::OfferedDevice<'_>> = offered
+            .iter()
+            .map(|d| crate::crypto::device_certificate::OfferedDevice {
+                device_id: &d.device_id,
+                keys: d.keys.view(),
+                certificate: d.certificate.as_deref(),
+            })
+            .collect();
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.judge_peer_devices(&trusted_device_ids, &views)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     // ── Operations with this device's own keys (the secrets stay here) ────────
