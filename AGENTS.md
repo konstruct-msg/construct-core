@@ -25,6 +25,7 @@
 ### Feature Flags
 - `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
 - `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
+- `store`: `construct-store` and the history projection (`history::project`) without UniFFI, for a Rust client with its own store (construct-client). The three platform features include it.
 - `post-quantum`: an empty alias since 0.56.0 (TODO 203), kept one release so old commands still run. ML-KEM-1024/768 and ML-DSA are unconditional: there is no classical-only core, and nothing to forget in a build command.
 
 ## Development Conventions
