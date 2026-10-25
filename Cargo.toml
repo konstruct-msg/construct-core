@@ -31,16 +31,20 @@ default = []
 # the build command (iOS release and Android CI passed it; CI's iOS/mac checks and the UniFFI
 # test run did not, so the configuration that ships was not the one tested). `lib.rs` has a
 # `compile_error!` for a platform feature without it, should this list ever lose it.
-ios = ["uniffi", "dep:construct-store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+ios = ["uniffi", "store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # mac = same capabilities as ios — UniFFI Swift bindings + construct-veil (veil-front)
 # Used when building libconstruct_core_mac.a for native macOS target
-mac = ["uniffi", "dep:construct-store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+mac = ["uniffi", "store", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # android = UniFFI JNI bindings (Kotlin) + construct-veil transport
-android = ["uniffi", "dep:construct-store", "construct-store?/vendored-openssl", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
+android = ["uniffi", "store", "construct-store?/vendored-openssl", "dep:construct-veil", "dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_basic_credential"]
 # ML-KEM and ML-DSA are unconditional since 0.56.0 (TODO 203): every build opens PQXDH v2 and
 # suite-4 sessions, and there is no classical-only core to build. The feature stays as an empty
 # alias for one release so `--features post-quantum` in scripts and docs keeps working.
 post-quantum = []
+# store = the history projection (records ↔ construct-store rows) without UniFFI: what a Rust
+# client that keeps its own construct-store (the desktop's construct-client) imports and exports
+# through. The platform features include it.
+store = ["dep:construct-store"]
 
 [dependencies]
 # Сериализация
