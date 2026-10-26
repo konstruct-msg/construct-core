@@ -17,10 +17,16 @@
 //! We use `m/44'/0'/0'/0'/0'` and the server must match this convention.
 
 use bip39::Mnemonic;
+use construct_server_trust::recovery as trust;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
+use zeroize::Zeroize;
 
+use crate::crypto::SecretBytes;
+use crate::crypto::provider::CryptoProvider;
+use crate::crypto::suites::hybrid::{HybridSuiteProvider, hybrid_signature_keypair_from_seeds};
 use crate::utils::error::{ConstructError, Result};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -121,6 +127,92 @@ pub fn verify_recovery_signature(
     };
     let sig = Signature::from_bytes(signature);
     verifying_key.verify(message.as_bytes(), &sig).is_ok()
+}
+
+// ── Hybrid recovery key (Ed25519 + ML-DSA-65) ────────────────────────────────
+
+/// HKDF salt of the ML-DSA-65 half's seed. A label of its own, so the seed shares nothing with the
+/// SLIP-0010 tree the Ed25519 half comes from.
+const MLDSA_SEED_LABEL: &[u8] = b"konstruct/v1/recovery/ml-dsa-65";
+
+/// A recovery key's public half and its signature over one recovery message.
+#[derive(Debug, Clone)]
+pub struct RecoverySigned {
+    /// Hybrid public key: Ed25519 (32) ‖ ML-DSA-65 (1952).
+    pub public_key: Vec<u8>,
+    /// Hybrid signature: Ed25519 (64) ‖ ML-DSA-65 (3309).
+    pub signature: Vec<u8>,
+}
+
+/// The hybrid recovery key a mnemonic determines: `(private, public)`, in the formats of
+/// `hybrid_signature_keypair_from_seeds`.
+///
+/// The Ed25519 half is `derive_recovery_keypair`'s key, unchanged — every phrase already written
+/// down keeps its key, and the account keeps the address that key names. The ML-DSA-65 seed is
+/// HKDF-SHA256 of the BIP39 seed under `MLDSA_SEED_LABEL`: symmetric all the way from the phrase,
+/// so a quantum adversary who holds the public key learns nothing more about either half.
+pub fn derive_hybrid_recovery_key(mnemonic: &str) -> Result<(SecretBytes, Vec<u8>)> {
+    let mut seed = mnemonic_to_seed(mnemonic)?;
+    let ed25519 = derive_recovery_keypair(&seed)?;
+    let mut mldsa_seed = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(MLDSA_SEED_LABEL), &seed)
+        .expand(&[], &mut mldsa_seed)
+        .expect("32 bytes is a valid HKDF-SHA256 length");
+    seed.zeroize();
+    let pair = hybrid_signature_keypair_from_seeds(&ed25519.private_key, &mldsa_seed);
+    mldsa_seed.zeroize();
+    Ok(pair)
+}
+
+/// The hybrid recovery public key a mnemonic determines.
+pub fn recovery_public_key(mnemonic: &str) -> Result<Vec<u8>> {
+    Ok(derive_hybrid_recovery_key(mnemonic)?.1)
+}
+
+/// The mnemonic's recovery key signing its setup on `account_id` — or the upgrade of the Ed25519
+/// key already set there, which is the same message (`construct_server_trust::recovery`).
+pub fn sign_recovery_setup(
+    mnemonic: &str,
+    account_id: &str,
+    timestamp: i64,
+) -> Result<RecoverySigned> {
+    let (private_key, public_key) = derive_hybrid_recovery_key(mnemonic)?;
+    let message = trust::setup_signable(account_id, timestamp, &public_key)
+        .map_err(|_| ConstructError::InvalidInput("recovery setup does not fit".into()))?;
+    sign_hybrid(private_key, public_key, &message)
+}
+
+/// The mnemonic's recovery key handing its account to the device these keys name.
+pub fn sign_recovery_claim(
+    mnemonic: &str,
+    timestamp: i64,
+    device_id: &str,
+    verifying_key: &[u8],
+    identity_public: &[u8],
+) -> Result<RecoverySigned> {
+    let (private_key, public_key) = derive_hybrid_recovery_key(mnemonic)?;
+    let message = trust::claim_signable(
+        &public_key,
+        timestamp,
+        device_id,
+        verifying_key,
+        identity_public,
+    )
+    .map_err(|_| ConstructError::InvalidInput("recovery claim does not fit".into()))?;
+    sign_hybrid(private_key, public_key, &message)
+}
+
+fn sign_hybrid(
+    private_key: SecretBytes,
+    public_key: Vec<u8>,
+    message: &[u8],
+) -> Result<RecoverySigned> {
+    let signature = HybridSuiteProvider::sign(&private_key, message)
+        .map_err(|e| ConstructError::InternalError(format!("recovery signature: {e}")))?;
+    Ok(RecoverySigned {
+        public_key,
+        signature,
+    })
 }
 
 /// Compute a Safety Number for two Construct devices, or `None` when either id cannot be read.
@@ -256,6 +348,114 @@ mod tests {
     use super::*;
 
     const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// The phrase's Ed25519 recovery key and its ML-DSA-65 seed, computed outside this crate
+    /// (Python: `hashlib.pbkdf2_hmac`, SLIP-0010 by hand, HKDF-SHA256 by hand, `cryptography`'s
+    /// Ed25519). The Ed25519 key is an account's address, so a phrase whose key moved would find
+    /// no account.
+    const TEST_ED25519_PRIVATE: &str =
+        "348de60391d98089828e3ceb3828991313a3a3e3220147e803fd3d4785640f45";
+    const TEST_ED25519_PUBLIC: &str =
+        "7c2e79f3a1701fb2a86a2c24a3fdf8634b7aad80886c0c0a526d44d23fe8e19a";
+    const TEST_MLDSA_SEED: &str =
+        "893c99ed51fbc470fd51abe1d8227be12918c619b8f49dc7a3539249a339cf24";
+    /// SHA-256 of the ML-DSA-65 public key FIPS 204 derives from `TEST_MLDSA_SEED`, taken from this
+    /// crate: a regression pin, not an independent vector.
+    const TEST_MLDSA_PUBLIC_SHA256: &str =
+        "21b05aea41785ddbdbcf9cb6c58744bc1cdc04559c674d053ee37b99a532f51d";
+
+    fn signed_verifies(signed: &RecoverySigned, message: &[u8]) -> bool {
+        HybridSuiteProvider::verify(&signed.public_key, message, &signed.signature).is_ok()
+    }
+
+    #[test]
+    fn the_ed25519_recovery_key_is_the_one_phrases_have_always_had() {
+        let seed = mnemonic_to_seed(TEST_PHRASE).unwrap();
+        let kp = derive_recovery_keypair(&seed).unwrap();
+        assert_eq!(hex::encode(kp.private_key), TEST_ED25519_PRIVATE);
+        assert_eq!(hex::encode(kp.public_key), TEST_ED25519_PUBLIC);
+    }
+
+    /// The hybrid key's Ed25519 half is the legacy key, and its ML-DSA half comes from the
+    /// labelled HKDF of the BIP39 seed.
+    #[test]
+    fn the_hybrid_recovery_key_keeps_the_ed25519_key_and_adds_ml_dsa() {
+        let (private, public) = derive_hybrid_recovery_key(TEST_PHRASE).unwrap();
+        assert_eq!(hex::encode(&private.expose()[..32]), TEST_ED25519_PRIVATE);
+        assert_eq!(hex::encode(&private.expose()[32..64]), TEST_MLDSA_SEED);
+        assert_eq!(hex::encode(&public[..32]), TEST_ED25519_PUBLIC);
+        assert_eq!(public.len(), 32 + 1952);
+        assert_eq!(
+            hex::encode(Sha256::digest(&public[32..])),
+            TEST_MLDSA_PUBLIC_SHA256
+        );
+        assert_eq!(recovery_public_key(TEST_PHRASE).unwrap(), public);
+    }
+
+    #[test]
+    fn another_phrase_has_another_ml_dsa_half() {
+        let other = generate_mnemonic(12).unwrap();
+        let a = recovery_public_key(TEST_PHRASE).unwrap();
+        let b = recovery_public_key(&other).unwrap();
+        assert_ne!(a[32..], b[32..]);
+    }
+
+    /// A setup signature verifies as a hybrid one; its Ed25519 half alone verifies under the
+    /// legacy key — what lets a server upgrade an account from the key it already holds.
+    #[test]
+    fn a_setup_is_signed_by_both_halves_and_the_ed25519_one_is_the_stored_key() {
+        let signed = sign_recovery_setup(TEST_PHRASE, "acct", 1_800_000_000).unwrap();
+        let message = trust::setup_signable("acct", 1_800_000_000, &signed.public_key).unwrap();
+        assert!(signed_verifies(&signed, &message));
+        assert_eq!(signed.signature.len(), 64 + 3309);
+
+        let legacy: [u8; 32] = hex::decode(TEST_ED25519_PUBLIC)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let ed_sig: [u8; 64] = signed.signature[..64].try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&legacy).unwrap();
+        assert!(vk.verify(&message, &Signature::from_bytes(&ed_sig)).is_ok());
+
+        let other = trust::setup_signable("other", 1_800_000_000, &signed.public_key).unwrap();
+        assert!(
+            !signed_verifies(&signed, &other),
+            "a setup for one account is not one for another"
+        );
+    }
+
+    /// A claim names the device it hands the account to: the same signature over another device's
+    /// keys does not verify.
+    #[test]
+    fn a_claim_is_for_the_device_it_names() {
+        let signed =
+            sign_recovery_claim(TEST_PHRASE, 1_800_000_000, "dev", &[1; 32], &[2; 32]).unwrap();
+        let claim = |vk: &[u8], ik: &[u8], ts: i64| {
+            trust::claim_signable(&signed.public_key, ts, "dev", vk, ik).unwrap()
+        };
+        assert!(signed_verifies(
+            &signed,
+            &claim(&[1; 32], &[2; 32], 1_800_000_000)
+        ));
+        assert!(!signed_verifies(
+            &signed,
+            &claim(&[9; 32], &[2; 32], 1_800_000_000)
+        ));
+        assert!(!signed_verifies(
+            &signed,
+            &claim(&[1; 32], &[9; 32], 1_800_000_000)
+        ));
+        assert!(!signed_verifies(
+            &signed,
+            &claim(&[1; 32], &[2; 32], 1_800_000_001)
+        ));
+    }
+
+    #[test]
+    fn an_invalid_phrase_signs_nothing() {
+        assert!(sign_recovery_setup("not a phrase", "acct", 1).is_err());
+        assert!(sign_recovery_claim("not a phrase", 1, "dev", &[], &[]).is_err());
+    }
 
     #[test]
     fn test_generate_12_words() {

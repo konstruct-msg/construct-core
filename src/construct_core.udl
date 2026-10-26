@@ -473,6 +473,13 @@ dictionary RecoveryKeypair {
     bytes public_key;
 };
 
+/// A hybrid recovery key's public half (Ed25519 ‖ ML-DSA-65, 1984 bytes) and its signature over
+/// one recovery message (3373 bytes). The bytes signed are `construct_server_trust::recovery`'s.
+dictionary RecoverySigned {
+    bytes public_key;
+    bytes signature;
+};
+
 // ── Post-Quantum Cryptography (ML-KEM) ───────────────────────────────────────
 
 /// Result of an ML-KEM-1024 encapsulation (history transfer to a peer's Kyber SPK).
@@ -552,6 +559,23 @@ namespace construct_core {
     bytes sign_recovery_challenge(bytes private_key, string message);
 
     boolean verify_recovery_signature(bytes public_key, string message, bytes signature);
+
+    // ── Hybrid recovery key (Ed25519 + ML-DSA-65), 0.59.0 ────────────────────
+    // The Ed25519 half is `derive_recovery_keypair`'s key, unchanged; none of these hands the
+    // private key out (todo 222 in construct-docs).
+
+    /// The hybrid recovery public key the mnemonic determines.
+    [Throws=CryptoError]
+    bytes recovery_public_key(string mnemonic);
+
+    /// The recovery key signing its setup on `account_id` — or the upgrade of the Ed25519 key
+    /// already set there, which is the same message.
+    [Throws=CryptoError]
+    RecoverySigned sign_recovery_setup(string mnemonic, string account_id, i64 timestamp);
+
+    /// The recovery key handing its account to the device these keys name.
+    [Throws=CryptoError]
+    RecoverySigned sign_recovery_claim(string mnemonic, i64 timestamp, string device_id, bytes verifying_key, bytes identity_public);
 
     // Timing: the one traffic-shaping export left. Cover traffic (`TrafficProtectionManager`)
     // was retired in 0.55.0 — dummies cost network and battery and no client ever sent one

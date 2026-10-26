@@ -958,6 +958,59 @@ pub fn verify_recovery_signature(public_key: Vec<u8>, message: String, signature
     recovery::verify_recovery_signature(&pk, &message, &sig)
 }
 
+/// A hybrid recovery key's public half and its signature over one recovery message.
+pub struct RecoverySigned {
+    /// Ed25519 (32) ‖ ML-DSA-65 (1952).
+    pub public_key: Vec<u8>,
+    /// Ed25519 (64) ‖ ML-DSA-65 (3309).
+    pub signature: Vec<u8>,
+}
+
+impl From<recovery::RecoverySigned> for RecoverySigned {
+    fn from(s: recovery::RecoverySigned) -> Self {
+        Self {
+            public_key: s.public_key,
+            signature: s.signature,
+        }
+    }
+}
+
+/// The hybrid recovery public key the mnemonic determines (Ed25519 ‖ ML-DSA-65, 1984 bytes).
+pub fn recovery_public_key(mnemonic: String) -> Result<Vec<u8>, CryptoError> {
+    recovery::recovery_public_key(&mnemonic).map_err(|_| CryptoError::InvalidKeyData)
+}
+
+/// The mnemonic's recovery key signing its setup on `account_id`, or the upgrade of the Ed25519
+/// key already set there.
+pub fn sign_recovery_setup(
+    mnemonic: String,
+    account_id: String,
+    timestamp: i64,
+) -> Result<RecoverySigned, CryptoError> {
+    recovery::sign_recovery_setup(&mnemonic, &account_id, timestamp)
+        .map(Into::into)
+        .map_err(|_| CryptoError::InvalidKeyData)
+}
+
+/// The mnemonic's recovery key handing its account to the device these keys name.
+pub fn sign_recovery_claim(
+    mnemonic: String,
+    timestamp: i64,
+    device_id: String,
+    verifying_key: Vec<u8>,
+    identity_public: Vec<u8>,
+) -> Result<RecoverySigned, CryptoError> {
+    recovery::sign_recovery_claim(
+        &mnemonic,
+        timestamp,
+        &device_id,
+        &verifying_key,
+        &identity_public,
+    )
+    .map(Into::into)
+    .map_err(|_| CryptoError::InvalidKeyData)
+}
+
 // ============================================================================
 // Timing (the one traffic-shaping export; cover traffic retired in 0.55.0)
 // ============================================================================

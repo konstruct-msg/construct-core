@@ -26,6 +26,8 @@
 
 use sha2::{Digest, Sha256};
 
+pub mod recovery;
+
 /// Hybrid signature public key: Ed25519 (32) ‖ ML-DSA-65 (1952).
 pub const HYBRID_PUBLIC_KEY_LEN: usize = 32 + 1952;
 /// Hybrid signature: Ed25519 (64) ‖ ML-DSA-65 (3309).
@@ -205,7 +207,7 @@ pub fn server_signable(purpose: Purpose, kid: &Kid, body: &[u8]) -> Vec<u8> {
     m
 }
 
-fn put_lp(out: &mut Vec<u8>, field: &[u8]) -> Result<(), Malformed> {
+pub(crate) fn put_lp(out: &mut Vec<u8>, field: &[u8]) -> Result<(), Malformed> {
     let len = u16::try_from(field.len()).map_err(|_| Malformed)?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(field);
