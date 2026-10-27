@@ -1,164 +1,183 @@
-# Construct Core - Project Context
+# AGENTS.md — construct-core
 
-`construct-core` is the central cryptographic and orchestration engine for **Construct Messenger**. It provides end-to-end encryption (E2EE), session management, and traffic protection for cross-platform clients (iOS, macOS, Desktop).
+The rules this project paid for in its first year, and the invariants of this repository. Each
+line is here because breaking it already cost something; the incident behind it lives in the
+vault. If a rule here and your plan disagree, the rule wins until a `decisions/` note says
+otherwise.
 
-## Architecture & Core Concepts
+`construct-core` is the I/O-free cryptographic and orchestration engine of Construct Messenger:
+E2EE, session lifecycle, MLS, history transfer, traffic protection. Every client (iOS, macOS,
+Android) calls it through UniFFI. **It is where the protocol lives**: a decision two clients must
+compute identically is made here, or it is made twice and diverges silently.
 
-- **I/O-Free Core**: The library is designed to be pure and deterministic. Side effects (storage, networking) are requested from the host platform as `Action`s returned by the orchestrator. Logging goes through `tracing`.
-- **Orchestration Layer**: The `OrchestratorCore` (in `src/orchestration`) is the main entry point. It processes `IncomingEvent`s and returns a sequence of `CfeAction`s for the platform to execute.
-- **Crypto-Agility**: The `CryptoProvider` trait has a **Classic** (X25519, Ed25519) and a **Hybrid** (Ed25519 + ML-DSA-65 signatures) implementation, but every session is built on `ClassicSuiteProvider`. Post-quantum protection comes from **PQXDH v2** — an ML-KEM-1024 secret in the session's initial key, mandatory, with Kyber keys owned by the core (`crypto::kyber_prekeys`, `orchestration::pq_prekey_plan`) — and the mandatory suite-3 sparse ML-KEM-768 ratchet, not from swapping the provider.
-- **CFE (Construct Format Envelope)**: A custom binary format — 16-byte header (magic, version, type, flags, payload length, CRC32) around a MessagePack payload (`rmp_serde::to_vec_named`) — used for state persistence and migration from legacy JSON formats.
-- **UniFFI Bindings**: Cross-platform bindings are defined in `src/construct_core.udl` and implemented in `src/uniffi_bindings.rs`.
+## Read first
 
-## Building and Running
+| Area | File |
+|---|---|
+| Why these rules exist; the checklist before any new protocol feature | `~/Code/construct-docs/decisions/rules-from-the-first-year.md` |
+| The API surface (source of truth, check before adding an export) | `src/construct_core.udl` |
+| How the core is driven | `cargo run --example two_devices` · `examples/two_devices.rs` |
+| Session lifecycle is one machine | `~/Code/construct-docs/decisions/session-is-one-state-machine.md` · `sessions-renew-by-sending.md` |
+| First message opens without the server | `~/Code/construct-docs/decisions/first-message-opens-without-the-server.md` |
+| Identity spaces; a peer is a set of devices | `~/Code/construct-docs/decisions/identity-spaces.md` · `a-peer-is-a-set-of-devices.md` |
+| One meaning, one carrier (before any field, counter, constant, timeout) | `~/Code/construct-docs/decisions/one-meaning-two-carriers.md` |
+| Content types, wire format, testing | `~/Code/construct-protos/conformance/knst_content_types.json` · `decisions/wire-format-one-authority.md` · `decisions/testing-by-pure-decision.md` |
+| Everything else | `~/Code/construct-docs` (vault; its own `AGENTS.md` is authoritative) |
 
-### Key Commands
-- **Build**: `cargo build`
-- **Test**: `cargo test` for the core; `cargo test --features mac` to include the UniFFI surface. `--all-features` also builds (construct-veil is a pinned git dependency — no sibling checkout needed).
-- **Benchmarks**: `cargo bench --bench crypto_bench`
-- **Walkthrough**: `cargo run --example two_devices` — two devices and a
-  toy server in one process; prints every event the app feeds the core and every action the
-  core returns: registration, the first messages, a restart from the Keychain, redelivered and
-  late messages. Read `examples/two_devices.rs` first when learning how the core is driven.
-- **Hooks**: `git config core.hooksPath .githooks` — `pre-push` runs `cargo metadata --locked`, `cargo fmt --check`, the key-material-in-logs check, then clippy default (`-D warnings`), matching CI. Not a pre-commit hook: clippy is too slow to run on every commit.
+## The Zen of Konstruct
 
-### Feature Flags
-- `ios` / `mac`: Enables UniFFI scaffolding and Swift bindings support (+ construct-veil, MLS).
-- `android`: The same surface for Kotlin (UniFFI JNI) + construct-veil.
-- `store`: `construct-store` and the history projection (`history::project`) without UniFFI, for a Rust client with its own store (construct-client). The three platform features include it.
-- `post-quantum`: an empty alias since 0.56.0 (TODO 203), kept one release so old commands still run. ML-KEM-1024/768 and ML-DSA are unconditional: there is no classical-only core, and nothing to forget in a build command.
+```
+Someone has solved it before. Read them first.
+The core decides; the app executes.
+A message names the state it means. Time is not an address.
+Reproduce, then fix.
+One meaning, one carrier.
+Bytes stay bytes.
+Measure, then build.
+The effect is the proof, not the exit code.
+A test that cannot fail is worse than no test.
+Boring before new.
+Temporary is permanent, unless something checks it.
+What nothing reads is not sent.
+Silence is the worst failure: a message that never appears raises no error.
+```
 
-## Development Conventions
+Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md` — change it there first.
 
-### 1. Architectural Integrity
-- **Logic vs. I/O**: Keep business logic in the `Orchestrator`. Never perform direct I/O (filesystem, network) inside the core. Use `Action`s to request these operations from the platform.
-- **State Management**: Orchestrator state should be exportable/importable via `export_orchestrator_state()` and `import_orchestrator_state()`.
+## Rules
 
-### 2. Cryptography
-- Use `CryptoProvider` abstractions instead of hardcoding specific algorithms where possible.
-- Sensitive data must be handled with `Zeroize` where appropriate.
-- Hybrid PQ-Classic schemes are preferred for long-term security.
+1. **Prior art first.** Before any mechanism, write down how Signal / MLS (RFC 9420) / Matrix solve
+   it and why we deviate. Group key management is MLS, not ours. END_SESSION reinvented for eight
+   months what Signal has had since 2016.
+2. **The core decides.** Anything two clients must compute identically, anything that reads or
+   writes ratchet/session state, any *plan* (which sessions an operation touches) and the
+   *lifecycle phase* of a device pair is exported from here — not described for clients to
+   rebuild. "The client must compute X the same way" means: export X. Take a **set of device ids,
+   return a decision over it**.
+3. **A control message names the state it refers to** (epoch, ratchet key, number). A fix that
+   adds a timer, cooldown, window, tie-break or retry budget means the message has no address —
+   stop and give it one. Two clients retrying on different clocks do not error, they storm.
+4. **Reproduce before fixing.** A two-party (N-party for groups) test that fails deterministically
+   comes first; the fix counts when it turns green.
+5. **One meaning, one carrier; different meanings, different types.** Identifiers are distinct
+   types. A comment saying two things "must match" means one should be a call to the other.
+6. **Bytes stay bytes**, source to destination (see UDL `bytes` below).
+7. **Measure, then build** — for anything on the network or performance path.
+8. **Verify the effect, not the exit code.** A `cargo test` that did not print `Compiling` may
+   have re-run a stale binary: look for it.
+9. **A test must be able to fail.** Put the decision in a pure function and test that;
+   mutation-check every new test (one mutation at a time, an unapplied mutation is fatal, restore
+   by shasum). A bare `cargo test` skips every `mac`-gated session test and still reports green.
+10. **Depth before breadth.** No new protocol surface (groups, rooms) until 1:1 sessions are boring
+    on the stand and with testers.
+11. **A temporary exception has an end date and a check.**
+12. **A branch and a PR, always** (see Git).
 
-### 3. Cross-Platform Boundary (UniFFI)
-- When modifying the public API, update `src/construct_core.udl` and ensure the `uniffi_bindings.rs` matches.
-- Byte data is `bytes` in the UDL — never `sequence<u8>`. Both are `Vec<u8>` in Rust, so nothing
-  here tells them apart, but the bindings do: `bytes` is `Data` / `ByteArray`, copied as one block;
-  `sequence<u8>` is `[UInt8]` copied one byte at a time, and in Kotlin a `List<UByte>` — an object
-  per byte. This line used to say "`bytes` (sequence<u8>)" as if they were one thing, and the UDL
-  carried 195 of the slow kind until 2026-09-29. `tests/udl_bytes_test.rs` fails on a new one.
-- **`construct-tui` is paused** (2026-09-25) until iOS, Android and multi-device are settled. It
-  uses this crate's `pub` Rust modules by path, and it already does not build against `main`. A
-  change here does not have to keep it building or be checked against it; it will be brought up to
-  date in one piece when work on it resumes.
+**A change on the delivery or crypto path answers three questions** in its commit message:
+(1) what does the server or any relay learn that it did not before; (2) what can a party —
+server, sender, sibling device — withhold or substitute that it could not before; (3) which trust
+boundary moves, and which way. An honest "something" to 1 or 2 is a `decisions/` note, not a merge.
 
-**If two clients must agree on it, this crate must export it — not describe it.** There are two
-clients now (`construct-messenger` on iOS, `construct-android`). Anything a client would
-otherwise reimplement is a decision that will diverge, and divergence here is silent: the copy is
-dropped as foreign, the message never appears, and neither side can say which one is right. The
-`content_type` split between iOS and the TUI was found by comparing tables, not by a failure.
+**A producer with no consumer is a defect.** A send, signal or action lands with its reader in
+the same change, or is removed.
 
-So a rule the clients must follow is not documentation — it is a missing export. If you find
-yourself writing "the client must compute X the same way", export X.
+## Invariants of this repo
 
-**What belongs here, restated for the receiving end** (the clients carry the mirror of this in their
-own `AGENTS.md`): anything two clients must compute identically, anything that reads or writes
-ratchet/session state, **any plan** — "which sessions does this operation touch" — and the
-**lifecycle phase of a pair of devices** (absent / opening / established / healing / tearing
-down). A plan answers who; the machine answers what state that pair is in. Both are protocol.
-Clients rebuild the machine as a pile of cooldowns because each incident feels local. It is
-not: two clients that retry on different clocks do not error, they storm. Guide:
-`construct-docs/decisions/session-is-one-state-machine.md`.
+### Architecture
 
-**What deliberately does not belong here:** `ServerUserId`. This crate speaks `CryptoDeviceId` only
-(`contact_id` everywhere; `set_local_user_id` is the one seam), and that stays. The consequence is a
-shape to keep in mind when designing an API: **take a set of device ids, return a decision over
-it.** A client that translates `account → devices` before calling is doing its own job; a client
-that must then also decide *which* of them to act on has been handed a job this crate should have
-done, and the next client will do it differently.
+- **I/O-free and deterministic.** Side effects (storage, network, filesystem) are `Action`s the
+  platform executes; `OrchestratorCore` (`src/orchestration`) takes `IncomingEvent`s and returns
+  `CfeAction`s. Logging goes through `tracing`. Orchestrator state stays exportable/importable
+  (`export_orchestrator_state` / `import_orchestrator_state`). I/O lives in `construct-store`.
+- **Crypto-Agility.** `CryptoProvider` is the abstraction (Classic: X25519/Ed25519; Hybrid:
+  Ed25519 + ML-DSA-65), but every session is built on `ClassicSuiteProvider`. Post-quantum comes
+  from PQXDH v2 (mandatory ML-KEM-1024 in the initial key; `crypto::kyber_prekeys`,
+  `orchestration::pq_prekey_plan`) and the suite-3 sparse ML-KEM-768 ratchet, not from swapping
+  the provider. Secrets use `Zeroize`.
+- **Identity space.** This crate speaks `CryptoDeviceId` only (`contact_id` everywhere;
+  `set_local_user_id` is the one seam). It never learns `ServerUserId` — the client translates
+  account → devices and hands over the set.
 
-Before adding an API, check it is not already there under another name. `derive_device_id`,
-`get_all_session_contact_ids` and `get_session_health` all exist, and each has
-been reimplemented or ignored client-side at least once.
+### Session lifecycle
 
-### 4. Serialization
-- CFE payloads are **MessagePack** (named fields, so fields can be added with `#[serde(default)]`). JSON is for legacy migration only. Do not add another format.
-- Use **Serde JSON** only for legacy compatibility or human-readable exports.
-- All persistent state should be versioned.
+- **A session renews by sending.** A message carrying the handshake header (ML-KEM ciphertext)
+  opens a new state beside the held one; previous states are kept and the one that decrypts is
+  promoted. INITIATOR and RESPONDER paths are distinct (`init_session` vs `open_receiving`).
+- **An unreadable message is answered with DECRYPTION_ERROR (type 28) naming the state** it was
+  written on; the writer's core retires that state only if it is current, and resends the named
+  message once. Reset, chat/contact deletion and logout are **local** — nothing is sent.
+- **Never rebuild:** END_SESSION, SESSION_RESET_INIT, `session_ready`, ping, confirm windows,
+  tie-breaks, heal, cooldowns, stale-by-timestamp checks.
+- **Receiving fetches nothing:** a first message opens with the key its sender certificate names,
+  once the core has checked the server's signature.
+- **The core owns the queue of messages waiting for a session**; clients keep envelopes only.
+- **Ask the core for the operation, never for the key** (`signWithDeviceKey`,
+  `openSealedToDevice`, `deviceCopyTag*`, MLS stores). Sealed boxes, media sealing, history
+  transfer (CTH1/CTT1/CTHF, `src/history/`) are protocol and live here, not written twice.
+- **Sealed sender:** after unseal only the inner `contentType` routes; the outer one is generic
+  on purpose. A new content type adds its row to `knst_content_types.json` in the same change.
+- Before adding an API, check it is not already exported under another name
+  (`derive_device_id`, `get_all_session_contact_ids`, `get_session_health` were each reimplemented
+  or ignored client-side).
 
-### 5. Versioning
+### UniFFI boundary and serialization
+
+- **Byte data is `bytes` in the UDL, never `sequence<u8>`.** Both are `Vec<u8>` in Rust, so nothing
+  here tells them apart; the bindings do: `bytes` is `Data`/`ByteArray` (one block copy),
+  `sequence<u8>` is `[UInt8]` copied per byte (`List<UByte>`, an object per byte, in Kotlin).
+  `tests/udl_bytes_test.rs` fails on a new one.
+- Changing the public API means updating `src/construct_core.udl` and `src/uniffi_bindings.rs`
+  together; the UDL is the source of truth.
+- CFE payloads are MessagePack (`rmp_serde::to_vec_named`, named fields so fields can be added with
+  `#[serde(default)]`) in a 16-byte header (magic, version, type, flags, length, CRC32). JSON is
+  legacy migration and human-readable export only; do not add another format. Persistent state is
+  versioned. Session state persists as CFE from `export_session_bytes_for`.
+- `construct-tui` is paused (2026-09-25) and does not build against `main`; a change here need not
+  keep it building. It is brought up to date in one piece when work resumes.
+
+### Versioning (§5)
+
 - **A commit that changes what a client can observe bumps `version` in `Cargo.toml` in the same
-  commit**, with `Cargo.lock`, and names the new version in its subject in parentheses —
-  `feat(pqxdh)!: … (0.22.0)`. Observable means: the UDL (`construct_core.udl`), a wire or file
-  format, persisted state, or a protocol decision.
-- `0.x.y`: a breaking change (`!`) or a new export is **minor** (`0.22.0 → 0.23.0`); a fix that
-  changes no signature is **patch** (`0.20.1`). Refactors, tests and docs do not bump.
-- The same rule holds for `construct-store` (`store/Cargo.toml`), on its own version.
-- Why: the version is what the apps stamp next to the hash (`0.22.0+<hash>`) and what Android's
-  pairing lock and the release notes name. Between 2026-09-26 and 2026-09-30 fifteen commits —
-  four of them breaking — shipped as `0.22.0`, so two different ABIs carried the same number and
-  only the hash told them apart.
+  commit**, with `Cargo.lock`, and names it in the subject — `feat(pqxdh)!: … (0.22.0)`.
+  Observable: the UDL, a wire or file format, persisted state, a protocol decision.
+- `0.x.y`: a breaking change (`!`) or a new export is **minor**; a fix that changes no signature is
+  **patch**. Refactors, tests and docs do not bump. `construct-store` (`store/Cargo.toml`) follows
+  the same rule on its own version.
+- Why: apps stamp `0.22.0+<hash>`, Android's pairing lock and release notes name it; fifteen
+  commits (four breaking) once shipped as one number.
 
-## Key Files
-- `src/construct_core.udl`: UniFFI interface definition (The "Source of Truth" for the cross-platform API).
-- `src/orchestration/orchestrator.rs`: Implementation of the main event loop.
-- `src/crypto/mod.rs`: Entry point for cryptographic primitives.
-- `src/cfe/mod.rs`: Definition of the Construct Format Envelope for state persistence.
-- `Cargo.toml`: Workspace configuration and feature flag definitions.
+### Build, test, checks
 
----
+- `cargo build` · `cargo test` · **`cargo test --features mac`** for the UniFFI surface and the
+  PQ-gated session tests (bare `cargo test` skips them and reports green) · `cargo bench --bench
+  crypto_bench`. Features: `ios`/`mac` (UniFFI + construct-veil + MLS), `android` (same for
+  Kotlin), `store` (store + `history::project` without UniFFI; the platform features include it).
+  `post-quantum` is an empty alias kept for old commands: ML-KEM and ML-DSA are unconditional.
+  `--all-features` builds; construct-veil is a pinned git dependency, no sibling checkout needed.
+- **Pre-push checks, before committing:** `git config core.hooksPath .githooks` (per clone). The
+  `pre-push` hook runs `cargo metadata --locked`, `cargo fmt --all -- --check`,
+  `.github/scripts/check-secret-logging.sh` (key material in logs), then
+  `cargo clippy --all-targets -- -D warnings` — the CI order. Also clippy `--features post-quantum`
+  when touching gated code (a shrinking change once tripped `large_enum_variant`).
+- A `rustc` older than `rust-version` makes cargo re-run a stale binary and report green; the
+  toolchain is pinned in `rust-toolchain.toml`.
+- The version stamp (`+<hash>`) only refreshes when `.git/HEAD` changes: `touch .git/HEAD` after
+  a fresh commit before building the xcframework.
 
-## Shared Construct Docs Workflow
+## Git and process
 
-The vault's own `~/Code/construct-docs/AGENTS.md` is **authoritative** for how to contribute docs —
-read it. The summary below is the operational subset for coding agents.
+- **Never commit on `main`.** Topic branch (`feat|fix|docs|chore|test/<topic>`) from an up-to-date
+  `main`, PR into `main`; `main` is what a release is built from and **the owner merges**. Agents
+  push and open the PR only when asked.
+- Check `git branch --show-current` and `git status` before every commit: other sessions share
+  the tree. Never `checkout -- .`, `restore .`, `reset --hard` or `stash`; name the files. Never
+  rewrite pushed history. A commit made on `main` by mistake and not pushed moves with
+  `git branch <topic> && git reset --keep origin/main && git switch <topic>`.
+- Conventional Commits.
 
-### Where durable reasoning goes
+## Docs
 
-Any reasoning that informed a code change must survive beyond the chat session — conclusions,
-trade-offs, and "why we didn't do X". After any session involving architectural changes, design
-decisions, API/data-format changes, bug root-cause analysis, or non-obvious implementation choices:
-
-1. **Always** write a session note at `~/Code/construct-docs/sessions/YYYY-MM-DD-<topic>.md`.
-2. **Always** fill in `## Why` — the reasoning, considered alternatives, and why they were rejected.
-   This is the most important section.
-3. If the decision will constrain future work or the same question is likely to recur, also create
-   or update `~/Code/construct-docs/decisions/<slug>.md`.
-4. Patch the affected spec in its domain folder in the **same** session — keep specs current.
-5. Before creating a new note, search for an existing one and extend it rather than duplicating.
-
-Do not skip session notes for "small" changes — if non-trivial reasoning was involved, write it down.
-
-### Session note format
-
-Plain markdown, no YAML frontmatter. `[[wikilinks]]` to other sessions/decisions/specs are welcome
-(Obsidian graph). Sections:
-
-1. `## Context` — what problem prompted this work
-2. `## What Changed` — concrete file/API/behaviour changes
-3. `## Why` — the reasoning: alternatives considered and why rejected
-4. `## Decisions` — discrete decisions, each as a one-liner
-5. `## Open Questions` — known unknowns, deferred work
-
-Decision records (`decisions/<slug>.md`) use: `## Context`, `## Decision`, `## Rationale`,
-`## Consequences`, plus a **Status** (accepted | superseded | deferred) and **Date** header.
-
-### Operational logging
-
-- Append a one-line entry to `~/Code/construct-docs/log.md` after creating/updating a session or
-  decision note. Format: `[YYYY-MM-DD HH:MM] note | <topic>`
-- Keep detailed rationale out of `log.md` — it belongs in the session/decision note.
-
-## Git workflow (branch + PR only)
-
-**Never commit on `main`.** Every change goes on a topic branch cut from an up-to-date `main`
-(`feat|fix|docs|chore|test/<topic>`) and lands through a GitHub pull request. Agents push and
-open the PR only when asked.
-
-`main` is what a release is built from, so it moves only by a reviewed merge. From 2026-09-11 to
-2026-10-01 changes went straight to `main` across the construct-* repos — two people on the
-project made a branch per change look like ceremony. That was reversed on purpose: the habit has
-to be in place before there is a release for it to break.
-
-A commit that landed on `main` by mistake and is not pushed moves off it with
-`git branch <topic> && git reset --keep origin/main && git switch <topic>`. Pushed history is
-never rewritten.
+The vault (`~/Code/construct-docs`, its `AGENTS.md` authoritative) holds everything not in this
+repo; search it before an architectural decision. After work: progress into the task note
+(`todo/NNN-*.md`); a `decisions/<slug>.md` for anything that constrains future work; a session
+note only for a root cause found the hard way (`## Why` mandatory); one line in `log.md`.
