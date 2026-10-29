@@ -82,14 +82,82 @@ pub enum IntakeError {
     InvalidKeyLength { got: usize },
     /// The account id was empty, or became empty once normalised.
     EmptyAccountId,
+    /// `intake_mint` was asked for the generation after `u32::MAX`.
+    GenerationExhausted,
 }
 
-/// A fresh `intake_key`.
+/// The account's intake key and its generation
+/// (`construct-docs/decisions/intake-key-is-the-accounts-not-the-devices.md`).
+///
+/// The generation is the key's address (rule 3 of the project): a card, a sync between our own
+/// devices and a publish each name it, so every holder tells the current key from a stale one by
+/// comparing two numbers, with no clock and no tie-break. Generation 0 is a key from before the
+/// account had one — each device minted its own — and is older than every generation minted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntakeKeyState {
+    pub generation: u32,
+    pub key: Vec<u8>,
+}
+
+/// What to do with an offered key: one from a contact's card (their account's key) or one from a
+/// card our own device sent (our account's key). One rule for both, because both are the same
+/// statement — "the key this account accepts, at generation g".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeOffer {
+    /// Hold the offered key from now on.
+    Adopt,
+    /// Keep what is held.
+    Keep,
+}
+
+/// A new key one generation above `above_generation`.
+///
+/// Called in exactly three cases, each named by state: the account's first device
+/// (`above_generation` 0), a rotation (the held generation), and an account with no live key
+/// anywhere (the generation the server reports). Never because a key is late to arrive.
+pub fn intake_mint(above_generation: u32) -> Result<IntakeKeyState, IntakeError> {
+    let generation = above_generation
+        .checked_add(1)
+        .ok_or(IntakeError::GenerationExhausted)?;
+    Ok(IntakeKeyState {
+        generation,
+        key: generate_intake_key(),
+    })
+}
+
+/// Whether to replace `held` with `offered`.
+///
+/// Only a higher generation replaces. An equal generation with a different key is kept as held:
+/// that is two of our devices rotating at once, both keys are published and valid, and the next
+/// rotation brings everyone back to one — choosing a winner would be a tie-break, and there is
+/// nothing to win, because either key works. A held key of the wrong length is no key at all.
+///
+/// An offered key of the wrong length is refused rather than kept: a card that carries one is
+/// malformed, and saying so is the only way the sender's bug is ever seen.
+pub fn intake_offer(
+    held: Option<&IntakeKeyState>,
+    offered: &IntakeKeyState,
+) -> Result<IntakeOffer, IntakeError> {
+    if offered.key.len() != INTAKE_KEY_LEN {
+        return Err(IntakeError::InvalidKeyLength {
+            got: offered.key.len(),
+        });
+    }
+    match held {
+        Some(held) if held.key.len() == INTAKE_KEY_LEN && held.generation >= offered.generation => {
+            Ok(IntakeOffer::Keep)
+        }
+        _ => Ok(IntakeOffer::Adopt),
+    }
+}
+
+/// A fresh `intake_key`. A platform mints through [`intake_mint`], which names the generation.
 ///
 /// One per account, not per device: every device of the account derives the same tags, and a
 /// device linked later receives this key over the account's own sync channel rather than
 /// generating its own — two keys for one account would mean half the contacts hold a credential
-/// the server does not recognise.
+/// the server does not recognise. Until 2026-10-29 the platforms did generate one per device, and
+/// that is how ~30% of tags in production came to be unrecognised.
 pub fn generate_intake_key() -> Vec<u8> {
     let mut key = vec![0u8; INTAKE_KEY_LEN];
     rand::rngs::OsRng.fill_bytes(&mut key);
@@ -298,4 +366,101 @@ mod tests {
     ///          hashlib.sha256).digest()[:16].hex()
     /// ```
     const KNOWN_TAG: &str = "bb7672311345ed228f7b5b584072a13a";
+
+    // MARK: the generation — which key is current
+
+    fn state(generation: u32, byte: u8) -> IntakeKeyState {
+        IntakeKeyState {
+            generation,
+            key: vec![byte; INTAKE_KEY_LEN],
+        }
+    }
+
+    #[test]
+    fn nothing_held_adopts() {
+        assert_eq!(intake_offer(None, &state(1, 1)), Ok(IntakeOffer::Adopt));
+        // A card from before generations (0) still beats having no key at all.
+        assert_eq!(intake_offer(None, &state(0, 1)), Ok(IntakeOffer::Adopt));
+    }
+
+    #[test]
+    fn a_higher_generation_adopts() {
+        assert_eq!(
+            intake_offer(Some(&state(1, 1)), &state(2, 2)),
+            Ok(IntakeOffer::Adopt)
+        );
+        // The migration: a per-device key (0) gives way to the account's first generation.
+        assert_eq!(
+            intake_offer(Some(&state(0, 1)), &state(1, 2)),
+            Ok(IntakeOffer::Adopt)
+        );
+    }
+
+    #[test]
+    fn a_lower_generation_is_kept_out() {
+        // An old card arriving late, or an old build still sending its per-device key.
+        assert_eq!(
+            intake_offer(Some(&state(2, 2)), &state(1, 1)),
+            Ok(IntakeOffer::Keep)
+        );
+        assert_eq!(
+            intake_offer(Some(&state(1, 2)), &state(0, 1)),
+            Ok(IntakeOffer::Keep)
+        );
+    }
+
+    /// Two of our devices rotated at once: both keys are valid, nobody picks a winner.
+    /// Mutation: `>=` → `>` — the different-key case adopts and this reddens.
+    #[test]
+    fn an_equal_generation_keeps_what_is_held() {
+        assert_eq!(
+            intake_offer(Some(&state(3, 1)), &state(3, 1)),
+            Ok(IntakeOffer::Keep)
+        );
+        assert_eq!(
+            intake_offer(Some(&state(3, 1)), &state(3, 2)),
+            Ok(IntakeOffer::Keep)
+        );
+    }
+
+    #[test]
+    fn a_damaged_held_key_is_no_key() {
+        let damaged = IntakeKeyState {
+            generation: 9,
+            key: vec![1; 16],
+        };
+        assert_eq!(
+            intake_offer(Some(&damaged), &state(1, 2)),
+            Ok(IntakeOffer::Adopt)
+        );
+    }
+
+    #[test]
+    fn a_wrong_length_offer_is_refused() {
+        let short = IntakeKeyState {
+            generation: 5,
+            key: vec![1; 31],
+        };
+        assert_eq!(
+            intake_offer(None, &short),
+            Err(IntakeError::InvalidKeyLength { got: 31 })
+        );
+    }
+
+    #[test]
+    fn mint_is_one_generation_above_with_a_fresh_key() {
+        let first = intake_mint(0).expect("room above 0");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.key.len(), INTAKE_KEY_LEN);
+        let next = intake_mint(first.generation).expect("room above 1");
+        assert_eq!(next.generation, 2);
+        assert_ne!(next.key, first.key);
+        // What it minted replaces what it was minted above.
+        assert_eq!(intake_offer(Some(&first), &next), Ok(IntakeOffer::Adopt));
+    }
+
+    #[test]
+    fn mint_refuses_to_wrap() {
+        assert_eq!(intake_mint(u32::MAX), Err(IntakeError::GenerationExhausted));
+    }
 }

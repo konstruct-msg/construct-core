@@ -1583,6 +1583,25 @@ pub fn intake_tag(
         .map_err(|_| CryptoError::InvalidKeyData)
 }
 
+pub use crate::intake::{IntakeKeyState, IntakeOffer};
+
+/// A new intake key one generation above `above_generation`.
+///
+/// Throws `InvalidKeyData` only at `u32::MAX`, which no account reaches.
+pub fn intake_mint(above_generation: u32) -> Result<IntakeKeyState, CryptoError> {
+    crate::intake::intake_mint(above_generation).map_err(|_| CryptoError::InvalidKeyData)
+}
+
+/// Whether an offered key replaces the held one: only a higher generation does.
+///
+/// Throws `InvalidKeyData` when the offered key is not 32 bytes — a malformed card.
+pub fn intake_offer(
+    held: Option<IntakeKeyState>,
+    offered: IntakeKeyState,
+) -> Result<IntakeOffer, CryptoError> {
+    crate::intake::intake_offer(held.as_ref(), &offered).map_err(|_| CryptoError::InvalidKeyData)
+}
+
 /// Unpack a received `encrypted_payload` blob into its components.
 /// Forwards to [`wire_payload::unpack`]. For reading routing fields only: decrypting takes the
 /// whole payload (`OrchestratorCore::decrypt_wire_payload`).
