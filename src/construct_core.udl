@@ -12,6 +12,13 @@ namespace construct_core {
     u64 intake_epoch(u64 unix_seconds);
     [Throws=CryptoError]
     bytes intake_tag(bytes intake_key, string recipient_account_id, u64 epoch);
+    // The account's key and its generation (decisions/intake-key-is-the-accounts-not-the-
+    // devices.md): mint one above a generation, and decide whether an offered key — from a
+    // contact's card or from one of our own devices — replaces the held one.
+    [Throws=CryptoError]
+    IntakeKeyState intake_mint(u32 above_generation);
+    [Throws=CryptoError]
+    IntakeOffer intake_offer(IntakeKeyState? held, IntakeKeyState offered);
 
     // `supports_pq_ratchet()` was here: suite 3 is mandatory in every platform build, and the
     // unsigned bundle flag it fed was the downgrade (PQXDH v2 cutover).
@@ -105,6 +112,17 @@ namespace construct_core {
 /// the header — for a control frame (`total_chunks == 1`) the body is its first
 /// `plaintext_length` bytes.
 /// See `seal_media`.
+/// The account's intake key at a generation. `key` is 32 bytes.
+dictionary IntakeKeyState {
+    u32 generation;
+    bytes key;
+};
+
+enum IntakeOffer {
+    "Adopt",
+    "Keep",
+};
+
 dictionary SealedMedia {
     bytes key;
     bytes blob;
