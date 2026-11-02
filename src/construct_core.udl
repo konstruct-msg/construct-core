@@ -231,7 +231,7 @@ interface OpenedSealed {
     /// A first flight sealed whole; `content_type` is `SealedInner.content_type`.
     FirstFlight(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, bytes first_flight_payload, u8 content_type);
     /// A sender certificate sealed to this device; the wire payload sits in `SealedInner.encrypted_payload`.
-    CertSealed(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, u8 content_type);
+    CertSealed(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, u8 content_type, bytes encrypted_payload);
 };
 
 // A KT inclusion proof as a bundle carries it (KtInclusionProof in key_service.proto).

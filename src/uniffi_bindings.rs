@@ -158,6 +158,7 @@ pub enum OpenedSealed {
         certificate: SenderCertificate,
         trust: CertificateVerdict,
         content_type: u8,
+        encrypted_payload: Vec<u8>,
     },
 }
 
@@ -199,12 +200,14 @@ impl From<crate::orchestration::SealedOpen> for OpenedSealed {
                 certificate,
                 trust,
                 content_type,
+                encrypted_payload,
             } => OpenedSealed::CertSealed {
                 writer_account,
                 writer_device,
                 certificate,
                 trust,
                 content_type,
+                encrypted_payload,
             },
         }
     }
