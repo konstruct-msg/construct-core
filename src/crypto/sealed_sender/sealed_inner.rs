@@ -136,11 +136,8 @@ mod tests {
 
     #[test]
     fn content_type_reads_field_five_and_defaults_to_zero() {
-        let inner = [
-            field(SENDER_CERT_CIPHERTEXT, b"cert"),
-            varint_field(CONTENT_TYPE, 14),
-        ]
-        .concat();
+        // Field 5 is pinned by `core/envelope.proto`; the literal keeps a wrong const red.
+        let inner = [field(SENDER_CERT_CIPHERTEXT, b"cert"), varint_field(5, 14)].concat();
         assert_eq!(content_type(&inner), 14);
         assert_eq!(content_type(&field(SENDER_CERT_CIPHERTEXT, b"cert")), 0);
         assert_eq!(content_type(&[]), 0);
@@ -148,11 +145,8 @@ mod tests {
 
     #[test]
     fn encrypted_payload_reads_field_four_and_defaults_to_empty() {
-        let inner = [
-            field(SENDER_CERT_CIPHERTEXT, b"cert"),
-            field(ENCRYPTED_PAYLOAD, b"body"),
-        ]
-        .concat();
+        // Field 4 is pinned by `core/envelope.proto`; the literal keeps a wrong const red.
+        let inner = [field(SENDER_CERT_CIPHERTEXT, b"cert"), field(4, b"body")].concat();
         assert_eq!(encrypted_payload(&inner), b"body");
         assert!(encrypted_payload(&field(SENDER_CERT_CIPHERTEXT, b"cert")).is_empty());
         assert!(encrypted_payload(&[]).is_empty());
