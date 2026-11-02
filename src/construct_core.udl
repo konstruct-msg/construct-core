@@ -220,6 +220,20 @@ enum CertificateVerdict {
     "Expired",
 };
 
+// A sealed delivery opened by `OrchestratorCore.open_sealed`: the route `sealed_route` chose and
+// its answer, so no platform reads `SealedInner` fields or branches on them again
+// (construct-docs TODO 140). `trust` is the core's `certificate_verdict`; a platform that keeps a
+// KT-verified key per contact composes its own trust label on top of it.
+[Enum]
+interface OpenedSealed {
+    /// A session envelope named the writer; `kind` 1 = ratchet wire payload, 2 = DECRYPTION_ERROR.
+    SessionEnvelope(string writer_device, string session_id, bytes body, u8 kind, boolean retired);
+    /// A first flight sealed whole; `content_type` is `SealedInner.content_type`.
+    FirstFlight(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, bytes first_flight_payload, u8 content_type);
+    /// A sender certificate sealed to this device; the wire payload sits in `SealedInner.encrypted_payload`.
+    CertSealed(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, u8 content_type);
+};
+
 // A KT inclusion proof as a bundle carries it (KtInclusionProof in key_service.proto).
 dictionary KtInclusionProof {
     u64 leaf_index;
@@ -1052,6 +1066,12 @@ interface OrchestratorCore {
     /// Kyber prekey no longer held (`FIRST_FLIGHT_KEY_UNAVAILABLE`), or not ours.
     [Throws=CryptoError]
     FirstFlightOpened open_first_flight(bytes sealed);
+
+    /// Open a sealed delivery (`SealedInner`) and return who wrote it and what it carries. The
+    /// route is decided here, not by the platform. Changes nothing — the platform then opens the
+    /// session or hands the body over as before.
+    [Throws=CryptoError]
+    OpenedSealed open_sealed(bytes sealed_inner);
 
     /// How late messages have arrived since the process started (PQR-4).
     ReorderStats reorder_stats();

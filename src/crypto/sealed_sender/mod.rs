@@ -418,6 +418,48 @@ pub enum CertificateVerdict {
     Expired,
 }
 
+/// Decode the `SenderCertificate` protobuf (`construct-protos/core/envelope.proto`) by field
+/// number, with the same wire reader the history protocol uses — the crate holds no generated
+/// copy of the schema. A known field with the wrong wire type is a parse failure, not a guess;
+/// unknown fields are skipped, as proto3 requires.
+pub fn decode_sender_certificate(bytes: &[u8]) -> Result<SenderCertificate, String> {
+    use crate::history::wire::{self, Value};
+
+    let mut cert = SenderCertificate {
+        user_id: String::new(),
+        domain: String::new(),
+        identity_key: Vec::new(),
+        device_id: String::new(),
+        issued_at: 0,
+        expires_at: 0,
+        signature: Vec::new(),
+        server_kid: Vec::new(),
+        server_signature_hybrid: Vec::new(),
+    };
+    for field in wire::fields(bytes) {
+        let (number, value) = field.map_err(|e| format!("sender certificate: {e}"))?;
+        match (number, value) {
+            (1, Value::Bytes(b)) => cert.user_id = String::from_utf8_lossy(b).into_owned(),
+            (2, Value::Bytes(b)) => cert.domain = String::from_utf8_lossy(b).into_owned(),
+            (3, Value::Bytes(b)) => cert.identity_key = b.to_vec(),
+            (4, Value::Bytes(b)) => cert.device_id = String::from_utf8_lossy(b).into_owned(),
+            (5, Value::Varint(v)) => cert.issued_at = v as i64,
+            (6, Value::Varint(v)) => cert.expires_at = v as i64,
+            (7, Value::Bytes(b)) => cert.signature = b.to_vec(),
+            (8, Value::Bytes(b)) => cert.server_kid = b.to_vec(),
+            (9, Value::Bytes(b)) => cert.server_signature_hybrid = b.to_vec(),
+            // A known number with the wrong wire type is not this schema.
+            (1..=9, _) => {
+                return Err(format!(
+                    "sender certificate: field {number} has the wrong wire type"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(cert)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -990,5 +1032,70 @@ mod tests {
                 CertificateVerdict::NoKey
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod decode_certificate_tests {
+    use super::*;
+
+    fn varint_field(number: u32, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::history::wire::write_varint(u64::from(number) << 3, &mut out);
+        crate::history::wire::write_varint(value, &mut out);
+        out
+    }
+
+    fn bytes_field(number: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::history::wire::write_varint(u64::from(number) << 3 | 2, &mut out);
+        crate::history::wire::write_varint(bytes.len() as u64, &mut out);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    #[test]
+    fn decodes_every_field() {
+        let identity = [7u8; 32];
+        let wire = [
+            bytes_field(1, b"user"),
+            bytes_field(2, b"konstruct.example"),
+            bytes_field(3, &identity),
+            bytes_field(4, b"device"),
+            varint_field(5, 1_700_000_000),
+            varint_field(6, 1_700_100_000),
+            bytes_field(7, b"sig"),
+            bytes_field(8, b"kid"),
+            bytes_field(9, b"hybrid"),
+        ]
+        .concat();
+        let cert = decode_sender_certificate(&wire).unwrap();
+        assert_eq!(cert.user_id, "user");
+        assert_eq!(cert.domain, "konstruct.example");
+        assert_eq!(cert.identity_key, identity);
+        assert_eq!(cert.device_id, "device");
+        assert_eq!(cert.issued_at, 1_700_000_000);
+        assert_eq!(cert.expires_at, 1_700_100_000);
+        assert_eq!(cert.signature, b"sig");
+        assert_eq!(cert.server_kid, b"kid");
+        assert_eq!(cert.server_signature_hybrid, b"hybrid");
+    }
+
+    #[test]
+    fn a_known_field_with_the_wrong_wire_type_is_refused() {
+        // Field 3 (identity_key) as a varint, not bytes.
+        assert!(decode_sender_certificate(&varint_field(3, 42)).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_skipped() {
+        let wire = [bytes_field(1, b"user"), bytes_field(20, b"future")].concat();
+        assert_eq!(decode_sender_certificate(&wire).unwrap().user_id, "user");
+    }
+
+    #[test]
+    fn the_last_occurrence_of_a_field_counts() {
+        let wire = [bytes_field(1, b"first"), bytes_field(1, b"last")].concat();
+        assert_eq!(decode_sender_certificate(&wire).unwrap().user_id, "last");
     }
 }

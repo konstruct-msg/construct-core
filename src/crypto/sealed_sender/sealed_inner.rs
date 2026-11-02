@@ -10,6 +10,10 @@ use crate::history::wire::{self, Value};
 
 /// `SealedInner.sender_cert_ciphertext`.
 const SENDER_CERT_CIPHERTEXT: u32 = 3;
+/// `SealedInner.content_type` — the only type field that still says anything on a sealed
+/// delivery, and only for a first flight or a certificate (a session envelope's type is inside
+/// the envelope).
+const CONTENT_TYPE: u32 = 5;
 /// `SealedInner.session_envelope`.
 const SESSION_ENVELOPE: u32 = 21;
 /// `SealedInner.first_flight`.
@@ -24,7 +28,7 @@ pub enum SealedRoute<'a> {
     /// A session's first flight, sealed whole to this device.
     FirstFlight(&'a [u8]),
     /// A sender certificate sealed to this device's identity key, with the payload beside it.
-    SenderCertificate,
+    SenderCertificate(&'a [u8]),
 }
 
 /// The route of `sealed_inner`, or `None` when it is not well-formed or names no writer.
@@ -49,10 +53,21 @@ pub fn sealed_route(sealed_inner: &[u8]) -> Option<SealedRoute<'_>> {
     } else if !first_flight.is_empty() {
         Some(SealedRoute::FirstFlight(first_flight))
     } else if !certificate.is_empty() {
-        Some(SealedRoute::SenderCertificate)
+        Some(SealedRoute::SenderCertificate(certificate))
     } else {
         None
     }
+}
+
+/// `SealedInner.content_type` (field 5), or 0 (UNSPECIFIED) when absent or not a varint. A
+/// malformed buffer is answered the same way — the caller that routed it has already refused it.
+pub fn content_type(sealed_inner: &[u8]) -> u8 {
+    for field in wire::fields(sealed_inner) {
+        if let Ok((CONTENT_TYPE, Value::Varint(v))) = field {
+            return v as u8;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -98,7 +113,22 @@ mod tests {
     #[test]
     fn a_certificate_alone_is_the_certificate_route() {
         let inner = [field(SENDER_CERT_CIPHERTEXT, b"cert"), field(4, b"payload")].concat();
-        assert_eq!(sealed_route(&inner), Some(SealedRoute::SenderCertificate));
+        assert_eq!(
+            sealed_route(&inner),
+            Some(SealedRoute::SenderCertificate(b"cert"))
+        );
+    }
+
+    #[test]
+    fn content_type_reads_field_five_and_defaults_to_zero() {
+        let inner = [
+            field(SENDER_CERT_CIPHERTEXT, b"cert"),
+            varint_field(CONTENT_TYPE, 14),
+        ]
+        .concat();
+        assert_eq!(content_type(&inner), 14);
+        assert_eq!(content_type(&field(SENDER_CERT_CIPHERTEXT, b"cert")), 0);
+        assert_eq!(content_type(&[]), 0);
     }
 
     #[test]
