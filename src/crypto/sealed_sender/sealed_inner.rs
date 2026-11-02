@@ -10,6 +10,9 @@ use crate::history::wire::{self, Value};
 
 /// `SealedInner.sender_cert_ciphertext`.
 const SENDER_CERT_CIPHERTEXT: u32 = 3;
+/// `SealedInner.encrypted_payload` — the E2EE body beside a sender certificate. A first flight's
+/// body and a session envelope's are inside those fields, not here.
+const ENCRYPTED_PAYLOAD: u32 = 4;
 /// `SealedInner.content_type` — the only type field that still says anything on a sealed
 /// delivery, and only for a first flight or a certificate (a session envelope's type is inside
 /// the envelope).
@@ -68,6 +71,18 @@ pub fn content_type(sealed_inner: &[u8]) -> u8 {
         }
     }
     0
+}
+
+/// `SealedInner.encrypted_payload` (field 4) — the E2EE body a sender certificate travels with,
+/// or empty when absent. A first flight and a session envelope carry their body inside their own
+/// field instead.
+pub fn encrypted_payload(sealed_inner: &[u8]) -> Vec<u8> {
+    for field in wire::fields(sealed_inner) {
+        if let Ok((ENCRYPTED_PAYLOAD, Value::Bytes(b))) = field {
+            return b.to_vec();
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -129,6 +144,18 @@ mod tests {
         assert_eq!(content_type(&inner), 14);
         assert_eq!(content_type(&field(SENDER_CERT_CIPHERTEXT, b"cert")), 0);
         assert_eq!(content_type(&[]), 0);
+    }
+
+    #[test]
+    fn encrypted_payload_reads_field_four_and_defaults_to_empty() {
+        let inner = [
+            field(SENDER_CERT_CIPHERTEXT, b"cert"),
+            field(ENCRYPTED_PAYLOAD, b"body"),
+        ]
+        .concat();
+        assert_eq!(encrypted_payload(&inner), b"body");
+        assert!(encrypted_payload(&field(SENDER_CERT_CIPHERTEXT, b"cert")).is_empty());
+        assert!(encrypted_payload(&[]).is_empty());
     }
 
     #[test]

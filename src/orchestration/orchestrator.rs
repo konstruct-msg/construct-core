@@ -279,6 +279,7 @@ pub enum SealedOpen {
         certificate: crate::crypto::sealed_sender::SenderCertificate,
         trust: crate::crypto::sealed_sender::CertificateVerdict,
         content_type: u8,
+        encrypted_payload: Vec<u8>,
     },
 }
 
@@ -1767,6 +1768,7 @@ impl Orchestrator {
                     certificate,
                     trust,
                     content_type: sealed_inner::content_type(sealed_inner),
+                    encrypted_payload: sealed_inner::encrypted_payload(sealed_inner),
                 })
             }
             None => Err("SEALED_OPEN: no writer named".to_string()),
@@ -5541,19 +5543,26 @@ mod pqxdh_v2_tests {
         let sealed_cert =
             crate::crypto::sealed_sender::seal_to_x25519_public(&encode_cert(&cert), &b3_identity)
                 .unwrap();
-        match b3.open_sealed(&sealed_inner_with(3, &sealed_cert)).unwrap() {
+        let inner = [
+            sealed_inner_with(3, &sealed_cert),
+            sealed_inner_with(4, b"body"),
+        ]
+        .concat();
+        match b3.open_sealed(&inner).unwrap() {
             SealedOpen::CertSealed {
                 writer_account,
                 writer_device,
                 certificate,
                 trust,
                 content_type,
+                encrypted_payload,
             } => {
                 assert_eq!(writer_account, "account");
                 assert_eq!(writer_device, a3_id);
                 assert_eq!(certificate, cert);
                 assert_eq!(trust, CertificateVerdict::Vouched);
                 assert_eq!(content_type, 0);
+                assert_eq!(encrypted_payload, b"body");
             }
             other => panic!("expected a sealed certificate, got {other:?}"),
         }
