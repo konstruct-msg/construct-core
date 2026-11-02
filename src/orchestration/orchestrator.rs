@@ -246,6 +246,42 @@ pub struct ReceivingOpen {
     pub awaiting_server_key: bool,
 }
 
+/// A sealed delivery opened by `Orchestrator::open_sealed`: the route `sealed_route` chose and its
+/// answer. This is what the platform's sender resolution used to compute across three separate
+/// calls and a hand-parsed `SealedInner`; the route is decided here, so no client reads
+/// `SealedInner` fields or branches on them again (construct-docs TODO 140).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealedOpen {
+    /// A session envelope named the writer. `kind` is `EnvelopeKind`: 1 = ratchet wire payload,
+    /// 2 = DECRYPTION_ERROR (whose content type the platform labels from `kind`).
+    SessionEnvelope {
+        writer_device: String,
+        session_id: String,
+        body: Vec<u8>,
+        kind: u8,
+        retired: bool,
+    },
+    /// A session's first flight sealed whole. The certificate names the writer; the wire payload
+    /// goes to the platform as before. `content_type` is `SealedInner.content_type`.
+    FirstFlight {
+        writer_account: String,
+        writer_device: String,
+        certificate: crate::crypto::sealed_sender::SenderCertificate,
+        trust: crate::crypto::sealed_sender::CertificateVerdict,
+        first_flight_payload: Vec<u8>,
+        content_type: u8,
+    },
+    /// A sender certificate sealed to this device's identity key; the wire payload travels in
+    /// `SealedInner.encrypted_payload` beside it.
+    CertSealed {
+        writer_account: String,
+        writer_device: String,
+        certificate: crate::crypto::sealed_sender::SenderCertificate,
+        trust: crate::crypto::sealed_sender::CertificateVerdict,
+        content_type: u8,
+    },
+}
+
 /// How long after `AppLaunched` the PQXDH v2 upgrade sweep runs (ms).
 ///
 /// After the launch-time fetch of pending messages, not with them: the
@@ -1683,6 +1719,60 @@ impl Orchestrator {
         self.lifecycle.client.envelopes().open(envelope)
     }
 
+    /// Open a sealed delivery (`SealedInner`) and return who wrote it and what it carries.
+    ///
+    /// The route is read here (`sealed_route`), not by the platform: a session envelope, a first
+    /// flight, or a sender certificate sealed to this device. Changes nothing — the platform then
+    /// opens the session (`open_receiving` / `MessageReceived`) or hands the body over as before.
+    ///
+    /// A certificate's `trust` is the same check a session opens on (`certificate_verdict`); a
+    /// platform that keeps a KT-verified key per contact composes its own label on top of it.
+    pub fn open_sealed(&self, sealed_inner: &[u8]) -> Result<SealedOpen, String> {
+        use crate::crypto::sealed_sender::decode_sender_certificate;
+        use crate::crypto::sealed_sender::sealed_inner::{self, SealedRoute, sealed_route};
+
+        match sealed_route(sealed_inner) {
+            Some(SealedRoute::SessionEnvelope(envelope)) => {
+                let opened = self
+                    .open_envelope(envelope)
+                    .ok_or_else(|| "SEALED_OPEN: no session envelope pair matched".to_string())?;
+                Ok(SealedOpen::SessionEnvelope {
+                    writer_device: opened.device,
+                    session_id: opened.session_id,
+                    body: opened.body,
+                    kind: opened.kind as u8,
+                    retired: opened.retired,
+                })
+            }
+            Some(SealedRoute::FirstFlight(sealed)) => {
+                let opened = self.open_first_flight(sealed)?;
+                let certificate = decode_sender_certificate(&opened.certificate)?;
+                let trust = certificate.verdict(&self.server_trust, self.clock.now_secs() as i64);
+                Ok(SealedOpen::FirstFlight {
+                    writer_account: certificate.user_id.clone(),
+                    writer_device: certificate.device_id.clone(),
+                    certificate,
+                    trust,
+                    first_flight_payload: opened.wire_payload,
+                    content_type: sealed_inner::content_type(sealed_inner),
+                })
+            }
+            Some(SealedRoute::SenderCertificate(ciphertext)) => {
+                let cert_bytes = self.open_sealed_to_device(ciphertext)?;
+                let certificate = decode_sender_certificate(&cert_bytes)?;
+                let trust = certificate.verdict(&self.server_trust, self.clock.now_secs() as i64);
+                Ok(SealedOpen::CertSealed {
+                    writer_account: certificate.user_id.clone(),
+                    writer_device: certificate.device_id.clone(),
+                    certificate,
+                    trust,
+                    content_type: sealed_inner::content_type(sealed_inner),
+                })
+            }
+            None => Err("SEALED_OPEN: no writer named".to_string()),
+        }
+    }
+
     /// A throwaway instance for `peek_sealed`, built from what the app keeps: the key record
     /// (`export_private_keys_cfe`) and, when there is one, the orchestrator state
     /// (`export_orchestrator_state_cfe`), which carries the envelope book.
@@ -1739,7 +1829,7 @@ impl Orchestrator {
             Some(SealedRoute::SessionEnvelope(envelope)) => {
                 self.peek_envelope(message_id, envelope, load_session)
             }
-            Some(SealedRoute::FirstFlight(_) | SealedRoute::SenderCertificate) | None => {
+            Some(SealedRoute::FirstFlight(_) | SealedRoute::SenderCertificate(_)) | None => {
                 PeekVerdict::Unreadable
             }
         }
@@ -5349,6 +5439,128 @@ mod pqxdh_v2_tests {
 
     fn sealed_envelope(envelope: &[u8]) -> Vec<u8> {
         sealed_inner_with(21, envelope)
+    }
+
+    /// The sender certificate's protobuf, as the server would have issued it. The reader is
+    /// `decode_sender_certificate`; this is the test's writer.
+    fn encode_cert(cert: &SenderCertificate) -> Vec<u8> {
+        fn bytes_field(out: &mut Vec<u8>, number: u32, bytes: &[u8]) {
+            crate::history::wire::write_varint(u64::from(number) << 3 | 2, out);
+            crate::history::wire::write_varint(bytes.len() as u64, out);
+            out.extend_from_slice(bytes);
+        }
+        fn varint_field(out: &mut Vec<u8>, number: u32, value: u64) {
+            crate::history::wire::write_varint(u64::from(number) << 3, out);
+            crate::history::wire::write_varint(value, out);
+        }
+        let mut out = Vec::new();
+        bytes_field(&mut out, 1, cert.user_id.as_bytes());
+        bytes_field(&mut out, 2, cert.domain.as_bytes());
+        bytes_field(&mut out, 3, &cert.identity_key);
+        bytes_field(&mut out, 4, cert.device_id.as_bytes());
+        varint_field(&mut out, 5, cert.issued_at as u64);
+        varint_field(&mut out, 6, cert.expires_at as u64);
+        bytes_field(&mut out, 7, &cert.signature);
+        if !cert.server_kid.is_empty() {
+            bytes_field(&mut out, 8, &cert.server_kid);
+        }
+        if !cert.server_signature_hybrid.is_empty() {
+            bytes_field(&mut out, 9, &cert.server_signature_hybrid);
+        }
+        out
+    }
+
+    /// `open_sealed` returns the route `sealed_route` chose and its answer, for every route the
+    /// platform used to branch on by hand. Garbage names no writer and is refused.
+    ///
+    /// Mutation: route a first flight to the certificate path — the trust and payload redden.
+    #[test]
+    fn open_sealed_names_the_writer_on_every_route() {
+        use crate::crypto::sealed_sender::CertificateVerdict;
+
+        // Session envelope: the writer is the device whose pair matched.
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        converged(&mut alice, &alice_id, &mut bob, &bob_id, &server);
+        let wire = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let envelope = alice.seal_envelope(&bob_id, &wire).unwrap();
+        match bob.open_sealed(&sealed_envelope(&envelope)).unwrap() {
+            SealedOpen::SessionEnvelope {
+                writer_device,
+                body,
+                kind,
+                retired,
+                ..
+            } => {
+                assert_eq!(writer_device, alice_id);
+                assert_eq!(body, wire);
+                assert_eq!(kind, 1);
+                assert!(!retired);
+            }
+            other => panic!("expected a session envelope, got {other:?}"),
+        }
+
+        // First flight: the certificate inside names the writer.
+        let ((mut a2, a2_id), (mut b2, b2_id)) = named_pair();
+        let server2 = trusting_server(&mut b2);
+        let (x3dh, kyber) = bundle_of(&mut b2, true);
+        let b2_identity = x3dh.identity_public.clone();
+        a2.init_session_with_bundle(&b2_id, x3dh, kyber, false)
+            .unwrap();
+        let m0 = a2.encrypt_bytes_for(&b2_id, b"first").unwrap();
+        let cert = certificate(&server2, &a2);
+        let cert_bytes = encode_cert(&cert);
+        let sealed = a2
+            .seal_first_flight(&b2_id, &b2_identity, &m0, &cert_bytes)
+            .unwrap()
+            .unwrap();
+        match b2.open_sealed(&sealed_inner_with(22, &sealed)).unwrap() {
+            SealedOpen::FirstFlight {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                first_flight_payload,
+                content_type,
+            } => {
+                assert_eq!(writer_account, "account");
+                assert_eq!(writer_device, a2_id);
+                assert_eq!(certificate, cert);
+                assert_eq!(trust, CertificateVerdict::Vouched);
+                assert_eq!(first_flight_payload, m0);
+                assert_eq!(content_type, 0);
+            }
+            other => panic!("expected a first flight, got {other:?}"),
+        }
+
+        // Sender certificate sealed to this device: the wire payload travels beside it.
+        let ((a3, a3_id), (mut b3, _b3_id)) = named_pair();
+        let server3 = trusting_server(&mut b3);
+        let b3_identity = b3.get_registration_bundle_fields().unwrap().identity_public;
+        let cert = certificate(&server3, &a3);
+        let sealed_cert =
+            crate::crypto::sealed_sender::seal_to_x25519_public(&encode_cert(&cert), &b3_identity)
+                .unwrap();
+        match b3.open_sealed(&sealed_inner_with(3, &sealed_cert)).unwrap() {
+            SealedOpen::CertSealed {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                content_type,
+            } => {
+                assert_eq!(writer_account, "account");
+                assert_eq!(writer_device, a3_id);
+                assert_eq!(certificate, cert);
+                assert_eq!(trust, CertificateVerdict::Vouched);
+                assert_eq!(content_type, 0);
+            }
+            other => panic!("expected a sealed certificate, got {other:?}"),
+        }
+
+        // Nothing naming a writer is refused, as is garbage.
+        assert!(b3.open_sealed(&[]).is_err());
+        assert!(b3.open_sealed(&[0xff, 0xff]).is_err());
     }
 
     /// What the extension builds from the Keychain: the key record and the orchestrator state.

@@ -134,6 +134,82 @@ pub struct EnvelopeOpened {
     pub retired: bool,
 }
 
+/// A sealed delivery opened by `OrchestratorCore::open_sealed` — UDL `[Enum] interface OpenedSealed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenedSealed {
+    SessionEnvelope {
+        writer_device: String,
+        session_id: String,
+        body: Vec<u8>,
+        kind: u8,
+        retired: bool,
+    },
+    FirstFlight {
+        writer_account: String,
+        writer_device: String,
+        certificate: SenderCertificate,
+        trust: CertificateVerdict,
+        first_flight_payload: Vec<u8>,
+        content_type: u8,
+    },
+    CertSealed {
+        writer_account: String,
+        writer_device: String,
+        certificate: SenderCertificate,
+        trust: CertificateVerdict,
+        content_type: u8,
+    },
+}
+
+impl From<crate::orchestration::SealedOpen> for OpenedSealed {
+    fn from(open: crate::orchestration::SealedOpen) -> Self {
+        use crate::orchestration::SealedOpen::*;
+        match open {
+            SessionEnvelope {
+                writer_device,
+                session_id,
+                body,
+                kind,
+                retired,
+            } => OpenedSealed::SessionEnvelope {
+                writer_device,
+                session_id,
+                body,
+                kind,
+                retired,
+            },
+            FirstFlight {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                first_flight_payload,
+                content_type,
+            } => OpenedSealed::FirstFlight {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                first_flight_payload,
+                content_type,
+            },
+            CertSealed {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                content_type,
+            } => OpenedSealed::CertSealed {
+                writer_account,
+                writer_device,
+                certificate,
+                trust,
+                content_type,
+            },
+        }
+    }
+}
+
 /// How late messages arrive, for this process — the measurement PQR-4 waits on. See
 /// `orchestration::reorder_stats`. Local diagnostics: never sent anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2244,6 +2320,14 @@ impl OrchestratorCore {
                 certificate: o.certificate,
                 wire_payload: o.wire_payload,
             })
+            .map_err(|message| CryptoError::DecryptionFailed { message })
+    }
+
+    /// See `Orchestrator::open_sealed`.
+    pub fn open_sealed(&self, sealed_inner: Vec<u8>) -> Result<OpenedSealed, CryptoError> {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.open_sealed(&sealed_inner)
+            .map(OpenedSealed::from)
             .map_err(|message| CryptoError::DecryptionFailed { message })
     }
 
