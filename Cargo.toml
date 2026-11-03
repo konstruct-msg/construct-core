@@ -114,7 +114,7 @@ uniffi = { version = "0.30", optional = true }
 construct-store = { path = "store", optional = true }
 # The bytes of a server signature, shared with construct-server and the root tool.
 construct-server-trust = { path = "server-trust" }
-construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "d864bb54f29a75618af0c914c0a8e47ad6c014c5", features = ["ffi"], optional = true }
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "b1742951a8a3188484015fcc984dcab45f3d6af6", features = ["ffi"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
