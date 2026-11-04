@@ -694,8 +694,9 @@ fn test_init_session_rejects_stale_spk() {
         .init_session("bob_user".to_string(), bob_bundle)
         .expect_err("init_session must reject a stale SPK bundle");
     assert!(
-        matches!(err, CryptoError::PeerSpkStale { .. }),
-        "expected PeerSpkStale, got {err:?}"
+        // The field the platform reads: 31 days, give or take the seconds of this test.
+        matches!(err, CryptoError::PeerSpkStale { age_secs } if age_secs / 86_400 == 31),
+        "expected PeerSpkStale of 31 days, got {err:?}"
     );
 }
 
@@ -855,8 +856,12 @@ fn test_reopen_session_replaces_only_once_the_new_one_exists() {
     old_build.hybrid_identity_signature = None;
     let err = alice.reopen_session(bob_id(), old_build).unwrap_err();
     assert!(
-        matches!(&err, CryptoError::SessionInitializationFailed { message }
-            if message.starts_with("PQ_REQUIRED")),
+        matches!(
+            &err,
+            CryptoError::PqRequired {
+                reason: PqxdhRefusal::HybridIdentityMissing
+            }
+        ),
         "{err:?}"
     );
     assert!(alice.has_session(bob_id()));
@@ -957,7 +962,7 @@ fn test_pqxdh_v2_through_the_exported_api() {
         .init_receiving_session_from_wire_payload(certified(&server, &alice, &carol), vec![0u8; 8])
         .unwrap_err();
     assert!(
-        matches!(&err, CryptoError::SessionInitializationFailed { message }
+        matches!(&err, CryptoError::SessionInitializationFailed { detail: message }
             if message.starts_with("wire_payload unpack failed")),
         "{err:?}"
     );
@@ -987,7 +992,7 @@ fn test_responder_refuses_before_the_server_keys_are_set() {
         .init_receiving_session_from_wire_payload(cert, wire)
         .unwrap_err();
     assert!(
-        matches!(&err, CryptoError::SessionInitializationFailed { message }
+        matches!(&err, CryptoError::SessionInitializationFailed { detail: message }
             if message == "SENDER_CERTIFICATE_REFUSED: NoTrustedKey"),
         "{err:?}"
     );
