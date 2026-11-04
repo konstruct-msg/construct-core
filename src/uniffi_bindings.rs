@@ -24,7 +24,7 @@ pub struct ClassicCryptoCore {
     inner: Mutex<ClassicClient<ClassicSuiteProvider>>,
 }
 
-// Error type that matches UDL definition (flat errors)
+// Error type that matches the UDL definition (`[Error] interface`: fields reach the platforms)
 // Note: We use UDL definition, not derive macro
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -34,14 +34,14 @@ pub enum CryptoError {
     #[error("Session not found")]
     SessionNotFound,
 
-    #[error("Session initialization failed: {message}")]
-    SessionInitializationFailed { message: String },
+    #[error("Session initialization failed: {detail}")]
+    SessionInitializationFailed { detail: String },
 
-    #[error("Encryption failed: {message}")]
-    EncryptionFailed { message: String },
+    #[error("Encryption failed: {detail}")]
+    EncryptionFailed { detail: String },
 
-    #[error("Decryption failed: {message}")]
-    DecryptionFailed { message: String },
+    #[error("Decryption failed: {detail}")]
+    DecryptionFailed { detail: String },
 
     #[error("Invalid key data")]
     InvalidKeyData,
@@ -49,8 +49,8 @@ pub enum CryptoError {
     #[error("Invalid ciphertext")]
     InvalidCiphertext,
 
-    #[error("Serialization failed: {message}")]
-    SerializationFailed { message: String },
+    #[error("Serialization failed: {detail}")]
+    SerializationFailed { detail: String },
 
     #[error("MessagePack deserialization failed - check format")]
     MessagePackDeserializationFailed,
@@ -70,6 +70,11 @@ pub enum CryptoError {
     /// a session reset, cleared by `forget_contact_state` (TODO 176).
     #[error("Peer SPK rotation epoch {received} is below the {known} already admitted")]
     PeerSpkEpochRegressed { received: u32, known: u32 },
+
+    /// The bundle yields no Kyber prekey this device can trust (PQXDH v2 is mandatory): nothing
+    /// was created, and a held session is still there.
+    #[error("PQ_REQUIRED: {reason:?}")]
+    PqRequired { reason: PqxdhRefusal },
 }
 
 impl From<crate::pow::PowError> for CryptoError {
@@ -89,7 +94,7 @@ impl From<crate::error::CryptoError> for CryptoError {
             crate::error::CryptoError::InvalidKeyData => CryptoError::InvalidKeyData,
             crate::error::CryptoError::InvalidCiphertext => CryptoError::InvalidCiphertext,
             e => CryptoError::SessionInitializationFailed {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
         }
     }
@@ -104,7 +109,7 @@ impl From<crate::error::CryptoError> for CryptoError {
 /// sites (CfeError, serde_json::Error, String).
 fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError {
     CryptoError::SerializationFailed {
-        message: format!("{context}: {err:?}"),
+        detail: format!("{context}: {err:?}"),
     }
 }
 
@@ -270,6 +275,8 @@ pub use crate::crypto::sealed_sender::CertificateVerdict;
 pub use crate::crypto::sealed_sender::SenderCertificate;
 /// What a session envelope's body is — UDL `enum EnvelopeKind`.
 pub use crate::crypto::sealed_sender::envelope::EnvelopeKind;
+/// Why a bundle yields no session — UDL `enum PqxdhRefusal`.
+pub use crate::orchestration::pq_prekey_plan::PqxdhRefusal;
 
 /// The verdicts on a bundle's proofs. UDL `dictionary KtVerdicts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,7 +672,7 @@ impl ClassicCryptoCore {
                     "init_session failed"
                 );
                 CryptoError::SessionInitializationFailed {
-                    message: e.to_string(),
+                    detail: e.to_string(),
                 }
             })?;
 
@@ -1688,7 +1695,7 @@ pub fn intake_offer(
 pub fn wire_payload_unpack(data: Vec<u8>) -> Result<WirePayload, CryptoError> {
     let decoded =
         crate::wire_payload::unpack(&data).map_err(|e| CryptoError::SerializationFailed {
-            message: format!("wire_payload_unpack: {e}"),
+            detail: format!("wire_payload_unpack: {e}"),
         })?;
     Ok(WirePayload {
         dh_public_key: decoded.dh_public_key,
@@ -1720,7 +1727,7 @@ pub struct WireSummary {
 pub fn wire_summary(wire_payload: Vec<u8>) -> Result<WireSummary, CryptoError> {
     let d = crate::wire_payload::unpack(&wire_payload).map_err(|e| {
         CryptoError::SerializationFailed {
-            message: format!("wire_summary: {e}"),
+            detail: format!("wire_summary: {e}"),
         }
     })?;
     let carrier = crate::orchestration::ReceivingInitCarrier {
@@ -1788,11 +1795,11 @@ fn media_error(e: crate::media::MediaError) -> CryptoError {
     use crate::media::MediaError;
     match e {
         MediaError::TooLarge(_) => CryptoError::EncryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         },
         MediaError::InvalidKey(_) => CryptoError::InvalidKeyData,
         MediaError::Unauthenticated => CryptoError::DecryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         },
         MediaError::MalformedPadding => CryptoError::InvalidCiphertext,
     }
@@ -1847,7 +1854,7 @@ pub fn mlkem1024_encapsulate(public_key: Vec<u8>) -> Result<MLKEMEncapsulation, 
             ciphertext: enc.ciphertext,
             shared_secret: enc.shared_secret.into_vec(),
         })
-        .map_err(|e| CryptoError::EncryptionFailed { message: e })
+        .map_err(|e| CryptoError::EncryptionFailed { detail: e })
 }
 
 // ── Post-Quantum Signatures (ML-DSA-65 + Hybrid) ────────────────────────────
@@ -1940,7 +1947,7 @@ pub fn hybrid_sign(private_key: Vec<u8>, message: Vec<u8>) -> Result<Vec<u8>, Cr
     use crate::crypto::suites::hybrid::HybridSuiteProvider;
     HybridSuiteProvider::sign(&crate::crypto::SecretBytes::new(private_key), &message).map_err(
         |e| CryptoError::EncryptionFailed {
-            message: format!("Hybrid sign failed: {e}"),
+            detail: format!("Hybrid sign failed: {e}"),
         },
     )
 }
@@ -2313,7 +2320,7 @@ impl OrchestratorCore {
             &wire_payload,
             &certificate,
         )
-        .map_err(|message| CryptoError::EncryptionFailed { message })
+        .map_err(|message| CryptoError::EncryptionFailed { detail: message })
     }
 
     /// See `Orchestrator::open_first_flight`.
@@ -2324,7 +2331,7 @@ impl OrchestratorCore {
                 certificate: o.certificate,
                 wire_payload: o.wire_payload,
             })
-            .map_err(|message| CryptoError::DecryptionFailed { message })
+            .map_err(|message| CryptoError::DecryptionFailed { detail: message })
     }
 
     /// See `Orchestrator::open_sealed`.
@@ -2332,7 +2339,7 @@ impl OrchestratorCore {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.open_sealed(&sealed_inner)
             .map(OpenedSealed::from)
-            .map_err(|message| CryptoError::DecryptionFailed { message })
+            .map_err(|message| CryptoError::DecryptionFailed { detail: message })
     }
 
     /// How late messages have arrived since the process started (PQR-4).
@@ -2470,7 +2477,7 @@ impl OrchestratorCore {
     pub fn open_sealed_to_device(&self, sealed_box: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.open_sealed_to_device(&sealed_box)
-            .map_err(|message| CryptoError::DecryptionFailed { message })
+            .map_err(|message| CryptoError::DecryptionFailed { detail: message })
     }
 
     pub fn device_copy_tag(
@@ -2504,7 +2511,7 @@ impl OrchestratorCore {
     ) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.history_file_channel_key(&sender_eph_pub, kem_key_id, &kem_ciphertext, &snapshot_id)
-            .map_err(|message| CryptoError::DecryptionFailed { message })
+            .map_err(|message| CryptoError::DecryptionFailed { detail: message })
     }
 
     pub fn seal_own_recovery_bundle(
@@ -2517,7 +2524,7 @@ impl OrchestratorCore {
             .map_err(|_| CryptoError::InvalidKeyData)?;
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.seal_own_recovery_bundle(&key, created_at)
-            .map_err(|message| CryptoError::EncryptionFailed { message })
+            .map_err(|message| CryptoError::EncryptionFailed { detail: message })
     }
 
     pub fn history_offer_nearby(
@@ -2740,7 +2747,14 @@ impl OrchestratorCore {
             kyber_keys_of(&recipient_bundle),
             allow_stale,
         )
-        .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+        .map_err(|refusal| match refusal {
+            crate::orchestration::OpenRefusal::PqRequired { reason, .. } => {
+                CryptoError::PqRequired { reason }
+            }
+            crate::orchestration::OpenRefusal::Other(message) => {
+                CryptoError::SessionInitializationFailed { detail: message }
+            }
+        })
     }
 
     /// Whether any of `devices` is opening a session with us right now. See
@@ -2828,7 +2842,7 @@ impl OrchestratorCore {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (session_id, plaintext) = orch
             .receiving_from_certificate(&sender_certificate, &wire_payload)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })?;
+            .map_err(|e| CryptoError::SessionInitializationFailed { detail: e })?;
         Ok(SessionInitResult {
             session_id,
             decrypted_message: plaintext,
@@ -2848,7 +2862,7 @@ impl OrchestratorCore {
     ) -> Result<Vec<u8>, CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.encrypt_bytes_for(&contact_id, &plaintext)
-            .map_err(|e| CryptoError::EncryptionFailed { message: e })
+            .map_err(|e| CryptoError::EncryptionFailed { detail: e })
     }
 
     /// Decrypt a wire payload from `contact_id` on the states held with it. The counterpart of
@@ -2861,7 +2875,7 @@ impl OrchestratorCore {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let plaintext = orch
             .decrypt_bytes_for(&contact_id, &wire_payload)
-            .map_err(|e| CryptoError::DecryptionFailed { message: e })?;
+            .map_err(|e| CryptoError::DecryptionFailed { detail: e })?;
         Ok(DecryptedMessageResult {
             plaintext,
             storage_key: gen_storage_key(),
@@ -3001,7 +3015,7 @@ impl OrchestratorCore {
             .map(crate::crypto::SecretBytes::into_vec)
             .map_err(|e| {
                 tracing::warn!(target: "crypto::uniffi", key_id, error = %e, "kyber_prekey_decapsulate failed");
-                CryptoError::DecryptionFailed { message: e }
+                CryptoError::DecryptionFailed { detail: e }
             })
     }
 
@@ -3042,7 +3056,7 @@ impl OrchestratorCore {
     pub fn export_orchestrator_state(&self) -> Result<Vec<u8>, CryptoError> {
         let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.export_orchestrator_state_cfe()
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+            .map_err(|e| CryptoError::SessionInitializationFailed { detail: e })
     }
 
     /// Restore the full orchestrator coordination state from a CFE blob produced
@@ -3051,7 +3065,7 @@ impl OrchestratorCore {
     pub fn import_orchestrator_state(&self, data: Vec<u8>) -> Result<(), CryptoError> {
         let mut orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         orch.import_orchestrator_state_cfe(&data)
-            .map_err(|e| CryptoError::SessionInitializationFailed { message: e })
+            .map_err(|e| CryptoError::SessionInitializationFailed { detail: e })
     }
 }
 
@@ -3431,7 +3445,7 @@ impl CfeAction {
 
 pub fn pp_blind_token(nonce: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::privacy_pass::pp_blind_token(nonce).map_err(|e| CryptoError::EncryptionFailed {
-        message: e.to_string(),
+        detail: e.to_string(),
     })
 }
 
@@ -3442,7 +3456,7 @@ pub fn pp_finalize_token(
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::privacy_pass::pp_finalize_token(evaluated_bytes, blind_factor_bytes, nonce)
         .map_err(|e| CryptoError::EncryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         })
 }
 
@@ -3472,7 +3486,7 @@ pub fn pp_seal_token_bytes(
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::privacy_pass::pp_seal_token_bytes(token, server_encryption_key).map_err(|e| {
         CryptoError::EncryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         }
     })
 }
@@ -3485,7 +3499,7 @@ pub fn sealed_seal_sender_cert(
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::sealed_sender::seal_to_x25519_public(&cert_bytes, &recipient_identity_key)
         .map_err(|e| CryptoError::EncryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         })
 }
 
@@ -3507,7 +3521,7 @@ pub fn seal_to_device_key(
 ) -> Result<Vec<u8>, CryptoError> {
     crate::crypto::sealed_sender::seal_to_x25519_public(&plaintext, &device_identity_public)
         .map_err(|e| CryptoError::EncryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         })
 }
 
@@ -3552,7 +3566,7 @@ pub fn sr_create_recovery_shares(
         .map_err(|_| CryptoError::InvalidKeyData)?;
     crate::crypto::social_recovery::create_recovery_shares(&key, threshold, share_count).map_err(
         |e| CryptoError::SessionInitializationFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         },
     )
 }
@@ -3561,7 +3575,7 @@ pub fn sr_reconstruct_vault_key(mnemonics: Vec<String>) -> Result<Vec<u8>, Crypt
     crate::crypto::social_recovery::reconstruct_vault_key(mnemonics)
         .map(|k| k.to_vec())
         .map_err(|e| CryptoError::DecryptionFailed {
-            message: e.to_string(),
+            detail: e.to_string(),
         })
 }
 

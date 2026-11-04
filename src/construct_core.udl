@@ -402,24 +402,46 @@ dictionary DecryptedMessageResult {
     bytes storage_key;  // 32-byte random key — store in MessageKeyStore; use to re-encrypt plaintext at rest
 };
 
+/// Why a bundle yields no session under PQXDH v2 (`CryptoError.PqRequired`).
+enum PqxdhRefusal {
+    "NoKyberPrekey",
+    "KyberPrekeyMalformed",
+    "KyberSignatureMissing",
+    /// An Ed25519 signature that does not verify: tampering, not a transition.
+    "KyberSignatureInvalid",
+    "KyberPrekeyStale",
+    "HybridIdentityMissing",
+    "HybridIdentityBindingInvalid",
+    /// A hybrid identity key other than the one pinned for this device.
+    "HybridIdentityChanged",
+    "HybridSignatureMissing",
+    "HybridSignatureInvalid",
+};
+
+// Fields are `detail`, never `message`: generated Kotlin errors already override `message`, and
+// a field of that name does not compile.
 [Error]
-enum CryptoError {
-    "InitializationFailed",
-    "SessionNotFound",
-    "SessionInitializationFailed",
-    "EncryptionFailed",
-    "DecryptionFailed",
-    "InvalidKeyData",
-    "InvalidCiphertext",
-    "SerializationFailed",
-    "MessagePackDeserializationFailed",
-    "PeerSpkStale",
-    "PowDifficultyTooHigh",
+interface CryptoError {
+    InitializationFailed();
+    SessionNotFound();
+    SessionInitializationFailed(string detail);
+    EncryptionFailed(string detail);
+    DecryptionFailed(string detail);
+    InvalidKeyData();
+    InvalidCiphertext();
+    SerializationFailed(string detail);
+    MessagePackDeserializationFailed();
+    PeerSpkStale(u64 age_secs);
+    PowDifficultyTooHigh(u32 difficulty, u32 max);
     // The bundle's SPK rotation epoch is below the one already admitted from the same peer
     // device: a replayed bundle. Per device, kept across a session reset, cleared by
     // `forget_contact_state`. The same refusal on the `OpenSession` answer path is an
     // `OPEN_SESSION_REFUSED` whose message starts with `SPK_EPOCH_REGRESSED:`.
-    "PeerSpkEpochRegressed",
+    PeerSpkEpochRegressed(u32 received, u32 known);
+    // The bundle yields no Kyber prekey this device can trust; nothing was created, and a held
+    // session is still there. The same refusal on the `OpenSession` answer path is an
+    // `OPEN_SESSION_REFUSED` whose message contains `PQ_REQUIRED:`.
+    PqRequired(PqxdhRefusal reason);
 };
 
 dictionary OtpkPair {

@@ -246,6 +246,25 @@ pub struct ReceivingOpen {
     pub awaiting_server_key: bool,
 }
 
+/// Why a bundle opened no session. `Display` is the text `OPEN_SESSION_REFUSED` carries.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenRefusal {
+    /// PQXDH v2 is mandatory and this bundle yields no Kyber prekey this device can trust.
+    #[error("PQ_REQUIRED: {reason:?} — no session opened to device {contact_id}")]
+    PqRequired {
+        reason: crate::orchestration::pq_prekey_plan::PqxdhRefusal,
+        contact_id: String,
+    },
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for OpenRefusal {
+    fn from(message: String) -> Self {
+        OpenRefusal::Other(message)
+    }
+}
+
 /// A sealed delivery opened by `Orchestrator::open_sealed`: the route `sealed_route` chose and its
 /// answer. This is what the platform's sender resolution used to compute across three separate
 /// calls and a hand-parsed `SealedInner`; the route is decided here, so no client reads
@@ -765,14 +784,14 @@ impl Orchestrator {
         public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
         kyber: KyberBundleKeys,
         allow_stale: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, OpenRefusal> {
         use crate::crypto::messaging::double_ratchet::PrekeyHeader;
 
         // Before anything is spent on it: a bundle that goes back behind what this device has
         // admitted from the peer is a replay, whoever asked for the open (TODO 176).
         let spk_epoch = public_bundle.spk_rotation_epoch;
         if let Some(regressed) = self.lifecycle.spk_epoch_regression(contact_id, spk_epoch) {
-            return Err(regressed.to_string());
+            return Err(regressed.to_string().into());
         }
 
         let remote_identity =
@@ -830,7 +849,10 @@ impl Orchestrator {
                     reason = ?reason,
                     "PQXDH refused: this bundle does not yield a Kyber prekey this device can trust"
                 );
-                format!("PQ_REQUIRED: {reason:?} — no session opened to device {contact_id}")
+                OpenRefusal::PqRequired {
+                    reason,
+                    contact_id: contact_id.to_string(),
+                }
             })?;
             match choice.one_time_prekey_rejected {
                 Some(
@@ -967,7 +989,7 @@ impl Orchestrator {
         public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
         kyber: KyberBundleKeys,
         allow_stale: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, OpenRefusal> {
         let held = self.lifecycle.client.take_session(contact_id);
         let opened = self.init_session_with_bundle(contact_id, public_bundle, kyber, allow_stale);
         match (&opened, held) {
@@ -2775,6 +2797,7 @@ impl Orchestrator {
         bundle: Result<SessionBundle, String>,
     ) -> Vec<Action> {
         let opened = bundle
+            .map_err(OpenRefusal::Other)
             .and_then(|b| self.reopen_session_with_bundle(&contact_id, b.x3dh, b.kyber, false));
         match opened {
             Ok(_) => {
@@ -4262,7 +4285,8 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle("bob", x3dh.clone(), kyber, false)
             .unwrap_err();
         assert!(
-            err.starts_with("PQ_REQUIRED: HybridSignatureMissing"),
+            err.to_string()
+                .starts_with("PQ_REQUIRED: HybridSignatureMissing"),
             "{err}"
         );
         assert!(alice.get_session_health("bob").is_none());
@@ -4271,7 +4295,8 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle("bob", x3dh, KyberBundleKeys::default(), false)
             .unwrap_err();
         assert!(
-            err.starts_with("PQ_REQUIRED: HybridIdentityMissing"),
+            err.to_string()
+                .starts_with("PQ_REQUIRED: HybridIdentityMissing"),
             "{err}"
         );
         assert!(alice.get_session_health("bob").is_none());
@@ -4302,7 +4327,8 @@ mod pqxdh_v2_tests {
             .init_session_with_bundle("bob", x3dh, kyber, false)
             .unwrap_err();
         assert!(
-            err.starts_with("PQ_REQUIRED: HybridIdentityChanged"),
+            err.to_string()
+                .starts_with("PQ_REQUIRED: HybridIdentityChanged"),
             "{err}"
         );
     }
@@ -4510,7 +4536,7 @@ mod pqxdh_v2_tests {
         let err = zed
             .reopen_session_with_bundle("bob", x3dh, KyberBundleKeys::default(), false)
             .unwrap_err();
-        assert!(err.starts_with("PQ_REQUIRED"), "{err}");
+        assert!(err.to_string().starts_with("PQ_REQUIRED"), "{err}");
         assert_eq!(zed.lifecycle.active_session_id("bob").unwrap(), before);
         assert_eq!(
             zed.get_session_health("bob").unwrap().pq_handshake,
@@ -6618,7 +6644,8 @@ mod pqxdh_v2_tests {
             .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
             .unwrap_err();
         assert!(
-            err.starts_with(crate::orchestration::SPK_EPOCH_REGRESSED),
+            err.to_string()
+                .starts_with(crate::orchestration::SPK_EPOCH_REGRESSED),
             "{err}"
         );
         assert!(alice.has_active_session(&bob_id), "the held session stays");
