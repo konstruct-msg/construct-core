@@ -126,8 +126,7 @@ pub struct EnvelopeOpened {
     pub contact_id: String,
     /// The session of that pair; pass it on as `MessageReceived::envelope_session`.
     pub session_id: String,
-    /// 1 = a ratchet wire payload, 2 = a DECRYPTION_ERROR.
-    pub kind: u8,
+    pub kind: EnvelopeKind,
     pub body: Vec<u8>,
     /// The pair's ratchet state is gone here: a ratchet body will not decrypt, and is answered
     /// with a DECRYPTION_ERROR along the same pair.
@@ -141,7 +140,7 @@ pub enum OpenedSealed {
         writer_device: String,
         session_id: String,
         body: Vec<u8>,
-        kind: u8,
+        kind: EnvelopeKind,
         retired: bool,
     },
     FirstFlight {
@@ -269,6 +268,8 @@ pub use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
 pub use crate::crypto::sealed_sender::CertificateVerdict;
 /// The sender certificate as a platform unsealed it. UDL `dictionary SenderCertificate`.
 pub use crate::crypto::sealed_sender::SenderCertificate;
+/// What a session envelope's body is — UDL `enum EnvelopeKind`.
+pub use crate::crypto::sealed_sender::envelope::EnvelopeKind;
 
 /// The verdicts on a bundle's proofs. UDL `dictionary KtVerdicts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2291,7 +2292,7 @@ impl OrchestratorCore {
         orch.open_envelope(&envelope).map(|o| EnvelopeOpened {
             contact_id: o.device,
             session_id: o.session_id,
-            kind: o.kind as u8,
+            kind: o.kind,
             body: o.body,
             retired: o.retired,
         })

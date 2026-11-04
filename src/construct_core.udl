@@ -224,10 +224,18 @@ enum CertificateVerdict {
 // its answer, so no platform reads `SealedInner` fields or branches on them again
 // (construct-docs TODO 140). `trust` is the core's `certificate_verdict`; a platform that keeps a
 // KT-verified key per contact composes its own trust label on top of it.
+/// What a session envelope's body is (first byte inside its ciphertext; the server never sees it).
+enum EnvelopeKind {
+    /// A ratchet wire payload.
+    "Ratchet",
+    /// A DECRYPTION_ERROR (content type 28), plain inside the envelope.
+    "DecryptionError",
+};
+
 [Enum]
 interface OpenedSealed {
-    /// A session envelope named the writer; `kind` 1 = ratchet wire payload, 2 = DECRYPTION_ERROR.
-    SessionEnvelope(string writer_device, string session_id, bytes body, u8 kind, boolean retired);
+    /// A session envelope named the writer; a DECRYPTION_ERROR is labelled from `kind`.
+    SessionEnvelope(string writer_device, string session_id, bytes body, EnvelopeKind kind, boolean retired);
     /// A first flight sealed whole; `content_type` is `SealedInner.content_type`.
     FirstFlight(string writer_account, string writer_device, SenderCertificate certificate, CertificateVerdict trust, bytes first_flight_payload, u8 content_type);
     /// A sender certificate sealed to this device; the wire payload sits in `SealedInner.encrypted_payload`.
@@ -365,7 +373,7 @@ dictionary SessionHealthReport {
 dictionary EnvelopeOpened {
     string contact_id;   // the device whose pair matched: who wrote it
     string session_id;   // pass on as MessageReceived.envelope_session
-    u8 kind;             // 1 = ratchet wire payload, 2 = DECRYPTION_ERROR
+    EnvelopeKind kind;
     bytes body;
     boolean retired;     // its ratchet state is gone here; a ratchet body will not decrypt
 };
