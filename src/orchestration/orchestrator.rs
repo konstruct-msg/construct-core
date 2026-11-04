@@ -252,13 +252,13 @@ pub struct ReceivingOpen {
 /// `SealedInner` fields or branches on them again (construct-docs TODO 140).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealedOpen {
-    /// A session envelope named the writer. `kind` is `EnvelopeKind`: 1 = ratchet wire payload,
-    /// 2 = DECRYPTION_ERROR (whose content type the platform labels from `kind`).
+    /// A session envelope named the writer. The platform labels a DECRYPTION_ERROR's content
+    /// type from `kind`.
     SessionEnvelope {
         writer_device: String,
         session_id: String,
         body: Vec<u8>,
-        kind: u8,
+        kind: crate::crypto::sealed_sender::envelope::EnvelopeKind,
         retired: bool,
     },
     /// A session's first flight sealed whole. The certificate names the writer; the wire payload
@@ -1741,7 +1741,7 @@ impl Orchestrator {
                     writer_device: opened.device,
                     session_id: opened.session_id,
                     body: opened.body,
-                    kind: opened.kind as u8,
+                    kind: opened.kind,
                     retired: opened.retired,
                 })
             }
@@ -5496,7 +5496,10 @@ mod pqxdh_v2_tests {
             } => {
                 assert_eq!(writer_device, alice_id);
                 assert_eq!(body, wire);
-                assert_eq!(kind, 1);
+                assert_eq!(
+                    kind,
+                    crate::crypto::sealed_sender::envelope::EnvelopeKind::Ratchet
+                );
                 assert!(!retired);
             }
             other => panic!("expected a session envelope, got {other:?}"),
