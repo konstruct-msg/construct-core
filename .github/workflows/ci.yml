@@ -86,7 +86,7 @@ jobs:
   # ── 2. iOS cross-compilation + Swift bindings (macOS) ────────────────────
   build-ios:
     name: iOS Cross-compile + Swift bindings
-    runs-on: macos-14 # Apple Silicon runner — faster Rust compilation
+    runs-on: macos-15 # Apple Silicon runner — faster Rust compilation
     needs: test
     steps:
       - name: Checkout construct-core
@@ -352,7 +352,7 @@ jobs:
   # library the app ships for another CPU, not the iOS/mac flavour.
   build-host-mac:
     name: Host library (darwin-aarch64)
-    runs-on: macos-14
+    runs-on: macos-15
     needs: test
     steps:
       - name: Checkout construct-core
