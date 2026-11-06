@@ -49,6 +49,12 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 1. **Prior art first.** Before any mechanism, write down how Signal / MLS (RFC 9420) / Matrix solve
    it and why we deviate. Group key management is MLS, not ours. END_SESSION reinvented for eight
    months what Signal has had since 2016.
+   Read them, do not recall them: the note links the code or spec it read (Session too when the
+   question is metadata). For a delivery, crypto or privacy mechanism it answers what theirs does,
+   who may call it and what a refused caller sees, and what happens to a party without the
+   credential; it lists what in ours is our own, why, and what would let us remove it; and it gives
+   the share of real traffic each new condition or exception affects.
+   `~/Code/construct-docs/scripts/check_prior_art.py` refuses a decision note without the link.
 2. **The core decides.** Anything two clients must compute identically, anything that reads or
    writes ratchet/session state, any *plan* (which sessions an operation touches) and the
    *lifecycle phase* of a device pair is exported from here — not described for clients to
