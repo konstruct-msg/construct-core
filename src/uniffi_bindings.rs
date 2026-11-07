@@ -2697,6 +2697,25 @@ impl OrchestratorCore {
         self.open_session_inner(contact_id, recipient_bundle, false, true)
     }
 
+    /// `reopen_session` for a bundle past the SPK age limit: what `init_session_allowing_stale` is
+    /// to `init_session`, with the same check kept. The caller flags the session at-risk.
+    pub fn reopen_session_allowing_stale(
+        &self,
+        contact_id: String,
+        recipient_bundle: BinaryKeyBundle,
+    ) -> Result<String, CryptoError> {
+        if recipient_bundle.suite_id == SuiteID::PQ_HYBRID.as_u16()
+            && recipient_bundle.kyber_spk_rotation_epoch == 0
+        {
+            self.inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reopen_refused(&contact_id);
+            return Err(CryptoError::InvalidKeyData);
+        }
+        self.open_session_inner(contact_id, recipient_bundle, true, true)
+    }
+
     fn init_session_inner(
         &self,
         contact_id: String,
