@@ -1125,6 +1125,12 @@ interface OrchestratorCore {
     [Throws=CryptoError]
     string reopen_session(string contact_id, BinaryKeyBundle recipient_bundle);
 
+    // reopen_session for a bundle past the SPK age limit, with the checks init_session_allowing_stale
+    // keeps. A session held is replaced only if the open succeeded, and stays a previous state.
+    // The caller is responsible for flagging the resulting session as "at-risk".
+    [Throws=CryptoError]
+    string reopen_session_allowing_stale(string contact_id, BinaryKeyBundle recipient_bundle);
+
     // The server's certificate-signing keys: the well-known key and any pins. Nothing opens a
     // receiving session until they are set, because a certificate is what it opens from.
     void set_trusted_server_keys(sequence<bytes> keys);

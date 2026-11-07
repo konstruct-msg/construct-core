@@ -770,6 +770,70 @@ fn test_degraded_session_encrypts_and_decrypts() {
     );
 }
 
+/// A degraded open over a held session keeps it as a previous state: what the peer already sent on
+/// it still decrypts. Until 0.63 the platform had to drop the session first, and that message was
+/// unreadable.
+///
+/// Mutation: pass `replace: false` — the held state is overwritten and `late` no longer decrypts.
+/// Mutation: pass `allow_stale: false` — the stale bundle is refused.
+#[test]
+fn a_degraded_reopen_keeps_what_the_peer_sent_on_the_held_state() {
+    let (alice, alice_id) = named_core();
+    let (bob, bob_id) = named_core();
+    let server = crate::crypto::sealed_sender::test_support::TestServer::new();
+
+    let session = alice
+        .init_session(bob_id.clone(), pq_bundle(&bob))
+        .expect("the first open");
+    let first = alice.encrypt_to_wire(session, b"hello".to_vec()).unwrap();
+    bob.init_receiving_session_from_wire_payload(certified(&server, &alice, &bob), first)
+        .unwrap();
+    let late = bob.encrypt_to_wire(alice_id, b"late".to_vec()).unwrap();
+
+    let mut stale = pq_bundle(&bob);
+    stale.spk_uploaded_at = unix_secs_days_ago(35);
+    let err = alice
+        .reopen_session(bob_id.clone(), stale.clone())
+        .expect_err("the strict reopen refuses a stale bundle");
+    assert!(matches!(err, CryptoError::PeerSpkStale { .. }), "{err:?}");
+
+    alice
+        .reopen_session_allowing_stale(bob_id.clone(), stale)
+        .expect("the degraded reopen accepts it");
+
+    let read = alice.decrypt_wire_payload(bob_id, late).unwrap();
+    assert_eq!(read.plaintext, b"late".to_vec());
+}
+
+/// A refusal leaves the held session as it was, and the check `init_session_allowing_stale` keeps
+/// is kept here. Mutation: drop the epoch check — a PQ bundle with no Kyber SPK is opened.
+#[test]
+fn a_refused_degraded_reopen_keeps_the_held_session() {
+    let (alice, _) = named_core();
+    let (bob, bob_id) = named_core();
+    alice.init_session(bob_id.clone(), pq_bundle(&bob)).unwrap();
+
+    let mut no_kyber = pq_bundle(&bob);
+    no_kyber.spk_uploaded_at = unix_secs_days_ago(35);
+    no_kyber.suite_id = 2; // PQ_HYBRID
+    no_kyber.kyber_spk_rotation_epoch = 0;
+    let err = alice
+        .reopen_session_allowing_stale(bob_id.clone(), no_kyber)
+        .unwrap_err();
+    assert!(matches!(err, CryptoError::InvalidKeyData), "{err:?}");
+    assert!(alice.has_session(bob_id.clone()));
+
+    let mut old_build = pq_bundle(&bob);
+    old_build.spk_uploaded_at = unix_secs_days_ago(35);
+    old_build.hybrid_identity_key = None;
+    old_build.hybrid_identity_signature = None;
+    let err = alice
+        .reopen_session_allowing_stale(bob_id.clone(), old_build)
+        .unwrap_err();
+    assert!(matches!(err, CryptoError::PqRequired { .. }), "{err:?}");
+    assert!(alice.has_session(bob_id));
+}
+
 /// A DEVICE-SHAPED bundle through the exported API, end to end: classic crypto suite (1), a
 /// real X25519 one-time prekey, the Kyber SPK and a Kyber one-time prekey from the core, fresh
 /// timestamps. PQXDH v2 opens a PQ-ratchet session on the one-time Kyber key; the first message's
