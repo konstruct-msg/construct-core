@@ -83,6 +83,86 @@ jobs:
         working-directory: construct-core
         run: cargo test --features mac
 
+  # ── 1b. construct-client against this core (Linux) ────────────────────────
+  # construct-client (Desktop, TUI) takes this crate by path, as a sibling checkout, and has no
+  # CI of its own. Core 0.62 changed `init_session_with_bundle`'s error type and the client stopped
+  # compiling; it showed only in construct-desktop's CI, two days later (construct-docs todo/267).
+  # Here the client is built against the core being changed: a branch of construct-client with the
+  # same name as this one is used when it exists, so a breaking change lands with its client half;
+  # otherwise the client's main.
+  client:
+    name: construct-client against this core (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          path: construct-core
+
+      - name: Which construct-client branch
+        id: client
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if git ls-remote --exit-code --heads https://github.com/konstruct-msg/construct-client.git "$BRANCH" > /dev/null; then
+            ref="$BRANCH"
+          else
+            ref=main
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "construct-client: $ref"
+
+      - name: Checkout construct-client
+        uses: actions/checkout@v4
+        with:
+          repository: konstruct-msg/construct-client
+          ref: ${{ steps.client.outputs.ref }}
+          path: construct-client
+
+      # The client's build.rs compiles the protos from the sibling checkout.
+      - name: Checkout construct-protos
+        uses: actions/checkout@v4
+        with:
+          repository: konstruct-msg/construct-protos
+          path: construct-protos
+
+      # libdbus for the Secret Service key store, ALSA for the `voice` feature. Ubuntu's protoc
+      # (3.12) predates proto3 `optional`, which the protos use.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev libasound2-dev pkg-config
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pinned Rust toolchain
+        working-directory: construct-client
+        run: rustup show
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            construct-client/target/
+          key: linux-cargo-client-${{ hashFiles('construct-client/Cargo.lock', 'construct-core/Cargo.lock') }}
+          restore-keys: linux-cargo-client-
+
+      # Without `--locked`: the client's lock names this core's version, which moves with it.
+      # construct-webrtc is left out: a spike with a libwebrtc prebuilt, it does not touch the core.
+      - name: Build construct-client and construct-screens (all features)
+        working-directory: construct-client
+        run: cargo check -p construct-client -p construct-screens --all-targets --all-features
+
+      - name: Run construct-client tests
+        working-directory: construct-client
+        run: cargo test -p construct-client --lib
+
   # ── 2. iOS cross-compilation + Swift bindings (macOS) ────────────────────
   build-ios:
     name: iOS Cross-compile + Swift bindings
