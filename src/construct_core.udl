@@ -75,6 +75,9 @@ namespace construct_core {
     /// seconds apart, each alone when it decided, and the conversation stopped for thirty-two
     /// seconds until one fell back to responder.
     InitiationDecision plan_initiation(InitiationContext context);
+    // A bundle refused as stale (PeerSpkStale { age_secs }): refetch after a wait, or open
+    // degraded now. Since 0.65; the wait itself is the platform's.
+    StaleSpkPlan plan_stale_spk(u64 age_secs);
 
     /// Classify a message: can it open a receiving session? One rule, one implementation —
     /// every client asks rather than reimplements. A handshake header (the KEM ciphertext) opens
@@ -733,6 +736,15 @@ dictionary ReceivingInitCarrier {
     u32 one_time_prekey_id;
     u32 kem_ciphertext_bytes;
     u32 pq_message_epoch;
+};
+
+/// What to do with a bundle refused as stale. See orchestration::stale_spk_plan.
+enum StaleSpkPlan {
+    /// The peer may have rotated already: refetch after a short wait, open degraded only if it is
+    /// still stale.
+    "WaitForRotation",
+    /// The peer has been away longer than a rotation takes to reach the key server: open degraded now.
+    "OpenDegraded",
 };
 
 /// Whether to open a session with a device right now. See orchestration::initiation_plan.

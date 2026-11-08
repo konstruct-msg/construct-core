@@ -30,6 +30,7 @@ pub mod reorder_stats;
 pub mod send_plan;
 pub mod session_lifecycle;
 pub mod session_machine;
+pub mod stale_spk_plan;
 
 pub use ack_store::{AckCheckResult, AckStore};
 pub use actions::{Action, IncomingEvent, SecureStoreSlot};
@@ -48,3 +49,4 @@ pub use session_lifecycle::{SPK_EPOCH_REGRESSED, SpkEpochRegressed};
 pub use session_machine::{
     Effect as SessionEffect, Event as SessionEvent, OPENING_TTL_MS, Phase, SessionMachine,
 };
+pub use stale_spk_plan::{StaleSpkPlan, plan_stale_spk};

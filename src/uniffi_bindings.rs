@@ -1756,6 +1756,12 @@ pub fn plan_initiation(context: InitiationContext) -> InitiationDecision {
     crate::orchestration::plan_initiation(&context)
 }
 
+/// What to do with a bundle refused as stale: refetch after a wait, or open degraded now. See
+/// `orchestration::stale_spk_plan`.
+pub fn plan_stale_spk(age_secs: u64) -> StaleSpkPlan {
+    crate::orchestration::plan_stale_spk(age_secs)
+}
+
 /// Compute a Safety Number for two Construct devices.
 ///
 /// Returns a 60-digit string (12 groups of 5, space-separated) that both parties
@@ -2113,6 +2119,7 @@ impl From<&ReceivingInitCarrier> for crate::orchestration::ReceivingInitCarrier 
 /// FFI layer: a mirror drifts by an added variant that nobody adds on the other side, and the UDL
 /// only needs the names to resolve at the crate root — which a re-export does.
 pub use crate::orchestration::initiation_plan::{InitiationContext, InitiationDecision};
+pub use crate::orchestration::stale_spk_plan::StaleSpkPlan;
 
 /// Mirror of the UDL `AckCheckResult` enum (must match UDL name exactly).
 pub enum AckCheckResult {
