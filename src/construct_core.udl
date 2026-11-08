@@ -877,7 +877,9 @@ interface CfeAction {
     /// no certificate; otherwise it is the X25519 box, sent as before.
     SendDecryptionError(string contact_id, string message_id, bytes payload, boolean enveloped);
     /// The peer could not read our current state with `contact_id`; it is retired and the next
-    /// send opens a new one — without a one-time prekey when `without_one_time_prekey`.
+    /// send opens a new one — without a one-time prekey when `without_one_time_prekey`. Since 0.64
+    /// the core applies that itself on the next open and the platform strips nothing; the flag is
+    /// for the log, and `opens_without_one_time_prekey` is the question to ask before a fetch.
     SessionRetired(string contact_id, boolean without_one_time_prekey);
     /// The peer could not read `message_id`: send it again to `contact_id` as a new message.
     ResendMessage(string contact_id, string message_id);
@@ -1074,6 +1076,11 @@ interface OrchestratorCore {
     sequence<string> get_all_session_contact_ids();
 
     boolean has_session(string contact_id);
+
+    // Whether the next open with contact_id goes without a one-time prekey (the peer said it does
+    // not hold the one it would be given). Ask before fetching the bundle, so as not to spend one
+    // of the peer's on the server; the open drops it either way. Since 0.64.
+    boolean opens_without_one_time_prekey(string contact_id);
 
     SessionHealthReport? get_session_health(string contact_id);
 
