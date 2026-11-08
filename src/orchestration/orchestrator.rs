@@ -218,6 +218,14 @@ pub struct Orchestrator {
     /// Messages already resent after a peer's decryption error. In memory: it bounds a loop within
     /// a run, and a restart that forgets it costs at most one more resend of each.
     resent_after_error: HashSet<String>,
+    /// Devices whose next open goes without a one-time prekey, classical or Kyber: the peer said in
+    /// a decryption error that it does not hold the one it would be given
+    /// (`DecryptionErrorHint::PrekeyUnavailable`). Until 0.64 each platform kept this beside the
+    /// `SessionRetired` action, iOS per account in memory and dropping only the classical key,
+    /// Android per device and fetching no one-time keys at all (todo/253). Cleared by the open that
+    /// honours it. In memory, as both platform copies were: a restart costs at most one more
+    /// refused handshake, which asks again.
+    open_without_one_time_prekey: HashSet<String>,
     /// The server keys a sender certificate is checked against before it opens a session
     /// (`set_trusted_server_keys`). In memory: the platform sets them at every launch.
     server_trust: crate::crypto::sealed_sender::ServerTrust,
@@ -346,6 +354,7 @@ impl Orchestrator {
             kyber_prekeys_dirty: false,
             pq_upgrade_asked: HashSet::new(),
             resent_after_error: HashSet::new(),
+            open_without_one_time_prekey: HashSet::new(),
             server_trust: crate::crypto::sealed_sender::ServerTrust::pinned(),
             clock,
         }
@@ -522,9 +531,13 @@ impl Orchestrator {
                         data: bytes.into(),
                     });
                 }
+                let without_one_time_prekey = error.hint == DecryptionErrorHint::PrekeyUnavailable;
+                if without_one_time_prekey {
+                    self.open_without_one_time_prekey.insert(contact_id.clone());
+                }
                 actions.push(Action::SessionRetired {
                     contact_id: contact_id.clone(),
-                    without_one_time_prekey: error.hint == DecryptionErrorHint::PrekeyUnavailable,
+                    without_one_time_prekey,
                 });
             }
         }
@@ -781,11 +794,23 @@ impl Orchestrator {
     pub fn init_session_with_bundle(
         &mut self,
         contact_id: &str,
-        public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
-        kyber: KyberBundleKeys,
+        mut public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        mut kyber: KyberBundleKeys,
         allow_stale: bool,
     ) -> Result<String, OpenRefusal> {
         use crate::crypto::messaging::double_ratchet::PrekeyHeader;
+
+        // The peer said it does not hold the one-time prekey it would be given: open on its signed
+        // prekeys alone, which it can always reproduce. Whatever the bundle carries is not used.
+        if self.opens_without_one_time_prekey(contact_id) {
+            public_bundle.one_time_prekey_public = None;
+            public_bundle.one_time_prekey_id = None;
+            kyber.one_time_prekey_id = None;
+            kyber.one_time_prekey_public = None;
+            kyber.one_time_prekey_created_at = None;
+            kyber.one_time_prekey_signature = None;
+            kyber.one_time_prekey_hybrid_signature = None;
+        }
 
         // Before anything is spent on it: a bundle that goes back behind what this device has
         // admitted from the peer is a replay, whoever asked for the open (TODO 176).
@@ -952,6 +977,7 @@ impl Orchestrator {
             );
         }
         self.lifecycle.note_spk_epoch(contact_id, spk_epoch);
+        self.open_without_one_time_prekey.remove(contact_id);
         tracing::info!(
             target: "crypto::orchestrator",
             contact_id = %contact_id,
@@ -959,6 +985,13 @@ impl Orchestrator {
             "session opened (PQXDH v2 initiator)"
         );
         Ok(contact_id.to_string())
+    }
+
+    /// Whether the next open with `contact_id` goes without a one-time prekey. What a platform asks
+    /// before fetching the bundle, so it does not spend one of the peer's on the server for
+    /// nothing; the open drops it either way.
+    pub fn opens_without_one_time_prekey(&self, contact_id: &str) -> bool {
+        self.open_without_one_time_prekey.contains(contact_id)
     }
 
     /// Whether a bundle of `contact_id` with SPK rotation epoch `epoch` would be refused as a
@@ -6389,6 +6422,102 @@ mod pqxdh_v2_tests {
                 }
             )),
             "{retired:?}"
+        );
+    }
+
+    /// The open that follows honours the hint itself (todo/253). The bundle Alice opens from still
+    /// names the one-time key Bob no longer holds — the server does not know it is gone — and the
+    /// open goes on Bob's signed prekeys, so Bob reads it. The open after that uses one-time keys
+    /// again.
+    ///
+    /// Mutation: keep the bundle's one-time keys in `init_session_with_bundle` — Bob cannot open
+    /// and this reddens. Mutation: never clear the mark — the last assertion reddens.
+    #[test]
+    fn the_open_after_the_hint_goes_without_the_missing_prekey() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let burned = kyber
+            .one_time_prekey_id
+            .expect("the bundle carries a one-time key");
+        alice
+            .init_session_with_bundle(&bob_id, x3dh.clone(), kyber.clone(), false)
+            .unwrap();
+        bob.lifecycle
+            .client
+            .key_manager_mut()
+            .kyber_prekeys_mut()
+            .remove_otpk(burned);
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "m0", m0);
+        alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload: error_payload(&answer, "m0"),
+            opened: false,
+        });
+        assert!(alice.opens_without_one_time_prekey(&bob_id));
+
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let n0 = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        receive(&mut bob, &alice, &alice_id, &server, "n0", n0);
+
+        assert!(
+            bob.lifecycle.client.has_session(&alice_id),
+            "Bob opened from the second handshake"
+        );
+        assert!(
+            !alice.opens_without_one_time_prekey(&bob_id),
+            "the mark goes with the open that honoured it"
+        );
+    }
+
+    /// The same for the classical one-time prekey, which the iOS copy of this hint was the only one
+    /// to drop. Mutation: keep the bundle's classical one-time key — this reddens.
+    #[test]
+    fn the_open_after_the_hint_goes_without_the_missing_classical_prekey() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let (mut x3dh, kyber) = bundle_of(&mut bob, false);
+        let (id, public) = bob
+            .lifecycle
+            .client
+            .key_manager_mut()
+            .generate_one_time_prekeys(1)
+            .unwrap()
+            .remove(0);
+        x3dh.one_time_prekey_id = Some(id);
+        x3dh.one_time_prekey_public = Some(ClassicSuiteProvider::kem_public_key_from_bytes(public));
+        alice
+            .init_session_with_bundle(&bob_id, x3dh.clone(), kyber.clone(), false)
+            .unwrap();
+        bob.lifecycle
+            .client
+            .key_manager_mut()
+            .consume_one_time_prekey(id)
+            .expect("Bob held it");
+        let m0 = alice.encrypt_bytes_for(&bob_id, b"hello").unwrap();
+        let answer = receive(&mut bob, &alice, &alice_id, &server, "m0", m0);
+        alice.handle_event(IncomingEvent::DecryptionErrorReceived {
+            contact_id: bob_id.clone(),
+            payload: error_payload(&answer, "m0"),
+            opened: false,
+        });
+        assert!(
+            alice.opens_without_one_time_prekey(&bob_id),
+            "Bob said the prekey is gone"
+        );
+
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let n0 = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        receive(&mut bob, &alice, &alice_id, &server, "n0", n0);
+
+        assert!(
+            bob.lifecycle.client.has_session(&alice_id),
+            "Bob opened from the second handshake"
         );
     }
 

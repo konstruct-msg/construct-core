@@ -2644,6 +2644,14 @@ impl OrchestratorCore {
         orch.get_all_session_contact_ids()
     }
 
+    /// Whether the next open with `contact_id` goes without a one-time prekey: asked before the
+    /// bundle is fetched, so the platform does not spend one of the peer's on the server for
+    /// nothing. The open drops it either way (`Orchestrator::init_session_with_bundle`).
+    pub fn opens_without_one_time_prekey(&self, contact_id: String) -> bool {
+        let orch = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        orch.opens_without_one_time_prekey(&contact_id)
+    }
+
     /// Asked before every send: an unanswered handshake past its age is retired first
     /// (`Orchestrator::has_session_for_sending`), so the platform opens a new state.
     pub fn has_session(&self, contact_id: String) -> bool {
