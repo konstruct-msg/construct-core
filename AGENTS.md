@@ -60,6 +60,12 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
    *lifecycle phase* of a device pair is exported from here — not described for clients to
    rebuild. "The client must compute X the same way" means: export X. Take a **set of device ids,
    return a decision over it**.
+   **Client rules too:** a pure decision over protocol data or a client's own state that two
+   clients or more make and that must behave the same (the mailbox-gap notice, the stream cursor,
+   a retry queue, delivery-status transitions) lives once, in `rules/` (`construct-rules`: sans-IO,
+   no cryptography), exported through `rules_bindings`. A third copy in Swift or Kotlin is not
+   written; a rule found in two copies moves here on the first occasion
+   (`decisions/client-rules-shared-in-rust.md`).
 3. **A control message names the state it refers to** (epoch, ratchet key, number). A fix that
    adds a timer, cooldown, window, tie-break or retry budget means the message has no address —
    stop and give it one. Two clients retrying on different clocks do not error, they storm.
@@ -67,7 +73,11 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
    comes first; the fix counts when it turns green.
 5. **One meaning, one carrier; different meanings, different types.** Identifiers are distinct
    types. A comment saying two things "must match" means one should be a call to the other.
-6. **Bytes stay bytes**, source to destination (see UDL `bytes` below).
+6. **Bytes stay bytes**, source to destination (see UDL `bytes` below). **Persisted state is
+   CFE** — here and in every client: each kind of state has its own `CfeMessageType` (one registry,
+   `src/cfe/types.rs`). JSON or any other format only with a written reason next to the code: an
+   external format (a token payload, a canonical signing string, conformance vectors) or a file a
+   person edits by hand. "Simpler" and "readable while debugging" are not reasons.
 7. **Measure, then build** — for anything on the network or performance path.
 8. **Verify the effect, not the exit code.** A `cargo test` that did not print `Compiling` may
    have re-run a stale binary: look for it.
@@ -95,6 +105,10 @@ the same change, or is removed.
   platform executes; `OrchestratorCore` (`src/orchestration`) takes `IncomingEvent`s and returns
   `CfeAction`s. Logging goes through `tracing`. Orchestrator state stays exportable/importable
   (`export_orchestrator_state` / `import_orchestrator_state`). I/O lives in `construct-store`.
+- **Workspace crates.** `.` the core (crypto, sessions, protocol, the one UniFFI component);
+  `store` the local store; `server-trust` the server signature format; `rules` the client rules
+  (`construct-rules`, depends on `serde` only — the core owns their format, `rule_state`). A crate
+  below the core never depends on it; the core re-exports what a client needs.
 - **Crypto-Agility.** `CryptoProvider` is the abstraction (Classic: X25519/Ed25519; Hybrid:
   Ed25519 + ML-DSA-65), but every session is built on `ClassicSuiteProvider`. Post-quantum comes
   from PQXDH v2 (mandatory ML-KEM-1024 in the initial key; `crypto::kyber_prekeys`,

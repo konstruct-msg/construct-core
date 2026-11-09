@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "store", "server-trust"]
+members = [".", "store", "server-trust", "rules"]
 resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.65.0"
+version = "0.66.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -114,6 +114,9 @@ uniffi = { version = "0.30", optional = true }
 construct-store = { path = "store", optional = true }
 # The bytes of a server signature, shared with construct-server and the root tool.
 construct-server-trust = { path = "server-trust" }
+# Client rules written once (decisions/client-rules-shared-in-rust.md); exported below via
+# `rules_bindings`, and used directly by a Rust client.
+construct-rules = { path = "rules" }
 construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "b1742951a8a3188484015fcc984dcab45f3d6af6", features = ["ffi"], optional = true }
 
 [dev-dependencies]

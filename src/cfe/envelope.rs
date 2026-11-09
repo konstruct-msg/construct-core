@@ -27,7 +27,12 @@ pub const MAX_STATE_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 /// reader would refuse, so the writer learns at write time, not the next launch.
 pub fn max_payload_len(msg_type: CfeMessageType) -> usize {
     match msg_type {
-        CfeMessageType::Generic => MAX_PAYLOAD_LEN,
+        CfeMessageType::Generic
+        | CfeMessageType::MailboxGapNotice
+        | CfeMessageType::ClientAuthSession
+        | CfeMessageType::ClientBlockWishes
+        | CfeMessageType::ClientStickerState
+        | CfeMessageType::ClientVeilFronts => MAX_PAYLOAD_LEN,
         CfeMessageType::PrivateKeys
         | CfeMessageType::SessionState
         | CfeMessageType::OtpkBundle

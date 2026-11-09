@@ -49,6 +49,7 @@ pub mod knst;
 pub mod media;
 pub mod orchestration;
 pub mod pow;
+pub mod rule_state;
 pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;
@@ -77,6 +78,12 @@ pub use uniffi_bindings::*;
 mod local_store_bindings;
 #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 pub use local_store_bindings::*;
+
+// The client rules (`construct-rules`) in this library's UniFFI component.
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+mod rules_bindings;
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
+pub use rules_bindings::*;
 
 // Include UniFFI generated scaffolding when a binding feature is enabled.
 // Without `android` in this list, the Android cdylib contains none of the
