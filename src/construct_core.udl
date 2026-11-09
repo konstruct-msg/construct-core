@@ -935,12 +935,13 @@ dictionary MailboxGapInterval {
     i64? until_ms;
 };
 
-/// The "messages may not have arrived" notice, one rule for every client (construct-rules
-/// `mailbox_gap`, decisions/client-rules-shared-in-rust.md). It keeps the server's reports, open
-/// and closed: the server reports the same loss on every stream until the cursor moves, and a
-/// report the person closed does not raise the notice again. The platform keeps `to_bytes` (a CFE
-/// envelope) and shows `interval`.
-interface MailboxGapNotice {
+/// The state of the "messages may not have arrived" notice, one rule for every client
+/// (construct-rules `mailbox_gap`, decisions/client-rules-shared-in-rust.md). It keeps the server's
+/// reports, open and closed: the server reports the same loss on every stream until the cursor
+/// moves, and a report the person closed does not raise the notice again. The platform keeps
+/// `to_bytes` (a CFE envelope) and shows `interval`. Named `…State`, not `…Notice`: the platform's
+/// own notice type, which holds it, keeps that name.
+interface MailboxGapState {
     /// An empty notice.
     constructor();
 

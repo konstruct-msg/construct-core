@@ -15,18 +15,18 @@ pub struct MailboxGapInterval {
     pub until_ms: Option<i64>,
 }
 
-/// The "messages may not have arrived" notice (`construct_rules::mailbox_gap`).
-pub struct MailboxGapNotice {
+/// The state of the "messages may not have arrived" notice (`construct_rules::mailbox_gap`).
+pub struct MailboxGapState {
     notice: Mutex<mailbox_gap::Notice>,
 }
 
-impl Default for MailboxGapNotice {
+impl Default for MailboxGapState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MailboxGapNotice {
+impl MailboxGapState {
     pub fn new() -> Self {
         Self {
             notice: Mutex::new(mailbox_gap::Notice::default()),
