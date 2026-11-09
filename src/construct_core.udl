@@ -954,8 +954,9 @@ interface MailboxGapState {
     /// already closed, or one whose cursor names no moment changes nothing.
     boolean record(string after_cursor, string resumes_at);
 
-    /// The person closed the notice.
-    void close();
+    /// The person closed the notice. Not `close`: Kotlin objects already have `close()`, which
+    /// frees them (`tests/udl_reserved_names_test.rs`).
+    void dismiss();
 
     /// What to show; null when nothing is open.
     MailboxGapInterval? interval();

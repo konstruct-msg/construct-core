@@ -50,7 +50,7 @@ impl MailboxGapState {
         })
     }
 
-    pub fn close(&self) {
+    pub fn dismiss(&self) {
         self.notice().close();
     }
 
