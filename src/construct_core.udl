@@ -927,6 +927,44 @@ callback interface PeekSessionSource {
     bytes? session(string device_id);
 };
 
+/// What the "messages may not have arrived" notice says: messages sent from `from_ms` to
+/// `until_ms` (Unix ms) may not have arrived; `until_ms` is null when the mailbox held nothing to
+/// resume from ("since …").
+dictionary MailboxGapInterval {
+    i64 from_ms;
+    i64? until_ms;
+};
+
+/// The state of the "messages may not have arrived" notice, one rule for every client
+/// (construct-rules `mailbox_gap`, decisions/client-rules-shared-in-rust.md). It keeps the server's
+/// reports, open and closed: the server reports the same loss on every stream until the cursor
+/// moves, and a report the person closed does not raise the notice again. The platform keeps
+/// `to_bytes` (a CFE envelope) and shows `interval`. Named `…State`, not `…Notice`: the platform's
+/// own notice type, which holds it, keeps that name.
+interface MailboxGapState {
+    /// An empty notice.
+    constructor();
+
+    /// The notice as it was kept. Bytes that are not one start it empty (the reason is logged):
+    /// a notice nobody can read is one nobody can show.
+    [Name=from_bytes]
+    constructor(bytes kept);
+
+    /// A `MailboxGap` the server sent. Whether the notice changed: the same report again, one
+    /// already closed, or one whose cursor names no moment changes nothing.
+    boolean record(string after_cursor, string resumes_at);
+
+    /// The person closed the notice.
+    void close();
+
+    /// What to show; null when nothing is open.
+    MailboxGapInterval? interval();
+
+    /// The notice to keep.
+    [Throws=CryptoError]
+    bytes to_bytes();
+};
+
 /// A throwaway view of this device's sessions for the notification extension. Built from the key
 /// record and the orchestrator state the app saved; it answers `peek` and nothing else. Nothing it
 /// does is saved, sent or marked, and no session state leaves it.

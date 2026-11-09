@@ -22,6 +22,21 @@ pub enum CfeMessageType {
     /// private material). See `group::MlsStore`.
     MlsStore = 0x44,
 
+    // Client rules (`construct-rules`), 0x60–0x67: a rule's state as every client keeps it.
+    /// The "messages may not have arrived" notice (`construct_rules::mailbox_gap::Notice`).
+    MailboxGapNotice = 0x60,
+
+    // One client's own state, 0x68–0x6F: what a single client keeps and no other reads. Listed
+    // here so every persisted format has one registry (rule 6, `rules-from-the-first-year`).
+    /// construct-client: the signed-in session (tokens, device id).
+    ClientAuthSession = 0x68,
+    /// construct-client: blocks and unblocks not yet confirmed by the server.
+    ClientBlockWishes = 0x69,
+    /// construct-client: installed sticker packs, recents, order.
+    ClientStickerState = 0x6A,
+    /// construct-client: the VEIL fronts learned and still usable.
+    ClientVeilFronts = 0x6B,
+
     // Utilities
     Generic = 0x7F,
 }
@@ -36,6 +51,11 @@ impl CfeMessageType {
             0x05 => Self::OrchestratorState,
             0x20 => Self::KyberPrivateKeys,
             0x44 => Self::MlsStore,
+            0x60 => Self::MailboxGapNotice,
+            0x68 => Self::ClientAuthSession,
+            0x69 => Self::ClientBlockWishes,
+            0x6A => Self::ClientStickerState,
+            0x6B => Self::ClientVeilFronts,
             0x7F => Self::Generic,
             _ => return None,
         })
