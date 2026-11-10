@@ -56,6 +56,30 @@ namespace construct_core {
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
+    // Client rules (construct-rules; decisions/client-rules-shared-in-rust.md): one decision for
+    // every client, called by each.
+
+    /// The name generated from an account id ("silent dolphin"), lower case: what a person who
+    /// chose no name is called on every client.
+    string generated_name(string user_id);
+    /// Whether `name` is only `user_id`'s generated name, in any case and trimmed.
+    boolean is_generated_name(string name, string user_id);
+    /// The name a person is shown by: the one we gave them (`alias`), then the one they shared
+    /// unless it is their generated name, then their username, then the generated name. Each
+    /// trimmed; an empty one is none.
+    string shown_name(string? alias, string display_name, string username, string user_id);
+
+    /// Why the server refused this device: from the gRPC status code and the first value of the
+    /// `construct-device-refusal` trailer. Only UNAUTHENTICATED (16) carries one; never the text.
+    DeviceRefusalKind device_refusal_of(u32 status_code, string? trailer);
+    /// Whether that refusal erases this device: `Removed`, and the answer came over direct TLS
+    /// before and after the call. Through VEIL a relay could forge it.
+    boolean refusal_erases_device(DeviceRefusalKind refusal, boolean over_direct_tls);
+
+    /// What an outgoing message is after its send failed: queued when no answer came or the
+    /// status says the path failed (CANCELLED, DEADLINE_EXCEEDED, UNAVAILABLE), failed otherwise.
+    MessageAfterSendFailure after_send_failure(SendFailureKind failure);
+
     // KNST plaintext frame — the header every message body is framed with before encryption.
     // The core's, since 0.31; vectors: construct-protos/conformance/knst_frame.json.
     /// `payload` split into frames of at most 3770 bytes, each carrying the whole body's length;
@@ -119,6 +143,31 @@ namespace construct_core {
 dictionary IntakeKeyState {
     u32 generation;
     bytes key;
+};
+
+/// Why the server refused this device (construct-protos `DeviceRefusal`), as `device_refusal_of`
+/// reads it.
+enum DeviceRefusalKind {
+    "Unspecified",
+    "Removed",
+    "NotFound",
+};
+
+/// A failed send, as a platform reports it to `after_send_failure`.
+[Enum]
+interface SendFailureKind {
+    /// No answer came: our deadline, a broken or replaced connection, the VEIL tunnel not up yet.
+    NoAnswer();
+    /// The server, or a relay on its behalf, answered with this gRPC status code.
+    Status(u32 code);
+};
+
+/// What an outgoing message is after its send failed.
+enum MessageAfterSendFailure {
+    /// Waits for a path; the same ciphertext is sent again.
+    "Queued",
+    /// Refused; the person sees it did not go.
+    "Failed",
 };
 
 enum IntakeOffer {
