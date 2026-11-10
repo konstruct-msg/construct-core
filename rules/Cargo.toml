@@ -1,6 +1,6 @@
 [package]
 name = "construct-rules"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.96"
@@ -13,3 +13,5 @@ description = "Client rules every Konstruct client applies the same way, written
 # same functions of the core it already depends on.
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+# The generated name picks its words by SHA-256 of the account id (`names`); nothing secret.
+sha2 = "0.10"
