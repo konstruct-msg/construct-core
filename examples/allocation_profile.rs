@@ -20,6 +20,12 @@ static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 static REALLOCS: AtomicUsize = AtomicUsize::new(0);
 static REALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SHRINK_MOVED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn malloc_size(pointer: *const std::ffi::c_void) -> usize;
+}
 
 fn allocated(size: usize, is_realloc: bool) {
     let live = LIVE.fetch_add(size, Relaxed) + size;
@@ -61,6 +67,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let new = unsafe { System.realloc(ptr, layout, size) };
         if !new.is_null() {
+            if ACTIVE.load(Relaxed) && size < layout.size() && new != ptr {
+                SHRINK_MOVED.fetch_add(1, Relaxed);
+            }
             LIVE.fetch_sub(layout.size(), Relaxed);
             allocated(size, true);
         }
@@ -68,14 +77,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-fn measure(name: &str, metadata: &serde_json::Value, f: impl FnOnce()) -> serde_json::Value {
+fn start_measurement() -> usize {
     let baseline = LIVE.load(Relaxed);
     ALLOCS.store(0, Relaxed);
     BYTES.store(0, Relaxed);
     REALLOCS.store(0, Relaxed);
     REALLOC_BYTES.store(0, Relaxed);
+    SHRINK_MOVED.store(0, Relaxed);
     PEAK.store(baseline, Relaxed);
     ACTIVE.store(true, Relaxed);
+    baseline
+}
+
+fn measure(name: &str, metadata: &serde_json::Value, f: impl FnOnce()) -> serde_json::Value {
+    let baseline = start_measurement();
     f();
     ACTIVE.store(false, Relaxed);
     let allocations = ALLOCS.load(Relaxed);
@@ -90,7 +105,64 @@ fn measure(name: &str, metadata: &serde_json::Value, f: impl FnOnce()) -> serde_
         "live_delta_after_drop": retained})
 }
 
+fn measure_held(
+    name: &str,
+    metadata: &serde_json::Value,
+    f: impl FnOnce() -> Vec<u8>,
+) -> serde_json::Value {
+    let baseline = start_measurement();
+    let output = black_box(f());
+    ACTIVE.store(false, Relaxed);
+    let allocations = ALLOCS.load(Relaxed);
+    let bytes = BYTES.load(Relaxed);
+    let reallocations = REALLOCS.load(Relaxed);
+    let realloc_bytes = REALLOC_BYTES.load(Relaxed);
+    let peak = PEAK.load(Relaxed).saturating_sub(baseline);
+    let held = LIVE.load(Relaxed) as i64 - baseline as i64;
+    let shrink_moved = SHRINK_MOVED.load(Relaxed);
+    let len = output.len();
+    let capacity = output.capacity();
+    // SAFETY: a nonempty Vec<u8> allocated by System starts at its malloc allocation base.
+    #[cfg(target_os = "macos")]
+    let backend_bytes = Some(unsafe { malloc_size(output.as_ptr().cast()) });
+    #[cfg(not(target_os = "macos"))]
+    let backend_bytes: Option<usize> = None;
+    drop(output);
+    let after_drop = LIVE.load(Relaxed) as i64 - baseline as i64;
+    assert_eq!(
+        held, capacity as i64,
+        "only the returned output should remain live"
+    );
+    assert_eq!(after_drop, 0);
+    json!({"case":name,"metadata":metadata,"allocations":allocations,"allocated_bytes":bytes,
+        "reallocations":reallocations,"realloc_requested_bytes":realloc_bytes,
+        "additional_peak_bytes":peak,"live_bytes_with_output":held,"live_delta_after_drop":after_drop,
+        "output_len":len,"output_capacity":capacity,"backend_output_bytes":backend_bytes,
+        "shrink_relocations":shrink_moved})
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--held-outputs") {
+        for &(skipped, previous) in CASES {
+            let pair = Pair::with_history(skipped, previous);
+            let mut current = decode_session(&pair.bob, &pair.alice_id);
+            current.previous.clear();
+            let metadata = json!({"skipped":skipped,"previous":previous});
+            let stage = measure_held(
+                &format!("held/S4/k{skipped}_p{previous}"),
+                &metadata,
+                || cfe::encode(CfeMessageType::SessionState, &current).unwrap(),
+            );
+            let full = measure_held(
+                &format!("held/SF/k{skipped}_p{previous}"),
+                &metadata,
+                || pair.bob.export_session_cfe(&pair.alice_id).unwrap(),
+            );
+            println!("{stage}");
+            println!("{full}");
+        }
+        return;
+    }
     let empty = json!({});
     let noop = measure("calibration/noop", &empty, || {
         black_box(0usize);

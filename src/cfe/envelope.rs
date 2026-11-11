@@ -4,6 +4,7 @@ use super::types::CfeMessageType;
 use crc32fast::Hasher as Crc32Hasher;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::io::{self, Write};
 
 pub const CFE_MAGIC: [u8; 2] = [0x43, 0x46]; // "CF"
 pub const CFE_VERSION: u8 = 0x01;
@@ -51,35 +52,62 @@ pub struct CfeEnvelope {
     pub payload: Vec<u8>,
 }
 
+/// Like rmp-serde's to_vec_named writer, allocation failure remains a serialization error.
+/// Write is memory-only: the core performs no I/O here.
+#[derive(Default)]
+struct EncodeBuffer(Vec<u8>);
+
+impl Write for EncodeBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0
+            .try_reserve(bytes.len())
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The flags byte is part of the header format but no flag is defined: it is written as zero
 /// and any other value is refused on read.
 pub fn encode<T: Serialize>(msg_type: CfeMessageType, value: &T) -> Result<Vec<u8>, CfeError> {
-    let payload =
-        rmp_serde::to_vec_named(value).map_err(|e| CfeError::SerializeFailed(e.to_string()))?;
+    let mut out = EncodeBuffer::default();
+    out.write_all(&[0; CFE_HEADER_LEN])
+        .map_err(|e| CfeError::SerializeFailed(e.to_string()))?;
+    rmp_serde::encode::write_named(&mut out, value)
+        .map_err(|e| CfeError::SerializeFailed(e.to_string()))?;
+    let payload_len = out.0.len() - CFE_HEADER_LEN;
     let max = max_payload_len(msg_type);
-    if payload.len() > max {
+    if payload_len > max {
         return Err(CfeError::PayloadTooLarge {
             max,
-            got: payload.len(),
+            got: payload_len,
         });
     }
 
     let crc = {
         let mut hasher = Crc32Hasher::new();
-        hasher.update(&payload);
+        hasher.update(&out.0[CFE_HEADER_LEN..]);
         hasher.finalize()
     };
 
-    let mut out = Vec::with_capacity(CFE_HEADER_LEN + payload.len());
-    out.extend_from_slice(&CFE_MAGIC);
-    out.push(CFE_VERSION);
-    out.push(msg_type as u8);
-    out.push(0); // flags: none defined
-    out.extend_from_slice(&[0u8; 3]); // reserved
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&payload);
-    Ok(out)
+    out.0[..2].copy_from_slice(&CFE_MAGIC);
+    out.0[2] = CFE_VERSION;
+    out.0[3] = msg_type as u8;
+    // Flags and reserved bytes stay zero; length and checksum describe the payload only.
+    out.0[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    out.0[12..16].copy_from_slice(&crc.to_le_bytes());
+    // Queued saves must not retain the writer's growth capacity. Compaction may use realloc,
+    // but there is no second payload Vec; Box's slice length fixes the returned capacity.
+    Ok(out.0.into_boxed_slice().into_vec())
 }
 
 pub fn decode(data: &[u8]) -> Result<CfeEnvelope, CfeError> {
@@ -181,6 +209,76 @@ mod tests {
     struct Dummy {
         a: u32,
         b: String,
+    }
+
+    /// TODO 296 step 2: keep the named MessagePack bytes and payload-only CRC while
+    /// reserving header space before serialization. The CRC is an independent zlib vector.
+    #[test]
+    fn reserved_header_keeps_the_exact_cfe_bytes_and_serializes_once() {
+        use std::cell::Cell;
+
+        struct Counted<'a>(&'a Cell<usize>);
+        impl Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.set(self.0.get() + 1);
+                Dummy {
+                    a: 42,
+                    b: "hello".into(),
+                }
+                .serialize(serializer)
+            }
+        }
+
+        let calls = Cell::new(0);
+        let actual = encode(CfeMessageType::SessionState, &Counted(&calls)).unwrap();
+        // fixmap {"a":42,"b":"hello"}: 12 bytes, CRC32 = 0x2d0d5ef3.
+        let expected =
+            hex::decode("43460102000000000c000000f35e0d2d82a1612aa162a568656c6c6f").unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a Serialize implementation may have side effects"
+        );
+        assert_eq!(
+            decode_as::<Dummy>(&actual, CfeMessageType::SessionState).unwrap(),
+            Dummy {
+                a: 42,
+                b: "hello".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_serializer_failure_after_writing_is_returned_without_an_envelope() {
+        struct Refused;
+        impl Serialize for Refused {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut sequence = serializer.serialize_seq(Some(2))?;
+                sequence.serialize_element(&17u8)?;
+                Err(serde::ser::Error::custom("fixture refused"))
+            }
+        }
+        assert!(matches!(encode(CfeMessageType::Generic, &Refused),
+            Err(CfeError::SerializeFailed(message)) if message == "fixture refused"));
+    }
+
+    #[test]
+    fn the_payload_limit_does_not_include_the_reserved_header() {
+        // MessagePack bin32 contributes exactly five bytes to this payload.
+        let mut blob = vec![9u8; MAX_PAYLOAD_LEN - 5];
+        let encoded = encode(CfeMessageType::Generic, &serde_bytes::Bytes::new(&blob)).unwrap();
+        assert_eq!(encoded.len(), CFE_HEADER_LEN + MAX_PAYLOAD_LEN);
+        assert_eq!(
+            u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize,
+            MAX_PAYLOAD_LEN
+        );
+        blob.push(9);
+        assert!(
+            matches!(encode(CfeMessageType::Generic, &serde_bytes::Bytes::new(&blob)),
+            Err(CfeError::PayloadTooLarge { max, got }) if max == MAX_PAYLOAD_LEN && got == MAX_PAYLOAD_LEN + 1)
+        );
     }
 
     #[test]

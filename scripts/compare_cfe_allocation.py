@@ -21,6 +21,8 @@ def main():
     parser.add_argument('--after-target', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--label', default='step1')
+    parser.add_argument('--held-outputs', action='store_true')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     roots = {'before': args.before_root, 'after': args.after_root}
@@ -44,18 +46,22 @@ def main():
             'base_commit': subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
             'binary_sha256': {k:hashlib.sha256(v.read_bytes()).hexdigest() for k,v in binaries.items()},
             'source_sha256': {p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in [*fixture_files,
-                'src/crypto/messaging/double_ratchet/storage.rs','src/orchestration/session_lifecycle.rs','src/uniffi_bindings.rs']},
+                'src/crypto/messaging/double_ratchet/storage.rs','src/cfe/envelope.rs',
+                'src/orchestration/session_lifecycle.rs','src/uniffi_bindings.rs']},
         }
     (args.output/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
     for trial in range(1,args.repeats+1):
         for side in ['before','after']:
             with (args.output/f'{side}-alloc-{trial}.jsonl').open('w') as out, (args.output/f'{side}-alloc-{trial}.stderr').open('w') as err:
                 subprocess.run([str(alloc_targets[side]/'release/examples/allocation_profile')],cwd=roots[side],stdout=out,stderr=err,check=True)
+            if args.held_outputs:
+                with (args.output/f'{side}-held-{trial}.jsonl').open('w') as out:
+                    subprocess.run([str(alloc_targets[side]/'release/examples/allocation_profile'),'--held-outputs'],cwd=roots[side],stdout=out,check=True)
     selected = r'save/SF/k(0|100|500|900)_p0$|save/SF/k500_p3$|payload/PE/(50|65536)$'
     for trial in range(1,args.repeats+1):
         order = ['before','after'] if trial%2 else ['after','before']
         for side in order:
-            label = f'step1-{side}-{trial}'
+            label = f'{args.label}-{side}-{trial}'
             print('START',label,flush=True)
             env = dict(os.environ,CARGO_TARGET_DIR=str(targets[side]))
             command = [str(targets[side]/'release/examples/allocation_baseline'), '--bench',
@@ -102,6 +108,22 @@ def main():
             if row['after_allocations']>=row['before_allocations'] or row['after_live_delta']!=0:
                 raise SystemExit(f'Missing allocation effect: {case}')
         rows.append(row)
+    if args.held_outputs:
+        held={}
+        for side in roots:
+            runs=[{v['case']:v for v in map(json.loads,p.read_text().splitlines())}
+                  for p in sorted(args.output.glob(f'{side}-held-[0-9]*.jsonl'))]
+            if not all(run==runs[0] for run in runs): raise SystemExit(f'Non-identical held-output runs: {side}')
+            held[side]=runs[0]
+        for case,before in held['before'].items():
+            after=held['after'][case]
+            if after['output_len']!=before['output_len'] or after['live_bytes_with_output']>before['live_bytes_with_output']:
+                raise SystemExit(f'Retained output regressed: {case}')
+            if after['additional_peak_bytes']>=before['additional_peak_bytes']:
+                raise SystemExit(f'No peak memory effect: {case}')
+            # Rust capacity is exact after compaction, but malloc may keep a larger size class.
+            # Record that tradeoff rather than treating capacity as physical memory evidence.
+        (args.output/'held-comparison.json').write_text(json.dumps(held,indent=2)+'\n')
     (args.output/'comparison.json').write_text(json.dumps(rows,indent=2)+'\n')
     with (args.output/'comparison.csv').open('w') as out:
         writer=csv.DictWriter(out,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
