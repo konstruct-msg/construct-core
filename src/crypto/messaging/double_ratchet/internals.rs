@@ -644,10 +644,17 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 }
             },
         };
+        // Behind the chain with no skipped key: not a duplicate verdict. `(epoch, index)` names a
+        // position, not a state — every state of a record numbers its epochs and keys from the
+        // same start — so a message of another state lands here as often as a repeat of one of
+        // ours. Until 2026-11-11 this said `MESSAGE_KEY_CONSUMED`, the search over previous
+        // states stopped on it, and a late message of the old state was dropped as a duplicate
+        // once the new one had read past its position (TODO 298). A repeat is told by the DH
+        // chain the message names, in `decrypt`, as libsignal tells it by the sender ratchet key
+        // (`consume_message_key`); its SPQR errors are `InvalidMessage`, never a duplicate.
         if index < chain.index {
             return Err(format!(
-                "{}: PQ key {epoch}/{index} already used (chain at {})",
-                super::MESSAGE_KEY_CONSUMED,
+                "PQ key {epoch}/{index} is behind this state's chain (at {}) and was not kept",
                 chain.index
             ));
         }
