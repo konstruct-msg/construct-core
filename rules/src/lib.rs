@@ -17,3 +17,4 @@ pub mod device_refusal;
 pub mod mailbox_gap;
 pub mod names;
 pub mod send_failure;
+pub mod stream_cursor;

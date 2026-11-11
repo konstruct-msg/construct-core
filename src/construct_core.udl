@@ -1015,6 +1015,70 @@ interface MailboxGapState {
     bytes to_bytes();
 };
 
+/// How the pipeline ended with a tracked stream message (construct-rules `stream_cursor`).
+enum StreamCursorOutcome {
+    /// Kept, a control applied, or given up for good.
+    "Durable",
+    /// Waiting (behind a session being opened, a retry): holds the cursor.
+    "Deferred",
+    /// Not this caller's to decide: leaves the entry as it is.
+    "Skip",
+};
+
+/// Why the entry at the front holds the cursor.
+enum StreamCursorHold {
+    "Pending",
+    "Deferred",
+};
+
+/// The entry holding the cursor back, for the log line that names a stall.
+dictionary StreamCursorBlocker {
+    string message_id;
+    StreamCursorHold hold;
+    i64 tracked_at_ms;
+};
+
+/// What `skip_held_backlog` did: the cursor now committed, how many entries were abandoned, and
+/// the one that held them.
+dictionary StreamCursorSkip {
+    string cursor;
+    u32 held;
+    StreamCursorBlocker? head;
+};
+
+/// The stream resume cursor of one connection: it never moves past a message that has not reached
+/// a durable end, since the server trims its queue up to it. Every method that can move it returns
+/// the cursor to store (`since_cursor`), or null when it did not move. Not kept itself.
+interface StreamCursorState {
+    constructor();
+
+    /// A new connection: drop what was held; the stored cursor is where it resumes.
+    void reset();
+
+    /// A stream entry, in arrival order, before it is handled. The same id again keeps its place.
+    void track(string message_id, string cursor, i64 now_ms);
+
+    /// A frame with nothing to keep (a receipt): takes its place in line so its cursor cannot
+    /// pass an earlier message still held.
+    string? track_resolved(string cursor, i64 now_ms);
+
+    /// How a tracked message ended.
+    string? report(string message_id, StreamCursorOutcome outcome);
+
+    /// A message finished: a waiting one drained and kept, or given up.
+    string? resolve(string message_id);
+
+    /// A person's explicit action only — never a timer: abandon everything held and commit the
+    /// furthest cursor delivered. What was held is trimmed on the server without being kept.
+    StreamCursorSkip? skip_held_backlog();
+
+    /// The entry holding the cursor back, if any.
+    StreamCursorBlocker? head_blocker();
+
+    /// Entries still held.
+    u32 in_flight();
+};
+
 /// A throwaway view of this device's sessions for the notification extension. Built from the key
 /// record and the orchestrator state the app saved; it answers `peek` and nothing else. Nothing it
 /// does is saved, sent or marked, and no session state leaves it.

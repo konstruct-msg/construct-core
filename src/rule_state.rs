@@ -9,7 +9,7 @@
 //! the state starts empty and the reason goes to the log. A notice nobody can read is a notice
 //! nobody can show; refusing to start over it would only keep the person from seeing the next one.
 
-pub use construct_rules::{device_refusal, mailbox_gap, names, send_failure};
+pub use construct_rules::{device_refusal, mailbox_gap, names, send_failure, stream_cursor};
 
 use crate::cfe::{self, CfeError, CfeMessageType};
 
