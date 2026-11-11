@@ -672,6 +672,55 @@ pub(crate) fn id_prefix(id: &str) -> &str {
 }
 
 impl SerializableSession {
+    /// Transfer a temporary snapshot into its persisted record.
+    pub(crate) fn into_cfe_v1(self) -> Result<crate::cfe::CfeSessionStateV1, String> {
+        let (suite_id, session_id) = self.cfe_header()?;
+        Ok(self.into_cfe_record(suite_id, session_id))
+    }
+
+    // Preserve the borrowed API without a second definition of the CFE field mapping.
+    // This is deliberately private: the snapshot does not gain a public Clone API.
+    fn copy_for_cfe(&self) -> Self {
+        Self {
+            version: self.version,
+            suite_id: self.suite_id,
+            root_key: self.root_key.clone(),
+            sending_chain_key: self.sending_chain_key.clone(),
+            sending_chain_length: self.sending_chain_length,
+            receiving_chain_key: self.receiving_chain_key.clone(),
+            receiving_chain_length: self.receiving_chain_length,
+            dh_ratchet_private: self.dh_ratchet_private.clone(),
+            dh_ratchet_public: self.dh_ratchet_public.clone(),
+            remote_dh_public: self.remote_dh_public.clone(),
+            previous_sending_length: self.previous_sending_length,
+            // Read-only legacy fields are not written by the CFE conversion.
+            skipped_message_keys: HashMap::new(),
+            skipped_key_timestamps: HashMap::new(),
+            skipped_keys: self
+                .skipped_keys
+                .iter()
+                .map(|e| SkippedKeyEntry {
+                    dh_public: e.dh_public.clone(),
+                    msg_number: e.msg_number,
+                    key_bytes: e.key_bytes.clone(),
+                    timestamp: e.timestamp,
+                })
+                .collect(),
+            prekey_header: self.prekey_header.clone(),
+            pq_handshake: self.pq_handshake,
+            session_id: String::new(), // already decoded by cfe_header before this copy
+            contact_id: self.contact_id.clone(),
+            local_user_id: self.local_user_id.clone(),
+            last_ratchet_at: self.last_ratchet_at,
+            peer_ad_version: self.peer_ad_version,
+            pq_authentication: self.pq_authentication,
+            pq_applied: self.pq_applied,
+            identity_proof_awaiting: self.identity_proof_awaiting,
+            identity_proof_ciphertext: self.identity_proof_ciphertext.clone(),
+            pq_ratchet: self.pq_ratchet.clone(),
+        }
+    }
+
     /// Check that this record is the session the caller believes it is loading.
     ///
     /// The identity of a session — who it is with, and who we were when it was made — is
@@ -735,8 +784,11 @@ impl SerializableSession {
     }
 
     pub fn to_cfe_v1(&self) -> Result<crate::cfe::CfeSessionStateV1, String> {
-        use serde_bytes::ByteBuf;
+        let (suite_id, session_id) = self.cfe_header()?;
+        Ok(self.copy_for_cfe().into_cfe_record(suite_id, session_id))
+    }
 
+    fn cfe_header(&self) -> Result<(u8, Vec<u8>), String> {
         let suite_id: u8 = self
             .suite_id
             .try_into()
@@ -751,42 +803,52 @@ impl SerializableSession {
             ));
         }
 
-        Ok(crate::cfe::CfeSessionStateV1 {
+        Ok((suite_id, session_id_raw))
+    }
+
+    fn into_cfe_record(
+        mut self,
+        suite_id: u8,
+        session_id_raw: Vec<u8>,
+    ) -> crate::cfe::CfeSessionStateV1 {
+        use serde_bytes::ByteBuf;
+        use std::mem::take;
+
+        crate::cfe::CfeSessionStateV1 {
             ver: 1,
             suite_id,
-            contact_id: self.contact_id.clone(),
-            local_uid: self.local_user_id.clone(),
+            contact_id: take(&mut self.contact_id),
+            local_uid: take(&mut self.local_user_id),
             session_id: ByteBuf::from(session_id_raw),
-            rk: crate::crypto::SecretBytes::from(self.root_key.clone()),
-            sck: crate::crypto::SecretBytes::from(self.sending_chain_key.clone()),
-            rck: crate::crypto::SecretBytes::from(self.receiving_chain_key.clone()),
+            rk: crate::crypto::SecretBytes::from(take(&mut self.root_key)),
+            sck: crate::crypto::SecretBytes::from(take(&mut self.sending_chain_key)),
+            rck: crate::crypto::SecretBytes::from(take(&mut self.receiving_chain_key)),
             scl: self.sending_chain_length,
             rcl: self.receiving_chain_length,
             psl: self.previous_sending_length,
             dh_priv: self
                 .dh_ratchet_private
-                .clone()
+                .take()
                 .map(crate::crypto::SecretBytes::from),
-            dh_pub: ByteBuf::from(self.dh_ratchet_public.clone()),
-            rdh_pub: self.remote_dh_public.clone().map(ByteBuf::from),
-            skipped: self
-                .skipped_keys
-                .iter()
+            dh_pub: ByteBuf::from(take(&mut self.dh_ratchet_public)),
+            rdh_pub: self.remote_dh_public.take().map(ByteBuf::from),
+            skipped: take(&mut self.skipped_keys)
+                .into_iter()
                 .map(|e| crate::cfe::CfeSkippedKeyEntryV1 {
-                    dh_pub: ByteBuf::from(e.dh_public.clone()),
+                    dh_pub: ByteBuf::from(e.dh_public),
                     msg_number: e.msg_number,
-                    key_bytes: crate::crypto::SecretBytes::from(e.key_bytes.clone()),
+                    key_bytes: crate::crypto::SecretBytes::from(e.key_bytes),
                     timestamp: e.timestamp,
                 })
                 .collect(),
             prekey_header: self
                 .prekey_header
-                .as_ref()
+                .take()
                 .map(|h| crate::cfe::CfePrekeyHeaderV1 {
                     one_time_prekey_id: h.one_time_prekey_id,
                     kyber_prekey_id: h.kyber_prekey_id,
-                    kem_ciphertext: ByteBuf::from(h.kem_ciphertext.clone()),
-                    kem_identity: ByteBuf::from(h.kem_identity.clone()),
+                    kem_ciphertext: ByteBuf::from(h.kem_ciphertext),
+                    kem_identity: ByteBuf::from(h.kem_identity),
                 }),
             pq_handshake: self.pq_handshake,
             last_ratchet_at: self.last_ratchet_at,
@@ -794,37 +856,37 @@ impl SerializableSession {
             pq_authentication: self.pq_authentication,
             pq_applied: self.pq_applied,
             identity_proof_awaiting: self.identity_proof_awaiting,
-            identity_proof_ciphertext: self.identity_proof_ciphertext.clone().map(ByteBuf::from),
+            identity_proof_ciphertext: self.identity_proof_ciphertext.take().map(ByteBuf::from),
             pqr: self
                 .pq_ratchet
-                .as_ref()
+                .take()
                 .map(|pq| crate::cfe::CfePqRatchetStateV2 {
                     is_initiator: pq.is_initiator,
                     current_epoch: pq.current_epoch,
-                    chains: pq.chains.iter().map(cfe_epoch_chains).collect(),
+                    chains: pq.chains.into_iter().map(cfe_epoch_chains).collect(),
                     skipped: pq
                         .skipped
-                        .iter()
-                        .map(|s| crate::cfe::CfePqSkippedKeyV2 {
+                        .into_iter()
+                        .map(|mut s| crate::cfe::CfePqSkippedKeyV2 {
                             epoch: s.epoch,
                             index: s.index,
-                            key: crate::crypto::SecretBytes::from(s.key.clone()),
+                            key: crate::crypto::SecretBytes::from(take(&mut s.key)),
                             at: s.at,
                         })
                         .collect(),
-                    pending_exchange: pq.pending_exchange.as_ref().map(|ex| {
+                    pending_exchange: pq.pending_exchange.map(|mut ex| {
                         crate::cfe::CfePqPendingExchangeV1 {
                             epoch: ex.epoch,
-                            public: ByteBuf::from(ex.public.clone()),
-                            secret: crate::crypto::SecretBytes::from(ex.secret.clone()),
+                            public: ByteBuf::from(take(&mut ex.public)),
+                            secret: crate::crypto::SecretBytes::from(take(&mut ex.secret)),
                         }
                     }),
-                    pending_ciphertext: pq.pending_ciphertext.as_ref().map(|p| {
+                    pending_ciphertext: pq.pending_ciphertext.map(|p| {
                         crate::cfe::CfePqPendingCiphertextV2 {
                             epoch: p.epoch,
-                            ek_hash: ByteBuf::from(p.ek_hash.clone()),
-                            ciphertext: ByteBuf::from(p.ciphertext.clone()),
-                            chains: cfe_epoch_chains(&p.chains),
+                            ek_hash: ByteBuf::from(p.ek_hash),
+                            ciphertext: ByteBuf::from(p.ciphertext),
+                            chains: cfe_epoch_chains(p.chains),
                         }
                     }),
                     pending_since: pq.pending_since,
@@ -835,7 +897,7 @@ impl SerializableSession {
             // manager's, which attaches them (`SessionLifecycleManager::export_session_bytes_for`).
             previous: Vec::new(),
             retired: None,
-        })
+        }
     }
 
     pub fn from_cfe_v1(data: crate::cfe::CfeSessionStateV1) -> Result<Self, String> {
@@ -926,15 +988,15 @@ impl SerializableSession {
     }
 }
 
-fn cfe_epoch_chains(c: &SerializablePqEpochChains) -> crate::cfe::CfePqEpochChainsV2 {
-    let chain = |ch: &SerializablePqChain| crate::cfe::CfePqChainV2 {
+fn cfe_epoch_chains(c: SerializablePqEpochChains) -> crate::cfe::CfePqEpochChainsV2 {
+    let chain = |mut ch: SerializablePqChain| crate::cfe::CfePqChainV2 {
         index: ch.index,
-        key: crate::crypto::SecretBytes::from(ch.key.clone()),
+        key: crate::crypto::SecretBytes::from(std::mem::take(&mut ch.key)),
     };
     crate::cfe::CfePqEpochChainsV2 {
         epoch: c.epoch,
-        send: c.send.as_ref().map(chain),
-        recv: chain(&c.recv),
+        send: c.send.map(chain),
+        recv: chain(c.recv),
     }
 }
 
@@ -948,4 +1010,119 @@ fn serializable_epoch_chains(c: &crate::cfe::CfePqEpochChainsV2) -> Serializable
         send: c.send.as_ref().map(chain),
         recv: chain(&c.recv),
     }
+}
+
+/// Verify both persistence compatibility and the ownership effect on real two-party states.
+#[cfg(test)]
+pub(super) fn checked_cfe_transfer(snapshot: SerializableSession) -> crate::cfe::CfeSessionStateV1 {
+    let logical_before = rmp_serde::to_vec_named(&snapshot).unwrap();
+    let expected = snapshot.to_cfe_v1().unwrap();
+    let mut original = vec![
+        snapshot.root_key.as_ptr(),
+        snapshot.sending_chain_key.as_ptr(),
+        snapshot.receiving_chain_key.as_ptr(),
+        snapshot.dh_ratchet_public.as_ptr(),
+        snapshot.contact_id.as_ptr(),
+        snapshot.local_user_id.as_ptr(),
+    ];
+    let mut converted = Vec::new();
+    if let Some(key) = &snapshot.dh_ratchet_private {
+        original.push(key.as_ptr());
+    }
+    if let Some(key) = &snapshot.remote_dh_public {
+        original.push(key.as_ptr());
+    }
+    for key in &snapshot.skipped_keys {
+        original.extend([key.dh_public.as_ptr(), key.key_bytes.as_ptr()]);
+    }
+    if let Some(header) = &snapshot.prekey_header {
+        original.extend([header.kem_ciphertext.as_ptr(), header.kem_identity.as_ptr()]);
+    }
+    if let Some(answer) = &snapshot.identity_proof_ciphertext {
+        original.push(answer.as_ptr());
+    }
+    if let Some(pq) = &snapshot.pq_ratchet {
+        for epoch in &pq.chains {
+            if let Some(send) = &epoch.send {
+                original.push(send.key.as_ptr());
+            }
+            original.push(epoch.recv.key.as_ptr());
+        }
+        for key in &pq.skipped {
+            original.push(key.key.as_ptr());
+        }
+        if let Some(ex) = &pq.pending_exchange {
+            original.extend([ex.public.as_ptr(), ex.secret.as_ptr()]);
+        }
+        if let Some(ct) = &pq.pending_ciphertext {
+            original.extend([ct.ek_hash.as_ptr(), ct.ciphertext.as_ptr()]);
+            if let Some(send) = &ct.chains.send {
+                original.push(send.key.as_ptr());
+            }
+            original.push(ct.chains.recv.key.as_ptr());
+        }
+    }
+    let actual = snapshot.into_cfe_v1().unwrap();
+    converted.extend([
+        actual.rk.expose().as_ptr(),
+        actual.sck.expose().as_ptr(),
+        actual.rck.expose().as_ptr(),
+        actual.dh_pub.as_ptr(),
+        actual.contact_id.as_ptr(),
+        actual.local_uid.as_ptr(),
+    ]);
+    if let Some(key) = &actual.dh_priv {
+        converted.push(key.expose().as_ptr());
+    }
+    if let Some(key) = &actual.rdh_pub {
+        converted.push(key.as_ptr());
+    }
+    for key in &actual.skipped {
+        converted.extend([key.dh_pub.as_ptr(), key.key_bytes.expose().as_ptr()]);
+    }
+    if let Some(header) = &actual.prekey_header {
+        converted.extend([header.kem_ciphertext.as_ptr(), header.kem_identity.as_ptr()]);
+    }
+    if let Some(answer) = &actual.identity_proof_ciphertext {
+        converted.push(answer.as_ptr());
+    }
+    if let Some(pq) = &actual.pqr {
+        for epoch in &pq.chains {
+            if let Some(send) = &epoch.send {
+                converted.push(send.key.expose().as_ptr());
+            }
+            converted.push(epoch.recv.key.expose().as_ptr());
+        }
+        for key in &pq.skipped {
+            converted.push(key.key.expose().as_ptr());
+        }
+        if let Some(ex) = &pq.pending_exchange {
+            converted.extend([ex.public.as_ptr(), ex.secret.expose().as_ptr()]);
+        }
+        if let Some(ct) = &pq.pending_ciphertext {
+            converted.extend([ct.ek_hash.as_ptr(), ct.ciphertext.as_ptr()]);
+            if let Some(send) = &ct.chains.send {
+                converted.push(send.key.expose().as_ptr());
+            }
+            converted.push(ct.chains.recv.key.expose().as_ptr());
+        }
+    }
+    assert_eq!(
+        original, converted,
+        "CFE conversion must transfer the existing buffers"
+    );
+    let encode = |state: &crate::cfe::CfeSessionStateV1| {
+        crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, state).unwrap()
+    };
+    // Avoid printing a secret record's bytes on a failed assertion.
+    assert!(
+        encode(&expected) == encode(&actual),
+        "consuming conversion changed persisted bytes"
+    );
+    let restored = SerializableSession::from_cfe_v1(actual.clone()).unwrap();
+    assert!(
+        logical_before == rmp_serde::to_vec_named(&restored).unwrap(),
+        "persisted record lost or changed snapshot state"
+    );
+    actual
 }

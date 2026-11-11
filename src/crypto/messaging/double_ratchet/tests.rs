@@ -2271,12 +2271,12 @@ fn test_pq_ratchet_chain_retention_bounded() {
 // the responder's only copy, so dropping it on restore bricks the epoch.
 
 /// Serialize a live session through the full production path
-/// (`to_serializable` → `to_cfe_v1` → CFE envelope encode → decode →
+/// (`to_serializable` → `into_cfe_v1` → CFE envelope encode → decode →
 /// `from_cfe_v1` → `from_serializable`) and hand back the restored session.
 fn cfe_round_trip(
     session: &DoubleRatchetSession<ClassicSuiteProvider>,
 ) -> DoubleRatchetSession<ClassicSuiteProvider> {
-    let cfe = session.to_serializable().to_cfe_v1().unwrap();
+    let cfe = super::storage::checked_cfe_transfer(session.to_serializable());
     let bytes = crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &cfe).unwrap();
     let decoded = crate::cfe::decode_as::<crate::cfe::CfeSessionStateV1>(
         &bytes,
@@ -2285,6 +2285,26 @@ fn cfe_round_trip(
     .unwrap();
     let ser = super::SerializableSession::from_cfe_v1(decoded).unwrap();
     DoubleRatchetSession::from_serializable(ser).unwrap()
+}
+
+/// TODO 296: the second snapshot-to-CFE copy made a 500-gap save allocate 3,531 buffers.
+/// A consumed snapshot must hand its buffers over and still open a delayed PQ message.
+#[test]
+fn consuming_cfe_keeps_skipped_keys_without_copying_their_buffers() {
+    let (mut alice, mut bob) = make_pq_session_pair("alice", "bob");
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let late = alice.encrypt(b"delayed").unwrap();
+    for _ in 0..7 {
+        let _held = alice.encrypt(b"held").unwrap();
+    }
+    let ahead = alice.encrypt(b"ahead").unwrap();
+    assert_eq!(bob.decrypt(&ahead).unwrap(), b"ahead");
+    assert_eq!(bob.skipped_message_keys.len(), 8);
+    assert_eq!(bob.pq_skipped_keys.len(), 8);
+    let mut restored = cfe_round_trip(&bob);
+    assert_eq!(restored.decrypt(&late).unwrap(), b"delayed");
+    let reply = restored.encrypt(b"continued").unwrap();
+    assert_eq!(alice.decrypt(&reply).unwrap(), b"continued");
 }
 
 /// Main persistence test: both sides are serialized mid-exchange (initiator

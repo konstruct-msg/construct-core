@@ -669,7 +669,10 @@ impl SessionLifecycleManager {
         // retired, so a record the peer's decryption error emptied survives a restart.
         let (mut cfe_state, rest) = match self.client.get_session(contact_id) {
             Some(session) => (
-                session.messaging_session().to_serializable().to_cfe_v1()?,
+                session
+                    .messaging_session()
+                    .to_serializable()
+                    .into_cfe_v1()?,
                 previous,
             ),
             None => {
@@ -680,7 +683,7 @@ impl SessionLifecycleManager {
                     .session
                     .messaging_session()
                     .to_serializable()
-                    .to_cfe_v1()?;
+                    .into_cfe_v1()?;
                 top.retired = Some(crate::cfe::CfeRetiredMarkV1 {
                     retired_at: newest.retired_at,
                     held_back: newest.held_back,
@@ -695,7 +698,7 @@ impl SessionLifecycleManager {
                     .session
                     .messaging_session()
                     .to_serializable()
-                    .to_cfe_v1()?,
+                    .into_cfe_v1()?,
                 held_back: state.held_back,
             });
         }

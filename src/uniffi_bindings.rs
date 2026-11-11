@@ -539,7 +539,7 @@ impl ClassicCryptoCore {
             .ok_or(CryptoError::SessionNotFound)?;
         let serializable = session.messaging_session().to_serializable();
         let payload = serializable
-            .to_cfe_v1()
+            .into_cfe_v1()
             .map_err(|e| serialization_failed("classic export_session/to_cfe_v1", e))?;
 
         crate::cfe::encode(crate::cfe::CfeMessageType::SessionState, &payload)
