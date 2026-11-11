@@ -2547,11 +2547,13 @@ fn test_pqr2_a_read_message_key_is_gone_from_both_sides() {
             "{side} kept the used key as a skipped one"
         );
     }
+    // Asking again is refused, not answered with a fresh derivation — and not called a duplicate:
+    // the position names no state (TODO 298); the replay test below gets the verdict from the DH
+    // chain instead.
+    let again = bob.pq_receive_key(epoch, msg.pq_key_index).unwrap_err();
     assert!(
-        bob.pq_receive_key(epoch, msg.pq_key_index)
-            .unwrap_err()
-            .starts_with(super::MESSAGE_KEY_CONSUMED),
-        "asking for the key again is a consumed key, not a fresh derivation"
+        !again.starts_with(super::MESSAGE_KEY_CONSUMED),
+        "a PQ position is not a duplicate verdict: {again}"
     );
 }
 
