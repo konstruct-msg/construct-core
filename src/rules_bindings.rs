@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use crate::rule_state::{self, device_refusal, mailbox_gap, names, send_failure};
+use crate::rule_state::{self, device_refusal, mailbox_gap, names, send_failure, stream_cursor};
 use crate::uniffi_bindings::CryptoError;
 
 /// What the notice says: messages sent from `from_ms` to `until_ms` (Unix ms) may not have
@@ -151,6 +151,115 @@ pub fn after_send_failure(failure: SendFailureKind) -> MessageAfterSendFailure {
     }
 }
 
+// ── Stream cursor ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCursorOutcome {
+    Durable,
+    Deferred,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCursorHold {
+    Pending,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCursorBlocker {
+    pub message_id: String,
+    pub hold: StreamCursorHold,
+    pub tracked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCursorSkip {
+    pub cursor: String,
+    pub held: u32,
+    pub head: Option<StreamCursorBlocker>,
+}
+
+impl From<stream_cursor::Blocker> for StreamCursorBlocker {
+    fn from(b: stream_cursor::Blocker) -> Self {
+        Self {
+            message_id: b.message_id,
+            hold: match b.hold {
+                stream_cursor::Hold::Pending => StreamCursorHold::Pending,
+                stream_cursor::Hold::Deferred => StreamCursorHold::Deferred,
+            },
+            tracked_at_ms: b.tracked_at_ms,
+        }
+    }
+}
+
+/// The stream resume cursor of one connection (`construct_rules::stream_cursor`). Not kept: the
+/// cursor it returns is what a client stores.
+pub struct StreamCursorState {
+    tracker: Mutex<stream_cursor::Tracker>,
+}
+
+impl Default for StreamCursorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamCursorState {
+    pub fn new() -> Self {
+        Self {
+            tracker: Mutex::new(stream_cursor::Tracker::new()),
+        }
+    }
+
+    fn tracker(&self) -> std::sync::MutexGuard<'_, stream_cursor::Tracker> {
+        self.tracker.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn reset(&self) {
+        self.tracker().reset();
+    }
+
+    pub fn track(&self, message_id: String, cursor: String, now_ms: i64) {
+        self.tracker().track(&message_id, &cursor, now_ms);
+    }
+
+    pub fn track_resolved(&self, cursor: String, now_ms: i64) -> Option<String> {
+        self.tracker().track_resolved(&cursor, now_ms)
+    }
+
+    pub fn report(&self, message_id: String, outcome: StreamCursorOutcome) -> Option<String> {
+        let outcome = match outcome {
+            StreamCursorOutcome::Durable => stream_cursor::Outcome::Durable,
+            StreamCursorOutcome::Deferred => stream_cursor::Outcome::Deferred,
+            StreamCursorOutcome::Skip => stream_cursor::Outcome::Skip,
+        };
+        self.tracker().report(&message_id, outcome)
+    }
+
+    pub fn resolve(&self, message_id: String) -> Option<String> {
+        self.tracker().resolve(&message_id)
+    }
+
+    pub fn skip_held_backlog(&self) -> Option<StreamCursorSkip> {
+        self.tracker()
+            .skip_held_backlog()
+            .map(|s| StreamCursorSkip {
+                cursor: s.cursor,
+                held: s.held,
+                head: s.head.map(Into::into),
+            })
+    }
+
+    pub fn head_blocker(&self) -> Option<StreamCursorBlocker> {
+        self.tracker().head_blocker().map(Into::into)
+    }
+
+    pub fn in_flight(&self) -> u32 {
+        u32::try_from(self.tracker().in_flight()).unwrap_or(u32::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +293,44 @@ mod tests {
             shown_name(None, "Анна".into(), "anna_k".into(), "test".into()),
             "Анна"
         );
+    }
+
+    /// The cursor object carries each outcome and hold through. Mutation that reddens it: map
+    /// `Deferred` to `Durable` in `report`, or swap the two holds.
+    #[test]
+    fn the_stream_cursor_carries_outcomes_and_holds() {
+        let cursor = StreamCursorState::new();
+        cursor.track("a".into(), "1-0".into(), 10);
+        cursor.track("b".into(), "2-0".into(), 11);
+        assert_eq!(
+            cursor.report("a".into(), StreamCursorOutcome::Deferred),
+            None
+        );
+        assert_eq!(
+            cursor.report("b".into(), StreamCursorOutcome::Durable),
+            None
+        );
+        assert_eq!(
+            cursor.head_blocker(),
+            Some(StreamCursorBlocker {
+                message_id: "a".into(),
+                hold: StreamCursorHold::Deferred,
+                tracked_at_ms: 10,
+            })
+        );
+        assert_eq!(cursor.report("a".into(), StreamCursorOutcome::Skip), None);
+        assert_eq!(cursor.resolve("a".into()).as_deref(), Some("2-0"));
+        cursor.track("c".into(), "3-0".into(), 12);
+        assert_eq!(
+            cursor.head_blocker().map(|b| b.hold),
+            Some(StreamCursorHold::Pending)
+        );
+        let skipped = cursor.skip_held_backlog().unwrap();
+        assert_eq!((skipped.cursor.as_str(), skipped.held), ("3-0", 1));
+        assert_eq!(
+            cursor.track_resolved("4-0".into(), 13).as_deref(),
+            Some("4-0")
+        );
+        assert_eq!(cursor.in_flight(), 0);
     }
 }
