@@ -51,6 +51,31 @@ fn a_late_message_of_the_old_state_reads_after_the_new_one_moved_on() {
         pair.bob.decrypt_bytes_for(&pair.alice_id, &late).unwrap(),
         b"late"
     );
+
+    // Reading it promotes the old state on Bob's side (`decrypt_ratchet_message`); the two sides
+    // must still talk afterwards, in both directions and more than once.
+    for round in 0..3 {
+        let reply = format!("bob {round}");
+        let wire = pair
+            .bob
+            .encrypt_bytes_for(&pair.alice_id, reply.as_bytes())
+            .unwrap();
+        assert_eq!(
+            pair.alice.decrypt_bytes_for(&pair.bob_id, &wire).unwrap(),
+            reply.as_bytes(),
+            "alice reads bob's reply {round} after the late message"
+        );
+        let next = format!("alice {round}");
+        let wire = pair
+            .alice
+            .encrypt_bytes_for(&pair.bob_id, next.as_bytes())
+            .unwrap();
+        assert_eq!(
+            pair.bob.decrypt_bytes_for(&pair.alice_id, &wire).unwrap(),
+            next.as_bytes(),
+            "bob reads alice's message {round} after the late message"
+        );
+    }
 }
 
 /// The shape the measurement found it in: many skipped keys, three previous states.
