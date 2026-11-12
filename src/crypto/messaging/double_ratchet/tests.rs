@@ -3101,3 +3101,491 @@ fn a_session_blob_of_a_later_version_is_refused_not_misread() {
         Ok(_) => panic!("a version-2 record was read as v1"),
     }
 }
+
+// ── Pinned by the core test audit (TODO 302): mutants no test caught ─────────────────────────
+
+/// The session id is in every message's AD, and both peers derive it on their own, each from
+/// its own copy of the core: a peer on another core version must get the same bytes, or every
+/// message between them fails AEAD. Pinned as a known answer, from both sides.
+///
+/// Mutation: swap the id order in `derive_shared_session_id` (`<=` → `>`) — both sides still
+/// agree with each other, the known answer does not, and this reddens.
+#[test]
+fn test_session_id_is_a_known_answer_from_either_side() {
+    let a = "0123456789abcdef0123456789abcdef";
+    let b = "fedcba9876543210fedcba9876543210";
+    let root = [7u8; 32];
+    let derive = |local: &str, contact: &str| {
+        super::derive_shared_session_id::<ClassicSuiteProvider>(&root, local, contact).unwrap()
+    };
+    assert_eq!(derive(a, b), "c7bae3e93158c4f861f98220f882368e");
+    assert_eq!(derive(b, a), "c7bae3e93158c4f861f98220f882368e");
+}
+
+/// The responder answers the initiator's KEM identity once, before it sends anything: a second
+/// answer would mix a second secret the initiator never sees, and an answer after a send would
+/// re-key a chain the peer already reads. Either one ends the session silently.
+///
+/// Mutation: `||` → `&&` in `answer_initiator_identity`'s guard — each case alone passes the
+/// guard and this reddens.
+#[test]
+fn test_initiator_identity_is_answered_once_and_only_before_sending() {
+    let (_alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000021",
+        "bbbbbbbb-0000-4000-8000-000000000022",
+    );
+    bob.answer_initiator_identity(&[1u8; 32], vec![9u8; 4])
+        .expect("first answer, nothing sent yet");
+    assert!(
+        bob.answer_initiator_identity(&[2u8; 32], vec![8u8; 4])
+            .is_err(),
+        "a second answer is refused"
+    );
+
+    let (_alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000023",
+        "bbbbbbbb-0000-4000-8000-000000000024",
+    );
+    bob.encrypt(b"sent first").unwrap();
+    assert!(
+        bob.answer_initiator_identity(&[1u8; 32], vec![9u8; 4])
+            .is_err(),
+        "an answer after a send is refused"
+    );
+}
+
+/// Each PQ secret holder wipes what it holds on `zeroize` — the snapshot copies and the values
+/// `take()` moves out rely on it through `Drop` (TODO 198). `Drop` itself cannot be observed
+/// from a test; `zeroize` can.
+///
+/// Mutation: make any of the five `zeroize` bodies `()` — its secret survives and this reddens.
+#[test]
+fn test_pq_secret_holders_wipe_their_secrets_on_zeroize() {
+    use super::{PendingPqCiphertext, PendingPqExchange, PqChain, PqEpochChains, PqRatchetKeyPair};
+    use zeroize::Zeroize;
+    let chain = |b: u8| PqChain {
+        index: 3,
+        key: vec![b; 32],
+    };
+    let chains = || PqEpochChains {
+        epoch: 1,
+        send: Some(chain(0xA1)),
+        recv: chain(0xA2),
+    };
+
+    let mut kp = PqRatchetKeyPair {
+        public: vec![1; 8],
+        secret: vec![0xB1; 32],
+    };
+    kp.zeroize();
+    assert!(kp.secret.iter().all(|&b| b == 0), "PqRatchetKeyPair");
+
+    let mut ex = PendingPqExchange {
+        epoch: 1,
+        keypair: PqRatchetKeyPair {
+            public: vec![1; 8],
+            secret: vec![0xB2; 32],
+        },
+    };
+    ex.zeroize();
+    assert!(
+        ex.keypair.secret.iter().all(|&b| b == 0),
+        "PendingPqExchange"
+    );
+
+    let mut c = chain(0xC1);
+    c.zeroize();
+    assert!(c.key.iter().all(|&b| b == 0), "PqChain");
+
+    let mut ec = chains();
+    ec.zeroize();
+    assert!(
+        ec.send.as_ref().unwrap().key.iter().all(|&b| b == 0)
+            && ec.recv.key.iter().all(|&b| b == 0),
+        "PqEpochChains"
+    );
+
+    let mut ct = PendingPqCiphertext {
+        epoch: 1,
+        ek_hash: [0; 8],
+        ciphertext: vec![5; 8],
+        chains: chains(),
+    };
+    ct.zeroize();
+    assert!(
+        ct.chains.recv.key.iter().all(|&b| b == 0)
+            && ct.chains.send.as_ref().unwrap().key.iter().all(|&b| b == 0),
+        "PendingPqCiphertext"
+    );
+}
+
+/// The PQ secret holders print what identifies them and nothing secret: their `Debug` is
+/// hand-written so that a `{:?}` of a session in a log carries no key.
+///
+/// Mutation: make either `fmt` write nothing — this reddens (and a derived `Debug` would print
+/// the key bytes, which this also catches).
+#[test]
+fn test_pq_secret_holders_debug_names_them_without_their_secret() {
+    use super::{PqChain, PqRatchetKeyPair};
+    let chain = PqChain {
+        index: 3,
+        key: vec![0xAB; 32],
+    };
+    assert_eq!(format!("{chain:?}"), "PqChain { index: 3, .. }");
+    let kp = PqRatchetKeyPair {
+        public: vec![1; 8],
+        secret: vec![0xAB; 32],
+    };
+    assert_eq!(format!("{kp:?}"), "PqRatchetKeyPair { public_len: 8, .. }");
+}
+
+// ── The jump guards bound the work a header can ask for (TODO 302) ───────────────────────────
+//
+// Each guard refuses before any HKDF step; past it the chain-advance loop does up to
+// `max_message_jump` steps for a header that then fails AEAD. A forged header is enough to ask —
+// so each guard is pinned by its refusal ("jump too large") and by its edge: a jump of exactly
+// `max_message_jump` is not the guard's to refuse (it fails AEAD instead, being forged).
+
+fn refused_by_a_jump_guard(result: Result<Vec<u8>, String>) -> bool {
+    matches!(result, Err(e) if e.contains("jump too large"))
+}
+
+/// Alice turned her DH key: `turned` is the first message of her new chain, after Bob's reply.
+fn turned_message() -> (Dr, Dr, EncryptedRatchetMessage) {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000031",
+        "bbbbbbbb-0000-4000-8000-000000000032",
+    );
+    let first = alice.encrypt(b"first").unwrap();
+    bob.decrypt(&first).unwrap();
+    let reply = bob.encrypt(b"reply").unwrap();
+    alice.decrypt(&reply).unwrap();
+    let turned = alice.encrypt(b"turned").unwrap();
+    (alice, bob, turned)
+}
+
+/// After a DH step the new chain starts at 0, so the number itself is the jump.
+///
+/// Mutation: `>` → `==` or `>=` on the after-DH-step guard — this reddens.
+#[test]
+fn test_jump_guard_after_a_dh_step_refuses_past_the_limit_only() {
+    let max_jump = crate::config::Config::global().max_message_jump;
+    let (_alice, mut bob, turned) = turned_message();
+
+    let mut over = turned.clone();
+    over.message_number = max_jump + 1;
+    assert!(refused_by_a_jump_guard(bob.decrypt(&over)));
+
+    let mut edge = turned.clone();
+    edge.message_number = max_jump;
+    assert!(!refused_by_a_jump_guard(bob.decrypt(&edge)));
+    assert_eq!(
+        bob.decrypt(&turned).unwrap(),
+        b"turned",
+        "nothing was committed"
+    );
+}
+
+/// The old chain is walked up to PN before the step: PN past the chain plus the limit is refused.
+///
+/// Mutation: `>` → `==` or `>=` on the PN guard — this reddens.
+#[test]
+fn test_jump_guard_on_the_previous_chain_refuses_past_the_limit_only() {
+    let max_jump = crate::config::Config::global().max_message_jump;
+    let (_alice, mut bob, turned) = turned_message();
+    let at = bob.receiving_chain_length;
+
+    let mut over = turned.clone();
+    over.previous_chain_length = at + max_jump + 1;
+    assert!(refused_by_a_jump_guard(bob.decrypt(&over)));
+    let mut kept = Dr::from_serializable(bob.to_serializable()).unwrap();
+    assert_eq!(
+        kept.decrypt(&turned).unwrap(),
+        b"turned",
+        "nothing was committed"
+    );
+
+    // Under AD v3 PN is outside the AD, so this edge message even decrypts (AD v4 covers it —
+    // `AD_VERSION_HEADER`); what is pinned here is only that the guard lets it through.
+    let mut edge = turned.clone();
+    edge.previous_chain_length = at + max_jump;
+    assert!(!refused_by_a_jump_guard(bob.decrypt(&edge)));
+}
+
+/// On the current chain: past the chain plus the limit is refused, the limit itself is not.
+///
+/// Mutation: `>` → `>=` on the same-chain guard — the edge is refused and this reddens.
+#[test]
+fn test_jump_guard_on_the_current_chain_refuses_past_the_limit_only() {
+    let max_jump = crate::config::Config::global().max_message_jump;
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000033",
+        "bbbbbbbb-0000-4000-8000-000000000034",
+    );
+    let next = alice.encrypt(b"next").unwrap();
+    let at = bob.receiving_chain_length;
+
+    let mut edge = next.clone();
+    edge.message_number = at + max_jump;
+    assert!(!refused_by_a_jump_guard(bob.decrypt(&edge)));
+    let mut over = next.clone();
+    over.message_number = at + max_jump + 1;
+    assert!(refused_by_a_jump_guard(bob.decrypt(&over)));
+    assert_eq!(bob.decrypt(&next).unwrap(), b"next");
+}
+
+/// The PQ chain has its own guard: the PQ index is not the DR number (an epoch spans DH chains),
+/// so a header can name a far PQ index with a near DR number.
+///
+/// Mutation: `>` → `==` or `>=` on the PQ guard — this reddens.
+#[test]
+fn test_pq_jump_guard_refuses_past_the_limit_only() {
+    let max_jump = crate::config::Config::global().max_message_jump;
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000035",
+        "bbbbbbbb-0000-4000-8000-000000000036",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let epoch = alice.current_pq_epoch;
+    let at = pq_chain(&bob, epoch, true)
+        .expect("bob reads the epoch")
+        .index;
+
+    let over = bob.pq_receive_key(epoch, at + max_jump + 1).unwrap_err();
+    assert!(over.contains("jump too large"), "{over}");
+    assert!(bob.pq_receive_key(epoch, at + max_jump).unwrap().is_some());
+}
+
+// ── Skipped keys age out (TODO 302) ──────────────────────────────────────────────────────────
+
+/// A PQ skipped key older than the age bound is dropped and its fresh neighbour kept: the
+/// classical half ages out on the same clock, and a PQ key alone opens nothing.
+///
+/// Mutation: break the PQ age arithmetic (`now - ts` → `now / ts`) — nothing ages out and this
+/// reddens.
+#[test]
+fn test_pq_skipped_key_past_the_age_bound_is_dropped() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000037",
+        "bbbbbbbb-0000-4000-8000-000000000038",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let _lost_a = alice.encrypt(b"lost a").unwrap();
+    let _lost_b = alice.encrypt(b"lost b").unwrap();
+    let read = alice.encrypt(b"read").unwrap();
+    bob.decrypt(&read).unwrap();
+    assert_eq!(bob.pq_skipped_keys.len(), 2);
+
+    let max_age = crate::config::Config::global().max_skipped_message_age_seconds;
+    let now = crate::utils::time::now();
+    let mut slots: Vec<_> = bob.pq_skipped_keys.keys().copied().collect();
+    slots.sort();
+    bob.pq_skipped_key_timestamps
+        .insert(slots[0], now - max_age as u64 - 10);
+    bob.cleanup_old_skipped_keys(max_age);
+
+    assert!(
+        !bob.pq_skipped_keys.contains_key(&slots[0]),
+        "the old key aged out"
+    );
+    assert!(
+        bob.pq_skipped_keys.contains_key(&slots[1]),
+        "the fresh key stays"
+    );
+}
+
+/// `decrypt` ages keys out on every hundredth position of the receiving chain while any are
+/// held — the path that runs between reloads.
+///
+/// Mutation: delete the `!` or turn the inner `&&` into `||` in that condition — a classical
+/// session (no PQ keys) then never ages out in `decrypt`, and this reddens.
+#[test]
+fn test_decrypt_ages_out_skipped_keys_on_the_hundredth_position() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000039",
+        "bbbbbbbb-0000-4000-8000-00000000003a",
+    );
+    let _lost = alice.encrypt(b"lost").unwrap();
+    let read = alice.encrypt(b"read").unwrap();
+    bob.decrypt(&read).unwrap();
+    assert_eq!(bob.skipped_message_keys.len(), 1);
+    let slot = bob.skipped_message_keys.keys().next().unwrap().clone();
+    let max_age = crate::config::Config::global().max_skipped_message_age_seconds;
+    bob.skipped_key_timestamps.insert(
+        slot.clone(),
+        crate::utils::time::now() - max_age as u64 - 10,
+    );
+
+    while !bob.receiving_chain_length.is_multiple_of(100) {
+        let m = alice.encrypt(b"filler").unwrap();
+        bob.decrypt(&m).unwrap();
+    }
+    assert!(
+        bob.skipped_message_keys.contains_key(&slot),
+        "not yet aged out"
+    );
+    let m = alice.encrypt(b"hundredth").unwrap();
+    bob.decrypt(&m).unwrap();
+    assert!(
+        !bob.skipped_message_keys.contains_key(&slot),
+        "aged out in decrypt"
+    );
+}
+
+// ── A persisted session is loaded only as what it says it is (TODO 302) ──────────────────────
+
+/// Versions 1 and 2 load; any other is refused rather than read as one of them.
+///
+/// Mutation: `!=` → `==` in the version check — version 3 loads and this reddens.
+#[test]
+fn test_an_unknown_session_version_is_refused() {
+    let (_alice, bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-00000000003b",
+        "bbbbbbbb-0000-4000-8000-00000000003c",
+    );
+    let mut ser = bob.to_serializable();
+    assert_eq!(ser.version, 2);
+    assert!(Dr::from_serializable(bob.to_serializable()).is_ok());
+    ser.version = 3;
+    assert!(Dr::from_serializable(ser).is_err());
+}
+
+/// A message written before the AD version was carried reads as v3 (`AD_VERSION_LEGACY`), never
+/// as 0 or 1.
+///
+/// Mutation: make `legacy_ad_version` return anything else — this reddens.
+#[test]
+fn test_a_message_without_an_ad_version_reads_as_legacy() {
+    let (mut alice, _bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-00000000003d",
+        "bbbbbbbb-0000-4000-8000-00000000003e",
+    );
+    let msg = alice.encrypt(b"x").unwrap();
+    let mut json = serde_json::to_value(&msg).unwrap();
+    json.as_object_mut().unwrap().remove("ad_version");
+    let read: EncryptedRatchetMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(read.ad_version, AD_VERSION_LEGACY);
+}
+
+// ── The PQ state survives a reload, or is dropped as corrupt (TODO 302) ──────────────────────
+//
+// `restore_pq_ratchet_state` drops the whole PQ state when `validate_pq_ratchet_state` refuses
+// it, with a log line only: a refusal of a valid state would silently cost every epoch-tagged
+// message after a restart. So: valid states — at the retention bound, at epoch 0 — survive; each
+// broken invariant, alone, is refused.
+
+fn reloaded(ser: super::SerializableSession) -> Dr {
+    Dr::from_serializable(ser).unwrap()
+}
+
+fn pq_pair_at_epoch(epoch: u32, n: u8) -> (Dr, Dr) {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        &format!("aaaaaaaa-0000-4000-8000-0000000004{n:02x}"),
+        &format!("bbbbbbbb-0000-4000-8000-0000000004{n:02x}"),
+    );
+    if epoch > 0 {
+        pq_drive_to_epoch(&mut alice, &mut bob, epoch);
+    }
+    (alice, bob)
+}
+
+/// Valid states load: one holding exactly `PQ_CHAIN_RETENTION` epochs, and a fresh one at
+/// epoch 0 (no chains, no send chain yet).
+///
+/// Mutation: `>` → `>=` or `==` on the retention check, or `>` → `>=` on `current_epoch > 0`
+/// — a valid state is dropped and this reddens.
+#[test]
+fn test_valid_pq_states_survive_a_reload() {
+    let (_alice, bob) = pq_pair_at_epoch(3, 1);
+    let ser = bob.to_serializable();
+    assert_eq!(
+        ser.pq_ratchet.as_ref().unwrap().chains.len(),
+        super::PQ_CHAIN_RETENTION
+    );
+    assert_eq!(reloaded(ser).current_pq_epoch, bob.current_pq_epoch);
+
+    let (alice, _bob) = pq_pair_at_epoch(0, 2);
+    assert!(alice.is_pq_initiator);
+    let back = reloaded(alice.to_serializable());
+    assert!(back.is_pq_initiator, "the epoch-0 state was kept");
+}
+
+/// Each broken invariant alone makes the PQ state be dropped on load (epoch back to 0).
+///
+/// Mutations: on the chain-epoch check `||` → `&&` (epoch 0 / ahead of current pass) and
+/// `>` → `<` (a held older epoch is refused — the valid-state test reddens); on the current-send
+/// check `>` → `<`/`==` and `&&` → `||`; on the skipped bound `>` → `==`; on the pending
+/// exchange sizes `||` → `&&` — each reddens one case here.
+#[test]
+fn test_each_broken_pq_invariant_is_refused_on_load() {
+    type Edit = fn(&mut super::storage::SerializablePqRatchetState);
+    let cases: [(&str, Edit); 6] = [
+        ("one epoch more than retention", |pq| {
+            let mut extra = pq.chains[0].clone();
+            extra.epoch = pq.current_epoch - pq.chains.len() as u32;
+            pq.chains.insert(0, extra);
+        }),
+        ("an epoch-0 chain", |pq| {
+            let older = pq
+                .chains
+                .iter_mut()
+                .find(|c| c.epoch != pq.current_epoch)
+                .unwrap();
+            older.epoch = 0;
+        }),
+        ("a chain ahead of current", |pq| {
+            let current = pq.current_epoch;
+            let older = pq.chains.iter_mut().find(|c| c.epoch != current).unwrap();
+            older.epoch = current + 1;
+        }),
+        ("the current epoch without a send chain", |pq| {
+            let current = pq.current_epoch;
+            pq.chains
+                .iter_mut()
+                .find(|c| c.epoch == current)
+                .unwrap()
+                .send = None;
+        }),
+        ("one skipped key more than the bound", |pq| {
+            let limit = crate::config::Config::global().max_skipped_messages;
+            pq.skipped = (0..=limit)
+                .map(|i| super::storage::SerializablePqSkippedKey {
+                    epoch: pq.current_epoch,
+                    index: i,
+                    key: vec![1; 32],
+                    at: crate::utils::time::now(),
+                })
+                .collect();
+        }),
+        ("a pending exchange with a short public key", |pq| {
+            pq.pending_ciphertext = None;
+            pq.pending_exchange = Some(super::storage::SerializablePqPendingExchange {
+                epoch: pq.current_epoch + 1,
+                public: vec![0; super::storage::MLKEM768_PUBLIC_LEN - 1],
+                secret: vec![0; super::storage::MLKEM768_SECRET_LEN],
+            });
+        }),
+    ];
+    let (alice, _bob) = pq_pair_at_epoch(3, 3);
+    let epoch = alice.current_pq_epoch;
+    assert!(epoch >= 3);
+
+    // The control: the same pending exchange with the right sizes is accepted.
+    let mut ok = alice.to_serializable();
+    {
+        let pq = ok.pq_ratchet.as_mut().unwrap();
+        pq.pending_ciphertext = None;
+        pq.pending_exchange = Some(super::storage::SerializablePqPendingExchange {
+            epoch: epoch + 1,
+            public: vec![0; super::storage::MLKEM768_PUBLIC_LEN],
+            secret: vec![0; super::storage::MLKEM768_SECRET_LEN],
+        });
+    }
+    assert_eq!(reloaded(ok).current_pq_epoch, epoch, "control case loads");
+
+    for (name, edit) in cases {
+        let mut ser = alice.to_serializable();
+        edit(ser.pq_ratchet.as_mut().unwrap());
+        assert_eq!(reloaded(ser).current_pq_epoch, 0, "{name}: must be refused");
+    }
+}

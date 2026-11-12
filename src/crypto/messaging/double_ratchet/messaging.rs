@@ -456,10 +456,6 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         &self.session_id
     }
 
-    fn contact_id(&self) -> &str {
-        &self.contact_id
-    }
-
     fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64) {
         use tracing::debug;
 

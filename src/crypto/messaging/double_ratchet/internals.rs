@@ -199,10 +199,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         Ok(())
     }
 
-    pub fn identity_proof(&self) -> &IdentityProof {
-        &self.identity_proof
-    }
-
     /// `HKDF(salt = secret, ikm = key)` for the root and for the chain the step derived, under
     /// separate labels — the Triple Ratchet's shape (PQ key as the salt), as in
     /// `mix_pq_message_key`.
