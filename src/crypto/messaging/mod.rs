@@ -223,16 +223,10 @@ pub trait SecureMessaging<P: CryptoProvider>: Sized {
         &mut self,
         message: &Self::EncryptedMessage,
         identity_secret: Option<&[u8]>,
-    ) -> Result<Vec<u8>, String> {
-        let _ = identity_secret;
-        self.decrypt(message)
-    }
+    ) -> Result<Vec<u8>, String>;
 
     /// Получить session ID
     fn session_id(&self) -> &str;
-
-    /// Получить contact ID
-    fn contact_id(&self) -> &str;
 
     /// Cleanup старых skipped message keys
     ///

@@ -289,8 +289,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 }
 
 /// ML-KEM-768 material sizes (bytes) — used to validate restored PQ state.
-const MLKEM768_PUBLIC_LEN: usize = 1184;
-const MLKEM768_SECRET_LEN: usize = 2400;
+pub(super) const MLKEM768_PUBLIC_LEN: usize = 1184;
+pub(super) const MLKEM768_SECRET_LEN: usize = 2400;
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 /// A PQ chain key and a key it yields are 32 bytes (`pq_chain_step`).
 const PQ_CHAIN_KEY_LEN: usize = 32;
@@ -483,7 +483,7 @@ pub(crate) struct SerializablePrekeyHeader {
 /// before JSON conversion, not here (to keep serialization format clean).
 #[derive(Serialize, Deserialize)]
 pub struct SerializableSession {
-    version: u16, // Protocol version for future compatibility
+    pub(super) version: u16, // Protocol version for future compatibility
     pub suite_id: u16,
     root_key: Vec<u8>,
     sending_chain_key: Vec<u8>,
@@ -538,7 +538,7 @@ pub struct SerializableSession {
     /// keys (PQR-2). Present only for PQ-ratchet sessions. Mirrors
     /// `CfeSessionStateV1.pqr` 1:1; see that type for field-level docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pq_ratchet: Option<SerializablePqRatchetState>,
+    pub(super) pq_ratchet: Option<SerializablePqRatchetState>,
 }
 
 /// JSON-side mirror of `CfePqRatchetStateV2` (see `cfe/types.rs` for the field
