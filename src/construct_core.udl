@@ -80,6 +80,55 @@ namespace construct_core {
     /// status says the path failed (CANCELLED, DEADLINE_EXCEEDED, UNAVAILABLE), failed otherwise.
     MessageAfterSendFailure after_send_failure(SendFailureKind failure);
 
+    /// Fan-out retry (construct-rules `fanout_retry`): attempts before an owed copy is given up,
+    /// and the first wait.
+    u32 fanout_retry_max_attempts();
+    i64 fanout_retry_base_backoff_ms();
+
+    /// Read sync (construct-rules `read_sync`; vectors `knst_read_markers.json`). `a` strictly
+    /// after `b`: a later time, or the same time and a greater id by its UTF-8 bytes.
+    boolean read_boundary_is_later(ReadBoundary a, ReadBoundary b);
+    /// An incoming message is read when it is at or before the boundary.
+    boolean read_boundary_covers(ReadBoundary boundary, ReadBoundary message);
+    /// Of the `unread` newest of `incoming` (oldest first), how many are past `boundary`: by the
+    /// position of the boundary's message when it is there, by time when it is not. Only lowers.
+    u32 read_unread_left(u32 unread, sequence<ReadIncoming> incoming, ReadBoundary boundary);
+
+    /// Intake decisions (construct-rules `intake`). The epochs a publish covers, from `current`.
+    sequence<u64> intake_window(u64 current);
+    /// How often a running process asks `intake_should_publish` again.
+    u64 intake_recheck_ms();
+    /// Names a key without storing it twice: the first 8 bytes of its SHA-256, hex.
+    string intake_key_id(bytes key);
+    /// Once per epoch per account and key; a clock set back is no reason to skip.
+    boolean intake_should_publish(IntakePublished? last, IntakePublished due);
+    /// The last publish the server took was this key's, for this account, and still covers
+    /// `current`.
+    boolean intake_server_holds(IntakePublished? last, string account_id, string key_id, u64 current);
+    /// The publish marker as bytes to keep, and back; null when the bytes are not one.
+    [Throws=CryptoError]
+    bytes intake_published_to_bytes(IntakePublished published);
+    IntakePublished? intake_published_from_bytes(bytes kept);
+    /// The server refused a publish as stale: the account is at `current`, above `ours`.
+    boolean intake_refused_as_stale(u32 current, u32 ours);
+    /// What to do about our own key, from the generation this device holds (null: none) and what
+    /// the server says of the account.
+    IntakeOwnKeyNext intake_own_key(u32? held_generation, u32 server_generation, boolean server_has_live_tags);
+    /// A rotation mints above what we hold and what the server has (null: could not be asked).
+    u32 intake_mint_above(u32? held, u32? server);
+    /// After a stale refusal: mint once more above `current` — once, and only above `minted`.
+    u32? intake_re_mint_above(u32 minted, u32 current, boolean already_re_minted);
+    /// Who gets the new card after a rotation and when (ms from now, within the hour): everyone
+    /// but the dropped, the blocked and ourselves, once each, each at its own moment drawn from
+    /// `seed` (random bytes).
+    sequence<IntakeCard> intake_card_schedule(sequence<string> contacts, string dropped, sequence<string> blocked, string own_account, bytes seed);
+    /// Whether a send's verdict suspends the key: NOT_ACCEPTED (3) only.
+    boolean intake_verdict_suspends_key(i32 verdict);
+    /// A key as a client keeps it: the generation big-endian then the key; 32 bytes alone is
+    /// generation 0. Null when damaged.
+    bytes intake_key_record_encode(IntakeKeyState state);
+    IntakeKeyState? intake_key_record_decode(bytes kept);
+
     // KNST plaintext frame — the header every message body is framed with before encryption.
     // The core's, since 0.31; vectors: construct-protos/conformance/knst_frame.json.
     /// `payload` split into frames of at most 3770 bytes, each carrying the whole body's length;
@@ -1013,6 +1062,124 @@ interface MailboxGapState {
     /// The notice to keep.
     [Throws=CryptoError]
     bytes to_bytes();
+};
+
+/// One message to one recipient and the devices of theirs still owed it (construct-rules
+/// `fanout_retry`). `owed_device_ids` empty: plan the fan-out again. `key` names the entry.
+dictionary OwedCopy {
+    string key;
+    string base_message_id;
+    string recipient_user_id;
+    string sender_user_id;
+    sequence<string> owed_device_ids;
+    u32 attempts;
+    i64 next_attempt_at_ms;
+    i64 created_at_ms;
+};
+
+/// The owed copies a client keeps: five attempts, 30 s doubling to an hour, a day's life.
+/// Persist `to_bytes` after every change.
+interface FanoutRetryState {
+    constructor();
+    /// The queue as it was kept; bytes that are not one start it empty.
+    [Name=from_bytes]
+    constructor(bytes kept);
+    /// The entries an earlier build kept in its own format, read once.
+    [Name=restore]
+    constructor(sequence<OwedCopy> entries);
+    /// `owed` devices still need their copy; a second enqueue merges, keeping age and attempts.
+    void enqueue(string base_message_id, string recipient_user_id, string sender_user_id, sequence<string> owed, i64 now_ms);
+    /// One attempt spent, before it is made: the entry after, or null once it is given up.
+    OwedCopy? record_attempt(string key, i64 now_ms);
+    /// Exactly the devices a retry lost; none left removes the entry.
+    void replace_owed(string key, sequence<string> owed);
+    void remove(string key);
+    void remove_all();
+    /// Entries whose wait is over, oldest first; expired ones are dropped.
+    sequence<OwedCopy> due(i64 now_ms);
+    /// When the next live entry comes due.
+    i64? next_due(i64 now_ms);
+    sequence<OwedCopy> all();
+    [Throws=CryptoError]
+    bytes to_bytes();
+};
+
+/// A point in a chat (construct-rules `read_sync`): the sender's time, then the message id.
+dictionary ReadBoundary {
+    u64 sent_at_ms;
+    string message_id;
+};
+
+/// An incoming message as the unread count reads it: its id and the time this device keeps.
+dictionary ReadIncoming {
+    string message_id;
+    u64 at_ms;
+};
+
+dictionary PartnerBoundary {
+    string partner;
+    ReadBoundary boundary;
+};
+
+/// What a received read marker did.
+enum ReadMarkerOutcome {
+    "Apply",
+    /// Not later than what is held.
+    "Ignore",
+    /// Not from our own account.
+    "Drop",
+};
+
+/// What a client keeps of read sync, per partner (lowercased): how far the account has read, the
+/// newest incoming seen, and markers not yet sent to our other devices. Persist `to_bytes` after
+/// every change.
+interface ReadMarkerState {
+    constructor();
+    [Name=from_bytes]
+    constructor(bytes kept);
+    ReadBoundary? boundary(string partner);
+    /// Move the boundary if later; whether it moved.
+    boolean advance(string partner, ReadBoundary to);
+    /// Whether a message from `partner` is already read on one of our devices.
+    boolean covers(string partner, ReadBoundary message);
+    void note_incoming(string partner, ReadBoundary message);
+    ReadBoundary? newest_incoming(string partner);
+    /// Read here: the boundary moves and the marker waits to go out. Whether it moved.
+    boolean note_read(string partner, ReadBoundary boundary);
+    /// A marker from another device: applied when from our own account and later.
+    ReadMarkerOutcome apply_marker(string partner, ReadBoundary marker, boolean from_own_account, string own_account);
+    /// What to send now; pending is emptied.
+    sequence<PartnerBoundary> take_pending();
+    /// A send that failed: back into pending unless reading moved further meanwhile.
+    void return_pending(sequence<PartnerBoundary> unsent);
+    boolean has_pending();
+    [Throws=CryptoError]
+    bytes to_bytes();
+};
+
+/// What the last intake publish covered.
+dictionary IntakePublished {
+    string account_id;
+    u64 epoch;
+    string key_id;
+};
+
+/// What to do about our own intake key.
+[Enum]
+interface IntakeOwnKeyNext {
+    Use();
+    /// The pre-generation key becomes the account's generation 1.
+    Promote();
+    /// No live key on the account: a new one above `above`.
+    Mint(u32 above);
+    /// The account has a live key this device lacks: due from our own devices.
+    Wait();
+};
+
+/// One contact's card after a rotation, `delay_ms` from now.
+dictionary IntakeCard {
+    string contact;
+    u64 delay_ms;
 };
 
 /// How the pipeline ended with a tracked stream message (construct-rules `stream_cursor`).
