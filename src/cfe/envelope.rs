@@ -30,6 +30,9 @@ pub fn max_payload_len(msg_type: CfeMessageType) -> usize {
     match msg_type {
         CfeMessageType::Generic
         | CfeMessageType::MailboxGapNotice
+        | CfeMessageType::FanoutRetryQueue
+        | CfeMessageType::ReadSyncState
+        | CfeMessageType::IntakePublished
         | CfeMessageType::ClientAuthSession
         | CfeMessageType::ClientBlockWishes
         | CfeMessageType::ClientStickerState

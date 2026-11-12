@@ -25,6 +25,12 @@ pub enum CfeMessageType {
     // Client rules (`construct-rules`), 0x60–0x67: a rule's state as every client keeps it.
     /// The "messages may not have arrived" notice (`construct_rules::mailbox_gap::Notice`).
     MailboxGapNotice = 0x60,
+    /// Devices still owed their copy of a sent message (`construct_rules::fanout_retry::Queue`).
+    FanoutRetryQueue = 0x61,
+    /// Read boundaries, newest incoming and unsent markers (`construct_rules::read_sync::State`).
+    ReadSyncState = 0x62,
+    /// What the last intake publish covered (`construct_rules::intake::Published`).
+    IntakePublished = 0x63,
 
     // One client's own state, 0x68–0x6F: what a single client keeps and no other reads. Listed
     // here so every persisted format has one registry (rule 6, `rules-from-the-first-year`).
@@ -52,6 +58,9 @@ impl CfeMessageType {
             0x20 => Self::KyberPrivateKeys,
             0x44 => Self::MlsStore,
             0x60 => Self::MailboxGapNotice,
+            0x61 => Self::FanoutRetryQueue,
+            0x62 => Self::ReadSyncState,
+            0x63 => Self::IntakePublished,
             0x68 => Self::ClientAuthSession,
             0x69 => Self::ClientBlockWishes,
             0x6A => Self::ClientStickerState,

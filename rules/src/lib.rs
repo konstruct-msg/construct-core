@@ -14,7 +14,10 @@
 //! re-exports the rule and writes its state, so no client depends on two versions of it.
 
 pub mod device_refusal;
+pub mod fanout_retry;
+pub mod intake;
 pub mod mailbox_gap;
 pub mod names;
+pub mod read_sync;
 pub mod send_failure;
 pub mod stream_cursor;
