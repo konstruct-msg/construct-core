@@ -1503,68 +1503,216 @@ fn test_cross_session_message_rejected_by_ad() {
     );
 }
 
-/// desync-test-skipped-keys-limit: DoS protection.
-///
-/// Alice encrypts `limit + 2` messages but only delivers the last one to Bob.
-/// Bob must receive `Err("Too many skipped messages")` — no panic — when trying
-/// to skip `limit + 1` keys to reach the delivered message.
-///
-/// After the failed decrypt the session state must be rolled back to the
-/// snapshot (restore_snapshot path), so a normally-delivered follow-up message
-/// still decrypts successfully.
-#[test]
-fn test_skipped_keys_dos_limit_returns_error_and_session_survives() {
-    let alice_uuid = "aaaaaaaa-0000-4000-8000-000000000011";
-    let bob_uuid = "bbbbbbbb-0000-4000-8000-000000000012";
+// ── A full skipped-key store drops its oldest key, never the message (TODO 302) ──────────────
+//
+// libsignal `double_ratchet.rs` `store_skipped_key`: the new key goes in, the oldest of the chain
+// past `MAX_MESSAGE_KEYS` goes out. Until 2026-11-12 ours refused the arriving message ("Too many
+// skipped messages") and every later message with a gap on that state, for a week.
 
-    let (mut alice, mut bob) = make_session_pair(alice_uuid, bob_uuid);
-
+/// `limit` keys stored: Bob reads Alice's message `limit`, having skipped `0 .. limit`.
+fn fill_skipped_store(
+    alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+    bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+) -> Vec<EncryptedRatchetMessage> {
     let limit = crate::config::Config::global().max_skipped_messages as usize;
-
-    // Alice encrypts `limit + 2` messages (indices 0 … limit+1).
-    // We keep only the very last one to present a gap of limit+1 to Bob.
-    let mut overflow_msg = None;
-    for i in 0..=(limit + 1) {
-        let ct = alice.encrypt(format!("msg-{i}").as_bytes()).unwrap();
-        if i == limit + 1 {
-            overflow_msg = Some(ct);
-        }
-    }
-    let overflow_msg = overflow_msg.unwrap();
-
-    // Bob tries to decrypt a message that requires skipping limit+1 keys.
-    // This must return an error, not panic.
-    let result = bob.decrypt(&overflow_msg);
-    assert!(
-        result.is_err(),
-        "decrypt must return Err when the gap exceeds MAX_SKIPPED_MESSAGES"
+    let sent: Vec<_> = (0..=limit)
+        .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
+        .collect();
+    assert_eq!(
+        bob.decrypt(&sent[limit]).unwrap(),
+        format!("msg-{limit}").as_bytes()
     );
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("Too many skipped"),
-        "error message should mention skipped messages, got: {err}"
-    );
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    sent
+}
 
-    // Session must be rolled back to the pre-decrypt snapshot — Bob's
-    // skipped_message_keys must be empty (no partial state leaked).
-    let bob_snap = bob.to_serializable();
-    assert!(
-        bob_snap.skipped_keys.is_empty(),
-        "snapshot restore must leave skipped_keys empty after overflow error"
+/// A gap wider than the store is read; the newest `limit` keys of it are kept.
+///
+/// Mutation: store every key of the gap (drop the `keep_from` condition) — the store ends above
+/// the limit and this reddens; restore the refusal and the first decrypt reddens.
+#[test]
+fn test_gap_wider_than_the_skipped_store_is_read_and_keeps_its_newest_keys() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000011",
+        "bbbbbbbb-0000-4000-8000-000000000012",
     );
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let sent: Vec<_> = (0..=limit + 1)
+        .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
+        .collect();
 
-    // Bob's SENDING chain is independent of his receiving chain and must still
-    // be usable — the overflow only affects Alice→Bob decryption.
-    // (Alice→Bob requires END_SESSION + re-init once the gap exceeds the limit;
-    //  that is correct, intentional DR behaviour — not a bug to fix here.)
-    let bob_msg = bob.encrypt(b"bob send after overflow").unwrap();
-    let alice_received = alice.decrypt(&bob_msg);
-    assert!(
-        alice_received.is_ok(),
-        "Bob must still be able to send after the overflow; Alice decrypt failed: {:?}",
-        alice_received.err()
+    assert_eq!(
+        bob.decrypt(&sent[limit + 1]).unwrap(),
+        format!("msg-{}", limit + 1).as_bytes()
     );
-    assert_eq!(alice_received.unwrap(), b"bob send after overflow");
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    assert_eq!(
+        bob.decrypt(&sent[limit]).unwrap(),
+        format!("msg-{limit}").as_bytes()
+    );
+    assert_eq!(bob.decrypt(&sent[1]).unwrap(), b"msg-1");
+    assert!(
+        bob.decrypt(&sent[0]).is_err(),
+        "the oldest position of the gap is the one not kept"
+    );
+}
+
+/// With the store full, a new gap of one costs the oldest stored key, and the arriving message
+/// and the one it skipped are both read.
+///
+/// Mutation: make `make_room_for_skipped` a no-op — the store grows past the limit and this
+/// reddens; evict the newest instead of the oldest — `sent[1]` is gone and this reddens.
+#[test]
+fn test_full_skipped_store_drops_its_oldest_key_for_a_new_gap() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000013",
+        "bbbbbbbb-0000-4000-8000-000000000014",
+    );
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let sent = fill_skipped_store(&mut alice, &mut bob);
+    let skipped = alice.encrypt(b"skipped").unwrap();
+    let arriving = alice.encrypt(b"arriving").unwrap();
+
+    assert_eq!(bob.decrypt(&arriving).unwrap(), b"arriving");
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    assert_eq!(bob.decrypt(&skipped).unwrap(), b"skipped");
+    assert_eq!(bob.decrypt(&sent[1]).unwrap(), b"msg-1");
+    assert!(
+        bob.decrypt(&sent[0]).is_err(),
+        "the oldest key made the room"
+    );
+}
+
+/// The room is made before the AEAD check, so a message that does not decrypt must evict
+/// nothing: a forged header with a gap cannot empty the store.
+///
+/// Mutation: skip the snapshot restore on the AEAD failure — `sent[0]` is gone and this reddens.
+#[test]
+fn test_message_that_does_not_decrypt_evicts_no_skipped_key() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000015",
+        "bbbbbbbb-0000-4000-8000-000000000016",
+    );
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let sent = fill_skipped_store(&mut alice, &mut bob);
+    let _skipped = alice.encrypt(b"skipped").unwrap();
+    let mut forged = alice.encrypt(b"forged").unwrap();
+    let last = forged.ciphertext.len() - 1;
+    forged.ciphertext[last] ^= 0x01;
+
+    assert!(bob.decrypt(&forged).is_err());
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    assert_eq!(bob.decrypt(&sent[0]).unwrap(), b"msg-0");
+}
+
+/// The PQ half keeps the same bound and drops its oldest the same way; a store over the bound
+/// would make the persisted PQ state invalid and the whole of it dropped on load.
+///
+/// Mutation: make `make_room_for_pq_skipped` a no-op — the PQ store ends at `limit + 1` and this
+/// reddens.
+#[test]
+fn test_full_pq_skipped_store_drops_its_oldest_key_and_stays_loadable() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000017",
+        "bbbbbbbb-0000-4000-8000-000000000018",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let epoch = alice.current_pq_epoch;
+    let sent: Vec<_> = (0..=limit + 1)
+        .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
+        .collect();
+    assert!(sent.iter().all(|m| m.pq_message_epoch == epoch));
+    assert_eq!(
+        bob.decrypt(&sent[limit + 1]).unwrap(),
+        format!("msg-{}", limit + 1).as_bytes()
+    );
+    assert_eq!(bob.pq_skipped_keys.len(), limit);
+
+    let skipped = alice.encrypt(b"skipped").unwrap();
+    let arriving = alice.encrypt(b"arriving").unwrap();
+    assert_eq!(bob.decrypt(&arriving).unwrap(), b"arriving");
+    assert_eq!(bob.pq_skipped_keys.len(), limit);
+
+    let reloaded =
+        DoubleRatchetSession::<ClassicSuiteProvider>::from_serializable(bob.to_serializable())
+            .unwrap();
+    assert_eq!(reloaded.current_pq_epoch, bob.current_pq_epoch);
+    assert_eq!(reloaded.pq_skipped_keys.len(), limit);
+    assert_eq!(bob.decrypt(&skipped).unwrap(), b"skipped");
+}
+
+/// Alice's chain-1 messages `1 ..= n` never reached Bob, Bob replies, Alice turns her DH key:
+/// the first message of her new chain makes Bob store what is left of chain 1 (the PN gap).
+fn turn_alice_after_unread(
+    alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+    bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+    unread: usize,
+) -> (Vec<EncryptedRatchetMessage>, EncryptedRatchetMessage) {
+    let lost: Vec<_> = (0..unread)
+        .map(|i| alice.encrypt(format!("lost-{i}").as_bytes()).unwrap())
+        .collect();
+    let reply = bob.encrypt(b"reply").unwrap();
+    assert_eq!(alice.decrypt(&reply).unwrap(), b"reply");
+    let turned = alice.encrypt(b"turned").unwrap();
+    assert_ne!(
+        turned.dh_public_key, lost[0].dh_public_key,
+        "Alice turned her DH key"
+    );
+    (lost, turned)
+}
+
+/// A PN gap wider than the store is read across the DH step; the newest `limit` keys of the old
+/// chain are kept.
+///
+/// Mutation: refuse in the PN loop when the store is full (the code before 2026-11-12) — the
+/// turned message is refused and this reddens.
+#[test]
+fn test_previous_chain_gap_wider_than_the_store_is_read_across_the_dh_step() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-000000000019",
+        "bbbbbbbb-0000-4000-8000-00000000001a",
+    );
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let first = alice.encrypt(b"first").unwrap();
+    assert_eq!(bob.decrypt(&first).unwrap(), b"first");
+    let (lost, turned) = turn_alice_after_unread(&mut alice, &mut bob, limit + 1);
+
+    assert_eq!(bob.decrypt(&turned).unwrap(), b"turned");
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    assert_eq!(
+        bob.decrypt(&lost[limit]).unwrap(),
+        format!("lost-{limit}").as_bytes()
+    );
+    assert_eq!(bob.decrypt(&lost[1]).unwrap(), b"lost-1");
+    assert!(
+        bob.decrypt(&lost[0]).is_err(),
+        "the oldest of the PN gap is not kept"
+    );
+}
+
+/// With the store full, a PN gap of one costs the oldest stored key.
+///
+/// Mutation: make `make_room_for_skipped` a no-op — the store ends at `limit + 1` and this
+/// reddens.
+#[test]
+fn test_full_skipped_store_drops_its_oldest_key_for_a_previous_chain_gap() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-00000000001b",
+        "bbbbbbbb-0000-4000-8000-00000000001c",
+    );
+    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let sent = fill_skipped_store(&mut alice, &mut bob);
+    let (lost, turned) = turn_alice_after_unread(&mut alice, &mut bob, 1);
+
+    assert_eq!(bob.decrypt(&turned).unwrap(), b"turned");
+    assert_eq!(bob.skipped_message_keys.len(), limit);
+    assert_eq!(bob.decrypt(&lost[0]).unwrap(), b"lost-0");
+    assert_eq!(bob.decrypt(&sent[1]).unwrap(), b"msg-1");
+    assert!(
+        bob.decrypt(&sent[0]).is_err(),
+        "the oldest key made the room"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════
