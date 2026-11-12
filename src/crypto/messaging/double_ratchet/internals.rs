@@ -5,6 +5,66 @@ use crate::crypto::provider::CryptoProvider;
 use zeroize::Zeroize;
 
 impl<P: CryptoProvider> DoubleRatchetSession<P> {
+    /// How many skipped keys a state keeps, classical and PQ each.
+    pub(super) fn max_skipped() -> u32 {
+        Config::global().max_skipped_messages
+    }
+
+    /// Make room for `incoming` classical skipped keys by dropping the oldest stored ones (by
+    /// when they were stored, then by position).
+    ///
+    /// libsignal's `store_skipped_key` inserts the new key and drops the oldest of the chain
+    /// past `MAX_MESSAGE_KEYS`: a full store costs the oldest lost message, never the one that
+    /// arrived. Until 2026-11-12 ours refused the arriving message instead ("Too many skipped
+    /// messages"), and every later message with a gap on that state too, until the week-long
+    /// age-out (TODO 302). Called before the AEAD check: a message that does not decrypt
+    /// restores the snapshot, so a forged header cannot evict anything.
+    pub(super) fn make_room_for_skipped(&mut self, incoming: u32) {
+        let max = Self::max_skipped() as usize;
+        let excess =
+            (self.skipped_message_keys.len() + (incoming as usize).min(max)).saturating_sub(max);
+        if excess == 0 {
+            return;
+        }
+        let mut slots: Vec<_> = self.skipped_message_keys.keys().cloned().collect();
+        slots.sort_by_key(|slot| {
+            (
+                self.skipped_key_timestamps.get(slot).copied().unwrap_or(0),
+                slot.1,
+            )
+        });
+        for slot in slots.into_iter().take(excess) {
+            self.skipped_message_keys.remove(&slot);
+            self.skipped_key_timestamps.remove(&slot);
+        }
+    }
+
+    /// The PQ half of `make_room_for_skipped`: oldest by when stored, then epoch, then index.
+    pub(super) fn make_room_for_pq_skipped(&mut self, incoming: usize) {
+        let max = Self::max_skipped() as usize;
+        let excess = (self.pq_skipped_keys.len() + incoming.min(max)).saturating_sub(max);
+        if excess == 0 {
+            return;
+        }
+        let mut slots: Vec<_> = self.pq_skipped_keys.keys().copied().collect();
+        slots.sort_by_key(|slot| {
+            (
+                self.pq_skipped_key_timestamps
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(0),
+                slot.0,
+                slot.1,
+            )
+        });
+        for slot in slots.into_iter().take(excess) {
+            if let Some(mut key) = self.pq_skipped_keys.remove(&slot) {
+                key.zeroize();
+            }
+            self.pq_skipped_key_timestamps.remove(&slot);
+        }
+    }
+
     /// Cleanup старых skipped message keys с дефолтным периодом (7 дней)
     pub fn cleanup_old_skipped_keys_default(&mut self) {
         self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
@@ -664,18 +724,28 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 chain.index
             ));
         }
-        let now = crate::utils::time::now();
-        loop {
-            let (i, key) = Self::pq_chain_step(chain)?;
+        // Only the newest `max_skipped` keys of the gap are kept, and a full store drops its
+        // oldest to make room — never refuses the message (`make_room_for_skipped`).
+        let keep_from = index.saturating_sub(max_skipped as u32);
+        let mut kept = Vec::new();
+        let found = loop {
+            let (i, mut key) = Self::pq_chain_step(chain)?;
             if i == index {
-                return Ok(Some(key));
+                break key;
             }
-            if self.pq_skipped_keys.len() >= max_skipped {
-                return Err("Too many skipped PQ keys".to_string());
+            if i >= keep_from {
+                kept.push((i, key));
+            } else {
+                key.zeroize();
             }
+        };
+        self.make_room_for_pq_skipped(kept.len());
+        let now = crate::utils::time::now();
+        for (i, key) in kept {
             self.pq_skipped_keys.insert((epoch, i), key);
             self.pq_skipped_key_timestamps.insert((epoch, i), now);
         }
+        Ok(Some(found))
     }
 
     /// Hybridize a Double Ratchet message key with the message's PQ chain key:

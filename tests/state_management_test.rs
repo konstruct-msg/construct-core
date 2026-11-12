@@ -165,34 +165,20 @@ fn test_message_gap() {
     assert_eq!(bob.decrypt(&msg10).unwrap(), b"Message 10");
 }
 
+/// A gap wider than the skipped-key store is read, as libsignal reads it: the store keeps the
+/// newest keys of the gap (TODO 302). Until 2026-11-12 this message was refused.
 #[test]
-fn test_max_skipped_messages_protection() {
+fn test_gap_wider_than_the_skipped_store_is_read() {
     let (mut alice, mut bob) = setup_sessions();
 
-    // Alice отправляет сообщение 0
     let msg0 = alice.encrypt(b"Message 0").unwrap();
     assert_eq!(bob.decrypt(&msg0).unwrap(), b"Message 0");
 
-    // Alice генерирует много сообщений (не отправляет)
     for _ in 1..1001 {
         alice.encrypt(b"Skipped").unwrap();
     }
-
-    // Отправляем сообщение 1001
     let msg1001 = alice.encrypt(b"Message 1001").unwrap();
-
-    // Bob пытается расшифровать → должен получить ошибку DoS protection
-    let result = bob.decrypt(&msg1001);
-    assert!(
-        result.is_err(),
-        "Should fail with 'Too many skipped messages'"
-    );
-    let err_msg = result.unwrap_err();
-    assert!(
-        err_msg.contains("Too many skipped messages"),
-        "Error message should mention skipped messages limit, got: {}",
-        err_msg
-    );
+    assert_eq!(bob.decrypt(&msg1001).unwrap(), b"Message 1001");
 }
 
 #[test]

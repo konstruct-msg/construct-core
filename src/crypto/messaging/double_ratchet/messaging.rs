@@ -431,8 +431,10 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
     ///
     /// # DoS Protection
     ///
-    /// - Лимит на количество skipped keys (MAX_SKIPPED_MESSAGES)
-    /// - Automatic cleanup старых ключей по timestamp
+    /// - A jump past `max_message_jump` is refused (CPU bound).
+    /// - At most `max_skipped_messages` skipped keys are kept; a full store drops its oldest keys
+    ///   and never refuses a message (memory bound, as libsignal's `MAX_MESSAGE_KEYS`).
+    /// - Keys older than `max_skipped_message_age_seconds` are cleaned up.
     fn decrypt(&mut self, encrypted: &Self::EncryptedMessage) -> Result<Vec<u8>, String> {
         self.decrypt_with_identity_secret(encrypted, None)
     }
@@ -655,13 +657,10 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             if let Some(old_remote_dh) = &self.remote_dh_public {
                 let old_chain_key_bytes = old_remote_dh.as_ref().to_vec();
                 let pn = encrypted.previous_chain_length;
+                // No bound here: the store is brought back to `max_skipped_messages` before the
+                // new chain's loop below, by dropping its oldest keys (`make_room_for_skipped`).
+                // `max_message_jump` above bounds what this loop can add meanwhile.
                 while self.receiving_chain_length < pn {
-                    if self.skipped_message_keys.len()
-                        >= crate::config::Config::global().max_skipped_messages as usize
-                    {
-                        self.restore_snapshot(snapshot);
-                        return Err("Too many skipped messages".to_string());
-                    }
                     let (msg_key, next_chain) =
                         P::kdf_ck(&self.receiving_chain_key).map_err(|e| {
                             self.restore_snapshot(snapshot.clone());
@@ -693,7 +692,15 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                 })?;
         }
 
-        // Derive keys until we reach the message number
+        // Derive keys until we reach the message number. A full store drops its oldest keys —
+        // including any the PN loop above just stored past the bound — and only the newest
+        // `max_skipped_messages` of this gap are kept.
+        let keep_from = encrypted.message_number.saturating_sub(Self::max_skipped());
+        self.make_room_for_skipped(
+            encrypted
+                .message_number
+                .saturating_sub(self.receiving_chain_length),
+        );
         while self.receiving_chain_length <= encrypted.message_number {
             let (msg_key, next_chain) = P::kdf_ck(&self.receiving_chain_key).map_err(|e| {
                 self.restore_snapshot(snapshot.clone());
@@ -730,13 +737,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             } else {
                 // Store skipped key keyed by (remote_dh_chain, msg_number)
                 // so keys from different DH chains never collide.
-                let timestamp = crate::utils::time::now();
-                let chain_key = encrypted.dh_public_key.to_vec();
-
-                self.skipped_message_keys
-                    .insert((chain_key.clone(), self.receiving_chain_length), msg_key);
-                self.skipped_key_timestamps
-                    .insert((chain_key, self.receiving_chain_length), timestamp);
+                if self.receiving_chain_length >= keep_from {
+                    let timestamp = crate::utils::time::now();
+                    let chain_key = encrypted.dh_public_key.to_vec();
+                    self.skipped_message_keys
+                        .insert((chain_key.clone(), self.receiving_chain_length), msg_key);
+                    self.skipped_key_timestamps
+                        .insert((chain_key, self.receiving_chain_length), timestamp);
+                }
                 self.receiving_chain_key = next_chain;
                 self.receiving_chain_length = match self.receiving_chain_length.checked_add(1) {
                     Some(v) => v,
@@ -745,13 +753,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         return Err("receiving_chain_length overflow".to_string());
                     }
                 };
-
-                // DoS protection: reject if stored skipped key count reaches the configured max.
-                if self.skipped_message_keys.len() >= Config::global().max_skipped_messages as usize
-                {
-                    self.restore_snapshot(snapshot);
-                    return Err("Too many skipped messages".to_string());
-                }
             }
         }
 
