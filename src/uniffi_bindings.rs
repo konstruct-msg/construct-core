@@ -113,6 +113,17 @@ fn serialization_failed(context: &str, err: impl std::fmt::Debug) -> CryptoError
     }
 }
 
+// One client's local OS share. This is a storage codec, not a send or session operation.
+pub use crate::share_draft::{ShareDraft, ShareDraftItem, ShareDraftStage};
+
+pub fn share_draft_encode(draft: ShareDraft) -> Result<Vec<u8>, CryptoError> {
+    crate::share_draft::encode(&draft).map_err(|e| serialization_failed("share draft", e))
+}
+
+pub fn share_draft_decode(kept: Vec<u8>) -> Result<ShareDraft, CryptoError> {
+    crate::share_draft::decode(&kept).map_err(|e| serialization_failed("share draft", e))
+}
+
 // Re-export PoW types from pow module (for UniFFI UDL)
 // Note: We use UDL definition, not derive macro
 pub use crate::pow::{PowChallenge, PowProgressCallback, PowSolution};

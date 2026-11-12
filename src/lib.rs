@@ -50,6 +50,7 @@ pub mod media;
 pub mod orchestration;
 pub mod pow;
 pub mod rule_state;
+pub mod share_draft;
 pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;
