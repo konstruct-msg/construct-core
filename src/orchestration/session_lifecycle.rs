@@ -24,7 +24,8 @@ use crate::orchestration::clock::{Clock, system_clock};
 ///
 /// A previous state exists for the messages the peer sent before it saw the state that replaced
 /// it: both sides opening at once, or a reopen crossing the peer's traffic. That is one or two
-/// states in practice; three leaves room for a reopen during a crossing. Signal keeps forty.
+/// states in practice; three leaves room for a reopen during a crossing. libsignal keeps three too
+/// (`MAX_ARCHIVED_SESSIONS`, `consts.rs`, main 0abcfd40).
 /// Each one kept is chain keys kept — see `PREVIOUS_STATE_TTL_SECONDS`.
 pub const MAX_PREVIOUS_STATES: usize = 3;
 
@@ -126,7 +127,10 @@ impl SessionLifecycleManager {
         client.set_local_user_id(my_user_id.clone());
         Self {
             client,
-            ack_store: AckStore::new_with_clock(30 * 24 * 60 * 60, clock.clone()),
+            ack_store: AckStore::new_with_clock(
+                super::ack_store::DEFAULT_MAX_AGE_SECONDS,
+                clock.clone(),
+            ),
             previous: HashMap::new(),
             hybrid_identity_pins: std::collections::BTreeMap::new(),
             kem_identity_pins: std::collections::BTreeMap::new(),
@@ -1151,6 +1155,83 @@ mod tests {
         clock.advance_ms(PREVIOUS_STATE_TTL_SECONDS * 1000 + 1000);
         assert!(bob.decrypt_ratchet_message(&alice_id, &late).is_err());
         assert_eq!(bob.previous_state_count(&alice_id), 0);
+    }
+
+    /// A replaced state is kept a week from its replacement: through the week's last second, and
+    /// dropped at the week itself.
+    ///
+    /// Mutation: change any factor of `PREVIOUS_STATE_TTL_SECONDS`, or `<` → `<=` in
+    /// `prune_previous` — this reddens.
+    #[test]
+    fn a_replaced_state_is_kept_for_exactly_a_week() {
+        assert_eq!(PREVIOUS_STATE_TTL_SECONDS, 604_800);
+        let clock = Arc::new(crate::orchestration::clock::MockClock::new(1_000_000_000));
+        let (mut alice, mut bob, alice_id, bob_id) = lifecycle_pair_with_clock(clock.clone());
+        reopen(&mut alice, &mut bob, &alice_id, &bob_id);
+
+        clock.advance_ms((PREVIOUS_STATE_TTL_SECONDS - 1) * 1000);
+        bob.prune_previous(&alice_id);
+        assert_eq!(bob.previous_state_count(&alice_id), 1);
+
+        clock.advance_ms(1000);
+        bob.prune_previous(&alice_id);
+        assert_eq!(bob.previous_state_count(&alice_id), 0);
+    }
+
+    /// A wire payload whose sealed box cannot hold the 12-byte nonce is refused as such, not
+    /// sliced; one of exactly 12 bytes (an empty ciphertext) goes on to the decrypt.
+    ///
+    /// Mutation: `<` → `==` in `decrypt_wire_payload` — the slice panics; `<` → `<=` — the
+    /// 12-byte box is refused as too short. Each reddens.
+    #[test]
+    fn a_sealed_box_shorter_than_its_nonce_is_refused_and_twelve_bytes_are_read() {
+        let wire = |len: usize| {
+            crate::wire_payload::pack(
+                &[9; 32],
+                0,
+                0,
+                0,
+                0,
+                1,
+                None,
+                None,
+                None,
+                &vec![0; len],
+                0,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+
+        let err = mgr.decrypt_wire_payload("bob", &wire(11)).unwrap_err();
+        assert!(err.starts_with("sealed_box too short"), "{err}");
+        let err = mgr.decrypt_wire_payload("bob", &wire(12)).unwrap_err();
+        assert!(err.starts_with("No active session"), "{err}");
+    }
+
+    /// A stored SPK epoch of 0 is "a server that has not migrated", which admits anything: it is
+    /// not loaded as a known epoch.
+    ///
+    /// Mutation: `>` → `>=` in the `spk_epochs` filter of `import_orchestrator_state_cfe` — this
+    /// reddens.
+    #[test]
+    fn a_stored_spk_epoch_of_zero_is_not_loaded() {
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut mgr = SessionLifecycleManager::new(client, "alice".to_string());
+        mgr.spk_epochs.insert("bob".to_string(), 0);
+        mgr.spk_epochs.insert("carol".to_string(), 4);
+        let bytes = mgr
+            .export_orchestrator_state_cfe(&std::collections::HashSet::new())
+            .unwrap();
+
+        let client = ClassicClient::<ClassicSuiteProvider>::new().unwrap();
+        let mut restored = SessionLifecycleManager::new(client, "alice".to_string());
+        restored.import_orchestrator_state_cfe(&bytes).unwrap();
+        assert_eq!(restored.known_spk_epoch("bob"), None);
+        assert_eq!(restored.known_spk_epoch("carol"), Some(4));
     }
 
     /// No more than `MAX_PREVIOUS_STATES` are kept; the oldest go first.

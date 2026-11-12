@@ -11,6 +11,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// How long a processed message id is remembered: 30 days, as the Swift store it mirrors. A
+/// shorter one lets the server's redelivery of an old message be processed twice.
+pub const DEFAULT_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 use crate::orchestration::actions::Action;
 use crate::orchestration::clock::{Clock, system_clock};
 
@@ -60,9 +64,9 @@ impl AckStore {
         }
     }
 
-    /// Default configuration: 30-day expiry (mirrors Swift implementation).
+    /// Default configuration: `DEFAULT_MAX_AGE_SECONDS` (mirrors the Swift implementation).
     pub fn new_default() -> Self {
-        Self::new(30 * 24 * 60 * 60)
+        Self::new(DEFAULT_MAX_AGE_SECONDS)
     }
 }
 
@@ -260,5 +264,16 @@ mod tests {
             panic!("expected PersistAck");
         };
         assert_eq!(*ts2, 8); // 8_000 ms / 1000 = 8 secs
+    }
+
+    /// The default expiry is 30 days, as the Swift store it mirrors: a shorter one lets the
+    /// server's redelivery of an old message be processed twice.
+    ///
+    /// Mutation: change any factor of `DEFAULT_MAX_AGE_SECONDS`, or pass another value in
+    /// `new_default` — this reddens.
+    #[test]
+    fn the_default_expiry_is_thirty_days() {
+        assert_eq!(DEFAULT_MAX_AGE_SECONDS, 2_592_000);
+        assert_eq!(AckStore::new_default().max_age_seconds, 2_592_000);
     }
 }

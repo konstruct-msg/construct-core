@@ -831,4 +831,117 @@ mod tests {
         assert_eq!(router.pending_count("bob"), 1);
         assert!(router.handshake_arrived_within(&["bob".to_string()], 1000));
     }
+
+    // ── Pinned by the core test audit (TODO 302) ─────────────────────────────────────────────
+
+    fn headerless(contact_id: &str, msg_id: &str) -> IncomingMessage {
+        IncomingMessage {
+            sender_certificate: None,
+            contact_id: contact_id.to_string(),
+            wire_payload: vec![],
+            message_id: msg_id.to_string(),
+            msg_number: 5,
+            content_type: 0,
+            envelope_session: None,
+        }
+    }
+
+    /// A drain stops at the first message that needs a DECRYPTION_ERROR; what follows it goes
+    /// back to the queue, and the one answered with the error does not. Losing the tail would be
+    /// silent: the messages were never acknowledged, but nothing asks the server for them again
+    /// until the next reconnect.
+    ///
+    /// Mutation: never re-queue the tail (`<` → `>` or `==`), or move the cut (`i + 1` → `i - 1`
+    /// / `i * 1`) — this reddens. `<` → `<=` is equivalent (the tail past the end is empty).
+    #[test]
+    fn a_drain_stopped_by_a_decryption_error_requeues_only_what_follows_it() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        router.route_message(&mut lifecycle, &msg("bob", "first", 0));
+        // A message that asks for an error when routed; it cannot get into a queue by routing.
+        router
+            .pending_queues
+            .get_mut("bob")
+            .unwrap()
+            .push_back(headerless("bob", "unreadable"));
+        router
+            .pending_queues
+            .get_mut("bob")
+            .unwrap()
+            .push_back(msg("bob", "after", 1));
+
+        let decisions = router.drain_pending("bob", &mut lifecycle);
+        assert!(matches!(
+            decisions.last(),
+            Some(RoutingDecision::DecryptionErrorNeeded { .. })
+        ));
+        let mut left: Vec<_> = router
+            .pending_messages("bob")
+            .into_iter()
+            .map(|m| m.message_id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["after", "first"]);
+    }
+
+    /// A queued message waits a day and no longer: at exactly 24 h it is kept, a millisecond
+    /// past it it is dropped on the next arrival (the server still holds it, unacknowledged).
+    ///
+    /// Mutation: change any factor of `MAX_PENDING_AGE_MS` — this reddens.
+    #[test]
+    fn a_queued_message_is_kept_for_exactly_a_day() {
+        let clock = std::sync::Arc::new(crate::orchestration::clock::MockClock::new(1_000));
+        let mut router = MessageRouter::with_clock(clock.clone());
+        let mut lifecycle = make_lifecycle("alice");
+        router.route_message(&mut lifecycle, &msg("bob", "old", 0));
+
+        clock.advance_ms(86_400_000);
+        router.route_message(&mut lifecycle, &msg("bob", "at-a-day", 1));
+        assert_eq!(router.pending_count("bob"), 2, "kept at exactly a day");
+
+        clock.advance_ms(1);
+        router.route_message(&mut lifecycle, &msg("bob", "past-a-day", 2));
+        let ids: Vec<_> = router
+            .pending_messages("bob")
+            .into_iter()
+            .map(|m| m.message_id)
+            .collect();
+        assert_eq!(ids, ["at-a-day", "past-a-day"]);
+    }
+
+    /// `handle_network_reconnected` drains every contact this lists: a contact missing from it
+    /// keeps its queue until the next session event.
+    ///
+    /// Mutation: return nothing, a made-up id, or the empty queues (`!` deleted) — this reddens.
+    #[test]
+    fn contacts_with_pending_lists_exactly_the_contacts_with_a_queue() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        router.route_message(&mut lifecycle, &msg("bob", "b1", 0));
+        router.route_message(&mut lifecycle, &msg("carol", "c1", 0));
+        router
+            .pending_queues
+            .insert("dave".to_string(), Default::default());
+
+        let mut ids = router.contacts_with_pending();
+        ids.sort();
+        assert_eq!(ids, ["bob", "carol"]);
+    }
+
+    /// Arrival times are kept only for what is still queued; without the prune they grow with
+    /// every message ever queued.
+    ///
+    /// Mutation: make `prune_arrivals` a no-op — this reddens.
+    #[test]
+    fn arrival_times_go_with_the_messages_that_leave_the_queue() {
+        let mut router = MessageRouter::new();
+        let mut lifecycle = make_lifecycle("alice");
+        router.route_message(&mut lifecycle, &msg("bob", "b1", 0));
+        router.route_message(&mut lifecycle, &msg("bob", "b2", 1));
+        assert_eq!(router.arrived_at.len(), 2);
+        router.remove_pending("bob", "b1");
+        assert_eq!(router.arrived_at.len(), 1);
+        router.take_pending("bob");
+        assert!(router.arrived_at.is_empty());
+    }
 }

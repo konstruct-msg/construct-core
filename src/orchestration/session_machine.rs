@@ -188,6 +188,35 @@ mod tests {
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
     }
 
+    /// An opening holds through its TTL's last millisecond and is gone at the TTL itself.
+    ///
+    /// Mutation: `<` → `<=` in `phase` — this reddens.
+    #[test]
+    fn an_open_holds_for_exactly_its_ttl() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("dev", Event::WantToOpen);
+        clock.advance_ms(OPENING_TTL_MS - 1);
+        assert!(matches!(m.phase("dev"), Phase::Opening { .. }));
+        clock.advance_ms(1);
+        assert_eq!(m.phase("dev"), Phase::Absent);
+    }
+
+    /// Pruning forgets exactly the openings `phase` no longer reports, and keeps the live ones.
+    ///
+    /// Mutation: empty `prune_expired`, or any change to its `<` — this reddens.
+    #[test]
+    fn pruning_forgets_exactly_the_expired_openings() {
+        let (mut m, clock) = machine(1_000);
+        m.handle("old", Event::WantToOpen);
+        clock.advance_ms(1);
+        m.handle("young", Event::WantToOpen);
+        clock.advance_ms(OPENING_TTL_MS - 1);
+
+        m.prune_expired();
+        let held: Vec<&String> = m.phases.keys().collect();
+        assert_eq!(held, ["young"]);
+    }
+
     /// A finished init releases the in-flight lock. For a responder that is the whole of it: the
     /// peer already holds the ratchet its own carrier built, so nothing was announced and nothing
     /// is awaited.

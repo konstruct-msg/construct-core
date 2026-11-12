@@ -4393,6 +4393,49 @@ mod pqxdh_v2_tests {
         assert!(err.starts_with("PQXDH_REQUIRED"), "{err}");
     }
 
+    /// A session still in its first flights — the initiator before the answer, the responder
+    /// before the initiator's proof — is refused without their key: the initiator could not seal
+    /// the later ones and the responder could not open them. Each side meets one of the two
+    /// conditions, never both.
+    ///
+    /// Mutation: `||` → `&&` in `import_session_bytes`'s `in_first_flights` — this reddens.
+    #[test]
+    fn a_session_in_its_first_flights_without_their_key_is_refused() {
+        use crate::crypto::kyber_prekey_auth::PqAuthentication;
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let msg0 = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &msg0).unwrap();
+
+        for (o, peer, initiator) in [(&mut alice, "bob", true), (&mut bob, "alice", false)] {
+            let ratchet = o
+                .lifecycle
+                .client
+                .get_session(peer)
+                .unwrap()
+                .messaging_session();
+            assert_eq!(ratchet.prekey_header().is_some(), initiator);
+            assert_eq!(
+                ratchet.pq_authentication() == PqAuthentication::Received,
+                !initiator
+            );
+            let bytes = o.lifecycle.export_session_bytes_for(peer).unwrap();
+            let session_id = o.lifecycle.active_session_id(peer).unwrap();
+            o.lifecycle.client.remove_session(peer);
+            o.lifecycle
+                .client
+                .envelopes_mut()
+                .clear_first_flight(&session_id);
+
+            let err = o.lifecycle.import_session_bytes(peer, &bytes).unwrap_err();
+            assert!(
+                err.starts_with(crate::orchestration::session_lifecycle::SESSION_PREDATES_ENVELOPE)
+                    && err.contains("first flights"),
+                "{peer}: {err}"
+            );
+        }
+    }
+
     /// The header lives in the session record: an initiator that restarts between opening the
     /// session and sending still sends it.
     #[test]

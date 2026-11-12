@@ -215,4 +215,46 @@ mod tests {
             DecryptionErrorHint::None
         );
     }
+
+    // ── Pinned by the core test audit (TODO 302) ─────────────────────────────────────────────
+
+    /// The plaintext is fixed-length so the box says nothing by its size, and both ends must
+    /// agree on that length: a peer on another core with another length refuses every error.
+    ///
+    /// Mutation: change any term of `PLAINTEXT_LEN` — this reddens.
+    #[test]
+    fn the_plaintext_is_131_bytes_whatever_the_id() {
+        for id in ["", "m", &"x".repeat(MAX_MESSAGE_ID_LEN)] {
+            let e = DecryptionError {
+                ratchet_key: vec![1; RATCHET_KEY_LEN],
+                message_id: id.to_string(),
+                hint: DecryptionErrorHint::from_byte(0),
+            };
+            assert_eq!(e.encode().unwrap().len(), 131, "id of {} bytes", id.len());
+        }
+    }
+
+    /// An id length byte up to `MAX_MESSAGE_ID_LEN` is read; past it the plaintext is refused —
+    /// without the check, a length past the padding would slice past the end and panic on input
+    /// any peer can send.
+    ///
+    /// Mutation: `>` → `>=` (the longest id is refused) or `==` (one past it slices out of
+    /// range) — this reddens.
+    #[test]
+    fn an_id_length_past_the_bound_is_refused_and_the_bound_itself_is_read() {
+        let longest = DecryptionError {
+            ratchet_key: vec![1; RATCHET_KEY_LEN],
+            message_id: "x".repeat(MAX_MESSAGE_ID_LEN),
+            hint: DecryptionErrorHint::from_byte(0),
+        };
+        let bytes = longest.encode().unwrap();
+        assert_eq!(
+            DecryptionError::decode(&bytes).unwrap().message_id,
+            longest.message_id
+        );
+
+        let mut past = bytes.clone();
+        past[2 + RATCHET_KEY_LEN] = (MAX_MESSAGE_ID_LEN + 1) as u8;
+        assert!(DecryptionError::decode(&past).is_err());
+    }
 }
