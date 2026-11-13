@@ -12,7 +12,7 @@
 # locally first to catch new-default lints before CI fails on them.
 
 [toolchain]
-channel = "1.96.0"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 targets = [
     "aarch64-apple-ios",
