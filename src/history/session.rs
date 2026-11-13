@@ -1125,13 +1125,7 @@ mod tests {
             Err(HistoryFailure::Malformed)
         );
         let mut receiver = Receiver::new(Source::Nearby, USER);
-        drive(
-            &mut receiver,
-            &sender.first_frame().to_vec(),
-            &mut 0,
-            &mut Vec::new(),
-        )
-        .unwrap();
+        drive(&mut receiver, sender.first_frame(), &mut 0, &mut Vec::new()).unwrap();
         let reply = receiver
             .accept(&new, &old.peer().known(), &Pin::BundleOnly)
             .unwrap()
