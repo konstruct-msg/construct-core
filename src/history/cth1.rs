@@ -1074,4 +1074,69 @@ mod tests {
             Err(HistoryFailure::Malformed)
         );
     }
+
+    /// The bytes before a record header: the preamble and a phase-`phase` manifest.
+    fn opened(phase: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Writer::new()
+            .record(record_type::MANIFEST, &manifest(phase), &mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn header(ty: u8, len: u64) -> Vec<u8> {
+        let mut h = vec![ty];
+        h.extend_from_slice(&len.to_le_bytes());
+        h
+    }
+
+    /// A record of exactly the cap is read (a skipped one costs nothing to hold); one byte more
+    /// is malformed. Mutation: `len > MAX_RECORD_BYTES` → `>=`.
+    #[test]
+    fn a_record_of_exactly_the_cap_is_read() {
+        let mut at_cap = opened(1);
+        at_cap.extend_from_slice(&header(0x0c, MAX_RECORD_BYTES));
+        assert_eq!(Reader::new(None).push(&at_cap, &mut Vec::new()), Ok(()));
+        let mut over = opened(1);
+        over.extend_from_slice(&header(0x0c, MAX_RECORD_BYTES + 1));
+        assert_eq!(
+            Reader::new(None).push(&over, &mut Vec::new()),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// A media head that does not end within its cap is malformed once the cap has arrived, not
+    /// waited on. Mutation: the guard `self.buf.len() >= want` → `false`.
+    #[test]
+    fn a_media_head_past_its_cap_is_malformed_when_the_cap_arrives() {
+        let mut bytes = opened(2);
+        bytes.extend_from_slice(&header(record_type::MEDIA_BLOB, 6000));
+        // Field 1 announcing 5000 bytes of id: its end lies past the 4096-byte head cap.
+        bytes.extend_from_slice(&[wire::tag(1, 2), 0x88, 0x27]);
+        bytes.resize(bytes.len() + MEDIA_HEAD_CAP - 3, b'i');
+        assert_eq!(
+            Reader::new(None).push(&bytes, &mut Vec::new()),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// A record or an unknown record of no bytes is released with its header, not with whatever
+    /// push comes next. Mutation: the `Record` or `Discard` arm of `complete_empty` deleted.
+    #[test]
+    fn an_empty_record_is_released_with_its_header() {
+        let mut bytes = opened(1);
+        bytes.extend_from_slice(&header(record_type::REACTION, 0));
+        let mut r = Reader::new(None);
+        let mut out = Vec::new();
+        r.push(&bytes, &mut out).unwrap();
+        assert_eq!(
+            out.last(),
+            Some(&Event::Record {
+                record_type: record_type::REACTION,
+                proto: Vec::new()
+            })
+        );
+        r.push(&header(0x0c, 0), &mut out).unwrap();
+        assert_eq!(out.last(), Some(&Event::Skipped { record_type: 0x0c }));
+    }
 }
