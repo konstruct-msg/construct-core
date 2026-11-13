@@ -2210,8 +2210,12 @@ fn kyber_keys_of(b: &BinaryKeyBundle) -> crate::orchestration::orchestrator::Kyb
 /// applies, so the two cannot drift). Returns `Ok(())` if fresh, absent (legacy server), or
 /// unparseable.
 fn check_bundle_freshness(bundle: &BinaryKeyBundle) -> Result<(), CryptoError> {
+    check_bundle_freshness_at(bundle, crate::utils::time::now())
+}
+
+/// [`check_bundle_freshness`] at `now` (unix seconds) — the decision, without the clock.
+fn check_bundle_freshness_at(bundle: &BinaryKeyBundle, now: u64) -> Result<(), CryptoError> {
     use crate::crypto::client_api::SPK_MAX_AGE_SECS;
-    let now = crate::utils::time::now();
 
     if bundle.spk_uploaded_at > 0 {
         let age = now.saturating_sub(bundle.spk_uploaded_at);
