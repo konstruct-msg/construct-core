@@ -946,4 +946,197 @@ mod tests {
         assert_eq!(events[1], Event::Skipped { record_type: 0x0c });
         assert_eq!(kinds(&events), ["manifest", "unknown", "end"]);
     }
+
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+
+    /// Mutation: `||` → `&&` in the writer's manifest check — a manifest of another version, or
+    /// of no known phase, is framed; the MESSAGE arm deleted — a message with no body is framed.
+    #[test]
+    fn the_writer_judges_a_manifest_and_a_message_as_the_reader_does() {
+        let mut out = Vec::new();
+        let mut version_2 = manifest(1);
+        version_2[1] = 2;
+        assert_eq!(
+            Writer::new().record(record_type::MANIFEST, &version_2, &mut out),
+            Err(HistoryFailure::Malformed)
+        );
+        assert_eq!(
+            Writer::new().record(record_type::MANIFEST, &manifest(4), &mut out),
+            Err(HistoryFailure::Malformed)
+        );
+        let mut w = Writer::new();
+        w.record(record_type::MANIFEST, &manifest(1), &mut out)
+            .unwrap();
+        assert_eq!(
+            w.record(record_type::MESSAGE, &[wire::tag(1, 2), 1, b'a'], &mut out),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// A media record with no payload names no media, and is refused as soon as its header has
+    /// arrived; `finish` then reports that failure, not a truncation. Mutation: the `MediaHead`
+    /// arm of `complete_empty` deleted — the push succeeds; the `Failed` arm of `finish` deleted
+    /// — it says `Truncated`.
+    #[test]
+    fn an_empty_media_record_is_refused_when_its_header_arrives() {
+        let mut bytes = Vec::new();
+        Writer::new()
+            .record(record_type::MANIFEST, &manifest(2), &mut bytes)
+            .unwrap();
+        bytes.push(record_type::MEDIA_BLOB);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut r = Reader::new(None);
+        let mut out = Vec::new();
+        assert_eq!(r.push(&bytes, &mut out), Err(HistoryFailure::Malformed));
+        assert_eq!(r.finish(), Err(HistoryFailure::Malformed));
+    }
+
+    /// Blob bytes that arrive in one push leave in one event. Mutation: `take_len` → `1` — one
+    /// event, and one step, per byte.
+    #[test]
+    fn a_blob_pushed_whole_comes_out_as_one_event() {
+        let mut w = Writer::new();
+        let mut bytes = Vec::new();
+        w.record(record_type::MANIFEST, &manifest(2), &mut bytes)
+            .unwrap();
+        w.begin_media("m", "", 1000, &mut bytes).unwrap();
+        w.media_bytes(&[3; 1000], &mut bytes).unwrap();
+        w.end(&mut bytes).unwrap();
+        let events = read_all(&bytes, None, bytes.len()).unwrap();
+        let pieces: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::MediaBytes(b) => Some(b.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pieces, [1000]);
+    }
+
+    /// Contacts, chats, peer hints and calls come before messages, and End comes after a
+    /// manifest. Mutation: the `Meta` or the `End` arm of `rank` deleted — that record goes
+    /// unordered.
+    #[test]
+    fn meta_records_and_end_keep_their_place() {
+        for ty in [
+            record_type::CONTACT,
+            record_type::CHAT,
+            record_type::PEER_DEVICE,
+            record_type::CALL,
+        ] {
+            let mut out = Vec::new();
+            let mut w = Writer::new();
+            w.record(record_type::MANIFEST, &manifest(1), &mut out)
+                .unwrap();
+            w.record(record_type::MESSAGE, &[wire::tag(6, 2), 0], &mut out)
+                .unwrap();
+            assert_eq!(
+                w.record(ty, &[], &mut out),
+                Err(HistoryFailure::RecordOrder),
+                "type {ty} after a message"
+            );
+        }
+        let mut bare_end = MAGIC.to_vec();
+        bare_end.extend_from_slice(&[VERSION, record_type::END]);
+        assert_eq!(
+            read_all(&bare_end, None, 1),
+            Err(HistoryFailure::RecordOrder)
+        );
+    }
+
+    /// Mutation: `byte_len > 0` → `>= 0` — an empty blob gets a length field the reader does not
+    /// need; the head and payload caps moved by one.
+    #[test]
+    fn a_media_head_is_written_exactly_and_capped_exactly() {
+        let begun = |id: &str, byte_len: u64| {
+            let mut w = Writer::new();
+            let mut out = Vec::new();
+            w.record(record_type::MANIFEST, &manifest(2), &mut out)
+                .unwrap();
+            let at = out.len();
+            w.begin_media(id, "", byte_len, &mut out)
+                .map(|()| out[at..].to_vec())
+        };
+
+        let mut empty = vec![record_type::MEDIA_BLOB];
+        empty.extend_from_slice(&3u64.to_le_bytes());
+        empty.extend_from_slice(&[wire::tag(1, 2), 1, b'm']);
+        assert_eq!(begun("m", 0), Ok(empty));
+
+        // tag ‖ 2-byte length ‖ id: 4093 bytes of id make a head of exactly the cap.
+        assert!(begun(&"i".repeat(4093), 0).is_ok());
+        assert_eq!(begun(&"i".repeat(4094), 0), Err(HistoryFailure::Malformed));
+
+        // tag ‖ 1 ‖ "m" ‖ tag ‖ 5-byte length: a head of 9.
+        assert!(begun("m", MAX_RECORD_BYTES - 9).is_ok());
+        assert_eq!(
+            begun("m", MAX_RECORD_BYTES - 8),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// The bytes before a record header: the preamble and a phase-`phase` manifest.
+    fn opened(phase: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Writer::new()
+            .record(record_type::MANIFEST, &manifest(phase), &mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn header(ty: u8, len: u64) -> Vec<u8> {
+        let mut h = vec![ty];
+        h.extend_from_slice(&len.to_le_bytes());
+        h
+    }
+
+    /// A record of exactly the cap is read (a skipped one costs nothing to hold); one byte more
+    /// is malformed. Mutation: `len > MAX_RECORD_BYTES` → `>=`.
+    #[test]
+    fn a_record_of_exactly_the_cap_is_read() {
+        let mut at_cap = opened(1);
+        at_cap.extend_from_slice(&header(0x0c, MAX_RECORD_BYTES));
+        assert_eq!(Reader::new(None).push(&at_cap, &mut Vec::new()), Ok(()));
+        let mut over = opened(1);
+        over.extend_from_slice(&header(0x0c, MAX_RECORD_BYTES + 1));
+        assert_eq!(
+            Reader::new(None).push(&over, &mut Vec::new()),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// A media head that does not end within its cap is malformed once the cap has arrived, not
+    /// waited on. Mutation: the guard `self.buf.len() >= want` → `false`.
+    #[test]
+    fn a_media_head_past_its_cap_is_malformed_when_the_cap_arrives() {
+        let mut bytes = opened(2);
+        bytes.extend_from_slice(&header(record_type::MEDIA_BLOB, 6000));
+        // Field 1 announcing 5000 bytes of id: its end lies past the 4096-byte head cap.
+        bytes.extend_from_slice(&[wire::tag(1, 2), 0x88, 0x27]);
+        bytes.resize(bytes.len() + MEDIA_HEAD_CAP - 3, b'i');
+        assert_eq!(
+            Reader::new(None).push(&bytes, &mut Vec::new()),
+            Err(HistoryFailure::Malformed)
+        );
+    }
+
+    /// A record or an unknown record of no bytes is released with its header, not with whatever
+    /// push comes next. Mutation: the `Record` or `Discard` arm of `complete_empty` deleted.
+    #[test]
+    fn an_empty_record_is_released_with_its_header() {
+        let mut bytes = opened(1);
+        bytes.extend_from_slice(&header(record_type::REACTION, 0));
+        let mut r = Reader::new(None);
+        let mut out = Vec::new();
+        r.push(&bytes, &mut out).unwrap();
+        assert_eq!(
+            out.last(),
+            Some(&Event::Record {
+                record_type: record_type::REACTION,
+                proto: Vec::new()
+            })
+        );
+        r.push(&header(0x0c, 0), &mut out).unwrap();
+        assert_eq!(out.last(), Some(&Event::Skipped { record_type: 0x0c }));
+    }
 }

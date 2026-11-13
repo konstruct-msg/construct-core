@@ -2017,3 +2017,143 @@ fn deleting_a_contact_takes_its_calls_devices_chunks_and_resends() {
         ids: vec!["dev-peer".into()]
     }));
 }
+
+// MARK: - Mutation audit, tier 2 (TODO 302)
+
+/// What `put` wrote, `get` reads; `remove` takes it out. Mutation: `get` → `Ok(None)` or a
+/// fixed value; `remove` → `Ok(())` without the delete.
+#[test]
+fn a_value_reads_back_until_it_is_removed() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    assert_eq!(store.get("cursor").unwrap(), None);
+    store.put("cursor", b"one").unwrap();
+    store.put("other", b"two").unwrap();
+    assert_eq!(store.get("cursor").unwrap(), Some(b"one".to_vec()));
+    store.put("cursor", b"three").unwrap();
+    assert_eq!(store.get("cursor").unwrap(), Some(b"three".to_vec()));
+    store.remove("cursor").unwrap();
+    assert_eq!(store.get("cursor").unwrap(), None);
+    assert_eq!(
+        store.get("other").unwrap(),
+        Some(b"two".to_vec()),
+        "only the key named"
+    );
+    store.remove("cursor").unwrap();
+}
+
+/// A delete of a row that is not there announces nothing: an observer would refetch a chat list
+/// or a transcript for nothing. Mutation: `removed > 0` → `>= 0` or `== 0` in each delete, and
+/// the `!` dropped in `expire_reactions`.
+#[test]
+fn a_delete_of_nothing_is_silent() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    with_chat(&store);
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    assert!(!store.delete_contact("nobody").unwrap());
+    store.delete_chat("nothing").unwrap();
+    assert!(!store.set_message_body("nothing", b"x", Some("x")).unwrap());
+    store.delete_message("nothing").unwrap();
+    store.delete_reaction("nothing", "nobody").unwrap();
+    assert_eq!(store.expire_reactions(i64::MAX).unwrap(), 0);
+    assert!(!store.delete_call("nothing").unwrap());
+
+    assert!(seen.changes.lock().unwrap().is_empty());
+}
+
+/// Mutation: `removed > 0` → `< 0` or `== 0` in `delete_reaction` and `delete_call` — the
+/// delete goes unannounced.
+#[test]
+fn a_reaction_or_call_deleted_is_announced() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store
+        .upsert_reaction(&Reaction {
+            target_message_id: "m1".into(),
+            reactor_user_id: "bob".into(),
+            emoji: "👍".into(),
+            timestamp_ms: 1,
+            received_at: None,
+        })
+        .unwrap();
+    store.upsert_call(&call("call1", Some(10), 1)).unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    store.delete_reaction("m1", "bob").unwrap();
+    assert!(store.delete_call("call1").unwrap());
+
+    assert_eq!(
+        *seen.changes.lock().unwrap(),
+        vec![
+            Change {
+                table: Table::Reactions,
+                ids: vec!["m1".into()]
+            },
+            Change {
+                table: Table::Calls,
+                ids: vec!["call1".into()]
+            },
+        ]
+    );
+}
+
+/// An archive that moves a message announces it once; one that leaves it where it was announces
+/// nothing. Mutation: the guard `t != status` → `true` — a message already queued is rewritten
+/// and announced; `> 0` → `< 0` or `== 0` on the update — the move goes unannounced.
+#[test]
+fn a_session_archive_announces_only_a_move() {
+    let store = with_messages(2);
+    store.set_delivery_status("m1", SENT).unwrap();
+    store.set_delivery_status("m2", QUEUED).unwrap();
+    assert_eq!([status(&store, "m1"), status(&store, "m2")], [SENT, QUEUED]);
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+
+    assert_eq!(
+        store.apply_session_archive("m1", 3).unwrap(),
+        Some(ArchiveOutcome::Resend)
+    );
+    assert_eq!(
+        store.apply_session_archive("m2", 3).unwrap(),
+        Some(ArchiveOutcome::Resend)
+    );
+
+    assert_eq!(
+        *seen.changes.lock().unwrap(),
+        vec![Change {
+            table: Table::Messages,
+            ids: vec!["m1".into()]
+        }]
+    );
+    assert_eq!(
+        [status(&store, "m1"), status(&store, "m2")],
+        [QUEUED, QUEUED]
+    );
+}
+
+/// Reactions expired with their message gone are announced, by target. Mutation: the `!`
+/// dropped in `expire_reactions` — the expiry goes unannounced.
+#[test]
+fn expired_reactions_are_announced() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store
+        .upsert_reaction(&Reaction {
+            target_message_id: "gone".into(),
+            reactor_user_id: "bob".into(),
+            emoji: "👍".into(),
+            timestamp_ms: 1,
+            received_at: Some(10),
+        })
+        .unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+    assert_eq!(store.expire_reactions(10).unwrap(), 1);
+    assert_eq!(
+        *seen.changes.lock().unwrap(),
+        vec![Change {
+            table: Table::Reactions,
+            ids: vec!["gone".into()]
+        }]
+    );
+}

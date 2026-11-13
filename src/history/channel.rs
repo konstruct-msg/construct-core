@@ -309,4 +309,48 @@ mod tests {
         let b = channel_key(&[1; 32], &[2; 32], Salt::File, &SNAPSHOT);
         assert_ne!(*a, *b);
     }
+
+    /// The cipher keeps its own bounds, apart from `sealed_len`: bytes that did not come through
+    /// it are `Malformed`, never a slice past the end, and a refused call does not use up an
+    /// index. Mutation: `||` → `&&` or a bound moved in `seal` / `open`; `+` → `*` in the sealed
+    /// length.
+    #[test]
+    fn the_cipher_refuses_a_chunk_outside_its_bounds() {
+        let key = [9u8; 32];
+        let mut sealer = ChunkCipher::new(&key, SNAPSHOT, USER);
+        let mut out = Vec::new();
+        assert_eq!(sealer.seal(b"", &mut out), Err(HistoryFailure::Malformed));
+        assert_eq!(
+            sealer.seal(&vec![1; CHUNK_PLAINTEXT + 1], &mut out),
+            Err(HistoryFailure::Malformed)
+        );
+        assert!(out.is_empty());
+
+        sealer.seal(b"x", &mut out).unwrap();
+        assert_eq!(out.len(), LEN_PREFIX + 29);
+        assert_eq!(out[..LEN_PREFIX], 29u32.to_le_bytes());
+        let one = out[LEN_PREFIX..].to_vec();
+        let start = out.len();
+        sealer.seal(&vec![2; CHUNK_PLAINTEXT], &mut out).unwrap();
+        assert_eq!(
+            out[start..start + LEN_PREFIX],
+            (MAX_SEALED_CHUNK as u32).to_le_bytes()
+        );
+        let full = out[start + LEN_PREFIX..].to_vec();
+        assert_eq!(full.len(), MAX_SEALED_CHUNK);
+
+        let mut opener = ChunkCipher::new(&key, SNAPSHOT, USER);
+        for cut in 0..one.len() {
+            assert_eq!(
+                opener.open(one[..cut].to_vec()),
+                Err(HistoryFailure::Malformed),
+                "{cut} bytes"
+            );
+        }
+        let mut long = full.clone();
+        long.push(0);
+        assert_eq!(opener.open(long), Err(HistoryFailure::Malformed));
+        assert_eq!(opener.open(one).unwrap(), b"x");
+        assert_eq!(opener.open(full).unwrap(), vec![2; CHUNK_PLAINTEXT]);
+    }
 }

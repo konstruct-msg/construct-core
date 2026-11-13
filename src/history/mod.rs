@@ -144,3 +144,51 @@ pub(crate) mod vectors {
         hex::decode(v[key].as_str().unwrap_or_else(|| panic!("{key} missing"))).expect("hex")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failure's name is the vectors' vocabulary (`expect` in knst_history_snapshot.json) and
+    /// what `Display` prints. Mutation: `as_str` → `""` / `"xyzzy"`, `Display` writing nothing.
+    #[test]
+    fn every_failure_has_its_own_name() {
+        use HistoryFailure as F;
+        let names = [
+            (F::Malformed, "malformed"),
+            (F::Truncated, "truncated"),
+            (F::UnknownVersion, "unknown_version"),
+            (F::UserMismatch, "user_mismatch"),
+            (F::RecordOrder, "record_order"),
+            (F::EnvelopeManifestMismatch, "envelope_manifest_mismatch"),
+            (F::V1RefusedForHistory, "v1_refused_for_history"),
+            (F::IdentityMismatch, "identity_mismatch"),
+            (F::KemKeyIdMismatch, "kem_key_id_mismatch"),
+            (F::QrPinMismatch, "qr_pin_mismatch"),
+            (F::QrPinAbsent, "qr_pin_absent"),
+            (F::NoHybridKey, "no_hybrid_key"),
+            (F::SignatureInvalid, "signature_invalid"),
+            (F::ChunkOpenFailed, "chunk_open_failed"),
+            (F::LocalKeysUnavailable, "local_keys_unavailable"),
+        ];
+        for (failure, name) in names {
+            assert_eq!(failure.as_str(), name);
+            assert_eq!(failure.to_string(), name);
+        }
+        let vocabulary: std::collections::HashSet<&str> = names.iter().map(|(_, n)| *n).collect();
+        for v in vectors::all() {
+            let Some(expect) = v["expect"].as_str() else {
+                continue;
+            };
+            if expect.ends_with("_failed") || expect.ends_with("_mismatch") {
+                assert!(vocabulary.contains(expect), "{expect} names no failure");
+            }
+        }
+    }
+
+    /// Mutation: `512 * 1024 * 1024` → `512 + 1024 * 1024` or `512 * 1024 + 1024`.
+    #[test]
+    fn a_record_is_at_most_512_mib() {
+        assert_eq!(MAX_RECORD_BYTES, 536_870_912);
+    }
+}

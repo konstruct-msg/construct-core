@@ -1101,6 +1101,68 @@ mod tests {
         );
     }
 
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+
+    /// A sender names its account, draws a fresh snapshot id each time, and frames nothing until
+    /// a reply is accepted — a record pushed early is refused and not half-taken. Mutation:
+    /// `random` → a constant; `Sender::user_id` → a constant; `Sender::streaming` → `Ok(())`
+    /// (the early manifest is framed, so the real one is out of order).
+    #[test]
+    fn a_sender_frames_nothing_before_a_reply() {
+        let old = TestDevice::new(1);
+        let new = TestDevice::new(7);
+        let mut sender = Sender::nearby(&old, USER, &new.peer(), false, None).unwrap();
+        let other = Sender::nearby(&old, USER, &new.peer(), false, None).unwrap();
+        assert_eq!(sender.user_id(), USER);
+        assert_ne!(sender.snapshot_id(), other.snapshot_id());
+        assert_ne!(sender.snapshot_id(), [0; 16]);
+        assert_ne!(sender.snapshot_id(), [1; 16]);
+
+        let mut out = Vec::new();
+        let m = manifest(sender.snapshot_id(), 1);
+        assert_eq!(
+            sender.push_record(record_type::MANIFEST, &m, &mut out),
+            Err(HistoryFailure::Malformed)
+        );
+        let mut receiver = Receiver::new(Source::Nearby, USER);
+        drive(&mut receiver, sender.first_frame(), &mut 0, &mut Vec::new()).unwrap();
+        let reply = receiver
+            .accept(&new, &old.peer().known(), &Pin::BundleOnly)
+            .unwrap()
+            .unwrap();
+        sender.accept_reply(&reply).unwrap();
+        sender
+            .push_record(record_type::MANIFEST, &m, &mut out)
+            .unwrap();
+    }
+
+    /// A receiver waiting for keys says whose; one that failed reports that failure at the end
+    /// of input, not a truncation. Mutation: the `AwaitKeys` arm of `status` or the `Failed`
+    /// arm of `end_of_input` deleted.
+    #[test]
+    fn a_receiver_says_whose_keys_it_waits_for_and_keeps_its_failure() {
+        let old = TestDevice::new(1);
+        let new = TestDevice::new(7);
+        let sender = Sender::file(&old, USER, &new.peer()).unwrap();
+        let header = sender.first_frame().to_vec();
+
+        let mut waiting = Receiver::new(Source::File, USER);
+        drive(&mut waiting, &header, &mut 0, &mut Vec::new()).unwrap();
+        assert_eq!(
+            waiting.status(),
+            Status::AwaitKeys {
+                sender_device_id: device_id_raw(&old.identity_public().unwrap())
+            }
+        );
+
+        let mut elsewhere = Receiver::new(Source::File, [9; 16]);
+        assert_eq!(
+            drive(&mut elsewhere, &header, &mut 0, &mut Vec::new()),
+            Err(HistoryFailure::UserMismatch)
+        );
+        assert_eq!(elsewhere.end_of_input(), Err(HistoryFailure::UserMismatch));
+    }
+
     /// Chunks reordered on the wire do not open; truncation before EOF is not a short snapshot.
     #[test]
     fn a_reordered_or_truncated_stream_fails_closed() {

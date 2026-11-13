@@ -319,4 +319,94 @@ mod tests {
             &Sha256::digest(b"konstruct/v1/kid\xab\xab\xab\xab")[..16]
         );
     }
+
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+    // The server builds these bytes from this crate and does not run construct-core's vector
+    // tests, so the format is pinned here too.
+
+    /// Conformance anchor: the kt-head signature in `knst_server_trust.json` — its kid, body and
+    /// the message a server key signs. Mutation: `server_signable` or `kt_head_body` → a fixed
+    /// vector.
+    #[test]
+    fn the_server_signed_message_is_fixed() {
+        let kid: Kid = hex::decode("c58f5d8fc760b4ee1152c4d71f9e36db")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let body = kt_head_body(1234, &[0x5a; 32]);
+        assert_eq!(
+            hex::encode(&body),
+            format!("00000000000004d2{}", "5a".repeat(32))
+        );
+        assert_eq!(
+            hex::encode(server_signable(Purpose::KtHead, &kid, &body)),
+            format!(
+                "6b6f6e7374727563742f76312f6b742d68656164c58f5d8fc760b4ee1152c4d71f9e36db{}",
+                hex::encode(&body)
+            )
+        );
+        assert_eq!(
+            sticker_manifest_body(b"abc").unwrap(),
+            [0, 0, 0, 3, b'a', b'b', b'c']
+        );
+    }
+
+    /// Mutation: `Delegation::kid` → the default; `Delegation::signable` → a fixed vector.
+    #[test]
+    fn a_delegation_signs_and_names_its_own_key() {
+        let d = Delegation {
+            purpose: Purpose::SenderCert,
+            not_before: 1,
+            not_after: 2,
+            public_key: vec![0xAB; 4],
+            root_signature: vec![],
+        };
+        assert_eq!(d.kid(), kid_of(&[0xAB; 4]));
+        assert_ne!(d.kid(), Kid::default());
+        assert_eq!(
+            d.signable(),
+            delegation_signable(Purpose::SenderCert, 1, 2, &[0xAB; 4])
+        );
+    }
+
+    /// Mutation: `||` → `&&` in `Delegation::decode` — a delegation of another version, or one
+    /// byte too long, is read.
+    #[test]
+    fn a_delegation_of_another_version_or_length_is_refused() {
+        let bytes = Delegation {
+            purpose: Purpose::KtHead,
+            not_before: 1,
+            not_after: 2,
+            public_key: vec![7; HYBRID_PUBLIC_KEY_LEN],
+            root_signature: vec![9; HYBRID_SIGNATURE_LEN],
+        }
+        .encode();
+        let mut version = bytes.clone();
+        version[0] = 2;
+        assert_eq!(Delegation::decode(&version), Err(Malformed));
+        let mut longer = bytes;
+        longer.push(0);
+        assert_eq!(Delegation::decode(&longer), Err(Malformed));
+    }
+
+    /// Mutation: `+` / `*` in the length and age constants; `grace_secs` → a fixed answer.
+    #[test]
+    fn the_lengths_and_the_grace_are_fixed() {
+        assert_eq!(HYBRID_PUBLIC_KEY_LEN, 1984);
+        assert_eq!(HYBRID_SIGNATURE_LEN, 3373);
+        assert_eq!(MAX_DELIVERY_AGE_SECS, 604_800);
+        assert_eq!(Purpose::SenderCert.grace_secs(), Some(86_400 + 604_800));
+        assert_eq!(Purpose::KtHead.grace_secs(), Some(0));
+        assert_eq!(Purpose::StickerManifest.grace_secs(), None);
+    }
+
+    /// What a person reads aloud: SHA-256 in 16 groups of 4. Mutation: `fingerprint` → a fixed
+    /// string.
+    #[test]
+    fn a_fingerprint_is_the_hash_in_groups_of_four() {
+        assert_eq!(
+            fingerprint(b""),
+            "e3b0 c442 98fc 1c14 9afb f4c8 996f b924 27ae 41e4 649b 934c a495 991b 7852 b855"
+        );
+    }
 }

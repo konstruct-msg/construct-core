@@ -249,4 +249,48 @@ mod tests {
             Err(HistoryFailure::Malformed)
         );
     }
+
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+
+    /// The tenth byte of a varint carries one bit: 0 and 1 read, 2 does not. Mutation:
+    /// `byte > 1` → `byte < 1`.
+    #[test]
+    fn the_tenth_varint_byte_carries_one_bit() {
+        let mut zero = vec![0x80; 9];
+        zero.push(0x00);
+        assert_eq!(read_varint(&zero, &mut 0), Ok(Some(0)));
+        let mut two = vec![0xff; 9];
+        two.push(0x02);
+        assert_eq!(read_varint(&two, &mut 0), Err(HistoryFailure::Malformed));
+    }
+
+    /// Fixed-width fields are stepped over by their width and the next field still reads.
+    /// Mutation: the `1` or `5` arm of `Fields::field` deleted — they are refused.
+    #[test]
+    fn fixed_width_fields_are_stepped_over() {
+        let mut buf = vec![tag(1, 1)];
+        buf.extend_from_slice(&[9; 8]);
+        buf.push(tag(2, 5));
+        buf.extend_from_slice(&[9; 4]);
+        buf.extend_from_slice(&[tag(3, 0), 5]);
+        let read: Vec<_> = fields(&buf).collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            read,
+            [
+                (1, Value::Fixed64),
+                (2, Value::Fixed32),
+                (3, Value::Varint(5))
+            ]
+        );
+    }
+
+    /// Mutation: the wrong-wire-type arm of `manifest` deleted — a snapshot id sent as a varint
+    /// reads as no snapshot id.
+    #[test]
+    fn a_manifest_field_of_the_wrong_wire_type_is_malformed() {
+        assert_eq!(
+            manifest(&[tag(1, 0), 1, tag(2, 0), 7]),
+            Err(HistoryFailure::Malformed)
+        );
+    }
 }

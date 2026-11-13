@@ -715,4 +715,134 @@ mod tests {
         huge[38..46].copy_from_slice(&(MAX_PAYLOAD_LEN + 1).to_le_bytes());
         assert_eq!(Prefix::parse(&huge), Err(HistoryFailure::Malformed));
     }
+
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+
+    fn opening() -> Opening {
+        Opening::parse(&vectors::hex_field(
+            &vectors::named("ctt1_v2_opening"),
+            "hex",
+        ))
+        .unwrap()
+    }
+
+    /// Mutation: a `*` in `MAX_PAYLOAD_LEN` → `+` or `/`; `>` → `>=` at the cap; `||` → `&&` in
+    /// the prefix's length-and-magic check.
+    #[test]
+    fn a_prefix_takes_up_to_two_gib_and_only_its_own_length_and_magic() {
+        assert_eq!(MAX_PAYLOAD_LEN, 2_147_483_648);
+        let mut at_cap = opening().to_bytes().unwrap()[..PREFIX_LEN].to_vec();
+        at_cap[38..46].copy_from_slice(&MAX_PAYLOAD_LEN.to_le_bytes());
+        assert_eq!(
+            Prefix::parse(&at_cap).map(|p| p.payload_len),
+            Ok(MAX_PAYLOAD_LEN)
+        );
+        let mut longer = at_cap.clone();
+        longer.push(0);
+        assert_eq!(Prefix::parse(&longer), Err(HistoryFailure::Malformed));
+        let mut magic = at_cap;
+        magic[0] = b'X';
+        assert_eq!(Prefix::parse(&magic), Err(HistoryFailure::Malformed));
+    }
+
+    /// Each field of a wrong length is refused on its own, and the payload cap holds where the
+    /// frame is written too. Mutation: any `||` → `&&` in `Opening` / `Reply` / `CthfHeader`
+    /// `to_bytes`; `>` → `>=` or `==` at the opening's payload cap.
+    #[test]
+    fn a_frame_with_one_field_of_the_wrong_length_is_not_written() {
+        let o = opening();
+        let wrong = [
+            Opening {
+                sender_hybrid: vec![1; HYBRID_PUBLIC - 1],
+                ..o.clone()
+            },
+            Opening {
+                kem_ct: vec![1; KEM_CT + 1],
+                ..o.clone()
+            },
+            Opening {
+                signature: vec![1; HYBRID_SIGNATURE - 1],
+                ..o.clone()
+            },
+            Opening {
+                payload_len: MAX_PAYLOAD_LEN + 1,
+                ..o.clone()
+            },
+        ];
+        for bad in wrong {
+            assert_eq!(bad.to_bytes(), Err(HistoryFailure::Malformed));
+        }
+        let at_cap = Opening {
+            payload_len: MAX_PAYLOAD_LEN,
+            ..o
+        };
+        assert_eq!(at_cap.to_bytes().map(|b| b.len()), Ok(OPENING_LEN));
+
+        let r = Reply::parse(&vectors::hex_field(&vectors::named("ctt1_v2_reply"), "hex")).unwrap();
+        for bad in [
+            Reply {
+                receiver_hybrid: vec![1; HYBRID_PUBLIC + 1],
+                ..r.clone()
+            },
+            Reply {
+                signature: vec![1; HYBRID_SIGNATURE + 1],
+                ..r
+            },
+        ] {
+            assert_eq!(bad.to_bytes(), Err(HistoryFailure::Malformed));
+        }
+
+        let h =
+            CthfHeader::parse(&vectors::hex_field(&vectors::named("cthf_header"), "hex")).unwrap();
+        for bad in [
+            CthfHeader {
+                sender_hybrid: vec![1; HYBRID_PUBLIC - 1],
+                ..h.clone()
+            },
+            CthfHeader {
+                kem_ct: vec![1; KEM_CT - 1],
+                ..h.clone()
+            },
+            CthfHeader {
+                signature: vec![1; HYBRID_SIGNATURE - 1],
+                ..h
+            },
+        ] {
+            assert_eq!(bad.to_bytes(), Err(HistoryFailure::Malformed));
+        }
+    }
+
+    /// A CTHF header of another length, magic or version, or with an all-zero KEM ciphertext,
+    /// does not parse. Mutation: either `||` → `&&` in `CthfHeader::parse`; `== 0` → `!= 0` in
+    /// the zero-ciphertext check.
+    #[test]
+    fn a_cthf_header_parses_only_as_written() {
+        let bytes = vectors::hex_field(&vectors::named("cthf_header"), "hex");
+        let mut longer = bytes.clone();
+        longer.push(0);
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        let mut version = bytes.clone();
+        version[4] = 2;
+        let mut h = CthfHeader::parse(&bytes).unwrap();
+        h.kem_ct = vec![0; KEM_CT];
+        let zero_kem = h.to_bytes().unwrap();
+        for bad in [longer, magic, version, zero_kem] {
+            assert_eq!(CthfHeader::parse(&bad), Err(HistoryFailure::Malformed));
+        }
+    }
+
+    /// An opening is CTT1 v2 and not a backup: either alone is refused. Mutation: `||` → `&&`
+    /// in `Opening::parse`.
+    #[test]
+    fn an_opening_of_v1_or_for_a_backup_is_refused() {
+        let bytes = opening().to_bytes().unwrap();
+        let mut v1 = bytes.clone();
+        v1[4] = CTT1_V1;
+        let mut backup = bytes;
+        backup[37] = transfer_type::BACKUP;
+        for bad in [v1, backup] {
+            assert_eq!(Opening::parse(&bad), Err(HistoryFailure::Malformed));
+        }
+    }
 }

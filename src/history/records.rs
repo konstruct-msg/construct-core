@@ -502,3 +502,80 @@ impl Writer {
         self.int(number, i64::from(v));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A true flag reads back true. Mutation: `v != 0` → `v == 0` for the sharing flags and the
+    /// call's direction.
+    #[test]
+    fn flags_read_back_as_written() {
+        let contact = ContactRecord {
+            user_id: vec![1; 16],
+            am_i_sharing_with: true,
+            is_sharing_with_me: true,
+            ..Default::default()
+        };
+        assert_eq!(ContactRecord::decode(&contact.encode()), Ok(contact));
+        let call = CallRecord {
+            id: "c".into(),
+            is_outgoing: true,
+            ..Default::default()
+        };
+        assert_eq!(CallRecord::decode(&call.encode()), Ok(call));
+    }
+
+    fn media(id: &str, mime: &str, media_type: i64) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.int(1, media_type);
+        w.bytes(6, mime.as_bytes());
+        w.bytes(13, id.as_bytes());
+        w.out
+    }
+
+    fn refs(content: Writer) -> Vec<(String, String)> {
+        media_refs(&MessageBody::Content(content.out))
+            .into_iter()
+            .map(|r| (r.id, r.mime))
+            .collect()
+    }
+
+    /// A single item, an album inside content, and a later oneof case that replaces them; a
+    /// missing MIME type comes from the media type. Mutation: any arm of `content_refs` or
+    /// `media_ref` deleted.
+    #[test]
+    fn a_contents_media_are_named_with_their_type() {
+        let pair = |id: &str, mime: &str| (id.to_owned(), mime.to_owned());
+        let mut single = Writer::default();
+        single.always_bytes(2, &media("one", "image/png", 2));
+        assert_eq!(refs(single), [pair("one", "image/png")]);
+
+        for (media_type, mime) in [
+            (1, "image/jpeg"),
+            (5, "image/jpeg"),
+            (2, "video/mp4"),
+            (3, "audio/m4a"),
+            (9, "application/octet-stream"),
+        ] {
+            let mut typed = Writer::default();
+            typed.always_bytes(2, &media("m", "", media_type));
+            assert_eq!(refs(typed), [pair("m", mime)], "media type {media_type}");
+        }
+
+        let mut album = Writer::default();
+        album.always_bytes(1, &media("a", "image/png", 0));
+        album.always_bytes(1, &media("b", "video/mp4", 0));
+        let mut in_content = Writer::default();
+        in_content.always_bytes(10, &album.out);
+        assert_eq!(
+            refs(in_content),
+            [pair("a", "image/png"), pair("b", "video/mp4")]
+        );
+
+        let mut replaced = Writer::default();
+        replaced.always_bytes(2, &media("one", "image/png", 0));
+        replaced.always_bytes(1, b"text");
+        assert!(refs(replaced).is_empty(), "the last case of the oneof wins");
+    }
+}
