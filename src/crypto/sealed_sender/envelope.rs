@@ -279,6 +279,24 @@ mod tests {
         assert!(DirectionKeys::from_bytes(&[0; 63]).is_err());
     }
 
+    /// Anything shorter than an empty envelope is no envelope and is refused without reading past
+    /// its end; an empty body is exactly `ENVELOPE_OVERHEAD` long and opens.
+    ///
+    /// Mutation: `<` → `==` or `<=` in `matches`, or `+` → `-` in `ENVELOPE_OVERHEAD` — this
+    /// reddens (a panic on a short slice, or the empty envelope refused).
+    #[test]
+    fn an_envelope_is_at_least_its_overhead_and_an_empty_body_opens() {
+        let keys = DirectionKeys::derive(&SK, A, B);
+        for len in 0..ENVELOPE_OVERHEAD {
+            assert!(!keys.matches(&vec![0u8; len]), "{len} bytes matched");
+            assert!(keys.open(&vec![0u8; len]).is_err(), "{len} bytes opened");
+        }
+        let empty = keys.seal(b"").unwrap();
+        assert_eq!(empty.len(), ENVELOPE_OVERHEAD);
+        assert!(keys.matches(&empty));
+        assert_eq!(keys.open(&empty).unwrap(), b"");
+    }
+
     /// Known answer, recomputed outside this code (Python `hmac`/`hashlib` + RFC 5869 HKDF and
     /// `cryptography`'s ChaCha20Poly1305) — the vector a second implementation checks against.
     #[test]

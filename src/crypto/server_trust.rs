@@ -355,6 +355,24 @@ mod tests {
         assert!(ring.admit(&d.encode()).is_ok());
     }
 
+    /// The offline tool refuses a key of the wrong size and a window that ends before it begins,
+    /// each on its own. Mutation: `||` → `&&` in `issue_delegation` — this reddens.
+    #[test]
+    fn a_delegation_needs_a_whole_key_and_a_forward_window() {
+        let (root_sk, _) = key(1);
+        let (_, server_pk) = key(10);
+        let short = &server_pk[..server_pk.len() - 1];
+        assert!(matches!(
+            issue_delegation(&root_sk, Purpose::KtHead, T0, T0 + DAY, short),
+            Err(TrustError::Malformed)
+        ));
+        assert!(matches!(
+            issue_delegation(&root_sk, Purpose::KtHead, T0, T0, &server_pk),
+            Err(TrustError::Malformed)
+        ));
+        assert!(issue_delegation(&root_sk, Purpose::KtHead, T0, T0 + 1, &server_pk).is_ok());
+    }
+
     #[test]
     fn every_delegated_field_is_covered_by_the_root_signature() {
         let (root_sk, root_pk) = key(1);

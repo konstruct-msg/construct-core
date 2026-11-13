@@ -382,12 +382,6 @@ where
         &self.contact_id
     }
 
-    /// Cleanup старых skipped message keys
-    pub fn cleanup_old_skipped_keys(&mut self, max_age_seconds: i64) {
-        self.messaging_session
-            .cleanup_old_skipped_keys(max_age_seconds);
-    }
-
     /// Return a read-only health snapshot of this session's Double Ratchet state.
     pub fn health_snapshot(&self) -> crate::crypto::messaging::double_ratchet::DrHealthSnapshot {
         self.messaging_session.health_snapshot()
@@ -608,51 +602,5 @@ mod tests {
         );
         assert_eq!(alice_session.contact_id(), "bob");
         assert_eq!(bob_session.contact_id(), "alice");
-    }
-
-    #[test]
-    fn test_session_cleanup_skipped_keys() {
-        let (alice_identity_priv, _alice_identity_pub) =
-            ClassicSuiteProvider::generate_kem_keys().unwrap();
-        let (_bob_identity_priv, bob_identity_pub) =
-            ClassicSuiteProvider::generate_kem_keys().unwrap();
-
-        let (_bob_signed_prekey_priv, bob_signed_prekey_pub) =
-            ClassicSuiteProvider::generate_kem_keys().unwrap();
-        let (bob_signing_key, bob_verifying_key) =
-            ClassicSuiteProvider::generate_signature_keys().unwrap();
-        let bob_signature = {
-            let prologue = build_prologue(SuiteID::CLASSIC);
-            let mut msg = prologue;
-            msg.extend_from_slice(bob_signed_prekey_pub.as_ref());
-            ClassicSuiteProvider::sign(&bob_signing_key, &msg).unwrap()
-        };
-
-        let bob_bundle = X3DHPublicKeyBundle {
-            identity_public: bob_identity_pub.clone(),
-            signed_prekey_public: bob_signed_prekey_pub.clone(),
-            signature: bob_signature,
-            verifying_key: bob_verifying_key,
-            suite_id: SuiteID::CLASSIC,
-            one_time_prekey_public: None,
-            one_time_prekey_id: None,
-            spk_uploaded_at: 0,
-            spk_rotation_epoch: 0,
-            kyber_spk_uploaded_at: 0,
-            kyber_spk_rotation_epoch: 0,
-        };
-
-        let mut session = TestSession::init_as_initiator(
-            &alice_identity_priv,
-            &bob_bundle,
-            &bob_identity_pub,
-            "bob".to_string(),
-            "alice".to_string(),
-            None,
-        )
-        .unwrap();
-
-        // Test cleanup method exists and doesn't panic
-        session.cleanup_old_skipped_keys(7 * 24 * 60 * 60); // 7 days
     }
 }

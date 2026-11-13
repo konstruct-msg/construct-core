@@ -281,9 +281,21 @@ mod tests {
             PqAuthentication::Authenticated,
             PqAuthentication::Unauthenticated,
             PqAuthentication::Received,
+            PqAuthentication::ReceivedProven,
         ] {
             assert_eq!(PqAuthentication::from_u8(label.as_u8()), label);
         }
         assert_eq!(PqAuthentication::from_u8(200), PqAuthentication::Unknown);
+    }
+
+    /// A session recorded before `PqHandshake` existed reads as the only kind it could have been
+    /// when its KEM secret was applied, and claims nothing otherwise.
+    ///
+    /// Mutation: delete the `Some(true)` arm of `legacy` — this reddens.
+    #[test]
+    fn a_legacy_session_with_an_applied_secret_was_deferred() {
+        assert_eq!(PqHandshake::legacy(Some(true)), PqHandshake::DeferredV1);
+        assert_eq!(PqHandshake::legacy(Some(false)), PqHandshake::None);
+        assert_eq!(PqHandshake::legacy(None), PqHandshake::None);
     }
 }

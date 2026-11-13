@@ -390,6 +390,23 @@ mod tests {
         assert!(alice.first_flight_by_handshake(&[9; 32]).is_none());
     }
 
+    /// The handshake picks its own session's key when several sessions still write first flights.
+    /// Mutation: the guard `ciphertext_hash ==` → `true` — the first entry answers for every
+    /// handshake; this reddens.
+    #[test]
+    fn each_handshake_finds_its_own_first_flight_key() {
+        let mut book = EnvelopeBook::new();
+        book.register(B, "s1", EnvelopePair::derive(&[1; 32], A, B));
+        book.register(C, "s2", EnvelopePair::derive(&[2; 32], A, C));
+        book.set_first_flight("s1", [9; 32], FirstFlightKey::from_kem_secret(&[5; 32]), 77);
+        book.set_first_flight("s2", [8; 32], FirstFlightKey::from_kem_secret(&[6; 32]), 78);
+        assert_eq!(
+            book.first_flight_by_handshake(&[8; 32]),
+            Some(&FirstFlightKey::from_kem_secret(&[6; 32]))
+        );
+        assert!(book.first_flight_by_handshake(&[7; 32]).is_none());
+    }
+
     #[test]
     fn an_unknown_kind_byte_is_not_opened() {
         let (alice, bob) = pair(&[1; 32], "s1");
