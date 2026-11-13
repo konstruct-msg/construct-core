@@ -2252,4 +2252,51 @@ mod residue_tests {
         let store = open_plain(&path);
         assert!(marked(&store), "and stays marked");
     }
+
+    /// A store already scrubbed is not rewritten on the next open: the VACUUM copies the whole
+    /// file, and an open runs on every launch.
+    ///
+    /// Mutation: `count(*) > 0` → `< 0` in `migrations::run` — every open of a held store
+    /// VACUUMs and the freelist is gone.
+    #[test]
+    fn a_marked_store_is_not_rewritten_at_every_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marked.db");
+        let freelist = |store: &Store| -> i64 {
+            store
+                .lock()
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .unwrap()
+        };
+        let store = open_plain(&path);
+        with_message(&store);
+        store
+            .insert_message(
+                &Message {
+                    id: "big".into(),
+                    chat_id: "c1".into(),
+                    order_key: "k2".into(),
+                    body: vec![0x5a; 512 * 1024],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        store.delete_message("big").unwrap();
+        let free = freelist(&store);
+        assert!(free > 0, "the deleted body left free pages");
+        drop(store);
+
+        let store = open_plain(&path);
+        assert_eq!(freelist(&store), free, "not rewritten");
+    }
+
+    /// Mutation: `Store::path` → `None`.
+    #[test]
+    fn a_store_on_disk_knows_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("here.db");
+        assert_eq!(open_plain(&path).path(), Some(path.as_path()));
+        assert_eq!(Store::open_in_memory(&[7; 32]).unwrap().path(), None);
+    }
 }

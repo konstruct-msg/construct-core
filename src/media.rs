@@ -388,4 +388,26 @@ mod tests {
             Err(MediaError::MalformedPadding)
         );
     }
+
+    /// v1 adds the nonce, the tag and the length prefix, and the largest file is the largest blob
+    /// less those. Mutation: `+` → `*` in `V1_OVERHEAD`; `-` → `+` in `max_plaintext_len`.
+    #[test]
+    fn the_v1_overhead_is_nonce_tag_and_length() {
+        assert_eq!(V1_OVERHEAD, 12 + 16 + 8);
+        assert_eq!(max_plaintext_len(), 100_000_000 - 36);
+        assert_eq!(blob_len(max_plaintext_len()), Ok(MEDIA_MAX_BLOB_LEN));
+        assert_eq!(
+            blob_len(max_plaintext_len() + 1),
+            Err(MediaError::TooLarge(max_plaintext_len() + 1))
+        );
+    }
+
+    /// An empty file sealed the legacy way is a nonce and a tag, 28 bytes, and opens.
+    /// Mutation: `blob.len() < NONCE_LEN + TAG_LEN` → `<=` — it is refused as too short.
+    #[test]
+    fn an_empty_legacy_file_opens() {
+        let blob = legacy_seal(&KEY, &NONCE, b"");
+        assert_eq!(blob.len(), 28);
+        assert_eq!(open_media(&KEY, &blob), Ok(Vec::new()));
+    }
 }

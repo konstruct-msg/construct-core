@@ -328,12 +328,15 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         struct TestProgressCallback {
-            updates: Arc<Mutex<Vec<f32>>>,
+            updates: Arc<Mutex<Vec<(u64, u64, f32)>>>,
         }
 
         impl PowProgressCallback for TestProgressCallback {
-            fn on_progress(&self, _nonce: u64, _attempts: u64, progress: f32) {
-                self.updates.lock().unwrap().push(progress);
+            fn on_progress(&self, nonce: u64, attempts: u64, progress: f32) {
+                self.updates
+                    .lock()
+                    .unwrap()
+                    .push((nonce, attempts, progress));
             }
         }
 
@@ -348,12 +351,34 @@ mod tests {
 
         assert!(!solution.hash.is_empty());
 
+        // Mutation: `attempts = nonce + 1` → `nonce * 1` — every report is one attempt short.
         let updates = updates.lock().unwrap();
-        assert!(!updates.is_empty(), "Expected progress updates");
-        assert!(
-            updates.last().unwrap() >= &0.95 || (updates.last().unwrap() - 1.0).abs() < 0.05,
-            "Final progress should be near completion"
-        );
+        let (last, periodic) = updates.split_last().expect("Expected progress updates");
+        assert_eq!(*last, (solution.nonce, solution.nonce + 1, 1.0));
+        for &(nonce, attempts, progress) in periodic {
+            assert_eq!(attempts, nonce + 1);
+            assert_eq!(attempts % 10, 0, "every tenth attempt");
+            assert_eq!(progress, estimate_progress(attempts, 16));
+        }
+    }
+
+    /// The progress a client shows: attempts over 2^difficulty, held below 0.95 until the answer
+    /// is found. Mutation: any of `estimate_max_attempts` / `estimate_progress` replaced or its
+    /// operators flipped.
+    #[test]
+    fn progress_is_attempts_over_the_expected_count() {
+        assert_eq!(estimate_max_attempts(0), 1);
+        assert_eq!(estimate_max_attempts(4), 16);
+        assert_eq!(estimate_max_attempts(62), 1 << 62);
+        assert_eq!(estimate_max_attempts(63), u64::MAX);
+        assert_eq!(estimate_max_attempts(64), u64::MAX);
+
+        assert_eq!(estimate_progress(4, 16), 0.25);
+        assert_eq!(estimate_progress(8, 16), 0.5);
+        assert_eq!(estimate_progress(16, 16), 0.95);
+        assert_eq!(estimate_progress(100, 16), 0.95);
+        assert_eq!(estimate_progress(0, 16), 0.0);
+        assert_eq!(estimate_progress(5, 0), 0.0);
     }
 
     #[test]
