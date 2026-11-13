@@ -331,7 +331,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             format!(
                 "AEAD encrypt: session_id '{}' is not valid hex — session may be corrupt; \
                  re-initialise the session",
-                &self.session_id
+                self.session_id
             )
         })?;
         let ad_version = self.ad_send_version();

@@ -3,7 +3,14 @@
 
 #![warn(clippy::all)]
 #![allow(clippy::too_many_arguments)]
-#![allow(unsafe_attr_outside_unsafe)] // Allow UniFFI generated code
+#![allow(unsafe_attr_outside_unsafe)]
+// Allow UniFFI generated code
+// UniFFI's generated UDL metadata is one large const (clippy 1.100 asks for a static); the code
+// is uniffi's, included below, and an attribute on `include!` is ignored.
+#![cfg_attr(
+    any(feature = "ios", feature = "mac", feature = "android"),
+    allow(clippy::large_const_arrays)
+)]
 
 /// Which build this is, readable from the shipped library and nothing else.
 ///

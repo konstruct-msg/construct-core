@@ -868,7 +868,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             format!(
                 "AEAD decrypt: session_id '{}' is not valid hex — session may be corrupt; \
                  re-initialise the session",
-                &self.session_id
+                self.session_id
             )
         })?;
         let associated_data = associated_data(
