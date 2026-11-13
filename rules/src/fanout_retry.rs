@@ -269,6 +269,14 @@ mod tests {
         assert!(q.entries.is_empty(), "nothing lost: done, not plan again");
     }
 
+    /// The day is the clients' rule (iOS `FanoutRetryQueue.swift` kept 24 h, matching its wire-payload
+    /// store), so it is pinned
+    /// by value: the test below counts from the constant and would follow a wrong one.
+    #[test]
+    fn the_entry_lifetime_is_a_day() {
+        assert_eq!(ENTRY_TTL_MS, 86_400_000);
+    }
+
     /// Mutation: compare the age with `<=` the day, or drop the expiry.
     #[test]
     fn an_entry_lives_a_day() {

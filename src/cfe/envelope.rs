@@ -278,6 +278,9 @@ mod tests {
             u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize,
             MAX_PAYLOAD_LEN
         );
+        // Exactly at the cap reads back. Mutation: refuse `>=` the cap on read.
+        let back: serde_bytes::ByteBuf = decode_as(&encoded, CfeMessageType::Generic).unwrap();
+        assert_eq!(back.as_ref(), blob.as_slice());
         blob.push(9);
         assert!(
             matches!(encode(CfeMessageType::Generic, &serde_bytes::Bytes::new(&blob)),
@@ -322,10 +325,32 @@ mod tests {
             a: 1,
             b: "x".to_string(),
         };
-        let mut bytes = encode(CfeMessageType::Generic, &msg).expect("encode");
-        bytes[5] = 1;
-        let err = decode(&bytes).expect_err("must fail");
-        assert!(matches!(err, CfeError::InvalidReservedBytes));
+        let bytes = encode(CfeMessageType::Generic, &msg).expect("encode");
+        // Each reserved byte alone. Mutation: refuse only when all three are set.
+        for at in 5..8 {
+            let mut set = bytes.clone();
+            set[at] = 1;
+            let err = decode(&set).expect_err("must fail");
+            assert!(matches!(err, CfeError::InvalidReservedBytes), "byte {at}");
+        }
+    }
+
+    /// The state cap is a value a device's stored blobs grow into; the tests above count from
+    /// the constant and would follow a wrong one. Mutation: any change to the product.
+    #[test]
+    fn the_caps_are_256_kib_and_64_mib() {
+        assert_eq!(MAX_PAYLOAD_LEN, 262_144);
+        assert_eq!(MAX_STATE_PAYLOAD_LEN, 67_108_864);
+    }
+
+    /// `encode` goes through `write_all`, so nothing in this crate calls `write`; a serializer
+    /// that does must see every byte taken. Mutation: report fewer bytes than written.
+    #[test]
+    fn the_encode_buffer_takes_every_byte_it_is_given() {
+        let mut buffer = EncodeBuffer::default();
+        assert_eq!(buffer.write(b"abc").unwrap(), 3);
+        assert_eq!(buffer.write(b"").unwrap(), 0);
+        assert_eq!(buffer.0, b"abc");
     }
 
     #[test]

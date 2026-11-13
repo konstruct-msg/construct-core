@@ -915,6 +915,137 @@ mod tests {
         ));
     }
 
+    /// A wire payload comes from the network: cut anywhere before its sealed box it is refused
+    /// as too short, and never read past its end. Every section is present once across the two
+    /// payloads (KEM ciphertext, KEM identity, the answer to it, both PQ-ratchet field types).
+    /// Mutation: any bounds check in `unpack` compared with `==`, or its sum taken with `-`/`*`
+    /// (a slice past the end panics).
+    #[test]
+    fn a_payload_cut_before_its_sealed_box_is_too_short_at_every_byte() {
+        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
+        let dh_key = vec![0xAA; 32];
+        let sealed = make_sealed_box(0xBB);
+        let first_flight = pack(
+            &dh_key,
+            0,
+            0,
+            1,
+            0,
+            4,
+            Some(&[0x44; 1568]),
+            Some(&[0x55; 1568]),
+            None,
+            &sealed,
+            1,
+            300,
+            Some(PqRatchetWireField::PublicKey {
+                epoch: 2,
+                key: vec![7; 1184],
+            }),
+        )
+        .unwrap();
+        let answer = pack(
+            &dh_key,
+            1,
+            0,
+            0,
+            0,
+            4,
+            None,
+            None,
+            Some(&[0x66; 1568]),
+            &sealed,
+            1,
+            0,
+            Some(PqRatchetWireField::Ciphertext {
+                epoch: 3,
+                ek_hash: [9; 8],
+                ct: vec![8; 1088],
+            }),
+        )
+        .unwrap();
+        for full in [first_flight, answer] {
+            assert!(unpack(&full).is_ok());
+            for len in 0..=full.len() - sealed.len() {
+                assert!(
+                    matches!(unpack(&full[..len]), Err(WirePayloadError::TooShort(_))),
+                    "cut at {len} of {}",
+                    full.len()
+                );
+            }
+        }
+    }
+
+    /// Each length the wire writes as a u16 is refused past `u16::MAX` and taken at it.
+    /// Mutation: compare a length with `>=` or `==` the limit.
+    #[test]
+    fn a_length_the_wire_writes_as_u16_fits_up_to_its_max() {
+        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
+        let dh_key = vec![0xAA; 32];
+        let sealed = make_sealed_box(0xBB);
+        let at = vec![1u8; u16::MAX as usize];
+        let past = vec![1u8; u16::MAX as usize + 1];
+        let with_kem = |kem: &[u8]| {
+            pack(
+                &dh_key,
+                0,
+                0,
+                0,
+                0,
+                1,
+                Some(kem),
+                None,
+                None,
+                &sealed,
+                0,
+                0,
+                None,
+            )
+        };
+        assert!(with_kem(&at).is_ok());
+        assert!(matches!(
+            with_kem(&past),
+            Err(WirePayloadError::KemTooLarge(_))
+        ));
+
+        let with_field = |field: PqRatchetWireField| {
+            pack(
+                &dh_key,
+                0,
+                0,
+                0,
+                0,
+                4,
+                None,
+                None,
+                None,
+                &sealed,
+                1,
+                0,
+                Some(field),
+            )
+        };
+        let key = |key: &Vec<u8>| PqRatchetWireField::PublicKey {
+            epoch: 1,
+            key: key.clone(),
+        };
+        let ct = |ct: &Vec<u8>| PqRatchetWireField::Ciphertext {
+            epoch: 1,
+            ek_hash: [0; 8],
+            ct: ct.clone(),
+        };
+        assert!(with_field(key(&at)).is_ok());
+        assert!(matches!(
+            with_field(key(&past)),
+            Err(WirePayloadError::PqFieldTooLarge(_))
+        ));
+        assert!(with_field(ct(&at)).is_ok());
+        assert!(matches!(
+            with_field(ct(&past)),
+            Err(WirePayloadError::PqFieldTooLarge(_))
+        ));
+    }
+
     /// Verify byte-level layout after format update (52-byte header).
     /// msgNum=1, dh=0x01×32, otpkId=2, kyberOtpkId=0, PN=5, suiteId=1, no PQC, sealed=0xAA×60
     #[test]
