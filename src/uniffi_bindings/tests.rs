@@ -1364,3 +1364,143 @@ fn restoring_from_the_key_record_keeps_old_spks() {
         "import_private_keys"
     );
 }
+
+// ── Tier 3 of the mutation audit (todo 302): the decisions that live in this file ──────────
+
+/// A bundle with no SPK timestamps and a classic suite: the baseline every case below edits.
+fn freshness_bundle() -> BinaryKeyBundle {
+    let mut b = bundle_fields_to_binary(
+        create_crypto_core()
+            .unwrap()
+            .get_registration_bundle_fields()
+            .unwrap(),
+    );
+    b.suite_id = SuiteID::CLASSIC.as_u16();
+    b
+}
+
+const NOW: u64 = 2_000_000_000;
+
+/// The SPK and the Kyber SPK each turn stale one second past `SPK_MAX_AGE_SECS`, not at it,
+/// and an upload time of 0 (a server that does not report it) is not "stale".
+#[test]
+fn a_peer_spk_is_stale_one_second_past_the_age_limit() {
+    use crate::crypto::client_api::SPK_MAX_AGE_SECS;
+    assert!(
+        check_bundle_freshness_at(&freshness_bundle(), NOW).is_ok(),
+        "no timestamps"
+    );
+    for kyber in [false, true] {
+        let at = |uploaded_at: u64| {
+            let mut b = freshness_bundle();
+            if kyber {
+                b.kyber_spk_uploaded_at = uploaded_at;
+            } else {
+                b.spk_uploaded_at = uploaded_at;
+            }
+            check_bundle_freshness_at(&b, NOW)
+        };
+        assert!(
+            at(NOW - SPK_MAX_AGE_SECS).is_ok(),
+            "kyber={kyber}: at the limit"
+        );
+        assert!(at(NOW - 1).is_ok(), "kyber={kyber}: a second old");
+        match at(NOW - SPK_MAX_AGE_SECS - 1) {
+            Err(CryptoError::PeerSpkStale { age_secs }) => {
+                assert_eq!(age_secs, SPK_MAX_AGE_SECS + 1, "kyber={kyber}")
+            }
+            other => panic!("kyber={kyber}: past the limit: {other:?}"),
+        }
+    }
+}
+
+/// A PQ-hybrid bundle whose Kyber SPK was never uploaded (epoch 0) is refused, so a session
+/// never falls back to classical-only agreement in silence; a classic bundle with epoch 0 and a
+/// PQ bundle with an epoch pass.
+#[test]
+fn a_pq_bundle_without_a_kyber_spk_epoch_is_refused() {
+    let with = |suite: SuiteID, epoch: u32| {
+        let mut b = freshness_bundle();
+        b.suite_id = suite.as_u16();
+        b.kyber_spk_rotation_epoch = epoch;
+        check_bundle_freshness_at(&b, NOW)
+    };
+    assert!(matches!(
+        with(SuiteID::PQ_HYBRID, 0),
+        Err(CryptoError::InvalidKeyData)
+    ));
+    assert!(with(SuiteID::PQ_HYBRID, 1).is_ok());
+    assert!(with(SuiteID::CLASSIC, 0).is_ok());
+}
+
+/// A core counts its current signed prekey and every archived one: 1 fresh, 2 after one
+/// rotation — on both cores the platforms hold.
+#[test]
+fn the_prekey_count_is_the_current_one_plus_the_archived() {
+    let classic = create_crypto_core().unwrap();
+    assert_eq!(
+        classic.prekeys_available_count(),
+        1,
+        "a fresh core archives nothing"
+    );
+    classic.rotate_signed_prekey().unwrap();
+    assert_eq!(
+        classic.prekeys_available_count(),
+        2,
+        "classic, after one rotation"
+    );
+
+    let (orch, _) = named_core();
+    assert_eq!(orch.prekeys_available_count(), 1, "orchestrator, fresh");
+    orch.rotate_signed_prekey().unwrap();
+    assert_eq!(
+        orch.prekeys_available_count(),
+        2,
+        "orchestrator, after one rotation"
+    );
+}
+
+/// Importing keys keeps the local user id the core already had: it is bound into every
+/// message's AD, and an import that dropped it would make every next message unreadable.
+#[test]
+fn importing_keys_keeps_the_local_user_id() {
+    let source = create_crypto_core().unwrap();
+    let blob = source.export_private_keys().unwrap();
+    let core = create_crypto_core().unwrap();
+    core.set_local_user_id("0123456789abcdef0123456789abcdef".to_string());
+    core.import_private_keys(blob).unwrap();
+    assert_eq!(
+        core.inner.lock().unwrap().local_user_id(),
+        "0123456789abcdef0123456789abcdef"
+    );
+}
+
+/// A history peer without either PQ half has no hybrid key: both halves are required.
+#[test]
+fn a_history_peer_needs_both_pq_halves() {
+    let (core, _) = named_core();
+    for (drop_hybrid, drop_kyber) in [(true, false), (false, true), (true, true)] {
+        let mut peer = history_peer(&core);
+        if drop_hybrid {
+            peer.hybrid_public.clear();
+        }
+        if drop_kyber {
+            peer.kyber_prekey_public.clear();
+        }
+        assert!(
+            matches!(peer.into_core(), Err(HistoryError::NoHybridKey)),
+            "hybrid dropped: {drop_hybrid}, kyber dropped: {drop_kyber}"
+        );
+    }
+    assert!(history_peer(&core).into_core().is_ok());
+}
+
+/// The exported blob limit is the record limit less the largest media head — the limit
+/// `cth1`'s writer accepts (`a_blob_at_the_exported_limit_is_accepted_and_one_at_the_record_limit_is_not`).
+#[test]
+fn the_exported_blob_limit_leaves_room_for_the_media_head() {
+    assert_eq!(
+        history_max_blob_bytes() + crate::history::cth1::MEDIA_HEAD_CAP as u64,
+        crate::history::MAX_RECORD_BYTES
+    );
+}
