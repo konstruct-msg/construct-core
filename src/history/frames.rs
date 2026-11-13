@@ -831,4 +831,18 @@ mod tests {
             assert_eq!(CthfHeader::parse(&bad), Err(HistoryFailure::Malformed));
         }
     }
+
+    /// An opening is CTT1 v2 and not a backup: either alone is refused. Mutation: `||` → `&&`
+    /// in `Opening::parse`.
+    #[test]
+    fn an_opening_of_v1_or_for_a_backup_is_refused() {
+        let bytes = opening().to_bytes().unwrap();
+        let mut v1 = bytes.clone();
+        v1[4] = CTT1_V1;
+        let mut backup = bytes;
+        backup[37] = transfer_type::BACKUP;
+        for bad in [v1, backup] {
+            assert_eq!(Opening::parse(&bad), Err(HistoryFailure::Malformed));
+        }
+    }
 }
