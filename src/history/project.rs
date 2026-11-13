@@ -766,4 +766,137 @@ mod tests {
             assert_eq!(records::raw(bad), None, "{bad}");
         }
     }
+
+    // ── Mutation audit, tier 2 (TODO 302) ────────────────────────────────────
+
+    /// An empty alias or avatar in the record sets nothing, a held one is kept, a flag only
+    /// rises, and a time of 0 is no time. Mutation: `&&` → `||` or the `!` dropped in the alias,
+    /// avatar and shared-at conditions; `|=` → `&=` for sharing; `> 0` → `>= 0`, `== 0` or `< 0`
+    /// on the times.
+    #[test]
+    fn a_contact_record_fills_only_what_is_empty() {
+        let proto = of("contact_chat_peer_call", record_type::CONTACT);
+        let base = records::ContactRecord::decode(&proto).unwrap();
+        let id = records::dashed(&base.user_id).unwrap();
+
+        let mut bare = base.clone();
+        bare.local_alias = String::new();
+        bare.avatar = Vec::new();
+        bare.am_i_sharing_with = true;
+        bare.is_sharing_with_me = true;
+        bare.added_at_unix = 0;
+        bare.shared_with_me_at_unix = 0;
+        let fresh = import_contact(&bare.encode(), None, 99).unwrap();
+        assert_eq!(fresh.local_alias, None, "an empty alias sets nothing");
+        assert_eq!(fresh.avatar, None, "an empty avatar sets nothing");
+        assert_eq!(fresh.added_at, Some(99), "no time: now");
+        assert_eq!(fresh.shared_with_me_at, None, "no time: none");
+        assert!(fresh.am_i_sharing_with && fresh.is_sharing_with_me);
+
+        let mut theirs = base;
+        theirs.local_alias = "Theirs".into();
+        theirs.avatar = vec![2];
+        theirs.am_i_sharing_with = false;
+        theirs.is_sharing_with_me = false;
+        theirs.shared_with_me_at_unix = 10;
+        let held = Contact {
+            id: id.clone(),
+            local_alias: Some("Mine".into()),
+            avatar: Some(vec![1]),
+            am_i_sharing_with: true,
+            is_sharing_with_me: true,
+            shared_with_me_at: Some(5),
+            ..Default::default()
+        };
+        let merged = import_contact(&theirs.encode(), Some(held), 99).unwrap();
+        assert_eq!(merged.local_alias.as_deref(), Some("Mine"));
+        assert_eq!(merged.avatar, Some(vec![1]));
+        assert!(
+            merged.am_i_sharing_with && merged.is_sharing_with_me,
+            "flags only rise"
+        );
+        assert_eq!(merged.shared_with_me_at, Some(5));
+
+        let filled = import_contact(
+            &theirs.encode(),
+            Some(Contact {
+                id,
+                ..Default::default()
+            }),
+            99,
+        )
+        .unwrap();
+        assert_eq!(filled.local_alias.as_deref(), Some("Theirs"));
+        assert_eq!(filled.avatar, Some(vec![2]));
+        assert_eq!(filled.shared_with_me_at, Some(10_000));
+    }
+
+    /// Our side of a message decides its peer even against the record's own flag, and a time of
+    /// 0 is no time. Mutation: `to == own` → `!=`; `> 0` → `>= 0` for the edit and transcript
+    /// times.
+    #[test]
+    fn our_side_decides_the_peer_and_zero_times_are_absent() {
+        let proto = of("message_content_text", record_type::MESSAGE);
+        let mut r = records::MessageRecord::decode(&proto).unwrap();
+        let from = records::dashed(&r.from_user_id).unwrap();
+        let to = records::dashed(&r.to_user_id).unwrap();
+        r.is_sent_by_me = true;
+        r.edited_at_unix_ms = 0;
+        r.transcript_generated_at_unix = 0;
+        let MessageImport::Row { peer_id, message } = import_message(&r.encode(), &to).unwrap()
+        else {
+            panic!("a row")
+        };
+        assert_eq!(peer_id, from, "it came to us: the peer is its sender");
+        assert_eq!(message.edited_at, None);
+        assert_eq!(message.transcript_generated_at, None);
+
+        r.edited_at_unix_ms = 1;
+        r.transcript_generated_at_unix = 1;
+        let MessageImport::Row { message, .. } = import_message(&r.encode(), &to).unwrap() else {
+            panic!("a row")
+        };
+        assert_eq!(message.edited_at, Some(1));
+        assert_eq!(message.transcript_generated_at, Some(1000));
+    }
+
+    /// A peer device and a call with no time are seen and started now, a completed call with no
+    /// duration has no end, and a contact and a device export back to themselves. Mutation:
+    /// `> 0` → `>= 0`, `== 0` or `< 0` on those times; `export_contact` / `export_peer_device`
+    /// → a fixed vector.
+    #[test]
+    fn zero_times_are_now_and_contacts_and_devices_export_back() {
+        let proto = of("contact_chat_peer_call", record_type::PEER_DEVICE);
+        let mut d = records::PeerDeviceRecord::decode(&proto).unwrap();
+        d.first_seen_at_unix = 0;
+        let now = import_peer_device(&d.encode(), 7).unwrap().unwrap();
+        assert_eq!(now.first_seen_at, 7);
+        d.first_seen_at_unix = 10;
+        let seen = import_peer_device(&d.encode(), 7).unwrap().unwrap();
+        assert_eq!(seen.first_seen_at, 10_000);
+        assert_eq!(
+            import_peer_device(&export_peer_device(&seen), 7),
+            Ok(Some(seen))
+        );
+
+        let mut c =
+            records::CallRecord::decode(&of("contact_chat_peer_call", record_type::CALL)).unwrap();
+        c.started_at_unix = 0;
+        c.status = 0;
+        c.duration_seconds = 0;
+        let call = import_call(&c.encode(), "", 7).unwrap();
+        assert_eq!(call.started_at, Some(7));
+        assert_eq!(call.ended_at, None, "no duration, no end");
+
+        let contact = import_contact(
+            &of("contact_chat_peer_call", record_type::CONTACT),
+            None,
+            99,
+        )
+        .unwrap();
+        assert_eq!(
+            import_contact(&export_contact(&contact), None, 0),
+            Ok(contact)
+        );
+    }
 }

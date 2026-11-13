@@ -7204,6 +7204,18 @@ mod pqxdh_v2_tests {
         );
     }
 
+    /// A history transfer names the Kyber prekey the device serves now. Mutation: the
+    /// orchestrator's `current_kyber_key_id` → `Ok(1)`.
+    #[test]
+    fn a_history_transfer_names_the_kyber_prekey_served_now() {
+        use crate::history::session::DeviceKeys;
+        let mut o = device("alice");
+        let pending = o.begin_kyber_spk_rotation().unwrap();
+        assert!(o.commit_kyber_spk_rotation());
+        assert_ne!(pending.key_id, 1, "a rotated id, not the first");
+        assert_eq!(DeviceKeys::current_kyber_key_id(&o), Ok(pending.key_id));
+    }
+
     /// What `rotate_spk` returns is what the bundle now serves, signed over the X3DH message.
     /// Mutation: `rotate_spk` returns a constant.
     #[test]
