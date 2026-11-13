@@ -4393,6 +4393,80 @@ mod pqxdh_v2_tests {
         assert!(err.starts_with("PQXDH_REQUIRED"), "{err}");
     }
 
+    /// A KEM ciphertext on the wire without the PQXDH v2 flag is not a v2 handshake either: the
+    /// flag is what says the ciphertext is one. The wire refuses a KEM identity key without the
+    /// flag, so the message carries none. Mutation: `||` → `&&` in `responder_kem`.
+    #[test]
+    fn a_kem_ciphertext_without_the_v2_flag_is_refused() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let d =
+            crate::wire_payload::unpack(&alice.encrypt_bytes_for("bob", b"x").unwrap()).unwrap();
+        assert!(d.kem_ciphertext.is_some());
+        let mut wire = crate::wire_payload::pack(
+            &d.dh_public_key,
+            d.message_number,
+            d.one_time_prekey_id,
+            d.kyber_otpk_id,
+            d.previous_chain_length,
+            d.suite_id,
+            d.kem_ciphertext.as_deref(),
+            None,
+            None,
+            &d.sealed_box,
+            d.pq_message_epoch,
+            d.pq_key_index,
+            d.pq_ratchet_field,
+        )
+        .unwrap();
+        let at = crate::wire_payload::HEADER_SIZE - 2;
+        let suite =
+            u16::from_le_bytes([wire[at], wire[at + 1]]) & !crate::wire_payload::PQXDH_V2_FLAG;
+        wire[at..at + 2].copy_from_slice(&suite.to_le_bytes());
+        let err = respond(&mut bob, &alice, "alice", &wire).unwrap_err();
+        assert!(err.starts_with("PQXDH_REQUIRED"), "{err}");
+    }
+
+    /// A sealed box shorter than its nonce is refused, on the first message and on a later one,
+    /// and nothing reads past it. Mutation: `<` → `==` in either length check (a box of 5 bytes
+    /// then slices 12).
+    #[test]
+    fn a_sealed_box_shorter_than_its_nonce_is_refused() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let shortened = |wire: &[u8]| {
+            let d = crate::wire_payload::unpack(wire).unwrap();
+            crate::wire_payload::pack_message(
+                d.ad_version,
+                &d.dh_public_key,
+                d.message_number,
+                d.one_time_prekey_id,
+                d.kyber_otpk_id,
+                d.previous_chain_length,
+                d.suite_id,
+                d.kem_ciphertext.as_deref(),
+                d.kem_identity.as_deref(),
+                d.identity_proof_ciphertext.as_deref(),
+                &d.sealed_box[..5],
+                d.pq_message_epoch,
+                d.pq_key_index,
+                d.pq_ratchet_field,
+            )
+            .unwrap()
+        };
+        let first = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        let err = respond(&mut bob, &alice, "alice", &shortened(&first)).unwrap_err();
+        assert!(err.contains("sealed_box too short"), "{err}");
+
+        respond(&mut bob, &alice, "alice", &first).unwrap();
+        let reply = bob.encrypt_bytes_for("alice", b"reply").unwrap();
+        let err = alice
+            .decrypt_bytes_for("bob", &shortened(&reply))
+            .unwrap_err();
+        assert!(err.contains("sealed_box too short"), "{err}");
+        assert_eq!(alice.decrypt_bytes_for("bob", &reply).unwrap(), b"reply");
+    }
+
     /// A session still in its first flights — the initiator before the answer, the responder
     /// before the initiator's proof — is refused without their key: the initiator could not seal
     /// the later ones and the responder could not open them. Each side meets one of the two
@@ -4581,10 +4655,12 @@ mod pqxdh_v2_tests {
         assert_eq!(opened(&sweep(&mut relaunched)), ["amy"]);
     }
 
+    /// Two full batches: the second sweep takes exactly one batch and asks for no third.
+    /// Mutation: rearm when the candidates are `>=` a batch.
     #[test]
     fn the_upgrade_sweep_goes_in_batches() {
         let (mut zed, mut bob) = (device("zed"), device("bob"));
-        let contacts: Vec<String> = (0..PQ_UPGRADE_BATCH + 2)
+        let contacts: Vec<String> = (0..PQ_UPGRADE_BATCH * 2)
             .map(|i| format!("c{i:02}"))
             .collect();
         for contact_id in &contacts {
@@ -6876,5 +6952,402 @@ mod pqxdh_v2_tests {
         alice.forget_contact_state(&bob_id);
         assert_eq!(alice.lifecycle.known_spk_epoch(&bob_id), None);
         assert!(alice.spk_epoch_regression(&bob_id, 4).is_none());
+    }
+
+    // ── The surface the platforms call (TODO 302, tier 2) ─────────────────────
+    //
+    // Thin over the key manager and the lifecycle, and called only through UniFFI, so nothing in
+    // the core went through them: a wrapper that returned nothing passed every test.
+
+    fn sends(actions: &[Action]) -> Vec<(&str, &str, &[u8], u8)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendEncryptedMessage {
+                    to,
+                    payload,
+                    message_id,
+                    content_type,
+                } => Some((
+                    to.as_str(),
+                    message_id.as_str(),
+                    payload.as_slice(),
+                    *content_type,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The send path of every client: the advanced state is saved, then the message goes, and it
+    /// reads on the other side. Mutation: `handle_outgoing_message` or `save_then_send` answers
+    /// with nothing, or the save goes after the send.
+    #[test]
+    fn an_outgoing_message_is_saved_then_sent_and_reads() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let actions = alice.handle_event(IncomingEvent::OutgoingMessage {
+            contact_id: "bob".to_string(),
+            message_id: "m1".to_string(),
+            plaintext: b"hello".to_vec(),
+            content_type: 0,
+        });
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(
+            saves_the_record(&actions[..1], "bob"),
+            "the save comes first"
+        );
+        let Action::SaveToSecureStore { data, .. } = &actions[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            data.expose(),
+            alice.export_session_cfe("bob").unwrap().as_slice()
+        );
+        let sent = sends(&actions);
+        assert_eq!(sent.len(), 1);
+        let (to, id, payload, ct) = sent[0];
+        assert_eq!((to, id, ct), ("bob", "m1", 0));
+        assert_eq!(
+            respond(&mut bob, &alice, "alice", payload).unwrap(),
+            b"hello"
+        );
+    }
+
+    /// A call signal goes the same way, named as one. Mutation: `handle_outgoing_call_signal`
+    /// answers with nothing.
+    #[test]
+    fn an_outgoing_call_signal_is_saved_then_sent_as_a_call_signal() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let actions = alice.handle_event(IncomingEvent::OutgoingCallSignal {
+            contact_id: "bob".to_string(),
+            message_id: "c1".to_string(),
+            proto_bytes: vec![1, 2, 3],
+        });
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(saves_the_record(&actions[..1], "bob"));
+        let sent = sends(&actions);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].3, crate::knst::CONTENT_TYPE_CALL_SIGNAL);
+        assert_eq!(
+            respond(&mut bob, &alice, "alice", sent[0].2).unwrap(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// After a restart a message the cache does not know waits for the platform's store. Not
+    /// there: it is read, and the coordination state is saved, since the ack is in it. There: it
+    /// is a duplicate, and nothing is saved. Mutation: `handle_ack_db_result` answers with
+    /// nothing; `decision_mutates_coordination_state` answers always or never;
+    /// `orchestrator_state_action` builds no save.
+    #[test]
+    fn after_a_restart_the_platforms_ack_store_decides() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let first = alice.encrypt_bytes_for("bob", b"first").unwrap();
+        respond(&mut bob, &alice, "alice", &first).unwrap();
+        let blob = bob.export_orchestrator_state_cfe().unwrap();
+        bob.import_orchestrator_state_cfe(&blob).unwrap();
+
+        let saves_state = |actions: &[Action]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::SaveToSecureStore {
+                        slot: SecureStoreSlot::OrchestratorState,
+                        ..
+                    }
+                )
+            })
+        };
+        for (id, text) in [("m2", &b"second"[..]), ("m3", &b"third"[..])] {
+            let wire = alice.encrypt_bytes_for("bob", text).unwrap();
+            let asked = deliver(&mut bob, "alice", id, wire, 0);
+            assert!(
+                matches!(&asked[..], [Action::CheckAckInDb { message_id }] if message_id == id),
+                "{asked:?}"
+            );
+        }
+        let read = bob.handle_event(IncomingEvent::AckDbResult {
+            message_id: "m2".to_string(),
+            is_processed: false,
+        });
+        assert_eq!(
+            decrypted(&read),
+            vec![("m2".to_string(), b"second".to_vec())]
+        );
+        assert!(saves_state(&read), "{read:?}");
+        // The platform's view of the counts is the lifecycle's. Mutation: `reorder_stats`
+        // returns the default.
+        assert!(bob.reorder_stats().decrypted > 0);
+
+        let dup = bob.handle_event(IncomingEvent::AckDbResult {
+            message_id: "m3".to_string(),
+            is_processed: true,
+        });
+        assert!(
+            dup.iter().any(
+                |a| matches!(a, Action::DuplicateDropped { message_id } if message_id == "m3")
+            )
+        );
+        assert!(!saves_state(&dup), "{dup:?}");
+    }
+
+    /// Retiring saves the record, which now holds the retired state; with no current state there
+    /// is nothing to save. Mutation: `retire_session` answers with nothing.
+    #[test]
+    fn retiring_a_session_saves_its_record() {
+        let (mut alice, mut bob) = (device("alice"), device("bob"));
+        open(&mut alice, &mut bob, false);
+        let actions = alice.retire_session("bob");
+        assert_eq!(actions.len(), 1);
+        assert!(saves_the_record(&actions, "bob"));
+        let Action::SaveToSecureStore { data, .. } = &actions[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            data.expose(),
+            alice.export_session_cfe("bob").unwrap().as_slice()
+        );
+        assert!(alice.retire_session("nobody").is_empty());
+    }
+
+    /// The ack the platform persists, once. Mutation: `ack_mark_processed` answers with nothing.
+    #[test]
+    fn a_processed_message_is_persisted_once() {
+        let mut o = device("alice");
+        let first = o.ack_mark_processed("m1");
+        assert!(
+            matches!(&first[..], [Action::PersistAck { message_id, .. }] if message_id == "m1")
+        );
+        assert!(o.ack_mark_processed("m1").is_empty());
+    }
+
+    /// The one-time prekeys come back after a restart as they were: the same keys and the same
+    /// next id, so a first message that names one still opens. Mutation: `export_otpks_cfe`
+    /// returns a constant; `import_otpks_cfe` imports nothing.
+    #[test]
+    fn one_time_prekeys_survive_a_restart() {
+        let mut alice = device("alice");
+        alice.generate_otpks(3).unwrap();
+        let keys = alice.export_private_keys_cfe().unwrap();
+        let otpks = alice.export_otpks_cfe().unwrap();
+
+        let decoded = crate::cfe::decode_as::<crate::cfe::CfePrivateKeysV1>(
+            &keys,
+            crate::cfe::CfeMessageType::PrivateKeys,
+        )
+        .unwrap();
+        let mut restored = Orchestrator::new(
+            ClassicClient::<ClassicSuiteProvider>::from_private_keys_cfe(decoded).unwrap(),
+            "alice".to_string(),
+        );
+        let fresh = restored.otpk_count();
+        restored.import_otpks_cfe(&otpks).unwrap();
+        assert_eq!(restored.otpk_count(), alice.otpk_count());
+        assert_ne!(restored.otpk_count(), fresh);
+        // The export walks a map, so the records come in no fixed order: compare them by id.
+        let bundle = |bytes: &[u8]| {
+            let mut b = crate::cfe::decode_as::<crate::cfe::CfeOtpkBundleV1>(
+                bytes,
+                crate::cfe::CfeMessageType::OtpkBundle,
+            )
+            .unwrap();
+            b.records.sort_by_key(|r| r.id);
+            b
+        };
+        let (before, after) = (
+            bundle(&otpks),
+            bundle(&restored.export_otpks_cfe().unwrap()),
+        );
+        assert_eq!(before.records.len(), 3);
+        assert_eq!(after.records, before.records);
+        assert_eq!(after.next_id, before.next_id);
+    }
+
+    /// The counts the platform tops the server up by. Mutation: `otpk_count`,
+    /// `prune_otpks_below` or `prekeys_available` returns a constant.
+    #[test]
+    fn the_prekey_counts_follow_the_keys() {
+        let mut o = device("alice");
+        let base = o.otpk_count();
+        let ids: Vec<u32> = o
+            .generate_otpks(4)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(o.otpk_count(), base + 4);
+        assert_eq!(o.prune_otpks_below(ids[2]), base + 2);
+        assert_eq!(o.otpk_count(), 2);
+        assert_eq!(o.prune_otpks_below(ids[2]), 0);
+
+        assert_eq!(o.prekeys_available(), 1, "the current SPK alone");
+        o.rotate_spk().unwrap();
+        assert_eq!(o.prekeys_available(), 2, "the old SPK is kept");
+    }
+
+    /// A rotation that did not upload is rolled back: the SPK served stays the old one and there
+    /// is nothing left to commit. Mutation: `rollback_kyber_spk_rotation` does nothing.
+    #[test]
+    fn a_rolled_back_kyber_rotation_leaves_the_old_spk() {
+        let mut o = device("alice");
+        let served = o.current_kyber_spk_upload().unwrap().unwrap().key_id;
+        let pending = o.begin_kyber_spk_rotation().unwrap();
+        assert_ne!(pending.key_id, served);
+        o.rollback_kyber_spk_rotation();
+        assert!(!o.commit_kyber_spk_rotation(), "nothing pending");
+        assert_eq!(
+            o.current_kyber_spk_upload().unwrap().unwrap().key_id,
+            served
+        );
+    }
+
+    /// What `rotate_spk` returns is what the bundle now serves, signed over the X3DH message.
+    /// Mutation: `rotate_spk` returns a constant.
+    #[test]
+    fn a_rotated_spk_is_the_one_the_bundle_serves() {
+        let mut o = device("alice");
+        let old = o.get_registration_bundle_fields().unwrap();
+        let (id, public, signature) = o.rotate_spk().unwrap();
+        let bundle = o.get_registration_bundle_fields().unwrap();
+        assert_ne!(public, old.signed_prekey_public);
+        assert_eq!(public, bundle.signed_prekey_public);
+        assert_eq!(signature, bundle.signature);
+        assert_eq!(
+            Some(id),
+            o.lifecycle.client.key_manager().current_signed_prekey_id()
+        );
+        assert!(id > 1, "a new id, not the first");
+    }
+
+    /// The hybrid prekey signature verifies under this device's hybrid key, and an imported
+    /// hybrid key replaces it. Mutation: `sign_hybrid_prekey` returns a constant;
+    /// `import_hybrid_signature_private_key` imports nothing.
+    #[test]
+    fn the_hybrid_key_signs_prekeys_and_an_imported_one_replaces_it() {
+        use crate::crypto::suites::hybrid::HybridSuiteProvider;
+        let mut o = device("alice");
+        let prekey = [0x5a; 32];
+        let sig = o.sign_hybrid_prekey(0x01, &prekey).unwrap();
+        let public = o.hybrid_signature_public_key().unwrap();
+        let message = Orchestrator::build_x3dh_sign_message(0x01, &prekey);
+        assert!(HybridSuiteProvider::verify(&public, &message, &sig).is_ok());
+
+        o.import_hybrid_signature_private_key(another_hybrid_key())
+            .unwrap();
+        assert_ne!(o.hybrid_signature_public_key().unwrap(), public);
+    }
+
+    /// Ten minutes between sweeps after the first; the timer tests count from the constant.
+    /// Mutation: any change to the product.
+    #[test]
+    fn the_gc_sweep_runs_every_ten_minutes() {
+        assert_eq!(GC_SWEEP_INTERVAL_MS, 600_000);
+    }
+
+    /// `build_x3dh_sign_message` is the key manager's, not a copy. Mutation: return a constant.
+    #[test]
+    fn the_x3dh_sign_message_is_the_key_managers() {
+        assert_eq!(
+            Orchestrator::build_x3dh_sign_message(0x01, &[7; 32]),
+            KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x01, &[7; 32])
+        );
+    }
+
+    /// The keys a device shows for linking, as the platform would pass them.
+    fn link_keys(o: &Orchestrator) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let bundle = o.get_registration_bundle_fields().unwrap();
+        let km = o.lifecycle.client.key_manager();
+        let hybrid = km.hybrid_signature_public_key().unwrap();
+        let bind = KeyManager::<ClassicSuiteProvider>::build_hybrid_identity_bind_message(&hybrid);
+        let binding = ClassicSuiteProvider::sign(km.signing_secret_key().unwrap(), &bind).unwrap();
+        (
+            bundle.identity_public,
+            bundle.verifying_key,
+            hybrid,
+            binding,
+        )
+    }
+
+    /// Linking through the orchestrator: the old device vouches for the new one, and a third
+    /// device that trusts the old one finds the new one vouched for. The new device's answer to
+    /// the QR secret is the proof over its own keys. Mutation: `issue_device_certificate`,
+    /// `device_link_key_proof` or `judge_peer_devices` returns a constant.
+    #[test]
+    fn a_linked_device_is_vouched_for_by_the_device_that_linked_it() {
+        use crate::crypto::device_certificate::{
+            DeviceKeys, DeviceVerdict, LinkEvidence, OfferedDevice, link_key_proof,
+        };
+        let (old, new, carol) = (device("old"), device("new"), device("carol"));
+        let (identity, verifying, hybrid, binding) = link_keys(&new);
+        let subject = DeviceKeys {
+            identity_public: &identity,
+            verifying_key: &verifying,
+            hybrid_public: &hybrid,
+            hybrid_binding: &binding,
+        };
+
+        let secret = [3u8; 32];
+        let proof = new.device_link_key_proof(&secret).unwrap();
+        assert_eq!(proof, link_key_proof(&secret, &identity, &hybrid).unwrap());
+        let certificate = old
+            .issue_device_certificate(
+                &subject,
+                &LinkEvidence::QrSecret {
+                    secret: &secret,
+                    proof: &proof,
+                },
+            )
+            .unwrap();
+
+        let (o_identity, o_verifying, o_hybrid, o_binding) = link_keys(&old);
+        let old_id = crate::device_id::derive_device_id(&o_identity);
+        let new_id = crate::device_id::derive_device_id(&identity);
+        let offered = [
+            OfferedDevice {
+                device_id: &old_id,
+                keys: DeviceKeys {
+                    identity_public: &o_identity,
+                    verifying_key: &o_verifying,
+                    hybrid_public: &o_hybrid,
+                    hybrid_binding: &o_binding,
+                },
+                certificate: None,
+            },
+            OfferedDevice {
+                device_id: &new_id,
+                keys: subject,
+                certificate: Some(&certificate),
+            },
+        ];
+        let verdicts = carol.judge_peer_devices(std::slice::from_ref(&old_id), &offered);
+        assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+        assert_eq!(verdicts[1], DeviceVerdict::Vouched { by: old_id.clone() });
+    }
+
+    /// A delegation counts only when a root this build trusts signed it. Mutation:
+    /// `admit_server_delegations` returns a constant.
+    #[test]
+    fn only_delegations_a_trusted_root_signed_are_admitted() {
+        use crate::crypto::server_trust::{Purpose, ServerKeyRing, issue_delegation};
+        use crate::crypto::suites::hybrid::hybrid_signature_keypair_from_seeds;
+        let (root_sk, root_pk) = hybrid_signature_keypair_from_seeds(&[1; 32], &[2; 32]);
+        let (_, server_pk) = hybrid_signature_keypair_from_seeds(&[10; 32], &[11; 32]);
+        let mut o = device("alice");
+        o.server_trust.ring = ServerKeyRing::new(vec![root_pk]);
+        let now = o.clock.now_secs() as i64;
+        let good = issue_delegation(
+            &root_sk,
+            Purpose::SenderCert,
+            now - 60,
+            now + 86_400,
+            &server_pk,
+        )
+        .unwrap()
+        .encode();
+        assert_eq!(o.admit_server_delegations(vec![vec![0; 8]]), 0);
+        assert_eq!(o.admit_server_delegations(vec![good, vec![0; 8]]), 1);
     }
 }

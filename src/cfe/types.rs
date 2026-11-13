@@ -662,3 +662,46 @@ pub struct CfeHybridPinV1 {
 fn u8_is_zero(v: &u8) -> bool {
     *v == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CfeMessageType::{self, *};
+
+    /// The registry's bytes are a persisted format: a blob on a device names its type by them.
+    /// Every byte the reader accepts is listed here, and each reads back as the type that
+    /// writes it. Mutation: drop a type's arm, or map a byte to another type.
+    #[test]
+    fn every_type_byte_reads_back_as_its_type() {
+        let registry: [(u8, CfeMessageType); 17] = [
+            (0x01, PrivateKeys),
+            (0x02, SessionState),
+            (0x03, OtpkBundle),
+            (0x04, RegistrationBundle),
+            (0x05, OrchestratorState),
+            (0x20, KyberPrivateKeys),
+            (0x44, MlsStore),
+            (0x60, MailboxGapNotice),
+            (0x61, FanoutRetryQueue),
+            (0x62, ReadSyncState),
+            (0x63, IntakePublished),
+            (0x68, ClientAuthSession),
+            (0x69, ClientBlockWishes),
+            (0x6A, ClientStickerState),
+            (0x6B, ClientVeilFronts),
+            (0x6C, ClientShareDraft),
+            (0x7F, Generic),
+        ];
+        for (byte, ty) in registry {
+            assert_eq!(ty as u8, byte);
+            assert_eq!(CfeMessageType::from_u8(byte), Some(ty), "{byte:#04x}");
+        }
+        let accepted = (0..=u8::MAX)
+            .filter(|b| CfeMessageType::from_u8(*b).is_some())
+            .count();
+        assert_eq!(
+            accepted,
+            registry.len(),
+            "a byte the registry above does not list"
+        );
+    }
+}

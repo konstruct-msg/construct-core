@@ -281,6 +281,20 @@ mod tests {
         }
     }
 
+    /// The largest body is `MAX_CHUNKS` full frames; one byte more is refused.
+    /// Mutation: refuse `>=` `MAX_CHUNKS` frames.
+    #[test]
+    fn a_body_of_max_chunks_full_frames_is_the_largest() {
+        let id = [7u8; 16];
+        let largest = vec![1u8; MAX_CHUNKS * CHUNK_PAYLOAD_SIZE];
+        assert_eq!(
+            encode_chunks(&largest, 1, &id).map(|f| f.len()),
+            Some(MAX_CHUNKS)
+        );
+        let past = vec![1u8; MAX_CHUNKS * CHUNK_PAYLOAD_SIZE + 1];
+        assert_eq!(encode_chunks(&past, 1, &id), None);
+    }
+
     #[test]
     fn a_whole_frame_reads_back_as_a_control_frame() {
         let id = message_id_bytes("0B8E2F5C-6A1D-4E7B-9C3F-1A2B3C4D5E6F").unwrap();

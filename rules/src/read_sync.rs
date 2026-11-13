@@ -231,6 +231,20 @@ mod tests {
         assert_eq!(outcome(&b(1, "x"), Some(&b(2, "y")), true), Outcome::Ignore);
     }
 
+    /// Mutation: ignore every marker once a boundary is held.
+    #[test]
+    fn a_later_marker_moves_a_held_boundary() {
+        assert_eq!(outcome(&b(3, "x"), Some(&b(2, "y")), true), Outcome::Apply);
+        assert_eq!(outcome(&b(2, "y"), Some(&b(2, "y")), true), Outcome::Ignore);
+        let mut s = State::default();
+        s.apply_marker("bob", b(10, "m"), true, "me");
+        assert_eq!(
+            s.apply_marker("bob", b(11, "n"), true, "me"),
+            Outcome::Apply
+        );
+        assert_eq!(s.boundary("bob"), Some(&b(11, "n")));
+    }
+
     /// Mutation: count by time when the boundary's message is in the chat.
     #[test]
     fn unread_left_by_position_when_the_message_is_here() {
@@ -296,6 +310,20 @@ mod tests {
         s.return_pending(unsent);
         assert_eq!(s.pending.get("bob"), Some(&b(20, "n")));
         assert_eq!(s.pending.get("ann"), Some(&b(10, "m")));
+    }
+
+    /// Two sends fail and come back in the wrong order: the older first, then the newer. The
+    /// newer must win. Mutation: keep whatever is pending.
+    #[test]
+    fn unsent_markers_returned_out_of_order_keep_the_later() {
+        let mut s = State::default();
+        s.note_read("bob", b(10, "m"));
+        let first = s.take_pending();
+        s.note_read("bob", b(20, "n"));
+        let second = s.take_pending();
+        s.return_pending(first);
+        s.return_pending(second);
+        assert_eq!(s.pending.get("bob"), Some(&b(20, "n")));
     }
 
     /// Mutation: skip the own-account check.

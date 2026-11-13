@@ -3075,6 +3075,10 @@ fn peer_ad_version_is_persisted() {
     )
     .unwrap();
     assert_eq!(back.peer_ad_version, AD_VERSION_HEADER);
+    // Through the bytes too: the field is left out of the blob when zero
+    // (`skip_serializing_if`), so a wrong skip test drops it only on this path.
+    // Mutation: skip it always, or skip it when not zero.
+    assert_eq!(cfe_round_trip(&bob).peer_ad_version, AD_VERSION_HEADER);
 
     let mut old = alice.to_serializable().to_cfe_v1().unwrap();
     old.peer_ad_version = 0;
