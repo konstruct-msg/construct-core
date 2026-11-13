@@ -2131,3 +2131,29 @@ fn a_session_archive_announces_only_a_move() {
         [QUEUED, QUEUED]
     );
 }
+
+/// Reactions expired with their message gone are announced, by target. Mutation: the `!`
+/// dropped in `expire_reactions` — the expiry goes unannounced.
+#[test]
+fn expired_reactions_are_announced() {
+    let store = Store::open_in_memory(&KEY).unwrap();
+    store
+        .upsert_reaction(&Reaction {
+            target_message_id: "gone".into(),
+            reactor_user_id: "bob".into(),
+            emoji: "👍".into(),
+            timestamp_ms: 1,
+            received_at: Some(10),
+        })
+        .unwrap();
+    let seen = Arc::new(Changes::default());
+    store.set_observer(Some(seen.clone()));
+    assert_eq!(store.expire_reactions(10).unwrap(), 1);
+    assert_eq!(
+        *seen.changes.lock().unwrap(),
+        vec![Change {
+            table: Table::Reactions,
+            ids: vec!["gone".into()]
+        }]
+    );
+}
