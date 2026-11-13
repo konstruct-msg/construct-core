@@ -352,6 +352,7 @@ mod tests {
         // Today's box: eph + nonce + tag around the certificate, beside the whole wire payload.
         let before = 32 + 12 + 16 + cert.len() + w.len();
         assert_eq!(sealed.len(), before + 6);
+        assert_eq!(sealed.len(), FIRST_FLIGHT_OVERHEAD + cert.len() + w.len());
         let h = handshake_of_box(&sealed).unwrap();
         assert_eq!(h.kyber_prekey_id, 1_000_007);
         let opened = open(&key, secret.as_bytes(), &sealed).unwrap();
@@ -427,5 +428,141 @@ mod tests {
         let mut w = vec![0u8; HEADER_SIZE];
         w.extend_from_slice(b"mid-ratchet");
         assert!(seal(&key, &public, &w, b"c").is_err());
+    }
+
+    /// A box around any `body`, framed and keyed as `seal_with` frames and keys one — for the
+    /// bodies `seal` never writes. Pinned to `seal_with` below, so it cannot drift from it.
+    fn box_around(
+        key: &FirstFlightKey,
+        recipient_public: &[u8],
+        kyber_id: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let kem = vec![0xcc; KEM_CIPHERTEXT_LEN];
+        let ephemeral = StaticSecret::from([0x11; 32]);
+        let eph = PublicKey::from(&ephemeral);
+        let dh = ephemeral.diffie_hellman(&PublicKey::from(key32(recipient_public, "r").unwrap()));
+        let box_key = box_key(dh.as_bytes(), key, eph.as_bytes(), &kem);
+        let mut out = Vec::new();
+        out.extend_from_slice(&kyber_id.to_be_bytes());
+        out.extend_from_slice(&kem);
+        out.extend_from_slice(eph.as_bytes());
+        let nonce = [0x22; NONCE_LEN];
+        let sealed = ChaCha20Poly1305::new(Key::from_slice(&box_key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: body,
+                    aad: &out[..AD_LEN],
+                },
+            )
+            .unwrap();
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&sealed);
+        out
+    }
+
+    fn opened_body(body: &[u8]) -> Result<OpenedFirstFlight, CryptoError> {
+        let (secret, public) = recipient();
+        let key = FirstFlightKey::from_kem_secret(&[3; 32]);
+        open(&key, secret.as_bytes(), &box_around(&key, &public, 5, body))
+    }
+
+    fn refused_as(result: Result<OpenedFirstFlight, CryptoError>, what: &str) -> bool {
+        matches!(result, Err(CryptoError::InvalidInputError(m)) if m.contains(what))
+    }
+
+    #[test]
+    fn the_test_box_is_the_box_seal_makes() {
+        let (_, public) = recipient();
+        let key = FirstFlightKey::from_kem_secret(&[3; 32]);
+        let w = wire(5, 0xcc);
+        let mut body = vec![0, 1, b'c'];
+        body.extend_from_slice(&w[..HEADER_SIZE]);
+        body.extend_from_slice(&w[HEADER_SIZE + KEM_CIPHERTEXT_LEN..]);
+        assert_eq!(
+            box_around(&key, &public, 5, &body),
+            seal_with(&key, &public, &w, b"c", &[0x11; 32], &[0x22; 12]).unwrap()
+        );
+    }
+
+    /// A payload shorter than the fixed header carries no handshake, and is read no further.
+    ///
+    /// Mutation: `<` → `==` in `handshake_of_wire` — a short payload is sliced past its end;
+    /// this reddens.
+    #[test]
+    fn a_payload_shorter_than_its_header_carries_no_handshake() {
+        for len in 0..HEADER_SIZE {
+            assert!(handshake_of_wire(&vec![0u8; len]).is_none(), "{len} bytes");
+        }
+    }
+
+    /// The handshake is read before the box opens, so the length that holds it is checked first:
+    /// every shorter input is refused, and the shortest that holds it is read.
+    ///
+    /// Mutation: `<` → `==` or `<=` in `handshake_of_box`, or any `+` in its bound → `-`/`*` —
+    /// this reddens.
+    #[test]
+    fn the_handshake_is_read_from_exactly_the_bytes_that_hold_it() {
+        let min = AD_LEN + NONCE_LEN + AEAD_TAG_LEN;
+        for len in 0..min {
+            assert!(
+                handshake_of_box(&vec![0u8; len]).is_err(),
+                "{len} bytes read"
+            );
+        }
+        let mut shortest = vec![0u8; min];
+        shortest[..ID_LEN].copy_from_slice(&9u32.to_be_bytes());
+        assert_eq!(handshake_of_box(&shortest).unwrap().kyber_prekey_id, 9);
+    }
+
+    /// A body that opens is still the sender's to shape. One too short for its own length
+    /// fields is refused by name, never read past its end.
+    ///
+    /// Mutation: `<` → `==` in either length check of `open` — a short body is sliced past its
+    /// end and panics; `<` → `<=` in the first — a two-byte body is called lengthless. Both
+    /// redden.
+    #[test]
+    fn a_body_shorter_than_its_own_lengths_is_refused() {
+        assert!(refused_as(opened_body(&[]), "no certificate length"));
+        assert!(refused_as(opened_body(&[0]), "no certificate length"));
+        assert!(refused_as(opened_body(&[0, 0]), "body too short"));
+        assert!(refused_as(
+            opened_body(&[0xff, 0xff, 1, 2, 3]),
+            "body too short"
+        ));
+        let mut short_header = vec![0, 0];
+        short_header.extend_from_slice(&wire(5, 0xcc)[..HEADER_SIZE - 1]);
+        assert!(refused_as(opened_body(&short_header), "body too short"));
+    }
+
+    /// The header inside must name the handshake outside on both counts: its prekey id and its
+    /// ciphertext length, each refused alone.
+    ///
+    /// Mutation: `||` → `&&` in `open` — this reddens.
+    #[test]
+    fn an_inner_header_naming_another_handshake_is_refused_on_either_field() {
+        let body_with = |header: &[u8]| {
+            let mut body = vec![0, 0];
+            body.extend_from_slice(header);
+            body.extend_from_slice(b"ratchet body");
+            body
+        };
+        let right = wire(5, 0xcc)[..HEADER_SIZE].to_vec();
+        assert!(opened_body(&body_with(&right)).is_ok());
+
+        let other_id = wire(6, 0xcc)[..HEADER_SIZE].to_vec();
+        assert!(refused_as(
+            opened_body(&body_with(&other_id)),
+            "another handshake"
+        ));
+
+        let mut other_len = right.clone();
+        other_len[KEM_LEN_OFFSET..KEM_LEN_OFFSET + 2]
+            .copy_from_slice(&((KEM_CIPHERTEXT_LEN - 1) as u16).to_le_bytes());
+        assert!(refused_as(
+            opened_body(&body_with(&other_len)),
+            "another handshake"
+        ));
     }
 }

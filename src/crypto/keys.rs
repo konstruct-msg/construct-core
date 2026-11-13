@@ -4,7 +4,7 @@
 use crate::crypto::CryptoProvider;
 use crate::crypto::SuiteID;
 use crate::utils::error::{ConstructError, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -113,14 +113,6 @@ impl Ed25519KeyPair {
 
     pub fn get_signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.private_key)
-    }
-
-    pub fn get_verifying_key(&self) -> Result<VerifyingKey> {
-        VerifyingKey::from_bytes(&self.public_key).map_err(|e| {
-            ConstructError::Crypto(crate::error::CryptoError::InvalidInputError(format!(
-                "Corrupted Ed25519 public key in keystore: {e}"
-            )))
-        })
     }
 }
 
@@ -1046,6 +1038,209 @@ mod tests {
             // Written before `retired_at` existed: a full window from now.
             km.add_old_prekey(spk_secret, spk_sig, 52, 0, None).unwrap();
             assert!(km.get_prekey(52).is_some());
+        }
+    }
+
+    mod restore {
+        use crate::crypto::CryptoProvider;
+        use crate::crypto::keys::*;
+        use crate::crypto::suites::classic::ClassicSuiteProvider;
+        use crate::crypto::suites::hybrid::{
+            HybridSuiteProvider, hybrid_signature_keypair_from_seeds,
+        };
+
+        type Km = KeyManager<ClassicSuiteProvider>;
+
+        fn initialized() -> Km {
+            let mut km = Km::new();
+            km.initialize().unwrap();
+            km
+        }
+
+        /// The values the first-flight bound is written against. `QUEUE_TTL_SECS` is the server's
+        /// `MESSAGE_TTL_DAYS`, not ours to choose; the const assertion only checks a sum.
+        ///
+        /// Mutation: either `*` → `+` in either constant — this reddens.
+        #[test]
+        fn the_first_flight_bound_is_seven_days_on_seven() {
+            assert_eq!(QUEUE_TTL_SECS, 604_800);
+            assert_eq!(MAX_UNANSWERED_HANDSHAKE_AGE_SECS, 604_800);
+        }
+
+        /// One-time prekeys are kept across a restart by exporting them and importing them back:
+        /// the same ids open with the same keys, and the counter moves past them.
+        ///
+        /// Mutation: `export_one_time_prekeys` → `vec![]` or a fixed tuple, `import_one_time_prekeys`
+        /// → `()`, the integrity guard → `false`, `==` → `!=` in it, or `>=` → `<` on the counter
+        /// — this reddens.
+        #[test]
+        fn one_time_prekeys_survive_export_and_import() {
+            let mut original = Km::new();
+            let issued = original.generate_one_time_prekeys(3).unwrap();
+            let exported = original.export_one_time_prekeys();
+            assert_eq!(exported.len(), 3);
+
+            let mut restored = Km::new();
+            restored.import_one_time_prekeys(exported);
+            assert_eq!(restored.one_time_prekey_count(), 3);
+            assert_eq!(restored.next_otpk_id(), original.next_otpk_id());
+            for (id, _) in &issued {
+                assert_eq!(
+                    restored
+                        .peek_one_time_prekey(*id)
+                        .map(|k| k.as_ref().to_vec()),
+                    original
+                        .peek_one_time_prekey(*id)
+                        .map(|k| k.as_ref().to_vec()),
+                    "key {id}"
+                );
+            }
+        }
+
+        /// A record whose public half does not derive from its private half is dropped, and only
+        /// that one: a session opened to it could never be read.
+        ///
+        /// Mutation: the integrity guard → `true` — this reddens.
+        #[test]
+        fn a_one_time_prekey_whose_halves_disagree_is_dropped() {
+            let mut original = Km::new();
+            original.generate_one_time_prekeys(2).unwrap();
+            let mut exported = original.export_one_time_prekeys();
+            exported.sort_by_key(|(id, _, _)| *id);
+            let (bad_id, good_id) = (exported[0].0, exported[1].0);
+            exported[0].2[0] ^= 1;
+
+            let mut restored = Km::new();
+            restored.import_one_time_prekeys(exported);
+            assert!(restored.peek_one_time_prekey(bad_id).is_none());
+            assert!(restored.peek_one_time_prekey(good_id).is_some());
+        }
+
+        /// The counter restored from a record never moves back, or a new key would reuse the id
+        /// of one a peer already holds.
+        ///
+        /// Mutation: `set_next_otpk_id` → `()`, or `>` → `==`, `<` or `>=` — this reddens.
+        #[test]
+        fn the_one_time_prekey_counter_only_moves_forward() {
+            let mut km = Km::new();
+            let start = km.next_otpk_id();
+            km.set_next_otpk_id(start + 10);
+            assert_eq!(km.next_otpk_id(), start + 10);
+            km.set_next_otpk_id(start + 3);
+            assert_eq!(km.next_otpk_id(), start + 10);
+            km.set_next_otpk_id(start + 10);
+            assert_eq!(km.next_otpk_id(), start + 10);
+            km.set_next_otpk_id(start + 11);
+            assert_eq!(km.next_otpk_id(), start + 11);
+        }
+
+        /// A restored old signed prekey moves the id counter past itself, so the next rotation
+        /// cannot overwrite it while a first message may still be on its way to it.
+        ///
+        /// Mutation: `>=` → `<` in `add_old_prekey` — this reddens; `old_prekeys_count` → 0 or 1
+        /// — this reddens.
+        #[test]
+        fn a_restored_old_signed_prekey_is_not_reused_by_the_next_rotation() {
+            let mut km = initialized();
+            let spk = km.current_signed_prekey().unwrap();
+            let (secret, sig) = (spk.key_pair.0.as_ref().to_vec(), spk.signature.clone());
+            let high = km.current_signed_prekey_id().unwrap() + 50;
+            km.add_old_prekey(secret.clone(), sig.clone(), high, 0, None)
+                .unwrap();
+            km.add_old_prekey(secret, sig, high + 1, 0, None).unwrap();
+            assert_eq!(km.old_prekeys_count(), 2);
+            km.rotate_signed_prekey().unwrap();
+            assert!(km.current_signed_prekey_id().unwrap() > high + 1);
+            assert_eq!(
+                km.old_prekeys_count(),
+                3,
+                "both restored keys and the rotated one"
+            );
+        }
+
+        /// A retired signed prekey is kept for its window from retirement and dropped at its end.
+        ///
+        /// Mutation: `cleanup_old_prekeys` → `()`, `-` → `/`, or `<` → `<=` — this reddens (the
+        /// last only when the test runs within one second, which it does).
+        #[test]
+        fn a_retired_signed_prekey_is_dropped_when_its_window_ends() {
+            let day = 24 * 3600;
+            let now = crate::utils::time::current_timestamp();
+            let mut km = initialized();
+            let spk = km.current_signed_prekey().unwrap();
+            let (secret, sig) = (spk.key_pair.0.as_ref().to_vec(), spk.signature.clone());
+            km.add_old_prekey(secret.clone(), sig.clone(), 60, 0, Some(now - 10 * day))
+                .unwrap();
+            km.add_old_prekey(secret, sig, 61, 0, Some(now - day))
+                .unwrap();
+            km.cleanup_old_prekeys(11 * day);
+            assert!(km.get_prekey(60).is_some(), "inside the window");
+            km.cleanup_old_prekeys(10 * day);
+            assert!(km.get_prekey(60).is_none(), "the window has ended");
+            assert!(km.get_prekey(61).is_some());
+        }
+
+        /// What `sign_hybrid_prekey` returns verifies under this device's hybrid key over the
+        /// X3DH sign message — what a peer checks.
+        ///
+        /// Mutation: `sign_hybrid_prekey` → `Ok(vec![])` or a one-byte vector — this reddens.
+        #[test]
+        fn a_hybrid_prekey_signature_verifies_under_the_hybrid_key() {
+            let mut km = initialized();
+            let prekey = [0x5a; 32];
+            let sig = km.sign_hybrid_prekey(0x01, &prekey).unwrap();
+            let public = km.hybrid_signature_public_key().unwrap();
+            let message = Km::build_x3dh_sign_message(0x01, &prekey);
+            assert!(HybridSuiteProvider::verify(&public, &message, &sig).is_ok());
+            assert!(
+                HybridSuiteProvider::verify(
+                    &public,
+                    &Km::build_x3dh_sign_message(0x01, &[0; 32]),
+                    &sig
+                )
+                .is_err()
+            );
+        }
+
+        /// The KEM identity is ML-KEM-1024 from HKDF-SHA256 over the ML-DSA seed alone — bytes
+        /// 32..64 of the hybrid private key. A peer pins this key, so a change of derivation is a
+        /// new identity for every device.
+        ///
+        /// Mutation: `+` → `*` in the seed's slice bound — this reddens.
+        #[test]
+        fn the_kem_identity_is_derived_from_the_ml_dsa_seed() {
+            use hkdf::Hkdf;
+            use sha2::Sha256;
+            let mut km = initialized();
+            let (private, _) = hybrid_signature_keypair_from_seeds(&[1; 32], &[2; 32]);
+            km.set_hybrid_signature_private(private.expose().to_vec())
+                .unwrap();
+            let mut seed = [0u8; crate::crypto::pq_x3dh::MLKEM_SEED_SIZE];
+            Hkdf::<Sha256>::new(Some(&[]), &[2; 32])
+                .expand(b"Construct-KEM-identity-v1", &mut seed)
+                .unwrap();
+            assert_eq!(
+                km.kem_identity_public().unwrap(),
+                crate::crypto::pq_x3dh::mlkem1024_public_from_seed(&seed).unwrap()
+            );
+        }
+
+        /// A rolled-back rotation leaves nothing pending and the current key in place.
+        ///
+        /// Mutation: `rollback_kyber_spk_rotation` → `()` — this reddens.
+        #[test]
+        fn a_rolled_back_kyber_rotation_leaves_nothing_to_commit() {
+            let mut km = initialized();
+            km.ensure_hybrid_signature_key().unwrap();
+            let first = km.begin_kyber_spk_rotation().unwrap();
+            assert!(km.commit_kyber_spk_rotation());
+            km.begin_kyber_spk_rotation().unwrap();
+            km.rollback_kyber_spk_rotation();
+            assert!(!km.commit_kyber_spk_rotation());
+            assert_eq!(
+                km.current_kyber_spk_upload().unwrap().unwrap().public_key,
+                first.public_key
+            );
         }
     }
 

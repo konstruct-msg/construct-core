@@ -493,6 +493,48 @@ mod tests {
         }
     }
 
+    /// Each of the three keys is measured on its own: one of the wrong length is refused as
+    /// malformed whatever the other two are.
+    ///
+    /// Mutation: either `||` → `&&` in `check_keys` — this reddens (the short key reaches the
+    /// binding or the fingerprint and is refused as something else, or not at all).
+    #[test]
+    fn a_single_key_of_the_wrong_length_is_malformed() {
+        let signer = TestDevice::new(1);
+        let subject = TestDevice::new(2);
+        let fp = subject.fingerprint();
+        let issue_with = |keys: DeviceKeys<'_>| {
+            issue(
+                &signer.identity,
+                &signer.hybrid_public,
+                &keys,
+                &LinkEvidence::QrFingerprint(&fp),
+                1_790_000_000,
+                |m| HybridSuiteProvider::sign(&signer.hybrid_private, m).ok(),
+            )
+        };
+        assert!(issue_with(subject.keys()).is_ok());
+        let identity = &subject.identity[..31];
+        let verifying = &subject.verifying[..31];
+        let hybrid = &subject.hybrid_public[..subject.hybrid_public.len() - 1];
+        for keys in [
+            DeviceKeys {
+                identity_public: identity,
+                ..subject.keys()
+            },
+            DeviceKeys {
+                verifying_key: verifying,
+                ..subject.keys()
+            },
+            DeviceKeys {
+                hybrid_public: hybrid,
+                ..subject.keys()
+            },
+        ] {
+            assert_eq!(issue_with(keys), Err(CertError::KeysMalformed));
+        }
+    }
+
     fn offered<'a>(d: &'a TestDevice, id: &'a str, cert: Option<&'a [u8]>) -> OfferedDevice<'a> {
         OfferedDevice {
             device_id: id,
