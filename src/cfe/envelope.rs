@@ -36,7 +36,8 @@ pub fn max_payload_len(msg_type: CfeMessageType) -> usize {
         | CfeMessageType::ClientAuthSession
         | CfeMessageType::ClientBlockWishes
         | CfeMessageType::ClientStickerState
-        | CfeMessageType::ClientVeilFronts => MAX_PAYLOAD_LEN,
+        | CfeMessageType::ClientVeilFronts
+        | CfeMessageType::ClientShareDraft => MAX_PAYLOAD_LEN,
         CfeMessageType::PrivateKeys
         | CfeMessageType::SessionState
         | CfeMessageType::OtpkBundle

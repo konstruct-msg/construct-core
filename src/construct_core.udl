@@ -53,6 +53,12 @@ namespace construct_core {
     /// The largest file `seal_media` takes — check before encoding or uploading anything.
     u64 media_max_plaintext_len();
 
+    /// An incoming OS share kept locally. No message is sent or ratchet advanced by this codec.
+    [Throws=CryptoError]
+    bytes share_draft_encode(ShareDraft draft);
+    [Throws=CryptoError]
+    ShareDraft share_draft_decode(bytes kept);
+
     // Safety Numbers — human-verifiable key fingerprint for two devices
     string? compute_safety_number(string my_device_id, string their_device_id);
 
@@ -2248,6 +2254,30 @@ interface HistoryMessageExport {
     Empty();
     /// A body from before CTM1: the client that wrote it converts it.
     Legacy();
+};
+
+/// Keys describe locally sealed source files, never an external provider URI.
+dictionary ShareDraftItem {
+    string id;
+    string name;
+    string mime;
+    bytes key;
+    u64 size;
+};
+
+enum ShareDraftStage {
+    "Importing",
+    "Ready",
+    "Submitted",
+    "Finished",
+};
+
+dictionary ShareDraft {
+    string id;
+    string text;
+    sequence<ShareDraftItem> items;
+    string? contact_id;
+    ShareDraftStage stage;
 };
 
 dictionary LocalSearchHit {

@@ -42,6 +42,8 @@ pub enum CfeMessageType {
     ClientStickerState = 0x6A,
     /// construct-client: the VEIL fronts learned and still usable.
     ClientVeilFronts = 0x6B,
+    /// A client's incoming OS share, including keys for its local sealed source files.
+    ClientShareDraft = 0x6C,
 
     // Utilities
     Generic = 0x7F,
@@ -65,6 +67,7 @@ impl CfeMessageType {
             0x69 => Self::ClientBlockWishes,
             0x6A => Self::ClientStickerState,
             0x6B => Self::ClientVeilFronts,
+            0x6C => Self::ClientShareDraft,
             0x7F => Self::Generic,
             _ => return None,
         })
