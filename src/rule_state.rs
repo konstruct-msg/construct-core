@@ -10,7 +10,7 @@
 //! nobody can show; refusing to start over it would only keep the person from seeing the next one.
 
 pub use construct_rules::{
-    device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync, send_failure,
+    calls, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync, send_failure,
     stream_cursor,
 };
 
