@@ -18,6 +18,7 @@ pub mod channel;
 pub mod cth1;
 pub mod discovery;
 pub mod frames;
+pub mod media_gate;
 #[cfg(feature = "store")]
 pub mod project;
 pub mod records;

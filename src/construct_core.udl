@@ -1651,7 +1651,17 @@ interface HistoryEvent {
     MediaStart(string media_id, string mime_type, u64 byte_len);
     MediaBytes(bytes data);
     MediaEnd();
+    /// A whole blob this device may not write: no `MediaStart`, no bytes. The transfer goes on.
+    MediaRefused(HistoryMediaRefusal reason);
     End();
+};
+
+/// Why a media blob was dropped (`construct-docs/decisions/history-transfer-whole-in-the-core.md`).
+enum HistoryMediaRefusal {
+    /// Its id is not a server media id (a dashed UUID): it would become a file name.
+    "BadId",
+    /// No message of the transcript — this transfer's, or one `expect_media` named — refers to it.
+    "NotReferenced",
 };
 
 [Enum]
@@ -1716,6 +1726,9 @@ interface HistorySender {
 /// The new device's end. Read exactly `need()` bytes, `feed` them, act on the status.
 interface HistoryReceiver {
     u32 need();
+    /// The media ids this device's own messages refer to. A media-only (phase 2) transfer carries
+    /// no messages; without these every blob in it is refused.
+    void expect_media(sequence<string> media_ids);
     [Throws=HistoryError]
     HistoryStep feed(bytes data);
     /// After `AwaitKeys`: the directory's keys for that device and the QR pin. Returns the reply

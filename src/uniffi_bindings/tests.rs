@@ -359,13 +359,17 @@ fn two_cores_move_history_over_the_local_network() {
             },
             HistoryRecordOut {
                 record_type: 4,
-                proto: vec![0x32, 0],
+                proto: history_message_naming(HISTORY_MEDIA_ID),
             },
         ])
         .unwrap();
     stream.extend(
         sender
-            .begin_media("m".into(), "image/jpeg".into(), blob.len() as u64)
+            .begin_media(
+                HISTORY_MEDIA_ID.into(),
+                "image/jpeg".into(),
+                blob.len() as u64,
+            )
             .unwrap(),
     );
     stream.extend(sender.push_media(blob.clone()).unwrap());
@@ -387,6 +391,140 @@ fn two_cores_move_history_over_the_local_network() {
         .collect();
     assert_eq!(received, blob);
     assert!(matches!(events.last(), Some(HistoryEvent::End)));
+}
+
+const HISTORY_MEDIA_ID: &str = "0b5c2f1e-8d3a-4c6b-9e7f-1a2b3c4d5e6f";
+const HISTORY_OTHER_MEDIA_ID: &str = "9f8e7d6c-5b4a-4321-8fed-cba987654321";
+
+/// A Message record whose `MessageContent` is one `MediaMessage` with `media_id`.
+fn history_message_naming(media_id: &str) -> Vec<u8> {
+    let mut media = vec![0x6a, media_id.len() as u8]; // field 13
+    media.extend_from_slice(media_id.as_bytes());
+    let mut content = vec![0x12, media.len() as u8]; // field 2
+    content.extend(media);
+    let mut record = vec![0x32, content.len() as u8]; // field 6
+    record.extend(content);
+    record
+}
+
+/// One whole nearby transfer of `phase` between two real cores: `messages` as Message records,
+/// then `media` as blobs. `expect` goes to the receiver before the stream. Returns its events.
+fn history_transfer(
+    phase: u8,
+    messages: Vec<Vec<u8>>,
+    media: Vec<(&str, Vec<u8>)>,
+    expect: Vec<String>,
+) -> Vec<HistoryEvent> {
+    let (old, _) = named_core();
+    let (new, _) = named_core();
+    let user = vec![0x33; 16];
+    let old_peer = history_peer(&old);
+    let sender = old
+        .history_offer_nearby(user.clone(), history_peer(&new), false, None)
+        .unwrap();
+    let receiver = new.clone().history_receive(user.clone(), false);
+    receiver.expect_media(expect);
+    let (mut events, mut at) = (Vec::new(), 0);
+    history_pump(&receiver, &sender.first_frame(), &mut at, &mut events).unwrap();
+    let reply = receiver
+        .accept(history_known(&old_peer), HistoryPin::BundleOnly)
+        .unwrap()
+        .unwrap();
+    sender.accept_reply(reply).unwrap();
+
+    let mut manifest = vec![0x08, 1, 0x12, 16];
+    manifest.extend_from_slice(&sender.snapshot_id());
+    manifest.extend_from_slice(&[0x1a, 16]);
+    manifest.extend_from_slice(&user);
+    manifest.extend_from_slice(&[0x68, phase]);
+    let mut records = vec![HistoryRecordOut {
+        record_type: 1,
+        proto: manifest,
+    }];
+    records.extend(messages.into_iter().map(|proto| HistoryRecordOut {
+        record_type: 4,
+        proto,
+    }));
+    let mut stream = sender.push_records(records).unwrap();
+    for (id, blob) in media {
+        stream.extend(
+            sender
+                .begin_media(id.into(), "image/jpeg".into(), blob.len() as u64)
+                .unwrap(),
+        );
+        stream.extend(sender.push_media(blob).unwrap());
+    }
+    stream.extend(sender.finish().unwrap());
+    let mut at = 0;
+    assert!(matches!(
+        history_pump(&receiver, &stream, &mut at, &mut events).unwrap(),
+        HistoryStatus::Done
+    ));
+    receiver.end_of_input().unwrap();
+    events
+}
+
+fn history_media_seen(events: &[HistoryEvent]) -> (Vec<String>, Vec<u8>, Vec<&'static str>) {
+    let mut started = Vec::new();
+    let mut bytes = Vec::new();
+    let mut refused = Vec::new();
+    for e in events {
+        match e {
+            HistoryEvent::MediaStart { media_id, .. } => started.push(media_id.clone()),
+            HistoryEvent::MediaBytes { data } => bytes.extend_from_slice(data),
+            HistoryEvent::MediaRefused { reason } => refused.push(match reason {
+                HistoryMediaRefusal::BadId => "bad_id",
+                HistoryMediaRefusal::NotReferenced => "not_referenced",
+            }),
+            _ => {}
+        }
+    }
+    (started, bytes, refused)
+}
+
+/// Through the exported receiver: a blob a message of the transfer names arrives; one no
+/// message names, and one whose id would be a path, are each one `MediaRefused` and no bytes.
+#[test]
+fn a_transfer_drops_the_blobs_its_transcript_does_not_name() {
+    let events = history_transfer(
+        3,
+        vec![history_message_naming(HISTORY_MEDIA_ID)],
+        vec![
+            (HISTORY_OTHER_MEDIA_ID, vec![0x01; 3000]),
+            ("..", vec![0x02; 10]),
+            (HISTORY_MEDIA_ID, vec![0x5a; 70_000]),
+        ],
+        Vec::new(),
+    );
+    let (started, bytes, refused) = history_media_seen(&events);
+    assert_eq!(started, [HISTORY_MEDIA_ID]);
+    assert_eq!(
+        bytes,
+        vec![0x5a; 70_000],
+        "only the named blob's bytes, whole"
+    );
+    assert_eq!(refused, ["not_referenced", "bad_id"]);
+    assert!(matches!(events.last(), Some(HistoryEvent::End)));
+}
+
+/// A media-only transfer brings no messages: its blobs pass only against the ids this device's
+/// own messages name.
+#[test]
+fn a_media_only_transfer_takes_the_ids_the_device_holds() {
+    let media = || vec![(HISTORY_MEDIA_ID, vec![0x07; 500])];
+    let (started, _, refused) = history_media_seen(&history_transfer(2, vec![], media(), vec![]));
+    assert!(started.is_empty());
+    assert_eq!(refused, ["not_referenced"]);
+
+    let (started, bytes, refused) = history_media_seen(&history_transfer(
+        2,
+        vec![],
+        media(),
+        vec![HISTORY_MEDIA_ID.to_owned()],
+    ));
+    assert_eq!(started, [HISTORY_MEDIA_ID]);
+    assert_eq!(bytes, vec![0x07; 500]);
+    assert!(refused.is_empty());
 }
 
 /// A file for the new device opens there and nowhere else: a third device of the account
