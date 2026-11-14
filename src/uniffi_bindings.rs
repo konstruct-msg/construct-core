@@ -1241,7 +1241,35 @@ pub enum HistoryEvent {
         data: Vec<u8>,
     },
     MediaEnd,
+    /// A whole blob the receiver may not write — its bytes are dropped
+    /// (`history::media_gate`).
+    MediaRefused {
+        reason: HistoryMediaRefusal,
+    },
     End,
+}
+
+/// Why a media blob of a transfer was dropped.
+pub enum HistoryMediaRefusal {
+    /// Its id is not a server media id (a dashed UUID).
+    BadId,
+    /// No message of the transcript — this transfer's or this device's — names it.
+    NotReferenced,
+}
+
+impl From<crate::history::media_gate::Gated> for HistoryEvent {
+    fn from(g: crate::history::media_gate::Gated) -> Self {
+        use crate::history::media_gate::{Gated, MediaRefusal};
+        match g {
+            Gated::Event(e) => e.into(),
+            Gated::Refused(MediaRefusal::BadId) => Self::MediaRefused {
+                reason: HistoryMediaRefusal::BadId,
+            },
+            Gated::Refused(MediaRefusal::NotReferenced) => Self::MediaRefused {
+                reason: HistoryMediaRefusal::NotReferenced,
+            },
+        }
+    }
 }
 
 impl From<crate::history::cth1::Event> for HistoryEvent {
@@ -1346,6 +1374,8 @@ impl HistorySender {
 pub struct HistoryReceiver {
     core: Arc<OrchestratorCore>,
     inner: Mutex<crate::history::session::Receiver>,
+    /// Which blobs may be written: every event passes it (`history::media_gate`).
+    media: Mutex<crate::history::media_gate::MediaGate>,
 }
 
 impl HistoryReceiver {
@@ -1357,9 +1387,23 @@ impl HistoryReceiver {
         self.lock().need() as u32
     }
 
+    /// Media ids the messages this device already holds refer to. A media-only (phase 2)
+    /// transfer brings no messages, so its blobs are let through against these.
+    pub fn expect_media(&self, media_ids: Vec<String>) {
+        self.media
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect(media_ids);
+    }
+
     pub fn feed(&self, data: Vec<u8>) -> Result<HistoryStep, HistoryError> {
         use crate::history::session::Status;
         let (events, status) = self.lock().feed(&data)?;
+        let events = self
+            .media
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .filter(events);
         Ok(HistoryStep {
             events: events.into_iter().map(HistoryEvent::from).collect(),
             status: match status {
@@ -2596,6 +2640,7 @@ impl OrchestratorCore {
         Arc::new(HistoryReceiver {
             core: self,
             inner: Mutex::new(Receiver::new(source, user_id)),
+            media: Mutex::new(Default::default()),
         })
     }
 
