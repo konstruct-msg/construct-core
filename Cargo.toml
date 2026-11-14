@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "construct-core"
-version = "0.72.0"
+version = "0.72.1"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.100"
@@ -107,7 +107,10 @@ uniffi = { version = "0.30", optional = true }
 # sibling checkout, broke the README's own git-dependency quick start, and let a construct-core
 # commit build against whatever construct-veil `main` happened to be when CI ran.
 #
-# Bump `rev` to take a veil change. To build against a local checkout while working on both,
+# Bump `rev` to take a veil change. eefd74f1 (2026-11-14): the native-TLS ferry sets SO_NOSIGPIPE on
+# what it adopts (veil #31; the iOS crash of todo 313). It also brings construct-veil-protocol's AUTH v4
+# token module and its blind-rsa-signatures / rsa 0.10.0-rc.18 dependency, not called by clients yet.
+# To build against a local checkout while working on both,
 # patch it outside this file (see README, "Working on construct-veil at the same time").
 # The local store every client keeps — exported through this library's UDL on the platform
 # features; the Tauri desktops and the TUI depend on it directly.
@@ -117,7 +120,7 @@ construct-server-trust = { path = "server-trust" }
 # Client rules written once (decisions/client-rules-shared-in-rust.md); exported below via
 # `rules_bindings`, and used directly by a Rust client.
 construct-rules = { path = "rules" }
-construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "b1742951a8a3188484015fcc984dcab45f3d6af6", features = ["ffi"], optional = true }
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "eefd74f1d13b1bf330e34c3dfe71eb61dc5ea60b", features = ["ffi"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
