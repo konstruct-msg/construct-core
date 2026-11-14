@@ -5,7 +5,7 @@
 use std::sync::Mutex;
 
 use crate::rule_state::{
-    self, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync, send_failure,
+    self, calls, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync, send_failure,
     stream_cursor,
 };
 use crate::uniffi_bindings::CryptoError;
@@ -709,9 +709,444 @@ pub fn intake_key_record_decode(kept: Vec<u8>) -> Option<crate::intake::IntakeKe
         .map(|(generation, key)| crate::intake::IntakeKeyState { generation, key })
 }
 
+// ── Calls ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl From<CallDirection> for calls::Direction {
+    fn from(d: CallDirection) -> Self {
+        match d {
+            CallDirection::Incoming => Self::Incoming,
+            CallDirection::Outgoing => Self::Outgoing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallHangupReason {
+    Unspecified,
+    Normal,
+    Busy,
+    Declined,
+    Timeout,
+    ConnectionFailed,
+    AcceptedElsewhere,
+}
+
+impl From<CallHangupReason> for calls::HangupReason {
+    fn from(r: CallHangupReason) -> Self {
+        match r {
+            CallHangupReason::Unspecified => Self::Unspecified,
+            CallHangupReason::Normal => Self::Normal,
+            CallHangupReason::Busy => Self::Busy,
+            CallHangupReason::Declined => Self::Declined,
+            CallHangupReason::Timeout => Self::Timeout,
+            CallHangupReason::ConnectionFailed => Self::ConnectionFailed,
+            CallHangupReason::AcceptedElsewhere => Self::AcceptedElsewhere,
+        }
+    }
+}
+
+impl From<calls::HangupReason> for CallHangupReason {
+    fn from(r: calls::HangupReason) -> Self {
+        match r {
+            calls::HangupReason::Unspecified => Self::Unspecified,
+            calls::HangupReason::Normal => Self::Normal,
+            calls::HangupReason::Busy => Self::Busy,
+            calls::HangupReason::Declined => Self::Declined,
+            calls::HangupReason::Timeout => Self::Timeout,
+            calls::HangupReason::ConnectionFailed => Self::ConnectionFailed,
+            calls::HangupReason::AcceptedElsewhere => Self::AcceptedElsewhere,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSignalError {
+    Unspecified,
+    CalleeOffline,
+    CalleeBusy,
+    RateLimited,
+    Unauthorized,
+    CallExpired,
+}
+
+impl From<CallSignalError> for calls::SignalError {
+    fn from(e: CallSignalError) -> Self {
+        match e {
+            CallSignalError::Unspecified => Self::Unspecified,
+            CallSignalError::CalleeOffline => Self::CalleeOffline,
+            CallSignalError::CalleeBusy => Self::CalleeBusy,
+            CallSignalError::RateLimited => Self::RateLimited,
+            CallSignalError::Unauthorized => Self::Unauthorized,
+            CallSignalError::CallExpired => Self::CallExpired,
+        }
+    }
+}
+
+impl From<calls::SignalError> for CallSignalError {
+    fn from(e: calls::SignalError) -> Self {
+        match e {
+            calls::SignalError::Unspecified => Self::Unspecified,
+            calls::SignalError::CalleeOffline => Self::CalleeOffline,
+            calls::SignalError::CalleeBusy => Self::CalleeBusy,
+            calls::SignalError::RateLimited => Self::RateLimited,
+            calls::SignalError::Unauthorized => Self::Unauthorized,
+            calls::SignalError::CallExpired => Self::CallExpired,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallEndCause {
+    Hangup { reason: CallHangupReason },
+    ServerError { error: CallSignalError },
+    Local,
+}
+
+impl From<CallEndCause> for calls::EndReason {
+    fn from(c: CallEndCause) -> Self {
+        match c {
+            CallEndCause::Hangup { reason } => Self::Hangup(reason.into()),
+            CallEndCause::ServerError { error } => Self::Error(error.into()),
+            CallEndCause::Local => Self::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallEndOutcome {
+    Ended { connected_seconds: Option<u32> },
+    Declined,
+    Busy,
+    NoAnswer,
+    Failed,
+}
+
+impl From<calls::Outcome> for CallEndOutcome {
+    fn from(o: calls::Outcome) -> Self {
+        match o {
+            calls::Outcome::Ended { connected_seconds } => Self::Ended { connected_seconds },
+            calls::Outcome::Declined => Self::Declined,
+            calls::Outcome::Busy => Self::Busy,
+            calls::Outcome::NoAnswer => Self::NoAnswer,
+            calls::Outcome::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<CallEndOutcome> for calls::Outcome {
+    fn from(o: CallEndOutcome) -> Self {
+        match o {
+            CallEndOutcome::Ended { connected_seconds } => Self::Ended { connected_seconds },
+            CallEndOutcome::Declined => Self::Declined,
+            CallEndOutcome::Busy => Self::Busy,
+            CallEndOutcome::NoAnswer => Self::NoAnswer,
+            CallEndOutcome::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallHistoryStatus {
+    Completed,
+    Missed,
+    Declined,
+    Failed,
+}
+
+impl From<calls::HistoryStatus> for CallHistoryStatus {
+    fn from(s: calls::HistoryStatus) -> Self {
+        match s {
+            calls::HistoryStatus::Completed => Self::Completed,
+            calls::HistoryStatus::Missed => Self::Missed,
+            calls::HistoryStatus::Declined => Self::Declined,
+            calls::HistoryStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallAnswerDisposition {
+    Accept {
+        device: String,
+        release: Vec<String>,
+    },
+    ReleaseLate {
+        device: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallHangupDisposition {
+    End { release: Vec<String> },
+    EndTakenElsewhere,
+    DropDevice { remaining: Vec<String> },
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallGlare {
+    KeepOurs,
+    Yield,
+}
+
+pub fn call_hangup_reason_from_wire(value: i32) -> CallHangupReason {
+    calls::HangupReason::from_wire(value).into()
+}
+
+pub fn call_hangup_reason_wire(reason: CallHangupReason) -> i32 {
+    calls::HangupReason::from(reason).wire()
+}
+
+pub fn call_signal_error_from_wire(value: i32) -> CallSignalError {
+    calls::SignalError::from_wire(value).into()
+}
+
+pub fn call_signal_targets(
+    chosen: Option<String>,
+    offered: Vec<String>,
+    pinned: Option<String>,
+) -> Vec<String> {
+    calls::targets(chosen.as_deref(), &offered, pinned.as_deref())
+}
+
+pub fn call_offer_devices(
+    planned: Vec<String>,
+    with_session: Vec<String>,
+    pinned: Option<String>,
+) -> Vec<String> {
+    calls::offer_devices(&planned, &with_session, pinned.as_deref())
+}
+
+pub fn call_admits(device: String, chosen: Option<String>) -> bool {
+    calls::admits(&device, chosen.as_deref())
+}
+
+pub fn call_on_answer(
+    device: String,
+    chosen: Option<String>,
+    offered: Vec<String>,
+) -> CallAnswerDisposition {
+    match calls::on_answer(&device, chosen.as_deref(), &offered) {
+        calls::AnswerDisposition::Accept { device, release } => {
+            CallAnswerDisposition::Accept { device, release }
+        }
+        calls::AnswerDisposition::ReleaseLate { device } => {
+            CallAnswerDisposition::ReleaseLate { device }
+        }
+    }
+}
+
+pub fn call_on_hangup(
+    device: String,
+    reason: CallHangupReason,
+    chosen: Option<String>,
+    offered: Vec<String>,
+) -> CallHangupDisposition {
+    match calls::on_hangup(&device, reason.into(), chosen.as_deref(), &offered) {
+        calls::HangupDisposition::End { release } => CallHangupDisposition::End { release },
+        calls::HangupDisposition::EndTakenElsewhere => CallHangupDisposition::EndTakenElsewhere,
+        calls::HangupDisposition::DropDevice { remaining } => {
+            CallHangupDisposition::DropDevice { remaining }
+        }
+        calls::HangupDisposition::Ignore => CallHangupDisposition::Ignore,
+    }
+}
+
+pub fn call_local_hangup_reason(direction: CallDirection, still_ringing: bool) -> CallHangupReason {
+    calls::local_hangup_reason(direction.into(), still_ringing).into()
+}
+
+pub fn call_glare(my_user_id: String, peer_user_id: String) -> CallGlare {
+    match calls::glare(&my_user_id, &peer_user_id) {
+        calls::Glare::KeepOurs => CallGlare::KeepOurs,
+        calls::Glare::Yield => CallGlare::Yield,
+    }
+}
+
+pub fn call_end_outcome(cause: CallEndCause, connected_seconds: Option<u32>) -> CallEndOutcome {
+    calls::outcome(cause.into(), connected_seconds).into()
+}
+
+pub fn call_outcome_wants_attention(outcome: CallEndOutcome) -> bool {
+    calls::Outcome::from(outcome).wants_attention()
+}
+
+pub fn call_history_status(
+    direction: CallDirection,
+    cause: CallEndCause,
+    answered: bool,
+) -> Option<CallHistoryStatus> {
+    calls::history_status(direction.into(), cause.into(), answered).map(Into::into)
+}
+
+pub fn call_duration_seconds(answered_at_ms: Option<i64>, ended_at_ms: i64) -> u32 {
+    calls::duration_seconds(answered_at_ms, ended_at_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The call exports carry every variant through, both ways. Mutation that reddens it: swap two
+    /// arms of any call `From`, or of `call_on_hangup` / `call_on_answer` / `call_glare`.
+    #[test]
+    fn the_call_exports_carry_every_variant() {
+        use CallHangupReason as R;
+        let reasons = [
+            R::Unspecified,
+            R::Normal,
+            R::Busy,
+            R::Declined,
+            R::Timeout,
+            R::ConnectionFailed,
+            R::AcceptedElsewhere,
+        ];
+        for (wire, reason) in reasons.into_iter().enumerate() {
+            assert_eq!(call_hangup_reason_from_wire(wire as i32), reason);
+            assert_eq!(call_hangup_reason_wire(reason), wire as i32);
+        }
+        use CallSignalError as E;
+        let errors = [
+            E::Unspecified,
+            E::CalleeOffline,
+            E::CalleeBusy,
+            E::RateLimited,
+            E::Unauthorized,
+            E::CallExpired,
+        ];
+        for (wire, error) in errors.into_iter().enumerate() {
+            assert_eq!(call_signal_error_from_wire(wire as i32), error);
+        }
+        // Each error reaches the rule as itself: busy and expired read apart from the rest.
+        let outcomes: Vec<CallEndOutcome> = errors
+            .into_iter()
+            .map(|error| call_end_outcome(CallEndCause::ServerError { error }, None))
+            .collect();
+        use CallEndOutcome as O;
+        assert_eq!(
+            outcomes,
+            vec![
+                O::Failed,
+                O::Failed,
+                O::Busy,
+                O::Failed,
+                O::Failed,
+                O::NoAnswer
+            ]
+        );
+        let hangups: Vec<CallEndOutcome> = reasons
+            .into_iter()
+            .map(|reason| call_end_outcome(CallEndCause::Hangup { reason }, Some(4)))
+            .collect();
+        let ended = O::Ended {
+            connected_seconds: Some(4),
+        };
+        assert_eq!(
+            hangups,
+            vec![
+                ended,
+                ended,
+                O::Busy,
+                O::Declined,
+                O::NoAnswer,
+                O::Failed,
+                ended
+            ]
+        );
+        assert_eq!(call_end_outcome(CallEndCause::Local, None), O::Failed);
+        assert!(!call_outcome_wants_attention(ended));
+        for o in [O::Declined, O::Busy, O::NoAnswer, O::Failed] {
+            assert!(call_outcome_wants_attention(o), "{o:?}");
+        }
+
+        use CallDirection::{Incoming, Outgoing};
+        use CallHistoryStatus as H;
+        let declined = CallEndCause::Hangup {
+            reason: R::Declined,
+        };
+        assert_eq!(
+            call_history_status(Incoming, declined, false),
+            Some(H::Declined)
+        );
+        assert_eq!(
+            call_history_status(Outgoing, declined, false),
+            Some(H::Missed)
+        );
+        assert_eq!(
+            call_history_status(Outgoing, CallEndCause::Local, true),
+            Some(H::Completed)
+        );
+        assert_eq!(
+            call_history_status(Outgoing, CallEndCause::Local, false),
+            Some(H::Failed)
+        );
+        assert_eq!(
+            call_history_status(
+                Incoming,
+                CallEndCause::Hangup {
+                    reason: R::AcceptedElsewhere
+                },
+                false
+            ),
+            None
+        );
+        assert_eq!(call_local_hangup_reason(Incoming, true), R::Declined);
+        assert_eq!(call_local_hangup_reason(Outgoing, true), R::Normal);
+        assert_eq!(call_duration_seconds(Some(0), 2_500), 2);
+
+        let offered = vec!["d1".to_string(), "d2".to_string()];
+        assert_eq!(
+            call_signal_targets(None, offered.clone(), None),
+            offered.clone()
+        );
+        assert_eq!(
+            call_offer_devices(offered.clone(), vec!["d2".into()], None),
+            vec!["d2".to_string()]
+        );
+        assert!(!call_admits("d2".into(), Some("d1".into())));
+        assert!(call_admits("d1".into(), Some("d1".into())));
+        assert_eq!(
+            call_on_answer("d1".into(), None, offered.clone()),
+            CallAnswerDisposition::Accept {
+                device: "d1".into(),
+                release: vec!["d2".into()]
+            }
+        );
+        assert_eq!(
+            call_on_answer("d2".into(), Some("d1".into()), offered.clone()),
+            CallAnswerDisposition::ReleaseLate {
+                device: "d2".into()
+            }
+        );
+        assert_eq!(
+            call_on_hangup("d1".into(), R::Busy, None, offered.clone()),
+            CallHangupDisposition::DropDevice {
+                remaining: vec!["d2".into()]
+            }
+        );
+        assert_eq!(
+            call_on_hangup("d1".into(), R::Declined, None, offered.clone()),
+            CallHangupDisposition::End {
+                release: vec!["d2".into()]
+            }
+        );
+        assert_eq!(
+            call_on_hangup("d1".into(), R::AcceptedElsewhere, Some("d1".into()), vec![]),
+            CallHangupDisposition::EndTakenElsewhere
+        );
+        assert_eq!(
+            call_on_hangup("d2".into(), R::Normal, Some("d1".into()), vec![]),
+            CallHangupDisposition::Ignore
+        );
+        assert_eq!(call_glare("b".into(), "a".into()), CallGlare::KeepOurs);
+        assert_eq!(call_glare("a".into(), "b".into()), CallGlare::Yield);
+    }
 
     /// The wrappers carry each variant through, both ways. Mutation that reddens it: swap two
     /// arms of a `From` or of `after_send_failure`.

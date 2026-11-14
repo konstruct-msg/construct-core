@@ -13,6 +13,7 @@
 //! the core's one UniFFI component; a Rust client through `construct_core::rule_state`, which
 //! re-exports the rule and writes its state, so no client depends on two versions of it.
 
+pub mod calls;
 pub mod device_refusal;
 pub mod fanout_retry;
 pub mod intake;

@@ -86,6 +86,35 @@ namespace construct_core {
     /// status says the path failed (CANCELLED, DEADLINE_EXCEEDED, UNAVAILABLE), failed otherwise.
     MessageAfterSendFailure after_send_failure(SendFailureKind failure);
 
+    /// Calls (construct-rules `calls`; decisions/a-call-rings-every-device.md). The values of
+    /// `HangupReason` (webrtc.proto) and `SignalErrorCode` (signaling_service.proto) by number; an
+    /// unknown one reads as `Unspecified`.
+    CallHangupReason call_hangup_reason_from_wire(i32 value);
+    i32 call_hangup_reason_wire(CallHangupReason reason);
+    CallSignalError call_signal_error_from_wire(i32 value);
+    /// Who a call signal is sealed for: the chosen device, else the offered ones, else the pinned.
+    sequence<string> call_signal_targets(string? chosen, sequence<string> offered, string? pinned);
+    /// The devices an offer rings: planned ones with a session, in plan order, each once; else the
+    /// pinned one.
+    sequence<string> call_offer_devices(sequence<string> planned, sequence<string> with_session, string? pinned);
+    /// Whether a signal from `device` belongs to the call: any device before one is chosen.
+    boolean call_admits(string device, string? chosen);
+    /// An answer to our outgoing call: the first wins and releases the rest; a later one is released.
+    CallAnswerDisposition call_on_answer(string device, string? chosen, sequence<string> offered);
+    /// A hangup or busy from one of the peer's devices.
+    CallHangupDisposition call_on_hangup(string device, CallHangupReason reason, string? chosen, sequence<string> offered);
+    /// Our own hangup's reason: declined for an incoming call still ringing, normal otherwise.
+    CallHangupReason call_local_hangup_reason(CallDirection direction, boolean still_ringing);
+    /// Both dialled each other: the greater account id by its bytes keeps its call.
+    CallGlare call_glare(string my_user_id, string peer_user_id);
+    /// How an ended call reads on its screen.
+    CallEndOutcome call_end_outcome(CallEndCause cause, u32? connected_seconds);
+    boolean call_outcome_wants_attention(CallEndOutcome outcome);
+    /// The history row's status; none for a call taken on another of our devices.
+    CallHistoryStatus? call_history_status(CallDirection direction, CallEndCause cause, boolean answered);
+    /// Whole seconds from the answer to the end; 0 if nobody answered.
+    u32 call_duration_seconds(i64? answered_at_ms, i64 ended_at_ms);
+
     /// Fan-out retry (construct-rules `fanout_retry`): attempts before an owed copy is given up,
     /// and the first wait.
     u32 fanout_retry_max_attempts();
@@ -206,6 +235,89 @@ enum DeviceRefusalKind {
     "Unspecified",
     "Removed",
     "NotFound",
+};
+
+/// Which side of the call we are.
+enum CallDirection {
+    "Incoming",
+    "Outgoing",
+};
+
+/// `HangupReason` of signaling/webrtc.proto.
+enum CallHangupReason {
+    "Unspecified",
+    "Normal",
+    "Busy",
+    "Declined",
+    "Timeout",
+    "ConnectionFailed",
+    /// Another device of the callee took the call.
+    "AcceptedElsewhere",
+};
+
+/// `SignalErrorCode` of services/signaling_service.proto.
+enum CallSignalError {
+    "Unspecified",
+    "CalleeOffline",
+    "CalleeBusy",
+    "RateLimited",
+    "Unauthorized",
+    "CallExpired",
+};
+
+/// Why a call ended.
+[Enum]
+interface CallEndCause {
+    /// Ours, or one the peer's device sent.
+    Hangup(CallHangupReason reason);
+    /// The signaling server's error.
+    ServerError(CallSignalError error);
+    /// Our own setup or path failed; a person ending the call is a hangup.
+    Local();
+};
+
+/// How an ended call reads on its screen.
+[Enum]
+interface CallEndOutcome {
+    /// `connected_seconds`: how long the two were connected, none if never.
+    Ended(u32? connected_seconds);
+    Declined();
+    Busy();
+    NoAnswer();
+    Failed();
+};
+
+/// A call history row's status; codes 0–3 in this order (history_snapshot.proto).
+enum CallHistoryStatus {
+    "Completed",
+    "Missed",
+    "Declined",
+    "Failed",
+};
+
+[Enum]
+interface CallAnswerDisposition {
+    /// `device` becomes the call's device; `release` are told it was taken elsewhere.
+    Accept(string device, sequence<string> release);
+    /// Another device answered first: tell this one it was taken elsewhere.
+    ReleaseLate(string device);
+};
+
+[Enum]
+interface CallHangupDisposition {
+    /// End the call; tell `release` it was taken elsewhere.
+    End(sequence<string> release);
+    /// Another of our devices took it: stop ringing, tell nobody, write no history.
+    EndTakenElsewhere();
+    /// Only this device is busy; the call keeps ringing on `remaining`.
+    DropDevice(sequence<string> remaining);
+    /// Not from this call's device.
+    Ignore();
+};
+
+enum CallGlare {
+    "KeepOurs",
+    "Yield",
 };
 
 /// A failed send, as a platform reports it to `after_send_failure`.
