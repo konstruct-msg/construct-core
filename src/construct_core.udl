@@ -114,6 +114,13 @@ namespace construct_core {
     CallHistoryStatus? call_history_status(CallDirection direction, CallEndCause cause, boolean answered);
     /// Whole seconds from the answer to the end; 0 if nobody answered.
     u32 call_duration_seconds(i64? answered_at_ms, i64 ended_at_ms);
+    /// What an arriving offer means: ring, wait for consent, resume an answer, renegotiate, glare
+    /// or busy (construct-rules `calls::on_offer`; `held` none for no call or one that is over).
+    CallOfferAction call_on_offer(boolean recently_ended, CallHeldCall? held, string my_user_id, string offerer_user_id);
+    /// What the signalling stream closing means for the call.
+    CallStreamClosedAction call_on_stream_closed(boolean can_reconnect, boolean media_connected, boolean awaiting_offer_after_answer);
+    /// Which channels a hangup is written to (end to end, the signalling stream).
+    CallHangupRoute call_hangup_route(CallHangupSide side, CallHangupReason reason);
 
     /// Fan-out retry (construct-rules `fanout_retry`): attempts before an owed copy is given up,
     /// and the first wait.
@@ -313,6 +320,42 @@ interface CallHangupDisposition {
     DropDevice(sequence<string> remaining);
     /// Not from this call's device.
     Ignore();
+};
+
+/// The call this device holds when an offer arrives.
+dictionary CallHeldCall {
+    boolean same_call;
+    CallDirection direction;
+    boolean with_offerer;
+    boolean answered;
+    boolean awaiting_offer_after_answer;
+};
+
+enum CallOfferAction {
+    "IgnoreEnded",
+    "ResumeAnswer",
+    "HoldUntilAnswered",
+    "Renegotiate",
+    "Ring",
+    "KeepOurs",
+    "ReplaceOutgoing",
+    "Busy",
+};
+
+enum CallStreamClosedAction {
+    "Reconnect",
+    "KeepOnMessagePath",
+    "EndCall",
+};
+
+enum CallHangupSide {
+    "Local",
+    "Remote",
+};
+
+dictionary CallHangupRoute {
+    boolean e2ee;
+    boolean stream;
 };
 
 enum CallGlare {

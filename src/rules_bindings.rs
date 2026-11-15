@@ -989,6 +989,124 @@ pub fn call_duration_seconds(answered_at_ms: Option<i64>, ended_at_ms: i64) -> u
     calls::duration_seconds(answered_at_ms, ended_at_ms)
 }
 
+/// The call this device holds when an offer arrives (`calls::HeldCall`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallHeldCall {
+    pub same_call: bool,
+    pub direction: CallDirection,
+    pub with_offerer: bool,
+    pub answered: bool,
+    pub awaiting_offer_after_answer: bool,
+}
+
+impl From<CallHeldCall> for calls::HeldCall {
+    fn from(h: CallHeldCall) -> Self {
+        Self {
+            same_call: h.same_call,
+            direction: h.direction.into(),
+            with_offerer: h.with_offerer,
+            answered: h.answered,
+            awaiting_offer_after_answer: h.awaiting_offer_after_answer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOfferAction {
+    IgnoreEnded,
+    ResumeAnswer,
+    HoldUntilAnswered,
+    Renegotiate,
+    Ring,
+    KeepOurs,
+    ReplaceOutgoing,
+    Busy,
+}
+
+impl From<calls::OfferAction> for CallOfferAction {
+    fn from(a: calls::OfferAction) -> Self {
+        match a {
+            calls::OfferAction::IgnoreEnded => Self::IgnoreEnded,
+            calls::OfferAction::ResumeAnswer => Self::ResumeAnswer,
+            calls::OfferAction::HoldUntilAnswered => Self::HoldUntilAnswered,
+            calls::OfferAction::Renegotiate => Self::Renegotiate,
+            calls::OfferAction::Ring => Self::Ring,
+            calls::OfferAction::KeepOurs => Self::KeepOurs,
+            calls::OfferAction::ReplaceOutgoing => Self::ReplaceOutgoing,
+            calls::OfferAction::Busy => Self::Busy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallStreamClosedAction {
+    Reconnect,
+    KeepOnMessagePath,
+    EndCall,
+}
+
+impl From<calls::StreamClosedAction> for CallStreamClosedAction {
+    fn from(a: calls::StreamClosedAction) -> Self {
+        match a {
+            calls::StreamClosedAction::Reconnect => Self::Reconnect,
+            calls::StreamClosedAction::KeepOnMessagePath => Self::KeepOnMessagePath,
+            calls::StreamClosedAction::EndCall => Self::EndCall,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallHangupSide {
+    Local,
+    Remote,
+}
+
+impl From<CallHangupSide> for calls::HangupSide {
+    fn from(s: CallHangupSide) -> Self {
+        match s {
+            CallHangupSide::Local => Self::Local,
+            CallHangupSide::Remote => Self::Remote,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallHangupRoute {
+    pub e2ee: bool,
+    pub stream: bool,
+}
+
+pub fn call_on_offer(
+    recently_ended: bool,
+    held: Option<CallHeldCall>,
+    my_user_id: String,
+    offerer_user_id: String,
+) -> CallOfferAction {
+    calls::on_offer(
+        recently_ended,
+        held.map(Into::into),
+        &my_user_id,
+        &offerer_user_id,
+    )
+    .into()
+}
+
+pub fn call_on_stream_closed(
+    can_reconnect: bool,
+    media_connected: bool,
+    awaiting_offer_after_answer: bool,
+) -> CallStreamClosedAction {
+    calls::on_stream_closed(can_reconnect, media_connected, awaiting_offer_after_answer).into()
+}
+
+pub fn call_hangup_route(side: CallHangupSide, reason: CallHangupReason) -> CallHangupRoute {
+    let route = calls::hangup_route(side.into(), reason.into());
+    CallHangupRoute {
+        e2ee: route.e2ee,
+        stream: route.stream,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,5 +1451,86 @@ mod tests {
             Some("4-0")
         );
         assert_eq!(cursor.in_flight(), 0);
+    }
+
+    /// The offer, stream and hangup-route exports carry every case through. Mutations that redden
+    /// it: swap two arms of `CallOfferAction`, `CallStreamClosedAction` or `CallHangupSide`; drop a
+    /// field of `CallHeldCall`; swap `e2ee` and `stream`.
+    #[test]
+    fn the_offer_stream_and_route_exports_carry_every_case() {
+        let held = |same_call, direction, answered, awaiting| CallHeldCall {
+            same_call,
+            direction,
+            with_offerer: true,
+            answered,
+            awaiting_offer_after_answer: awaiting,
+        };
+        use CallDirection::{Incoming, Outgoing};
+        use CallOfferAction as A;
+        let offer = |ended, h: Option<CallHeldCall>, me: &str| {
+            call_on_offer(ended, h, me.into(), "m".into())
+        };
+        assert_eq!(offer(true, None, "a"), A::IgnoreEnded);
+        assert_eq!(offer(false, None, "a"), A::Ring);
+        assert_eq!(
+            offer(false, Some(held(true, Incoming, true, true)), "a"),
+            A::ResumeAnswer
+        );
+        assert_eq!(
+            offer(false, Some(held(true, Incoming, false, false)), "a"),
+            A::HoldUntilAnswered
+        );
+        assert_eq!(
+            offer(false, Some(held(true, Incoming, true, false)), "a"),
+            A::Renegotiate
+        );
+        assert_eq!(
+            offer(false, Some(held(false, Outgoing, false, false)), "z"),
+            A::KeepOurs
+        );
+        assert_eq!(
+            offer(false, Some(held(false, Outgoing, false, false)), "a"),
+            A::ReplaceOutgoing
+        );
+        let other = CallHeldCall {
+            with_offerer: false,
+            ..held(false, Outgoing, false, false)
+        };
+        assert_eq!(offer(false, Some(other), "a"), A::Busy);
+
+        use CallStreamClosedAction as S;
+        assert_eq!(call_on_stream_closed(true, false, false), S::Reconnect);
+        assert_eq!(
+            call_on_stream_closed(false, true, false),
+            S::KeepOnMessagePath
+        );
+        assert_eq!(
+            call_on_stream_closed(false, false, true),
+            S::KeepOnMessagePath
+        );
+        assert_eq!(call_on_stream_closed(false, false, false), S::EndCall);
+
+        let route = |side, reason| call_hangup_route(side, reason);
+        assert_eq!(
+            route(CallHangupSide::Local, CallHangupReason::Normal),
+            CallHangupRoute {
+                e2ee: true,
+                stream: true
+            }
+        );
+        assert_eq!(
+            route(CallHangupSide::Remote, CallHangupReason::Normal),
+            CallHangupRoute {
+                e2ee: false,
+                stream: true
+            }
+        );
+        assert_eq!(
+            route(CallHangupSide::Local, CallHangupReason::AcceptedElsewhere),
+            CallHangupRoute {
+                e2ee: true,
+                stream: false
+            }
+        );
     }
 }
