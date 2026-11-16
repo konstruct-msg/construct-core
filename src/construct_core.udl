@@ -123,6 +123,10 @@ namespace construct_core {
     CallHangupRoute call_hangup_route(CallHangupSide side, CallHangupReason reason);
     /// The call timings the call machine keeps (construct-rules `call_machine::timing`).
     CallTimings call_timings();
+    /// The TURN urls a call relays through; null: the call is not placed. Every call is
+    /// relay-only — the platform sets the ICE transport policy to relay (construct-rules
+    /// `calls::relay_urls`).
+    sequence<string>? call_relay_urls(sequence<string> turn_urls, boolean veil_on);
 
     /// Fan-out retry (construct-rules `fanout_retry`): attempts before an owed copy is given up,
     /// and the first wait.
@@ -433,7 +437,7 @@ interface CallOfferStep {
     Hold();
     ResumeAnswer();
     Renegotiate();
-    Fail(CallEnded ended);
+    Fail(CallFailure failure);
 };
 
 enum CallAcceptStep {
@@ -450,6 +454,20 @@ dictionary CallLocalHangup {
     CallEnded ended;
 };
 
+/// A failure of ours ended the call; `hangup` (`CONNECTION_FAILED`) tells the peer, null when
+/// nothing goes out (their call, still ringing here).
+dictionary CallFailure {
+    CallEnded ended;
+    CallFailureHangup? hangup;
+};
+
+/// The hangup a failure sends: to `targets` (empty: the pinned device) on `route`.
+dictionary CallFailureHangup {
+    CallHangupReason reason;
+    sequence<string> targets;
+    CallHangupRoute route;
+};
+
 [Enum]
 interface CallRemoteHangupStep {
     Ignore();
@@ -461,7 +479,7 @@ interface CallRemoteHangupStep {
 interface CallStreamStep {
     Reconnect();
     KeepOnMessagePath();
-    End(CallEnded ended);
+    End(CallFailure failure);
 };
 
 enum CallIceStep {
@@ -473,7 +491,7 @@ enum CallIceStep {
 [Enum]
 interface CallDue {
     Unanswered(CallLocalHangup hangup);
-    NoOffer(CallEnded ended);
+    NoOffer(CallFailure failure);
     RestartIce();
 };
 
@@ -509,8 +527,8 @@ interface CallMachine {
     CallEnded? ended_by_server(CallHangupReason reason, i64 now_ms);
     /// A signalling error; null when the call goes on (a rate limit).
     CallEnded? server_error(CallSignalError error, i64 now_ms);
-    /// Our own setup or path failed.
-    CallEnded? fail(i64 now_ms);
+    /// Our own setup or path failed; the peer is told unless their call still rings here.
+    CallFailure? fail(i64 now_ms);
     void media_connected();
     CallIceStep media_quality(boolean reconnecting, i64 now_ms);
     /// The ICE-restart offer went out, or failed to.

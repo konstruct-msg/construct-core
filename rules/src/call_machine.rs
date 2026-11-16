@@ -220,8 +220,8 @@ pub enum OfferStep {
     ResumeAnswer,
     /// The call is under way and the peer renegotiates (an ICE restart): apply it.
     Renegotiate,
-    /// The offer for the call in progress carries no SDP: the call ends rather than wait on it.
-    Fail(Ended),
+    /// The offer for the call in progress carries no SDP: the call fails rather than wait on it.
+    Fail(Failure),
 }
 
 /// What the person answering an incoming call does.
@@ -244,6 +244,24 @@ pub struct Hangup {
     pub targets: Vec<String>,
     pub route: HangupRoute,
     pub ended: Ended,
+}
+
+/// A failure of ours ended the call: ICE, a send, an SDP that would not apply, a stream that
+/// would not reopen, an offer that never came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub ended: Ended,
+    /// The hangup (`ConnectionFailed`) that tells the peer; `None` when nothing goes out.
+    pub hangup: Option<FailureHangup>,
+}
+
+/// The hangup a failure sends: [`Hangup`] without the end, which [`Failure`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureHangup {
+    pub reason: HangupReason,
+    /// As [`Hangup::targets`].
+    pub targets: Vec<String>,
+    pub route: HangupRoute,
 }
 
 /// What a hangup or a busy from one of the peer's devices did.
@@ -271,8 +289,8 @@ pub enum StreamStep {
     Reconnect,
     /// No more reconnects, but media or the offer wait bounds the call.
     KeepOnMessagePath,
-    /// Nothing else could end the call: it ended.
-    End(Ended),
+    /// Nothing else could end the call: it failed.
+    End(Failure),
 }
 
 /// What ICE reporting the path disconnected does. `Schedule` puts the grace deadline in
@@ -291,8 +309,8 @@ pub enum IceStep {
 pub enum Due {
     /// Nobody answered: our hangup `TIMEOUT` goes out and the call ended.
     Unanswered(Hangup),
-    /// The answered call never got its offer: it ended.
-    NoOffer(Ended),
+    /// The answered call never got its offer: it failed.
+    NoOffer(Failure),
     /// ICE did not come back within the grace: restart it now (the caller's offer with fresh
     /// credentials). Call [`Calls::ice_restart_sent`] when it went out, or failed to.
     RestartIce,
@@ -453,8 +471,7 @@ impl Calls {
             | OfferAction::Renegotiate
                 if !usable =>
             {
-                self.end(EndReason::Local, now_ms)
-                    .map_or(OfferStep::Ignore, OfferStep::Fail)
+                self.fail(now_ms).map_or(OfferStep::Ignore, OfferStep::Fail)
             }
             OfferAction::HoldUntilAnswered
             | OfferAction::ResumeAnswer
@@ -616,8 +633,27 @@ impl Calls {
     }
 
     /// Our own setup or path failed (ICE failed, a send, an offer or answer that would not apply).
-    pub fn fail(&mut self, now_ms: i64) -> Option<Ended> {
-        self.end(EndReason::Local, now_ms)
+    ///
+    /// The peer is told with a `ConnectionFailed` hangup: until 0.76.0 a failure ended the call
+    /// here only, and the other side sat in "connecting" or "calling" until a person hung up
+    /// (2026-11-16, builds 779 and Android 724, twice in one evening). Our call always tells;
+    /// theirs once we accepted it. One still ringing here ends quietly: its caller may be ringing
+    /// our other devices, and a hangup from this one ends the call there too (`on_hangup`) —
+    /// Signal RingRTC `Call::should_send_hangup_on_failure`, the same rule.
+    pub fn fail(&mut self, now_ms: i64) -> Option<Failure> {
+        let call = self.active.as_ref()?;
+        let tells = calls::failure_tells_peer(call.direction, call.phase == Phase::Incoming);
+        let targets = call.targets();
+        let ended = self.end(EndReason::Local, now_ms)?;
+        let reason = HangupReason::ConnectionFailed;
+        Some(Failure {
+            ended,
+            hangup: tells.then(|| FailureHangup {
+                reason,
+                targets,
+                route: calls::hangup_route(HangupSide::Local, reason),
+            }),
+        })
     }
 
     // ── Media and the stream ────────────────────────────────────────────────
@@ -963,13 +999,25 @@ mod tests {
             OfferStep::Renegotiate
         );
 
-        let OfferStep::Fail(ended) = calls.offer("c1", "peer", "d1", false, "me", T0 + 61_000)
+        let OfferStep::Fail(failure) = calls.offer("c1", "peer", "d1", false, "me", T0 + 61_000)
         else {
             panic!("an unusable offer for the call in progress ends it");
         };
-        assert_eq!(ended.reason, EndReason::Local);
-        assert_eq!(ended.history, Some(HistoryStatus::Completed));
+        assert_eq!(failure.ended.reason, EndReason::Local);
+        assert_eq!(failure.ended.history, Some(HistoryStatus::Completed));
+        assert!(
+            failure.hangup.is_some(),
+            "an answered call tells its caller"
+        );
         assert!(calls.active().is_none());
+
+        // Still ringing here: it ends quietly, and the caller's other devices ring on.
+        let mut calls = Calls::new();
+        calls.push("c1", "peer", T0);
+        let OfferStep::Fail(failure) = calls.offer("c1", "peer", "d1", false, "me", T0) else {
+            panic!("an unusable offer for the ringing call ends it");
+        };
+        assert_eq!(failure.hangup, None);
     }
 
     // ── Answering ───────────────────────────────────────────────────────────
@@ -1191,11 +1239,15 @@ mod tests {
         calls.accept(T0);
         let due = T0 + timing::OFFER_WAIT_MS;
         assert_eq!(calls.tick(due - 1), None);
-        let Some(Due::NoOffer(ended)) = calls.tick(due) else {
+        let Some(Due::NoOffer(failure)) = calls.tick(due) else {
             panic!("the offer wait ends the call");
         };
-        assert_eq!(ended.reason, EndReason::Local);
-        assert_eq!(ended.history, Some(HistoryStatus::Failed));
+        assert_eq!(failure.ended.reason, EndReason::Local);
+        assert_eq!(failure.ended.history, Some(HistoryStatus::Failed));
+        assert!(
+            failure.hangup.is_some(),
+            "answered: the caller, still calling, is told"
+        );
 
         let mut calls = Calls::new();
         calls.push("c1", "peer", T0);
@@ -1253,10 +1305,14 @@ mod tests {
         for _ in 0..timing::MAX_STREAM_RETRIES {
             assert_eq!(calls.stream_closed(T0), Some(StreamStep::Reconnect));
         }
-        let Some(StreamStep::End(ended)) = calls.stream_closed(T0) else {
+        let Some(StreamStep::End(failure)) = calls.stream_closed(T0) else {
             panic!("nothing bounds a call before media without its stream");
         };
-        assert_eq!(ended.reason, EndReason::Local);
+        assert_eq!(failure.ended.reason, EndReason::Local);
+        assert!(
+            failure.hangup.is_some(),
+            "our call: the callee stops ringing"
+        );
 
         let mut calls = dialled(&["d1"]);
         calls.stream_closed(T0);
@@ -1283,13 +1339,58 @@ mod tests {
     #[test]
     fn a_failure_is_completed_after_the_answer_and_failed_before() {
         let mut calls = dialled(&["d1"]);
-        assert_eq!(calls.fail(T0).unwrap().history, Some(HistoryStatus::Failed));
+        assert_eq!(
+            calls.fail(T0).unwrap().ended.history,
+            Some(HistoryStatus::Failed)
+        );
         let mut calls = dialled(&["d1"]);
         calls.answer_from("c1", "d1");
         calls.answered(T0);
-        let ended = calls.fail(T0 + 3_000).unwrap();
+        let ended = calls.fail(T0 + 3_000).unwrap().ended;
         assert_eq!(ended.history, Some(HistoryStatus::Completed));
         assert_eq!(ended.duration_seconds, 3);
         assert_eq!(Calls::new().fail(T0), None);
+    }
+
+    /// A failure tells the peer, to the devices the call reached, end to end and on the stream
+    /// (2026-11-16: an iPhone whose ICE failed and an iPhone that could not fetch TURN each ended
+    /// the call alone, and the other side waited for a person to hang up).
+    ///
+    /// Mutations: no hangup; `Normal` for `ConnectionFailed`; the offered devices once one is
+    /// chosen; the remote route; a hangup from a device still ringing.
+    #[test]
+    fn a_failure_tells_the_devices_the_call_reached() {
+        let mut calls = dialled(&["d1", "d2"]);
+        let hangup = calls.fail(T0).unwrap().hangup.expect("our call tells");
+        assert_eq!(hangup.reason, HangupReason::ConnectionFailed);
+        assert_eq!(hangup.targets, vec!["d1".to_owned(), "d2".to_owned()]);
+        assert_eq!(
+            hangup.route,
+            HangupRoute {
+                e2ee: true,
+                stream: true
+            }
+        );
+
+        let mut calls = dialled(&["d1", "d2"]);
+        calls.answer_from("c1", "d2");
+        let hangup = calls.fail(T0).unwrap().hangup.unwrap();
+        assert_eq!(
+            hangup.targets,
+            vec!["d2".to_owned()],
+            "the one that answered"
+        );
+
+        let mut calls = rung();
+        calls.accept(T0);
+        let hangup = calls
+            .fail(T0)
+            .unwrap()
+            .hangup
+            .expect("accepted: theirs tells");
+        assert_eq!(hangup.targets, vec!["d1".to_owned()]);
+
+        let mut calls = rung();
+        assert_eq!(calls.fail(T0).unwrap().hangup, None, "still ringing here");
     }
 }

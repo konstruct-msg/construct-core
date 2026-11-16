@@ -1153,6 +1153,11 @@ pub struct CallTimings {
     pub ended_memory_ms: i64,
 }
 
+/// The TURN urls a call relays through; None: the call is not placed (`calls::relay_urls`).
+pub fn call_relay_urls(turn_urls: Vec<String>, veil_on: bool) -> Option<Vec<String>> {
+    calls::relay_urls(&turn_urls, veil_on)
+}
+
 pub fn call_timings() -> CallTimings {
     use call_machine::timing as t;
     CallTimings {
@@ -1301,7 +1306,7 @@ pub enum CallOfferStep {
     Hold,
     ResumeAnswer,
     Renegotiate,
-    Fail { ended: CallEnded },
+    Fail { failure: CallFailure },
 }
 
 impl From<call_machine::OfferStep> for CallOfferStep {
@@ -1316,8 +1321,8 @@ impl From<call_machine::OfferStep> for CallOfferStep {
             S::Hold => Self::Hold,
             S::ResumeAnswer => Self::ResumeAnswer,
             S::Renegotiate => Self::Renegotiate,
-            S::Fail(ended) => Self::Fail {
-                ended: ended.into(),
+            S::Fail(failure) => Self::Fail {
+                failure: failure.into(),
             },
         }
     }
@@ -1356,6 +1361,35 @@ impl From<call_machine::Hangup> for CallLocalHangup {
             targets: h.targets,
             route: h.route.into(),
             ended: h.ended.into(),
+        }
+    }
+}
+
+/// A failure of ours (`call_machine::Failure`): the end, and the hangup that tells the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallFailure {
+    pub ended: CallEnded,
+    /// None: nothing goes out (their call, still ringing here).
+    pub hangup: Option<CallFailureHangup>,
+}
+
+/// The hangup a failure sends (`call_machine::FailureHangup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallFailureHangup {
+    pub reason: CallHangupReason,
+    pub targets: Vec<String>,
+    pub route: CallHangupRoute,
+}
+
+impl From<call_machine::Failure> for CallFailure {
+    fn from(f: call_machine::Failure) -> Self {
+        Self {
+            ended: f.ended.into(),
+            hangup: f.hangup.map(|h| CallFailureHangup {
+                reason: h.reason.into(),
+                targets: h.targets,
+                route: h.route.into(),
+            }),
         }
     }
 }
@@ -1399,7 +1433,7 @@ impl From<call_machine::RemoteHangupStep> for CallRemoteHangupStep {
 pub enum CallStreamStep {
     Reconnect,
     KeepOnMessagePath,
-    End { ended: CallEnded },
+    End { failure: CallFailure },
 }
 
 impl From<call_machine::StreamStep> for CallStreamStep {
@@ -1407,8 +1441,8 @@ impl From<call_machine::StreamStep> for CallStreamStep {
         match s {
             call_machine::StreamStep::Reconnect => Self::Reconnect,
             call_machine::StreamStep::KeepOnMessagePath => Self::KeepOnMessagePath,
-            call_machine::StreamStep::End(ended) => Self::End {
-                ended: ended.into(),
+            call_machine::StreamStep::End(failure) => Self::End {
+                failure: failure.into(),
             },
         }
     }
@@ -1434,7 +1468,7 @@ impl From<call_machine::IceStep> for CallIceStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallDue {
     Unanswered { hangup: CallLocalHangup },
-    NoOffer { ended: CallEnded },
+    NoOffer { failure: CallFailure },
     RestartIce,
 }
 
@@ -1444,8 +1478,8 @@ impl From<call_machine::Due> for CallDue {
             call_machine::Due::Unanswered(hangup) => Self::Unanswered {
                 hangup: hangup.into(),
             },
-            call_machine::Due::NoOffer(ended) => Self::NoOffer {
-                ended: ended.into(),
+            call_machine::Due::NoOffer(failure) => Self::NoOffer {
+                failure: failure.into(),
             },
             call_machine::Due::RestartIce => Self::RestartIce,
         }
@@ -1569,7 +1603,7 @@ impl CallMachine {
             .map(Into::into)
     }
 
-    pub fn fail(&self, now_ms: i64) -> Option<CallEnded> {
+    pub fn fail(&self, now_ms: i64) -> Option<CallFailure> {
         self.calls().fail(now_ms).map(Into::into)
     }
 
@@ -1604,6 +1638,21 @@ mod tests {
 
     fn s(v: &str) -> String {
         v.to_owned()
+    }
+
+    /// Mutations that redden it: `None`; `Some(vec![])`; the arguments ignored.
+    #[test]
+    fn the_relay_urls_cross_the_bridge() {
+        let urls = vec![
+            "turn:t.example:3478".to_owned(),
+            "turns:t.example:5349".to_owned(),
+        ];
+        assert_eq!(call_relay_urls(Vec::new(), false), None);
+        assert_eq!(call_relay_urls(urls.clone(), false), Some(urls.clone()));
+        assert_eq!(
+            call_relay_urls(urls, true),
+            Some(vec!["turns:t.example:5349".to_owned()])
+        );
     }
 
     /// The call machine's exports carry its state and every step through. Mutations that redden
@@ -1735,12 +1784,15 @@ mod tests {
         assert_eq!(m.media_quality(true, 3), CallIceStep::Skip);
         m.media_connected();
         assert_eq!(m.media_quality(true, 3), CallIceStep::CalleeWaits);
-        let CallOfferStep::Fail { ended } = m.offer(s("c1"), s("a"), s("d1"), false, s("b"), 4)
+        let CallOfferStep::Fail { failure } = m.offer(s("c1"), s("a"), s("d1"), false, s("b"), 4)
         else {
             panic!("an unusable offer for the call in progress ends it");
         };
-        assert_eq!(ended.cause, CallEndCause::Local);
-        assert_eq!(ended.direction, CallDirection::Incoming);
+        assert_eq!(failure.ended.cause, CallEndCause::Local);
+        assert_eq!(failure.ended.direction, CallDirection::Incoming);
+        let hangup = failure.hangup.expect("answered: the caller is told");
+        assert_eq!(hangup.reason, CallHangupReason::ConnectionFailed);
+        assert_eq!(hangup.targets, vec![s("d1")]);
 
         // Theirs, by offer: held, then glare and the ways it ends.
         let m = CallMachine::new();
@@ -1810,10 +1862,10 @@ mod tests {
         let m = CallMachine::new();
         m.push(s("c1"), s("a"), 0);
         m.accept(0);
-        let CallDue::NoOffer { ended } = m.tick(45_000).unwrap() else {
+        let CallDue::NoOffer { failure } = m.tick(45_000).unwrap() else {
             panic!("the offer never came");
         };
-        assert_eq!(ended.history, Some(CallHistoryStatus::Failed));
+        assert_eq!(failure.ended.history, Some(CallHistoryStatus::Failed));
 
         let m = CallMachine::new();
         m.dial(s("c1"), s("b"), 0);
@@ -1832,10 +1884,10 @@ mod tests {
         for _ in 0..3 {
             m.stream_closed(0);
         }
-        let Some(CallStreamStep::End { ended }) = m.stream_closed(0) else {
+        let Some(CallStreamStep::End { failure }) = m.stream_closed(0) else {
             panic!("nothing bounds the call");
         };
-        assert_eq!(ended.outcome, CallEndOutcome::Failed);
+        assert_eq!(failure.ended.outcome, CallEndOutcome::Failed);
         m.dial(s("c4"), s("b"), 0);
         m.answer_from(s("c4"), s("d1"));
         m.answered(0);
@@ -1845,7 +1897,7 @@ mod tests {
         }
         assert_eq!(m.stream_closed(0), Some(CallStreamStep::KeepOnMessagePath));
         assert_eq!(
-            m.fail(0).unwrap().history,
+            m.fail(0).unwrap().ended.history,
             Some(CallHistoryStatus::Completed)
         );
         assert_eq!(m.fail(0), None);

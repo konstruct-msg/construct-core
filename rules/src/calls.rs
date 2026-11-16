@@ -219,6 +219,44 @@ pub fn local_hangup_reason(direction: Direction, still_ringing: bool) -> HangupR
     }
 }
 
+/// Whether a failure of ours tells the peer: always for our call, for theirs once we accepted it.
+/// A hangup from a device still ringing ends the call on every device ([`on_hangup`]), so a device
+/// that failed before the person answered stays quiet and leaves the others ringing (Signal
+/// RingRTC `Call::should_send_hangup_on_failure`).
+pub fn failure_tells_peer(direction: Direction, still_ringing: bool) -> bool {
+    direction == Direction::Outgoing || !still_ringing
+}
+
+// ── The relay ─────────────────────────────────────────────────────────────────
+
+/// The TURN urls a call relays through; `None`: the call is not placed.
+///
+/// Every call is relay-only (owner, 2026-10-16, for 1.0): a direct call hands each side the
+/// other's network address, and an address names a person where the account does not. So no
+/// STUN fallback without TURN — that would be a direct call — the call fails instead, which the
+/// person sees. With VEIL on, TURN over TLS (`turns:`) when the server offers it: the TURN
+/// handshake and the media are then inside TLS, not in clear on 3478. Without VEIL plain TURN
+/// stays, UDP first, for latency.
+///
+/// iOS had this since 2026-10-16 (`CallIcePlan`); Android still went direct with VEIL off, and its
+/// first candidate, a private host address, failed the iPhone's relay-only check in a second
+/// (2026-11-16). The platform sets the ICE transport policy to relay for every call.
+pub fn relay_urls(turn_urls: &[String], veil_on: bool) -> Option<Vec<String>> {
+    if turn_urls.is_empty() {
+        return None;
+    }
+    let over_tls: Vec<String> = turn_urls
+        .iter()
+        .filter(|url| url.to_ascii_lowercase().starts_with("turns:"))
+        .cloned()
+        .collect();
+    Some(if veil_on && !over_tls.is_empty() {
+        over_tls
+    } else {
+        turn_urls.to_vec()
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glare {
     /// Keep our outgoing call and ignore their offer.
@@ -611,6 +649,45 @@ mod tests {
         assert_eq!(
             local_hangup_reason(Direction::Outgoing, true),
             HangupReason::Normal
+        );
+    }
+
+    /// Mutations that redden it: `&&` for `||` (an outgoing call that failed while it rang says
+    /// nothing — the 2026-11-16 caller that waited); `true` (a ringing device that failed ends the
+    /// call on the others).
+    #[test]
+    fn a_failure_tells_the_peer_unless_their_call_is_still_ringing_here() {
+        assert!(failure_tells_peer(Direction::Outgoing, true));
+        assert!(failure_tells_peer(Direction::Outgoing, false));
+        assert!(failure_tells_peer(Direction::Incoming, false));
+        assert!(!failure_tells_peer(Direction::Incoming, true));
+    }
+
+    /// Mutations that redden it: `Some` for empty (a STUN-only, direct call); drop the VEIL check
+    /// (TLS only without VEIL); drop the TLS filter; return the TLS ones when there are none.
+    #[test]
+    fn a_call_relays_through_turn_or_is_not_placed() {
+        let mixed = ids(&[
+            "turn:t.example:3478?transport=udp",
+            "TURNS:t.example:5349?transport=tcp",
+        ]);
+        assert_eq!(relay_urls(&[], false), None, "no TURN: a direct call");
+        assert_eq!(relay_urls(&[], true), None);
+        assert_eq!(
+            relay_urls(&mixed, false),
+            Some(mixed.clone()),
+            "VEIL off: UDP first"
+        );
+        assert_eq!(
+            relay_urls(&mixed, true),
+            Some(ids(&["TURNS:t.example:5349?transport=tcp"])),
+            "VEIL on: inside TLS"
+        );
+        let plain = ids(&["turn:t.example:3478?transport=udp"]);
+        assert_eq!(
+            relay_urls(&plain, true),
+            Some(plain.clone()),
+            "VEIL on, no TLS offered: plain TURN, still relayed"
         );
     }
 
