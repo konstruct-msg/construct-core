@@ -121,6 +121,8 @@ namespace construct_core {
     CallStreamClosedAction call_on_stream_closed(boolean can_reconnect, boolean media_connected, boolean awaiting_offer_after_answer);
     /// Which channels a hangup is written to (end to end, the signalling stream).
     CallHangupRoute call_hangup_route(CallHangupSide side, CallHangupReason reason);
+    /// The call timings the call machine keeps (construct-rules `call_machine::timing`).
+    CallTimings call_timings();
 
     /// Fan-out retry (construct-rules `fanout_retry`): attempts before an owed copy is given up,
     /// and the first wait.
@@ -356,6 +358,166 @@ enum CallHangupSide {
 dictionary CallHangupRoute {
     boolean e2ee;
     boolean stream;
+};
+
+dictionary CallTimings {
+    i64 unanswered_ms;
+    i64 offer_wait_ms;
+    i64 ice_restart_grace_ms;
+    u32 max_ice_restarts;
+    u32 max_stream_retries;
+    u32 max_post_media_reconnects;
+    i64 ended_memory_ms;
+};
+
+/// Where the call in progress is. An ended call is not a phase: it leaves the machine as a
+/// `CallEnded`.
+enum CallMachinePhase {
+    "Incoming",
+    "Dialing",
+    "Ringing",
+    "Connecting",
+    "Active",
+};
+
+/// The call in progress, as `CallMachine` holds it.
+dictionary CallSnapshot {
+    string call_id;
+    string peer_user_id;
+    CallDirection direction;
+    CallMachinePhase phase;
+    string? chosen;
+    sequence<string> offered;
+    /// Who a signal of ours goes to now; empty: the pinned device.
+    sequence<string> targets;
+    i64 started_at_ms;
+    i64? answered_at_ms;
+    boolean holds_offer;
+    boolean awaiting_offer_after_answer;
+    boolean media_connected;
+    boolean reconnecting;
+};
+
+/// A call that ended: its screen and its history row (none: taken on another of our devices).
+dictionary CallEnded {
+    string call_id;
+    string peer_user_id;
+    CallDirection direction;
+    CallEndCause cause;
+    CallEndOutcome outcome;
+    CallHistoryStatus? history;
+    i64 started_at_ms;
+    u32 duration_seconds;
+};
+
+enum CallDialAction {
+    "Start",
+    "AnswerInstead",
+    "Busy",
+};
+
+enum CallPushAction {
+    "Begin",
+    "AlreadyTracking",
+    "DeferToGlare",
+    "DeclineBusy",
+};
+
+[Enum]
+interface CallOfferStep {
+    Ignore();
+    Ring();
+    ReplaceOutgoing(string replaced);
+    KeepOurs();
+    Busy();
+    Hold();
+    ResumeAnswer();
+    Renegotiate();
+    Fail(CallEnded ended);
+};
+
+enum CallAcceptStep {
+    "ApplyOffer",
+    "WaitForOffer",
+    "Ignore",
+};
+
+/// A hangup of ours: to `targets` (empty: the pinned device) on `route`.
+dictionary CallLocalHangup {
+    CallHangupReason reason;
+    sequence<string> targets;
+    CallHangupRoute route;
+    CallEnded ended;
+};
+
+[Enum]
+interface CallRemoteHangupStep {
+    Ignore();
+    DropDevice(sequence<string> remaining);
+    End(sequence<string> release, CallHangupReason reason, CallHangupRoute route, CallEnded ended);
+};
+
+[Enum]
+interface CallStreamStep {
+    Reconnect();
+    KeepOnMessagePath();
+    End(CallEnded ended);
+};
+
+enum CallIceStep {
+    "Schedule",
+    "CalleeWaits",
+    "Skip",
+};
+
+[Enum]
+interface CallDue {
+    Unanswered(CallLocalHangup hangup);
+    NoOffer(CallEnded ended);
+    RestartIce();
+};
+
+/// The call this device is in (construct-rules `call_machine`): its phase, devices, held or
+/// awaited offer, media, stream and ICE-restart budgets, ended ids and deadlines. Each method
+/// takes an event and the time (Unix ms) and returns what it decided; the app sends, runs WebRTC
+/// and CallKit, and keeps one timer at `next_deadline`, calling `tick` when it fires.
+interface CallMachine {
+    constructor();
+    CallSnapshot? active();
+    boolean recently_ended(string call_id, i64 now_ms);
+    /// The person asked to call `peer_user_id`.
+    CallDialAction dial(string call_id, string peer_user_id, i64 now_ms);
+    /// Our offer went to `devices`.
+    void offer_sent(sequence<string> devices);
+    /// A VoIP push (iOS): a call id, no SDP.
+    CallPushAction push(string call_id, string peer_user_id, i64 now_ms);
+    /// An offer out of the Double Ratchet from `device`; `usable`: it carries an SDP.
+    CallOfferStep offer(string call_id, string peer_user_id, string device, boolean usable, string my_user_id, i64 now_ms);
+    /// The person answered the incoming call.
+    CallAcceptStep accept(i64 now_ms);
+    /// Our answer went out (or a renegotiation's): the call is answered.
+    void answered(i64 now_ms);
+    /// One of their devices rang; whether the phase moved.
+    boolean ringing();
+    /// An answer to our call from `device`; null when it is not for this outgoing call.
+    CallAnswerDisposition? answer_from(string call_id, string device);
+    /// We end the call.
+    CallLocalHangup? hang_up(i64 now_ms);
+    /// A hangup or busy from one of the peer's devices, end to end.
+    CallRemoteHangupStep hangup_from(string call_id, string device, CallHangupReason reason, i64 now_ms);
+    /// The server ended it over the stream; nothing goes back.
+    CallEnded? ended_by_server(CallHangupReason reason, i64 now_ms);
+    /// A signalling error; null when the call goes on (a rate limit).
+    CallEnded? server_error(CallSignalError error, i64 now_ms);
+    /// Our own setup or path failed.
+    CallEnded? fail(i64 now_ms);
+    void media_connected();
+    CallIceStep media_quality(boolean reconnecting, i64 now_ms);
+    /// The ICE-restart offer went out, or failed to.
+    void ice_restart_sent();
+    CallStreamStep? stream_closed(i64 now_ms);
+    i64? next_deadline();
+    CallDue? tick(i64 now_ms);
 };
 
 enum CallGlare {

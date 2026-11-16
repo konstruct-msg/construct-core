@@ -5,8 +5,8 @@
 use std::sync::Mutex;
 
 use crate::rule_state::{
-    self, calls, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync, send_failure,
-    stream_cursor,
+    self, call_machine, calls, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync,
+    send_failure, stream_cursor,
 };
 use crate::uniffi_bindings::CryptoError;
 
@@ -1107,9 +1107,750 @@ pub fn call_hangup_route(side: CallHangupSide, reason: CallHangupReason) -> Call
     }
 }
 
+// ── The call machine ──────────────────────────────────────────────────────────
+
+impl From<calls::Direction> for CallDirection {
+    fn from(d: calls::Direction) -> Self {
+        match d {
+            calls::Direction::Incoming => Self::Incoming,
+            calls::Direction::Outgoing => Self::Outgoing,
+        }
+    }
+}
+
+impl From<calls::EndReason> for CallEndCause {
+    fn from(r: calls::EndReason) -> Self {
+        match r {
+            calls::EndReason::Hangup(reason) => Self::Hangup {
+                reason: reason.into(),
+            },
+            calls::EndReason::Error(error) => Self::ServerError {
+                error: error.into(),
+            },
+            calls::EndReason::Local => Self::Local,
+        }
+    }
+}
+
+impl From<calls::HangupRoute> for CallHangupRoute {
+    fn from(r: calls::HangupRoute) -> Self {
+        Self {
+            e2ee: r.e2ee,
+            stream: r.stream,
+        }
+    }
+}
+
+/// The timings the call machine keeps (`call_machine::timing`), for a platform's logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallTimings {
+    pub unanswered_ms: i64,
+    pub offer_wait_ms: i64,
+    pub ice_restart_grace_ms: i64,
+    pub max_ice_restarts: u32,
+    pub max_stream_retries: u32,
+    pub max_post_media_reconnects: u32,
+    pub ended_memory_ms: i64,
+}
+
+pub fn call_timings() -> CallTimings {
+    use call_machine::timing as t;
+    CallTimings {
+        unanswered_ms: t::UNANSWERED_MS,
+        offer_wait_ms: t::OFFER_WAIT_MS,
+        ice_restart_grace_ms: t::ICE_RESTART_GRACE_MS,
+        max_ice_restarts: t::MAX_ICE_RESTARTS,
+        max_stream_retries: t::MAX_STREAM_RETRIES,
+        max_post_media_reconnects: t::MAX_POST_MEDIA_RECONNECTS,
+        ended_memory_ms: t::ENDED_MEMORY_MS,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallMachinePhase {
+    Incoming,
+    Dialing,
+    Ringing,
+    Connecting,
+    Active,
+}
+
+impl From<call_machine::Phase> for CallMachinePhase {
+    fn from(p: call_machine::Phase) -> Self {
+        match p {
+            call_machine::Phase::Incoming => Self::Incoming,
+            call_machine::Phase::Dialing => Self::Dialing,
+            call_machine::Phase::Ringing => Self::Ringing,
+            call_machine::Phase::Connecting => Self::Connecting,
+            call_machine::Phase::Active => Self::Active,
+        }
+    }
+}
+
+/// The call in progress, as the machine holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSnapshot {
+    pub call_id: String,
+    pub peer_user_id: String,
+    pub direction: CallDirection,
+    pub phase: CallMachinePhase,
+    pub chosen: Option<String>,
+    pub offered: Vec<String>,
+    /// Who a signal of ours goes to now (`Call::targets`); empty: the pinned device.
+    pub targets: Vec<String>,
+    pub started_at_ms: i64,
+    pub answered_at_ms: Option<i64>,
+    pub holds_offer: bool,
+    pub awaiting_offer_after_answer: bool,
+    pub media_connected: bool,
+    pub reconnecting: bool,
+}
+
+impl From<&call_machine::Call> for CallSnapshot {
+    fn from(c: &call_machine::Call) -> Self {
+        Self {
+            call_id: c.call_id.clone(),
+            peer_user_id: c.peer_user_id.clone(),
+            direction: c.direction.into(),
+            phase: c.phase.into(),
+            chosen: c.chosen.clone(),
+            offered: c.offered.clone(),
+            targets: c.targets(),
+            started_at_ms: c.started_at_ms,
+            answered_at_ms: c.answered_at_ms,
+            holds_offer: c.holds_offer,
+            awaiting_offer_after_answer: c.awaiting_offer_after_answer,
+            media_connected: c.media_connected,
+            reconnecting: c.reconnecting,
+        }
+    }
+}
+
+/// A call that ended: its screen and its history row (`call_machine::Ended`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallEnded {
+    pub call_id: String,
+    pub peer_user_id: String,
+    pub direction: CallDirection,
+    pub cause: CallEndCause,
+    pub outcome: CallEndOutcome,
+    /// None: no row (taken on another of our devices).
+    pub history: Option<CallHistoryStatus>,
+    pub started_at_ms: i64,
+    pub duration_seconds: u32,
+}
+
+impl From<call_machine::Ended> for CallEnded {
+    fn from(e: call_machine::Ended) -> Self {
+        Self {
+            call_id: e.call_id,
+            peer_user_id: e.peer_user_id,
+            direction: e.direction.into(),
+            cause: e.reason.into(),
+            outcome: e.outcome.into(),
+            history: e.history.map(Into::into),
+            started_at_ms: e.started_at_ms,
+            duration_seconds: e.duration_seconds,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallDialAction {
+    Start,
+    AnswerInstead,
+    Busy,
+}
+
+impl From<call_machine::DialAction> for CallDialAction {
+    fn from(a: call_machine::DialAction) -> Self {
+        match a {
+            call_machine::DialAction::Start => Self::Start,
+            call_machine::DialAction::AnswerInstead => Self::AnswerInstead,
+            call_machine::DialAction::Busy => Self::Busy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallPushAction {
+    Begin,
+    AlreadyTracking,
+    DeferToGlare,
+    DeclineBusy,
+}
+
+impl From<call_machine::PushAction> for CallPushAction {
+    fn from(a: call_machine::PushAction) -> Self {
+        match a {
+            call_machine::PushAction::Begin => Self::Begin,
+            call_machine::PushAction::AlreadyTracking => Self::AlreadyTracking,
+            call_machine::PushAction::DeferToGlare => Self::DeferToGlare,
+            call_machine::PushAction::DeclineBusy => Self::DeclineBusy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallOfferStep {
+    Ignore,
+    Ring,
+    ReplaceOutgoing { replaced: String },
+    KeepOurs,
+    Busy,
+    Hold,
+    ResumeAnswer,
+    Renegotiate,
+    Fail { ended: CallEnded },
+}
+
+impl From<call_machine::OfferStep> for CallOfferStep {
+    fn from(s: call_machine::OfferStep) -> Self {
+        use call_machine::OfferStep as S;
+        match s {
+            S::Ignore => Self::Ignore,
+            S::Ring => Self::Ring,
+            S::ReplaceOutgoing { replaced } => Self::ReplaceOutgoing { replaced },
+            S::KeepOurs => Self::KeepOurs,
+            S::Busy => Self::Busy,
+            S::Hold => Self::Hold,
+            S::ResumeAnswer => Self::ResumeAnswer,
+            S::Renegotiate => Self::Renegotiate,
+            S::Fail(ended) => Self::Fail {
+                ended: ended.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAcceptStep {
+    ApplyOffer,
+    WaitForOffer,
+    Ignore,
+}
+
+impl From<call_machine::AcceptStep> for CallAcceptStep {
+    fn from(s: call_machine::AcceptStep) -> Self {
+        match s {
+            call_machine::AcceptStep::ApplyOffer => Self::ApplyOffer,
+            call_machine::AcceptStep::WaitForOffer => Self::WaitForOffer,
+            call_machine::AcceptStep::Ignore => Self::Ignore,
+        }
+    }
+}
+
+/// A hangup of ours (`call_machine::Hangup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLocalHangup {
+    pub reason: CallHangupReason,
+    pub targets: Vec<String>,
+    pub route: CallHangupRoute,
+    pub ended: CallEnded,
+}
+
+impl From<call_machine::Hangup> for CallLocalHangup {
+    fn from(h: call_machine::Hangup) -> Self {
+        Self {
+            reason: h.reason.into(),
+            targets: h.targets,
+            route: h.route.into(),
+            ended: h.ended.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallRemoteHangupStep {
+    Ignore,
+    DropDevice {
+        remaining: Vec<String>,
+    },
+    End {
+        release: Vec<String>,
+        reason: CallHangupReason,
+        route: CallHangupRoute,
+        ended: CallEnded,
+    },
+}
+
+impl From<call_machine::RemoteHangupStep> for CallRemoteHangupStep {
+    fn from(s: call_machine::RemoteHangupStep) -> Self {
+        use call_machine::RemoteHangupStep as S;
+        match s {
+            S::Ignore => Self::Ignore,
+            S::DropDevice { remaining } => Self::DropDevice { remaining },
+            S::End {
+                release,
+                reason,
+                route,
+                ended,
+            } => Self::End {
+                release,
+                reason: reason.into(),
+                route: route.into(),
+                ended: ended.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallStreamStep {
+    Reconnect,
+    KeepOnMessagePath,
+    End { ended: CallEnded },
+}
+
+impl From<call_machine::StreamStep> for CallStreamStep {
+    fn from(s: call_machine::StreamStep) -> Self {
+        match s {
+            call_machine::StreamStep::Reconnect => Self::Reconnect,
+            call_machine::StreamStep::KeepOnMessagePath => Self::KeepOnMessagePath,
+            call_machine::StreamStep::End(ended) => Self::End {
+                ended: ended.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallIceStep {
+    Schedule,
+    CalleeWaits,
+    Skip,
+}
+
+impl From<call_machine::IceStep> for CallIceStep {
+    fn from(s: call_machine::IceStep) -> Self {
+        match s {
+            call_machine::IceStep::Schedule => Self::Schedule,
+            call_machine::IceStep::CalleeWaits => Self::CalleeWaits,
+            call_machine::IceStep::Skip => Self::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallDue {
+    Unanswered { hangup: CallLocalHangup },
+    NoOffer { ended: CallEnded },
+    RestartIce,
+}
+
+impl From<call_machine::Due> for CallDue {
+    fn from(d: call_machine::Due) -> Self {
+        match d {
+            call_machine::Due::Unanswered(hangup) => Self::Unanswered {
+                hangup: hangup.into(),
+            },
+            call_machine::Due::NoOffer(ended) => Self::NoOffer {
+                ended: ended.into(),
+            },
+            call_machine::Due::RestartIce => Self::RestartIce,
+        }
+    }
+}
+
+/// The call this device is in (`construct_rules::call_machine`). One per app; it is not kept:
+/// a call does not outlive the process.
+pub struct CallMachine {
+    calls: Mutex<call_machine::Calls>,
+}
+
+impl Default for CallMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallMachine {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(call_machine::Calls::new()),
+        }
+    }
+
+    fn calls(&self) -> std::sync::MutexGuard<'_, call_machine::Calls> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn active(&self) -> Option<CallSnapshot> {
+        self.calls().active().map(Into::into)
+    }
+
+    pub fn recently_ended(&self, call_id: String, now_ms: i64) -> bool {
+        self.calls().recently_ended(&call_id, now_ms)
+    }
+
+    pub fn dial(&self, call_id: String, peer_user_id: String, now_ms: i64) -> CallDialAction {
+        self.calls().dial(&call_id, &peer_user_id, now_ms).into()
+    }
+
+    pub fn offer_sent(&self, devices: Vec<String>) {
+        self.calls().offer_sent(devices)
+    }
+
+    pub fn push(&self, call_id: String, peer_user_id: String, now_ms: i64) -> CallPushAction {
+        self.calls().push(&call_id, &peer_user_id, now_ms).into()
+    }
+
+    pub fn offer(
+        &self,
+        call_id: String,
+        peer_user_id: String,
+        device: String,
+        usable: bool,
+        my_user_id: String,
+        now_ms: i64,
+    ) -> CallOfferStep {
+        self.calls()
+            .offer(
+                &call_id,
+                &peer_user_id,
+                &device,
+                usable,
+                &my_user_id,
+                now_ms,
+            )
+            .into()
+    }
+
+    pub fn accept(&self, now_ms: i64) -> CallAcceptStep {
+        self.calls().accept(now_ms).into()
+    }
+
+    pub fn answered(&self, now_ms: i64) {
+        self.calls().answered(now_ms)
+    }
+
+    pub fn ringing(&self) -> bool {
+        self.calls().ringing()
+    }
+
+    pub fn answer_from(&self, call_id: String, device: String) -> Option<CallAnswerDisposition> {
+        self.calls()
+            .answer_from(&call_id, &device)
+            .map(|d| match d {
+                calls::AnswerDisposition::Accept { device, release } => {
+                    CallAnswerDisposition::Accept { device, release }
+                }
+                calls::AnswerDisposition::ReleaseLate { device } => {
+                    CallAnswerDisposition::ReleaseLate { device }
+                }
+            })
+    }
+
+    pub fn hang_up(&self, now_ms: i64) -> Option<CallLocalHangup> {
+        self.calls().hang_up(now_ms).map(Into::into)
+    }
+
+    pub fn hangup_from(
+        &self,
+        call_id: String,
+        device: String,
+        reason: CallHangupReason,
+        now_ms: i64,
+    ) -> CallRemoteHangupStep {
+        self.calls()
+            .hangup_from(&call_id, &device, reason.into(), now_ms)
+            .into()
+    }
+
+    pub fn ended_by_server(&self, reason: CallHangupReason, now_ms: i64) -> Option<CallEnded> {
+        self.calls()
+            .ended_by_server(reason.into(), now_ms)
+            .map(Into::into)
+    }
+
+    pub fn server_error(&self, error: CallSignalError, now_ms: i64) -> Option<CallEnded> {
+        self.calls()
+            .server_error(error.into(), now_ms)
+            .map(Into::into)
+    }
+
+    pub fn fail(&self, now_ms: i64) -> Option<CallEnded> {
+        self.calls().fail(now_ms).map(Into::into)
+    }
+
+    pub fn media_connected(&self) {
+        self.calls().media_connected()
+    }
+
+    pub fn media_quality(&self, reconnecting: bool, now_ms: i64) -> CallIceStep {
+        self.calls().media_quality(reconnecting, now_ms).into()
+    }
+
+    pub fn ice_restart_sent(&self) {
+        self.calls().ice_restart_sent()
+    }
+
+    pub fn stream_closed(&self, now_ms: i64) -> Option<CallStreamStep> {
+        self.calls().stream_closed(now_ms).map(Into::into)
+    }
+
+    pub fn next_deadline(&self) -> Option<i64> {
+        self.calls().next_deadline()
+    }
+
+    pub fn tick(&self, now_ms: i64) -> Option<CallDue> {
+        self.calls().tick(now_ms).map(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_owned()
+    }
+
+    /// The call machine's exports carry its state and every step through. Mutations that redden
+    /// it: swap two arms of any `call_machine` conversion, a snapshot field, an `Ended` field, a
+    /// timing.
+    #[test]
+    fn the_call_machine_crosses_the_bridge_whole() {
+        let t = call_timings();
+        assert_eq!(
+            (
+                t.unanswered_ms,
+                t.offer_wait_ms,
+                t.ice_restart_grace_ms,
+                t.ended_memory_ms
+            ),
+            (90_000, 45_000, 2_000, 120_000)
+        );
+        assert_eq!(
+            (
+                t.max_ice_restarts,
+                t.max_stream_retries,
+                t.max_post_media_reconnects
+            ),
+            (3, 3, 5)
+        );
+
+        // Ours: dial, offer, ring, answer, media, ICE, stream, hang up.
+        let m = CallMachine::new();
+        assert_eq!(m.dial(s("c1"), s("b"), 1_000), CallDialAction::Start);
+        assert_eq!(m.dial(s("c2"), s("x"), 1_000), CallDialAction::Busy);
+        m.offer_sent(vec![s("d1"), s("d2")]);
+        let snap = m.active().unwrap();
+        assert_eq!(
+            (snap.call_id.as_str(), snap.peer_user_id.as_str()),
+            ("c1", "b")
+        );
+        assert_eq!(snap.direction, CallDirection::Outgoing);
+        assert_eq!(snap.phase, CallMachinePhase::Dialing);
+        assert_eq!(snap.offered, vec![s("d1"), s("d2")]);
+        assert_eq!(snap.targets, vec![s("d1"), s("d2")]);
+        assert_eq!(snap.started_at_ms, 1_000);
+        assert!(m.ringing());
+        assert_eq!(m.active().unwrap().phase, CallMachinePhase::Ringing);
+        assert_eq!(
+            m.answer_from(s("c1"), s("d2")),
+            Some(CallAnswerDisposition::Accept {
+                device: s("d2"),
+                release: vec![s("d1")]
+            })
+        );
+        assert_eq!(
+            m.answer_from(s("c1"), s("d1")),
+            Some(CallAnswerDisposition::ReleaseLate { device: s("d1") })
+        );
+        m.answered(2_000);
+        m.media_connected();
+        let snap = m.active().unwrap();
+        assert_eq!(snap.phase, CallMachinePhase::Active);
+        assert_eq!(snap.chosen, Some(s("d2")));
+        assert_eq!(snap.answered_at_ms, Some(2_000));
+        assert!(snap.media_connected && !snap.holds_offer && !snap.awaiting_offer_after_answer);
+        assert_eq!(m.media_quality(true, 3_000), CallIceStep::Schedule);
+        assert!(m.active().unwrap().reconnecting);
+        assert_eq!(m.media_quality(true, 3_000), CallIceStep::Skip);
+        assert_eq!(m.next_deadline(), Some(5_000));
+        assert_eq!(m.tick(5_000), Some(CallDue::RestartIce));
+        assert_eq!(m.media_quality(true, 5_000), CallIceStep::Skip);
+        m.ice_restart_sent();
+        assert_eq!(m.media_quality(true, 5_000), CallIceStep::Schedule);
+        assert_eq!(m.stream_closed(5_000), Some(CallStreamStep::Reconnect));
+        assert_eq!(m.server_error(CallSignalError::RateLimited, 5_000), None);
+        let hangup = m.hang_up(9_000).unwrap();
+        assert_eq!(hangup.reason, CallHangupReason::Normal);
+        assert_eq!(hangup.targets, vec![s("d2")]);
+        assert_eq!(
+            hangup.route,
+            CallHangupRoute {
+                e2ee: true,
+                stream: true
+            }
+        );
+        let ended = hangup.ended;
+        assert_eq!(
+            (ended.call_id.as_str(), ended.peer_user_id.as_str()),
+            ("c1", "b")
+        );
+        assert_eq!(ended.direction, CallDirection::Outgoing);
+        assert_eq!(
+            ended.cause,
+            CallEndCause::Hangup {
+                reason: CallHangupReason::Normal
+            }
+        );
+        assert_eq!(
+            ended.outcome,
+            CallEndOutcome::Ended {
+                connected_seconds: Some(7)
+            }
+        );
+        assert_eq!(ended.history, Some(CallHistoryStatus::Completed));
+        assert_eq!((ended.started_at_ms, ended.duration_seconds), (1_000, 7));
+        assert!(m.recently_ended(s("c1"), 9_000));
+        assert!(!m.recently_ended(s("c9"), 9_000));
+        assert!(m.active().is_none());
+
+        // Theirs, by push: wait for the offer, then it resumes the answer.
+        let m = CallMachine::new();
+        assert_eq!(m.push(s("c1"), s("a"), 0), CallPushAction::Begin);
+        assert_eq!(m.push(s("c1"), s("a"), 0), CallPushAction::AlreadyTracking);
+        assert_eq!(m.push(s("c2"), s("x"), 0), CallPushAction::DeclineBusy);
+        assert_eq!(m.dial(s("c3"), s("a"), 0), CallDialAction::AnswerInstead);
+        assert_eq!(m.accept(0), CallAcceptStep::WaitForOffer);
+        assert!(m.active().unwrap().awaiting_offer_after_answer);
+        assert_eq!(m.accept(0), CallAcceptStep::Ignore);
+        assert_eq!(
+            m.offer(s("c1"), s("a"), s("d1"), true, s("b"), 1),
+            CallOfferStep::ResumeAnswer
+        );
+        assert!(m.active().unwrap().holds_offer);
+        m.answered(2);
+        assert_eq!(
+            m.offer(s("c1"), s("a"), s("d1"), true, s("b"), 3),
+            CallOfferStep::Renegotiate
+        );
+        assert_eq!(
+            m.offer(s("c4"), s("x"), s("x1"), true, s("b"), 3),
+            CallOfferStep::Busy
+        );
+        assert_eq!(m.media_quality(true, 3), CallIceStep::Skip);
+        m.media_connected();
+        assert_eq!(m.media_quality(true, 3), CallIceStep::CalleeWaits);
+        let CallOfferStep::Fail { ended } = m.offer(s("c1"), s("a"), s("d1"), false, s("b"), 4)
+        else {
+            panic!("an unusable offer for the call in progress ends it");
+        };
+        assert_eq!(ended.cause, CallEndCause::Local);
+        assert_eq!(ended.direction, CallDirection::Incoming);
+
+        // Theirs, by offer: held, then glare and the ways it ends.
+        let m = CallMachine::new();
+        assert_eq!(
+            m.offer(s("c1"), s("a"), s("d1"), false, s("b"), 0),
+            CallOfferStep::Ignore
+        );
+        assert_eq!(
+            m.offer(s("c1"), s("a"), s("d1"), true, s("b"), 0),
+            CallOfferStep::Ring
+        );
+        assert_eq!(m.active().unwrap().phase, CallMachinePhase::Incoming);
+        assert_eq!(
+            m.hangup_from(s("c1"), s("d9"), CallHangupReason::Normal, 0),
+            CallRemoteHangupStep::Ignore
+        );
+        assert_eq!(m.accept(0), CallAcceptStep::ApplyOffer);
+        assert_eq!(m.active().unwrap().phase, CallMachinePhase::Connecting);
+        let CallRemoteHangupStep::End {
+            release,
+            reason,
+            route,
+            ended,
+        } = m.hangup_from(s("c1"), s("d1"), CallHangupReason::Declined, 5)
+        else {
+            panic!("their decline ends the call");
+        };
+        assert!(release.is_empty());
+        assert_eq!(reason, CallHangupReason::Declined);
+        assert_eq!(
+            route,
+            CallHangupRoute {
+                e2ee: false,
+                stream: true
+            }
+        );
+        assert_eq!(ended.history, Some(CallHistoryStatus::Declined));
+
+        let m = CallMachine::new();
+        m.dial(s("mine"), s("a"), 0);
+        assert_eq!(
+            m.offer(s("theirs"), s("a"), s("d1"), true, s("b"), 0),
+            CallOfferStep::KeepOurs
+        );
+        let m = CallMachine::new();
+        m.dial(s("mine"), s("b"), 0);
+        m.offer_sent(vec![s("d1"), s("d2")]);
+        assert_eq!(
+            m.hangup_from(s("mine"), s("d1"), CallHangupReason::Busy, 0),
+            CallRemoteHangupStep::DropDevice {
+                remaining: vec![s("d2")]
+            }
+        );
+        assert_eq!(
+            m.offer(s("theirs"), s("b"), s("d1"), true, s("a"), 0),
+            CallOfferStep::ReplaceOutgoing {
+                replaced: s("mine")
+            }
+        );
+        let CallDue::Unanswered { hangup } = m.tick(90_000).unwrap() else {
+            panic!("nobody answered");
+        };
+        assert_eq!(hangup.reason, CallHangupReason::Timeout);
+        assert_eq!(hangup.ended.outcome, CallEndOutcome::NoAnswer);
+        assert_eq!(hangup.ended.history, Some(CallHistoryStatus::Missed));
+
+        let m = CallMachine::new();
+        m.push(s("c1"), s("a"), 0);
+        m.accept(0);
+        let CallDue::NoOffer { ended } = m.tick(45_000).unwrap() else {
+            panic!("the offer never came");
+        };
+        assert_eq!(ended.history, Some(CallHistoryStatus::Failed));
+
+        let m = CallMachine::new();
+        m.dial(s("c1"), s("b"), 0);
+        let ended = m.server_error(CallSignalError::CallExpired, 0).unwrap();
+        assert_eq!(
+            ended.cause,
+            CallEndCause::ServerError {
+                error: CallSignalError::CallExpired
+            }
+        );
+        assert_eq!(ended.outcome, CallEndOutcome::NoAnswer);
+        m.dial(s("c2"), s("b"), 0);
+        let ended = m.ended_by_server(CallHangupReason::Busy, 0).unwrap();
+        assert_eq!(ended.outcome, CallEndOutcome::Busy);
+        m.dial(s("c3"), s("b"), 0);
+        for _ in 0..3 {
+            m.stream_closed(0);
+        }
+        let Some(CallStreamStep::End { ended }) = m.stream_closed(0) else {
+            panic!("nothing bounds the call");
+        };
+        assert_eq!(ended.outcome, CallEndOutcome::Failed);
+        m.dial(s("c4"), s("b"), 0);
+        m.answer_from(s("c4"), s("d1"));
+        m.answered(0);
+        m.media_connected();
+        for _ in 0..5 {
+            m.stream_closed(0);
+        }
+        assert_eq!(m.stream_closed(0), Some(CallStreamStep::KeepOnMessagePath));
+        assert_eq!(
+            m.fail(0).unwrap().history,
+            Some(CallHistoryStatus::Completed)
+        );
+        assert_eq!(m.fail(0), None);
+        assert_eq!(m.next_deadline(), None);
+    }
 
     /// The call exports carry every variant through, both ways. Mutation that reddens it: swap two
     /// arms of any call `From`, or of `call_on_hangup` / `call_on_answer` / `call_glare`.
