@@ -40,7 +40,10 @@ pub enum Phase {
     /// We are opening a session by sending: the bundle is being fetched and the init run. Nothing
     /// else may start a second one — two inits spend two of the peer's one-time pre-keys for one
     /// state that will be used.
-    Opening { since_ms: u64 },
+    ///
+    /// `inherited`: restored from a previous run's state (`restore_opening`). Whoever was fetching
+    /// the bundle for it died with that run, so nothing will finish it; only its TTL ends it.
+    Opening { since_ms: u64, inherited: bool },
 }
 
 /// What a client of the machine wants to happen.
@@ -48,6 +51,10 @@ pub enum Phase {
 pub enum Event {
     /// Something needs a session with this device and there is none.
     WantToOpen,
+    /// A send of ours needs a session with this device and there is none (`SessionNeeded`). Like
+    /// [`Event::WantToOpen`], except that an inherited `Opening` does not hold it: the send would
+    /// wait for an open no one is running, and nothing would wake it before the TTL.
+    SendNeedsOpen,
     /// The init finished, either way. A failed init leaves no session, and a successful one is
     /// visible in the lifecycle manager.
     OpenFinished,
@@ -91,11 +98,13 @@ impl SessionMachine {
     pub fn phase(&self, device_id: &str) -> Phase {
         let now = self.clock.now_ms();
         match self.phases.get(device_id) {
-            Some(Phase::Opening { since_ms }) if now.saturating_sub(*since_ms) < OPENING_TTL_MS => {
-                Phase::Opening {
-                    since_ms: *since_ms,
-                }
-            }
+            Some(Phase::Opening {
+                since_ms,
+                inherited,
+            }) if now.saturating_sub(*since_ms) < OPENING_TTL_MS => Phase::Opening {
+                since_ms: *since_ms,
+                inherited: *inherited,
+            },
             _ => Phase::Absent,
         }
     }
@@ -110,15 +119,37 @@ impl SessionMachine {
                 }
                 // Opening while the peer opens is not a contradiction: both states are kept and
                 // the first message either side reads settles on one.
-                self.phases
-                    .insert(device_id.to_string(), Phase::Opening { since_ms: now });
-                Effect::Open
+                self.grant(device_id, now)
+            }
+            Event::SendNeedsOpen => {
+                if matches!(
+                    self.phase(device_id),
+                    Phase::Opening {
+                        inherited: false,
+                        ..
+                    }
+                ) {
+                    return Effect::WaitForOpen;
+                }
+                self.grant(device_id, now)
             }
             Event::OpenFinished | Event::OpenFailed | Event::Forget => {
                 self.phases.remove(device_id);
                 Effect::Nothing
             }
         }
+    }
+
+    /// This run opens with `device_id` from now on.
+    fn grant(&mut self, device_id: &str, now: u64) -> Effect {
+        self.phases.insert(
+            device_id.to_string(),
+            Phase::Opening {
+                since_ms: now,
+                inherited: false,
+            },
+        );
+        Effect::Open
     }
 
     /// Devices the machine currently holds a live `Opening` for — what the persisted
@@ -138,7 +169,13 @@ impl SessionMachine {
         let now = self.clock.now_ms();
         self.phases.clear();
         for id in device_ids {
-            self.phases.insert(id, Phase::Opening { since_ms: now });
+            self.phases.insert(
+                id,
+                Phase::Opening {
+                    since_ms: now,
+                    inherited: true,
+                },
+            );
         }
     }
 
@@ -146,7 +183,7 @@ impl SessionMachine {
     pub fn prune_expired(&mut self) {
         let now = self.clock.now_ms();
         self.phases.retain(|_, phase| match phase {
-            Phase::Opening { since_ms } => now.saturating_sub(*since_ms) < OPENING_TTL_MS,
+            Phase::Opening { since_ms, .. } => now.saturating_sub(*since_ms) < OPENING_TTL_MS,
             Phase::Absent => false,
         });
     }
@@ -238,6 +275,23 @@ mod tests {
         assert_eq!(m.phase("dev"), Phase::Absent);
     }
 
+    /// Two first sends to one device: the first opens, the second waits behind it — and so does a
+    /// send behind an open the core asked for itself (the PQXDH v2 upgrade). Found on Android,
+    /// 2026-11-12: both sends fetched a bundle, the second `init_session` was refused, and its
+    /// message failed.
+    ///
+    /// Mutation: return `Open` from `SendNeedsOpen` whatever the phase — this reddens.
+    #[test]
+    fn a_second_send_waits_behind_an_open_of_this_run() {
+        let (mut m, _) = machine(1_000);
+        assert_eq!(m.handle("dev", Event::SendNeedsOpen), Effect::Open);
+        assert_eq!(m.handle("dev", Event::SendNeedsOpen), Effect::WaitForOpen);
+        assert_eq!(m.handle("dev", Event::WantToOpen), Effect::WaitForOpen);
+
+        assert_eq!(m.handle("other", Event::WantToOpen), Effect::Open);
+        assert_eq!(m.handle("other", Event::SendNeedsOpen), Effect::WaitForOpen);
+    }
+
     #[test]
     fn devices_do_not_share_a_phase() {
         let (mut m, _) = machine(1_000);
@@ -266,6 +320,23 @@ mod tests {
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::WaitForOpen);
         clock.advance_ms(OPENING_TTL_MS + 1);
         assert_eq!(m.handle("dev", Event::WantToOpen), Effect::Open);
+    }
+
+    /// An opening a previous run left is not one this run is running: a send that waited behind
+    /// it would wait for nothing until the TTL. The send opens, and from then on the opening is
+    /// this run's, so the next send waits behind it. A receiving message still waits behind the
+    /// inherited one, as before.
+    ///
+    /// Mutations that redden it: hold a send behind an inherited opening; restore openings as
+    /// this run's own.
+    #[test]
+    fn an_inherited_opening_does_not_hold_a_send() {
+        let (mut m, _) = machine(1_000);
+        m.restore_opening(["dev".to_string(), "rx".to_string()]);
+        assert_eq!(m.handle("rx", Event::WantToOpen), Effect::WaitForOpen);
+
+        assert_eq!(m.handle("dev", Event::SendNeedsOpen), Effect::Open);
+        assert_eq!(m.handle("dev", Event::SendNeedsOpen), Effect::WaitForOpen);
     }
 
     /// Only live openings are carried out; an expired one is not worth a line in the store.

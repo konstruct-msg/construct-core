@@ -2217,16 +2217,27 @@ fn binary_bundle_to_x3dh(b: &BinaryKeyBundle) -> Result<X3DHPublicKeyBundle, Cry
     })
 }
 
-/// A bundle as the reopen takes it: fresh, and split into the X3DH half and the Kyber half.
-/// Shared by `reopen_session` and `CfeIncomingEvent::SessionBundleFetched`, so both refuse the
-/// same bundles.
-fn parse_bundle_for_reopen(
+/// A bundle as `CfeIncomingEvent::SessionBundleFetched` carries it: split, with its signed
+/// prekey's age when past the limit, for the orchestrator to decide (it knows whether a session
+/// is held; this boundary does not). Every other refusal of `check_bundle_freshness` still
+/// refuses here — a PQ bundle with no Kyber signed prekey is a downgrade, not an age.
+fn parse_fetched_bundle(
     b: &BinaryKeyBundle,
 ) -> Result<crate::orchestration::orchestrator::SessionBundle, CryptoError> {
-    check_bundle_freshness(b)?;
+    let stale_age_secs = match check_bundle_freshness(b) {
+        Ok(()) => None,
+        Err(CryptoError::PeerSpkStale { age_secs }) => {
+            if b.suite_id == SuiteID::PQ_HYBRID.as_u16() && b.kyber_spk_rotation_epoch == 0 {
+                return Err(CryptoError::InvalidKeyData);
+            }
+            Some(age_secs)
+        }
+        Err(e) => return Err(e),
+    };
     Ok(crate::orchestration::orchestrator::SessionBundle {
         x3dh: binary_bundle_to_x3dh(b)?,
         kyber: kyber_keys_of(b),
+        stale_age_secs,
     })
 }
 
@@ -3206,6 +3217,11 @@ pub enum CfeIncomingEvent {
     SessionBundleUnavailable {
         contact_id: String,
     },
+    /// A send of ours needs a session with this device and none is held. See
+    /// `IncomingEvent::SessionNeeded`.
+    SessionNeeded {
+        contact_id: String,
+    },
     NetworkReconnected,
     AppLaunched,
     TimerFired {
@@ -3279,11 +3295,13 @@ impl CfeIncomingEvent {
             Self::SessionBundleFetched { contact_id, bundle } => SessionBundleFetched {
                 contact_id,
                 // Refused here or in the core, a bundle ends the same way: the handler's refusal.
-                bundle: Box::new(parse_bundle_for_reopen(&bundle).map_err(|e| e.to_string())),
+                // A stale one is not refused here: whether it opens is the orchestrator's call.
+                bundle: Box::new(parse_fetched_bundle(&bundle).map_err(|e| e.to_string())),
             },
             Self::SessionBundleUnavailable { contact_id } => {
                 SessionBundleUnavailable { contact_id }
             }
+            Self::SessionNeeded { contact_id } => SessionNeeded { contact_id },
             Self::NetworkReconnected => NetworkReconnected,
             Self::AppLaunched => AppLaunched,
             Self::TimerFired { timer_id } => TimerFired { timer_id },
@@ -3403,8 +3421,20 @@ pub enum CfeAction {
     },
     /// Open a session with `contact_id` now, as INITIATOR, over the one held: `reopen_session`.
     /// Nothing is announced — the handshake header rides on the next message. The PQXDH v2
-    /// upgrade sweep asks this for classical sessions.
+    /// upgrade sweep asks this for classical sessions, and `SessionNeeded` for a first send.
     OpenSession {
+        contact_id: String,
+    },
+    /// See `Action::OpenInFlight`: an open with `contact_id` is in flight; the send waits for it.
+    OpenInFlight {
+        contact_id: String,
+    },
+    /// See `Action::SessionHeld`: a session with `contact_id` is held after all; send now.
+    SessionHeld {
+        contact_id: String,
+    },
+    /// See `Action::SessionOpenedAtRisk`: opened from a stale signed prekey; mark it at risk.
+    SessionOpenedAtRisk {
         contact_id: String,
     },
     /// Message is queued inside the core behind an in-flight session init. Nothing lost,
@@ -3524,6 +3554,9 @@ impl CfeAction {
             },
             CheckAckInDb { message_id } => Self::CheckAckInDb { message_id },
             OpenSession { contact_id } => Self::OpenSession { contact_id },
+            OpenInFlight { contact_id } => Self::OpenInFlight { contact_id },
+            SessionHeld { contact_id } => Self::SessionHeld { contact_id },
+            SessionOpenedAtRisk { contact_id } => Self::SessionOpenedAtRisk { contact_id },
             MessageQueuedPendingInit {
                 contact_id,
                 queued_count,

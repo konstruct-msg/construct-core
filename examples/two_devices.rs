@@ -408,6 +408,7 @@ impl Server {
         Ok(SessionBundle {
             x3dh: reg.x3dh.clone(),
             kyber,
+            stale_age_secs: None,
         })
     }
 
@@ -555,6 +556,29 @@ fn execute(device: &mut Device, server: &mut Server, actions: Vec<Action>) {
                         bundle: Box::new(bundle),
                     });
                 execute(device, server, next);
+            }
+            Action::OpenInFlight { contact_id } => {
+                // Ответ на `SessionNeeded`, пока открытие уже идёт: отправка ждёт в очереди
+                // приложения. Пример шлёт по одному сообщению и сюда не приходит.
+                println!(
+                    "    {} ждёт открытия с {}",
+                    device.label,
+                    short(&contact_id)
+                );
+            }
+            Action::SessionHeld { contact_id } => {
+                println!(
+                    "    {} — сессия с {} уже есть",
+                    device.label,
+                    short(&contact_id)
+                );
+            }
+            Action::SessionOpenedAtRisk { contact_id } => {
+                println!(
+                    "    {} открыл сессию с {} от устаревшего ключа",
+                    device.label,
+                    short(&contact_id)
+                );
             }
             Action::MessageQueuedPendingInit {
                 contact_id,

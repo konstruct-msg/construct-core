@@ -1266,6 +1266,12 @@ interface CfeIncomingEvent {
     /// The answer to `CfeAction::OpenSession` when no bundle could be fetched. The held session
     /// stays; the core stops waiting for the open now instead of at its time-out.
     SessionBundleUnavailable(string contact_id);
+    /// A send of ours needs a session with `contact_id` — a device — and none is held. Answered
+    /// with `OpenSession` (open it: fetch the bundle, answer with `SessionBundleFetched`),
+    /// `OpenInFlight` (an open is already running: the send waits in the outbox until it is
+    /// answered) or `SessionHeld` (one was opened meanwhile: send now). Instead of calling
+    /// `init_session` for a first send: two sends at once opened twice and the second failed.
+    SessionNeeded(string contact_id);
     NetworkReconnected();
     AppLaunched();
     TimerFired(string timer_id);
@@ -1302,8 +1308,17 @@ interface CfeAction {
     /// that device's bundle and answer with `SessionBundleFetched` (or `SessionBundleUnavailable`).
     /// Do not call `reopen_session` for it: the event's answer carries the save and the drained
     /// queue that the call cannot. Nothing is sent — the handshake header rides on the next
-    /// message. Raised by the PQXDH v2 upgrade sweep.
+    /// message. Raised by the PQXDH v2 upgrade sweep, and by `SessionNeeded` for a first send.
     OpenSession(string contact_id);
+    /// The answer to `SessionNeeded` while an open with `contact_id` is in flight: do not send and
+    /// do not fetch. The send waits in the outbox and goes once that open is answered.
+    OpenInFlight(string contact_id);
+    /// The answer to `SessionNeeded` when a session with `contact_id` is held after all: send now.
+    SessionHeld(string contact_id);
+    /// A session with `contact_id` was opened from a bundle past the signed-prekey age limit (no
+    /// session was held, and waiting for a rotation would not help). Mark it at risk until the
+    /// device writes to us or a clean open replaces it.
+    SessionOpenedAtRisk(string contact_id);
     /// Message queued inside the core behind an in-flight session init. Nothing lost.
     MessageQueuedPendingInit(string contact_id, u32 queued_count);
     /// Write `data` into `slot`; empty `data` is a delete sentinel where the slot says so.
