@@ -64,6 +64,11 @@ pub struct KyberBundleKeys {
 pub struct SessionBundle {
     pub x3dh: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
     pub kyber: KyberBundleKeys,
+    /// Set when the bundle's signed prekey is past the age limit: its age, in seconds. The
+    /// answer to `OpenSession` decides from it whether to open at risk or refuse
+    /// (`handle_session_bundle_fetched`); `None` is a fresh bundle.
+    #[serde(default)]
+    pub stale_age_secs: Option<u64>,
 }
 
 /// Binary first message for RESPONDER path — replaces JSON-encoded `&[u8]`.
@@ -411,6 +416,7 @@ impl Orchestrator {
                 self.reopen_refused(&contact_id);
                 Vec::new()
             }
+            IncomingEvent::SessionNeeded { contact_id } => self.handle_session_needed(contact_id),
             IncomingEvent::NetworkReconnected => self.handle_network_reconnected(),
             IncomingEvent::AppLaunched => self.handle_app_launched(),
             IncomingEvent::TimerFired { timer_id } => self.handle_timer_fired(timer_id),
@@ -2824,19 +2830,37 @@ impl Orchestrator {
     /// open, exactly as for a receiving open. A refusal keeps the held session (the reopen puts it
     /// back) and ends `Opening`; the reason goes out as `OPEN_SESSION_REFUSED`, its message
     /// starting with the core's prefix (`PQ_REQUIRED: …` for a peer without Kyber-1024 keys).
+    ///
+    /// A bundle past the signed-prekey age limit opens only when no session is held and waiting
+    /// for a rotation would not help (`plan_stale_spk` → `OpenDegraded`), and the answer then
+    /// says so (`SessionOpenedAtRisk`). With a session held it is refused: the held one still
+    /// works, and a degraded state would replace a sound one.
     fn handle_session_bundle_fetched(
         &mut self,
         contact_id: String,
         bundle: Result<SessionBundle, String>,
     ) -> Vec<Action> {
-        let opened = bundle
-            .map_err(OpenRefusal::Other)
-            .and_then(|b| self.reopen_session_with_bundle(&contact_id, b.x3dh, b.kyber, false));
+        let mut at_risk = false;
+        let opened = bundle.map_err(OpenRefusal::Other).and_then(|b| {
+            if let Some(age_secs) = b.stale_age_secs {
+                at_risk = self.opens_stale_bundle(&contact_id, age_secs)?;
+            }
+            self.reopen_session_with_bundle(&contact_id, b.x3dh, b.kyber, at_risk)
+        });
         match opened {
             Ok(_) => {
                 self.sessions
                     .handle(&contact_id, SessionEvent::OpenFinished);
-                self.after_session_opened(&contact_id)
+                let mut actions = self.after_session_opened(&contact_id);
+                if at_risk {
+                    tracing::warn!(
+                        target: "crypto::orchestrator",
+                        contact_id = %contact_id,
+                        "opened from a stale signed prekey — at risk until the device writes"
+                    );
+                    actions.push(Action::SessionOpenedAtRisk { contact_id });
+                }
+                actions
             }
             Err(reason) => {
                 // `reopen_session_with_bundle` ends the phase on its own refusals; a bundle the
@@ -2847,6 +2871,38 @@ impl Orchestrator {
                     message: format!("contact={contact_id}: {reason}"),
                 }]
             }
+        }
+    }
+
+    /// Whether a bundle `age_secs` past its signed prekey's upload may open a session with
+    /// `contact_id`: `Ok(true)` to open at risk, `Err` with the refusal otherwise.
+    fn opens_stale_bundle(&self, contact_id: &str, age_secs: u64) -> Result<bool, OpenRefusal> {
+        use crate::orchestration::stale_spk_plan::{StaleSpkPlan, plan_stale_spk};
+        let refused =
+            || OpenRefusal::Other(format!("PeerSpkStale: signed prekey {age_secs} s old"));
+        if self.lifecycle.has_active_session(contact_id) {
+            return Err(refused());
+        }
+        match plan_stale_spk(age_secs) {
+            StaleSpkPlan::OpenDegraded => Ok(true),
+            StaleSpkPlan::WaitForRotation => Err(refused()),
+        }
+    }
+
+    /// A send of ours needs a session with `contact_id` and the platform holds none. One open per
+    /// device: the first send is told to open, every later one to wait for it.
+    fn handle_session_needed(&mut self, contact_id: String) -> Vec<Action> {
+        if self.has_session_for_sending(&contact_id) {
+            return vec![Action::SessionHeld { contact_id }];
+        }
+        match self
+            .sessions
+            .handle(&contact_id, SessionEvent::SendNeedsOpen)
+        {
+            SessionEffect::Open => vec![Action::OpenSession { contact_id }],
+            SessionEffect::WaitForOpen => vec![Action::OpenInFlight { contact_id }],
+            // The machine answers a want with `Open` or `WaitForOpen`; nothing else reaches here.
+            SessionEffect::Nothing => Vec::new(),
         }
     }
 
@@ -4764,7 +4820,15 @@ mod pqxdh_v2_tests {
         assert!(still_opening(&mut zed, "bob"));
 
         let (x3dh, kyber) = bundle_of(&mut bob, true);
-        let answer = answer_open(&mut zed, "bob", Ok(SessionBundle { x3dh, kyber }));
+        let answer = answer_open(
+            &mut zed,
+            "bob",
+            Ok(SessionBundle {
+                x3dh,
+                kyber,
+                stale_age_secs: None,
+            }),
+        );
 
         assert!(saves_the_record(&answer, "bob"), "{answer:?}");
         assert!(answer.iter().any(
@@ -4795,6 +4859,7 @@ mod pqxdh_v2_tests {
             Ok(SessionBundle {
                 x3dh,
                 kyber: KyberBundleKeys::default(),
+                stale_age_secs: None,
             }),
         );
 
@@ -4873,7 +4938,15 @@ mod pqxdh_v2_tests {
         assert!(decrypted(&waited).is_empty());
 
         let (x3dh, kyber) = bundle_of(&mut bob, true);
-        let mut answer = answer_open(&mut alice, &bob_id, Ok(SessionBundle { x3dh, kyber }));
+        let mut answer = answer_open(
+            &mut alice,
+            &bob_id,
+            Ok(SessionBundle {
+                x3dh,
+                kyber,
+                stale_age_secs: None,
+            }),
+        );
         assert!(
             answer.iter().any(
                 |a| matches!(a, Action::OpenReceiving { contact_id } if *contact_id == bob_id)
@@ -4885,6 +4958,172 @@ mod pqxdh_v2_tests {
             decrypted(&answer),
             vec![("crossing".to_string(), b"crossing".to_vec())]
         );
+    }
+
+    // ── A first send asks the machine to open ────────────────────────────────
+
+    fn need(o: &mut Orchestrator, contact_id: &str) -> Vec<Action> {
+        o.handle_event(IncomingEvent::SessionNeeded {
+            contact_id: contact_id.to_string(),
+        })
+    }
+
+    fn fresh(
+        x3dh: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        kyber: KyberBundleKeys,
+    ) -> SessionBundle {
+        SessionBundle {
+            x3dh,
+            kyber,
+            stale_age_secs: None,
+        }
+    }
+
+    /// A bundle whose signed prekey was uploaded `age_secs` ago, as the FFI boundary hands it on:
+    /// the age set, and the X3DH half old enough that the inner gate refuses it unless the open
+    /// is allowed to be stale.
+    fn stale(peer: &mut Orchestrator, age_secs: u64) -> SessionBundle {
+        let (mut x3dh, kyber) = bundle_of(peer, true);
+        x3dh.spk_uploaded_at = crate::utils::time::now() - age_secs;
+        SessionBundle {
+            x3dh,
+            kyber,
+            stale_age_secs: Some(age_secs),
+        }
+    }
+
+    fn at_risk(actions: &[Action], contact_id: &str) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SessionOpenedAtRisk { contact_id: c } if c == contact_id))
+    }
+
+    fn refused(actions: &[Action]) -> bool {
+        actions.iter().any(
+            |a| matches!(a, Action::NotifyError { code, .. } if code == "OPEN_SESSION_REFUSED"),
+        )
+    }
+
+    /// Two first sends to one device (Android, 2026-11-12): the first is told to open, the second
+    /// to wait for it. Once the open is answered the session is held, the next send is told so,
+    /// and nothing asks for a second bundle — a second would spend another of the peer's one-time
+    /// prekeys and, before this, failed in `init_session` with "Session already exists".
+    ///
+    /// Mutations that redden it: answer `OpenSession` to every `SessionNeeded`; drop the held
+    /// check from `handle_session_needed`.
+    #[test]
+    fn two_first_sends_open_one_session() {
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+
+        assert_eq!(opened(&need(&mut zed, "bob")), ["bob"]);
+        let second = need(&mut zed, "bob");
+        assert!(
+            matches!(second.as_slice(), [Action::OpenInFlight { contact_id }] if contact_id == "bob"),
+            "{second:?}"
+        );
+
+        let (x3dh, kyber) = bundle_of(&mut bob, true);
+        let answer = answer_open(&mut zed, "bob", Ok(fresh(x3dh, kyber)));
+        assert!(saves_the_record(&answer, "bob"), "{answer:?}");
+        assert!(!at_risk(&answer, "bob"));
+        assert!(zed.lifecycle.has_active_session("bob"));
+        assert_eq!(zed.lifecycle.previous_state_count("bob"), 0);
+
+        let after = need(&mut zed, "bob");
+        assert!(
+            matches!(after.as_slice(), [Action::SessionHeld { contact_id }] if contact_id == "bob"),
+            "{after:?}"
+        );
+    }
+
+    /// A first open whose bundle could not be fetched ends at once, so the next send opens rather
+    /// than waiting out the TTL behind an open that is over.
+    #[test]
+    fn a_first_open_without_a_bundle_lets_the_next_send_open() {
+        let mut zed = device("zed");
+        assert_eq!(opened(&need(&mut zed, "bob")), ["bob"]);
+        zed.handle_event(IncomingEvent::SessionBundleUnavailable {
+            contact_id: "bob".to_string(),
+        });
+        assert_eq!(opened(&need(&mut zed, "bob")), ["bob"]);
+    }
+
+    /// The app died while it fetched a bundle; the restored state still says `Opening`. A send
+    /// after the restart opens: nothing is running that open any more, and a send told to wait
+    /// would wait for nothing until the TTL.
+    ///
+    /// Mutation: restore openings as this run's own — this reddens.
+    #[test]
+    fn a_send_after_a_restart_is_not_held_by_the_dead_open() {
+        let mut zed = device("zed");
+        need(&mut zed, "bob");
+        let state = zed.export_orchestrator_state_cfe().unwrap();
+
+        let mut restarted = device("zed");
+        restarted.import_orchestrator_state_cfe(&state).unwrap();
+        assert!(still_opening(&mut restarted, "bob"));
+        assert_eq!(opened(&need(&mut restarted, "bob")), ["bob"]);
+    }
+
+    /// No session held, and the peer has been away for longer than a rotation takes to reach the
+    /// key server: the first open goes at risk rather than not at all, and says so. Before 0.77.0
+    /// the app made this call itself, around `init_session_allowing_stale`.
+    ///
+    /// Mutations that redden it: open strictly whatever the age; drop `SessionOpenedAtRisk`.
+    #[test]
+    fn a_first_open_from_a_long_stale_bundle_opens_at_risk() {
+        use crate::crypto::client_api::SPK_MAX_AGE_SECS;
+        use crate::orchestration::stale_spk_plan::SPK_ROTATION_GRACE_SECS;
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        need(&mut zed, "bob");
+
+        let bundle = stale(&mut bob, SPK_MAX_AGE_SECS + SPK_ROTATION_GRACE_SECS + 3600);
+        let answer = answer_open(&mut zed, "bob", Ok(bundle));
+
+        assert!(at_risk(&answer, "bob"), "{answer:?}");
+        assert!(saves_the_record(&answer, "bob"));
+        assert!(zed.lifecycle.has_active_session("bob"));
+        assert!(!still_opening(&mut zed, "bob"));
+    }
+
+    /// Just past the limit the peer may have rotated already: the open is refused, so the next
+    /// send fetches again, and the refusal ends the open.
+    ///
+    /// Mutation: open at risk from the limit itself (skip `plan_stale_spk`) — this reddens.
+    #[test]
+    fn a_first_open_from_a_just_stale_bundle_is_refused() {
+        use crate::crypto::client_api::SPK_MAX_AGE_SECS;
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        need(&mut zed, "bob");
+
+        let bundle = stale(&mut bob, SPK_MAX_AGE_SECS + 60);
+        let answer = answer_open(&mut zed, "bob", Ok(bundle));
+
+        assert!(refused(&answer), "{answer:?}");
+        assert!(!at_risk(&answer, "bob"));
+        assert!(!zed.lifecycle.has_active_session("bob"));
+        assert!(!still_opening(&mut zed, "bob"));
+    }
+
+    /// A session held: a stale bundle never replaces it, however long the peer has been away —
+    /// the held one still works, and the reopen is the upgrade's, not a send's.
+    ///
+    /// Mutation: drop the held check from `opens_stale_bundle` — this reddens.
+    #[test]
+    fn a_stale_bundle_never_replaces_a_held_session() {
+        use crate::crypto::client_api::SPK_MAX_AGE_SECS;
+        use crate::orchestration::stale_spk_plan::SPK_ROTATION_GRACE_SECS;
+        let (mut zed, mut bob) = (device("zed"), device("bob"));
+        classical(&mut zed, &mut bob, "bob");
+        let before = zed.lifecycle.active_session_id("bob").unwrap();
+        sweep(&mut zed);
+
+        let bundle = stale(&mut bob, SPK_MAX_AGE_SECS + SPK_ROTATION_GRACE_SECS + 3600);
+        let answer = answer_open(&mut zed, "bob", Ok(bundle));
+
+        assert!(refused(&answer), "{answer:?}");
+        assert!(!at_risk(&answer, "bob"));
+        assert_eq!(zed.lifecycle.active_session_id("bob").unwrap(), before);
     }
 
     // ── open_receiving: the walk is the core's ─────────────────────────────────

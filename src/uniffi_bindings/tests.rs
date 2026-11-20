@@ -1571,6 +1571,34 @@ fn a_pq_bundle_without_a_kyber_spk_epoch_is_refused() {
     assert!(with(SuiteID::CLASSIC, 0).is_ok());
 }
 
+/// A fetched bundle past the age limit reaches the orchestrator with its age, for it to decide
+/// whether to open at risk (it knows whether a session is held; this boundary does not). A fresh
+/// one carries none. A PQ bundle with no Kyber signed prekey is still refused here, stale or not:
+/// that is a downgrade, not an age.
+///
+/// Mutations that redden it: refuse a stale bundle here, as before 0.77.0; drop the epoch check
+/// from the stale arm of `parse_fetched_bundle`.
+#[test]
+fn a_fetched_bundle_carries_its_stale_age_to_the_orchestrator() {
+    use crate::crypto::client_api::SPK_MAX_AGE_SECS;
+    let old = crate::utils::time::now() - SPK_MAX_AGE_SECS - 100;
+
+    let fresh = parse_fetched_bundle(&freshness_bundle()).unwrap();
+    assert_eq!(fresh.stale_age_secs, None);
+
+    let mut b = freshness_bundle();
+    b.spk_uploaded_at = old;
+    let age = parse_fetched_bundle(&b).unwrap().stale_age_secs.unwrap();
+    assert!(age >= SPK_MAX_AGE_SECS + 100, "{age}");
+
+    b.suite_id = SuiteID::PQ_HYBRID.as_u16();
+    b.kyber_spk_rotation_epoch = 0;
+    assert!(matches!(
+        parse_fetched_bundle(&b),
+        Err(CryptoError::InvalidKeyData)
+    ));
+}
+
 /// A core counts its current signed prekey and every archived one: 1 fresh, 2 after one
 /// rotation — on both cores the platforms hold.
 #[test]
@@ -1640,5 +1668,46 @@ fn the_exported_blob_limit_leaves_room_for_the_media_head() {
     assert_eq!(
         history_max_blob_bytes() + crate::history::cth1::MEDIA_HEAD_CAP as u64,
         crate::history::MAX_RECORD_BYTES
+    );
+}
+
+/// Through the FFI, as a platform sees it: the first `SessionNeeded` is told to open, the second
+/// to wait, and after the answer the third is told a session is held. Each answer is its own
+/// `CfeAction` — a platform keeps a row queued on one and sends on another.
+///
+/// Mutation: map `OpenInFlight` or `SessionHeld` to another `CfeAction` — this reddens.
+#[test]
+fn a_first_send_is_answered_once_per_open_through_the_ffi() {
+    let (alice, _) = named_core();
+    let (bob, bob_id) = named_core();
+    let need = || {
+        alice
+            .handle_event(CfeIncomingEvent::SessionNeeded {
+                contact_id: bob_id.clone(),
+            })
+            .unwrap()
+    };
+
+    assert!(
+        matches!(need().as_slice(), [CfeAction::OpenSession { contact_id }] if *contact_id == bob_id)
+    );
+    assert!(
+        matches!(need().as_slice(), [CfeAction::OpenInFlight { contact_id }] if *contact_id == bob_id)
+    );
+
+    let answer = alice
+        .handle_event(CfeIncomingEvent::SessionBundleFetched {
+            contact_id: bob_id.clone(),
+            bundle: pq_bundle(&bob),
+        })
+        .unwrap();
+    assert!(
+        !answer
+            .iter()
+            .any(|a| matches!(a, CfeAction::NotifyError { .. }))
+    );
+    assert!(alice.has_session(bob_id.clone()));
+    assert!(
+        matches!(need().as_slice(), [CfeAction::SessionHeld { contact_id }] if *contact_id == bob_id)
     );
 }

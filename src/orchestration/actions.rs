@@ -65,8 +65,33 @@ pub enum Action {
     /// previous one, and answers with the save, the drained queue and the end of `Opening`.
     /// Nothing is sent for it: the handshake header rides on the next message to the device.
     ///
-    /// Raised by the PQXDH v2 upgrade sweep (`Orchestrator::pq_upgrade_candidates`).
+    /// Raised by the PQXDH v2 upgrade sweep (`Orchestrator::pq_upgrade_candidates`), and by
+    /// `IncomingEvent::SessionNeeded` when a send of ours needs a session and none is held —
+    /// then there is nothing to keep, and the answer opens the first state.
     OpenSession {
+        contact_id: String,
+    },
+
+    /// The answer to `IncomingEvent::SessionNeeded` while an open with `contact_id` is already
+    /// in flight in this run: do not send now and do not fetch a bundle. The send waits in the
+    /// platform's outbox and goes once the platform has answered that open (`OpenSession` →
+    /// `SessionBundleFetched` / `SessionBundleUnavailable`). A second open would spend another of
+    /// the peer's one-time prekeys on a state that will not be used.
+    OpenInFlight {
+        contact_id: String,
+    },
+
+    /// The answer to `IncomingEvent::SessionNeeded` when a session with `contact_id` is held
+    /// after all — an open finished between the platform's check and the event. Send now.
+    SessionHeld {
+        contact_id: String,
+    },
+
+    /// A session with `contact_id` was opened from a bundle past the signed-prekey age limit,
+    /// because none was held and waiting for a rotation would not help
+    /// (`stale_spk_plan::plan_stale_spk` → `OpenDegraded`; `decisions/stale-peer-reachability.md`).
+    /// The platform marks it at risk until the device writes to us or a clean open replaces it.
+    SessionOpenedAtRisk {
         contact_id: String,
     },
 
@@ -292,6 +317,16 @@ pub enum IncomingEvent {
     /// The answer to `Action::OpenSession` when no bundle could be fetched (network, no such
     /// device on the server). Ends `Opening` now rather than at its TTL; the held session stays.
     SessionBundleUnavailable {
+        contact_id: String,
+    },
+    /// A send of ours needs a session with `contact_id` — a device — and the platform holds none.
+    /// The core's machine answers once per open: `OpenSession` to the first send, `OpenInFlight`
+    /// to every send while that open is in flight, `SessionHeld` if one was opened meanwhile.
+    ///
+    /// Until 0.77.0 a first send called `init_session` itself, past the machine: two sends at
+    /// once both fetched a bundle, and the second `init_session` was refused (Android,
+    /// 2026-11-12; `decisions/a-first-send-asks-the-machine-to-open.md`).
+    SessionNeeded {
         contact_id: String,
     },
     NetworkReconnected,
