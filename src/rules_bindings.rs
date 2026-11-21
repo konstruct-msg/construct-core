@@ -5,8 +5,8 @@
 use std::sync::Mutex;
 
 use crate::rule_state::{
-    self, call_machine, calls, device_refusal, fanout_retry, intake, mailbox_gap, names, read_sync,
-    send_failure, stream_cursor,
+    self, call_machine, calls, device_refusal, device_set, fanout_retry, intake, mailbox_gap,
+    names, read_sync, send_failure, stream_cursor,
 };
 use crate::uniffi_bindings::CryptoError;
 
@@ -127,6 +127,18 @@ pub fn device_refusal_of(status_code: u32, trailer: Option<String>) -> DeviceRef
 
 pub fn refusal_erases_device(refusal: DeviceRefusalKind, over_direct_tls: bool) -> bool {
     device_refusal::erases_device(refusal.into(), over_direct_tls)
+}
+
+// ── Device set ────────────────────────────────────────────────────────────────
+
+pub fn device_set_named(answers: Vec<Vec<String>>) -> Vec<String> {
+    device_set::named(&answers).into_iter().collect()
+}
+
+pub fn device_set_should_ask(named: Vec<String>, already_asked: Option<Vec<String>>) -> bool {
+    let named = named.into_iter().collect();
+    let asked = already_asked.map(|a| a.into_iter().collect());
+    device_set::should_ask(&named, asked.as_ref())
 }
 
 // ── Send failure ──────────────────────────────────────────────────────────────
@@ -2057,6 +2069,22 @@ mod tests {
         );
         assert_eq!(call_glare("b".into(), "a".into()), CallGlare::KeepOurs);
         assert_eq!(call_glare("a".into(), "b".into()), CallGlare::Yield);
+    }
+
+    /// A set is a set across the boundary: an answer in another order is the same set, and the
+    /// named one comes back sorted. Mutation that reddens it: compare the lists as they came.
+    #[test]
+    fn a_device_set_is_compared_as_a_set() {
+        let ba = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(
+            device_set_named(vec![vec![], ba.clone(), vec![]]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(!device_set_should_ask(
+            vec!["a".into(), "b".into()],
+            Some(ba.clone())
+        ));
+        assert!(device_set_should_ask(ba, None));
     }
 
     /// The wrappers carry each variant through, both ways. Mutation that reddens it: swap two
