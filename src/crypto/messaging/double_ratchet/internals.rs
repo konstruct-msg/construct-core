@@ -698,7 +698,9 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
         if let Some(key) = self.pq_skipped_keys.remove(&(epoch, index)) {
             self.pq_skipped_key_timestamps.remove(&(epoch, index));
-            return Ok(Some(key));
+            // Leaves `SecretBytes` the way a freshly stepped key arrives: as the `Vec` the caller
+            // mixes and wipes.
+            return Ok(Some(key.into_vec()));
         }
         let current = self.current_pq_epoch;
         let max_jump = Config::global().max_message_jump;
@@ -753,7 +755,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.make_room_for_pq_skipped(kept.len());
         let now = crate::utils::time::now();
         for (i, key) in kept {
-            self.pq_skipped_keys.insert((epoch, i), key);
+            self.pq_skipped_keys
+                .insert((epoch, i), SecretBytes::new(key));
             self.pq_skipped_key_timestamps.insert((epoch, i), now);
         }
         Ok(Some(found))
