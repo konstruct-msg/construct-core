@@ -1118,6 +1118,26 @@ mod tests {
         assert_eq!(bob.active_session_id(&alice_id).unwrap(), current);
     }
 
+    /// A second copy from a chain the current state has left is a duplicate on the record too,
+    /// so the router drops it instead of answering it as unreadable — what three messages of an
+    /// iOS log on 2026-11-21 were answered with (`AEAD decryption failed`).
+    #[test]
+    fn a_repeat_from_a_left_chain_is_a_duplicate_on_the_record() {
+        let (mut alice, mut bob, alice_id, bob_id) = make_session_pair();
+        let first = alice.client.encrypt_message(&bob_id, b"first").unwrap();
+        bob.decrypt_ratchet_message(&alice_id, &first).unwrap();
+        let answer = bob.client.encrypt_message(&alice_id, b"answer").unwrap();
+        alice.decrypt_ratchet_message(&bob_id, &answer).unwrap();
+        let next = alice.client.encrypt_message(&bob_id, b"next").unwrap();
+        bob.decrypt_ratchet_message(&alice_id, &next).unwrap();
+
+        let err = bob.decrypt_ratchet_message(&alice_id, &first).unwrap_err();
+        assert!(
+            err.starts_with(crate::crypto::messaging::double_ratchet::MESSAGE_KEY_CONSUMED),
+            "{err}"
+        );
+    }
+
     /// Previous states are part of the record: saved with the current one and loaded with it.
     ///
     /// Mutation: drop the `previous` list in `export_session_bytes_for` — this reddens.

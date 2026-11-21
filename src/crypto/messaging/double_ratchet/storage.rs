@@ -40,6 +40,11 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             skipped_message_keys: Default::default(), // legacy field, no longer written
             skipped_key_timestamps: Default::default(), // legacy field, no longer written
             skipped_keys,
+            left_chains: self
+                .left_receiving_chains
+                .iter()
+                .map(|c| (c.remote_dh_public.clone(), c.reached))
+                .collect(),
             prekey_header: self
                 .prekey_header
                 .as_ref()
@@ -165,6 +170,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             previous_sending_length: data.previous_sending_length,
             skipped_message_keys,
             skipped_key_timestamps,
+            left_receiving_chains: data
+                .left_chains
+                .iter()
+                .map(|(remote_dh_public, reached)| LeftReceivingChain {
+                    remote_dh_public: remote_dh_public.clone(),
+                    reached: *reached,
+                })
+                .collect(),
             prekey_header: data.prekey_header.as_ref().map(|h| PrekeyHeader {
                 one_time_prekey_id: h.one_time_prekey_id,
                 kyber_prekey_id: h.kyber_prekey_id,
@@ -506,6 +519,9 @@ pub struct SerializableSession {
     /// v2: skipped keys properly namespaced by (remote_dh_public, msg_number)
     #[serde(default)]
     pub(crate) skipped_keys: Vec<SkippedKeyEntry>,
+    /// The receiving chains the ratchet has left (`LeftReceivingChain`), newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    left_chains: Vec<(Vec<u8>, u32)>,
     /// INITIATOR: the handshake header the first flight repeats (`PrekeyHeader`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prekey_header: Option<SerializablePrekeyHeader>,
@@ -706,6 +722,7 @@ impl SerializableSession {
                     timestamp: e.timestamp,
                 })
                 .collect(),
+            left_chains: self.left_chains.clone(),
             prekey_header: self.prekey_header.clone(),
             pq_handshake: self.pq_handshake,
             session_id: String::new(), // already decoded by cfe_header before this copy
@@ -841,6 +858,13 @@ impl SerializableSession {
                     timestamp: e.timestamp,
                 })
                 .collect(),
+            left_chains: take(&mut self.left_chains)
+                .into_iter()
+                .map(|(dh_pub, reached)| crate::cfe::CfeLeftChainV1 {
+                    dh_pub: ByteBuf::from(dh_pub),
+                    reached,
+                })
+                .collect(),
             prekey_header: self
                 .prekey_header
                 .take()
@@ -933,6 +957,11 @@ impl SerializableSession {
                     key_bytes: e.key_bytes.into_vec(),
                     timestamp: e.timestamp,
                 })
+                .collect(),
+            left_chains: data
+                .left_chains
+                .into_iter()
+                .map(|c| (c.dh_pub.into_vec(), c.reached))
                 .collect(),
             prekey_header: data.prekey_header.map(|h| SerializablePrekeyHeader {
                 one_time_prekey_id: h.one_time_prekey_id,

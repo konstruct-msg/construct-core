@@ -73,6 +73,23 @@ pub use storage::{SerializableSession, SkippedKeyEntry};
 /// so it takes the DH ratchet step and fails, if it fails, on AEAD.
 pub const MESSAGE_KEY_CONSUMED: &str = "MESSAGE_KEY_CONSUMED";
 
+/// How many receiving chains the ratchet remembers after leaving them, newest last — libsignal's
+/// `MAX_RECEIVER_CHAINS`. A repeat from one of them is a duplicate; from an older one it fails as
+/// before (AEAD), and is answered as unreadable.
+pub(crate) const MAX_LEFT_RECEIVING_CHAINS: usize = 5;
+
+/// A receiving chain the ratchet has left: the sender's ratchet key that named it and the
+/// position it had reached. Positions below `reached` were read or kept as skipped keys; a
+/// message naming one of them with no skipped key left is a second copy (`MESSAGE_KEY_CONSUMED`).
+/// Keys are not kept — libsignal keeps the chain key too, so a late message past `reached` can
+/// still open there; here the step's PN already kept every key up to `reached`, and an honest
+/// sender never writes past it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeftReceivingChain {
+    pub(crate) remote_dh_public: Vec<u8>,
+    pub(crate) reached: u32,
+}
+
 /// AD (Associated Data) version byte — the first byte of the AD, so a format mismatch surfaces
 /// as an AEAD failure rather than a silent format bug. The wire names the version a message was
 /// sealed with (`wire_payload::AD_V4_FLAG`); the AD itself is never on the wire.
@@ -420,6 +437,9 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
 
+    /// The last `MAX_LEFT_RECEIVING_CHAINS` receiving chains a DH step left, newest last.
+    left_receiving_chains: Vec<LeftReceivingChain>,
+
     /// INITIATOR only, until the peer's first message arrives: the handshake header every
     /// outgoing message repeats, so the responder can build the session from whichever of the
     /// first flight reaches it first.
@@ -507,6 +527,7 @@ struct DecryptSnapshot<P: CryptoProvider> {
     previous_sending_length: u32,
     skipped_message_keys: HashMap<(Vec<u8>, u32), P::AeadKey>,
     skipped_key_timestamps: HashMap<(Vec<u8>, u32), u64>,
+    left_receiving_chains: Vec<LeftReceivingChain>,
     pq_turns_since_mix: u32,
     current_pq_epoch: u32,
     pq_chains: Vec<PqEpochChains>,
@@ -533,6 +554,7 @@ impl<P: CryptoProvider> Clone for DecryptSnapshot<P> {
             previous_sending_length: self.previous_sending_length,
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            left_receiving_chains: self.left_receiving_chains.clone(),
             pq_turns_since_mix: self.pq_turns_since_mix,
             current_pq_epoch: self.current_pq_epoch,
             pq_chains: self.pq_chains.clone(),
