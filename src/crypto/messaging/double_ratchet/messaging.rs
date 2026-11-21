@@ -90,6 +90,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
+            left_receiving_chains: Vec::new(),
             prekey_header: None,
             pq_handshake: PqHandshake::None,
             pq_turns_since_mix: 0,
@@ -208,6 +209,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
             previous_sending_length: 0,
             skipped_message_keys: HashMap::new(),
             skipped_key_timestamps: HashMap::new(),
+            left_receiving_chains: Vec::new(),
             prekey_header: None,
             pq_handshake: PqHandshake::None,
             pq_turns_since_mix: 0,
@@ -575,6 +577,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             previous_sending_length: self.previous_sending_length,
             skipped_message_keys: self.skipped_message_keys.clone(),
             skipped_key_timestamps: self.skipped_key_timestamps.clone(),
+            left_receiving_chains: self.left_receiving_chains.clone(),
             pq_turns_since_mix: self.pq_turns_since_mix,
             current_pq_epoch: self.current_pq_epoch,
             pq_chains: self.pq_chains.clone(),
@@ -613,6 +616,25 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             );
             self.commit_pq_post_decrypt(encrypted);
             return Ok(plaintext);
+        }
+
+        // 1b. A second copy from a chain this ratchet has left: the position was read (or its key
+        // kept above) and nothing is left to open it with. Stepping on it would fail the AEAD and
+        // read as a sender whose state forked; libsignal answers `DuplicatedMessage` here
+        // (`consume_message_key`, with the receiver chain it keeps). Nothing has changed yet.
+        if needs_ratchet
+            && let Some(left) = self
+                .left_receiving_chains
+                .iter()
+                .find(|c| c.remote_dh_public == encrypted.dh_public_key)
+            && encrypted.message_number < left.reached
+        {
+            return Err(format!(
+                "{}: message {} of a receiving chain left at {} has no key left",
+                super::MESSAGE_KEY_CONSUMED,
+                encrypted.message_number,
+                left.reached
+            ));
         }
 
         // 2. CPU DoS guards: reject a message whose numbers would make the chain-advance loops
@@ -680,6 +702,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                         }
                     };
                 }
+                self.remember_left_chain(old_chain_key_bytes);
             }
             debug!(target: "crypto::double_ratchet", "Performing DH ratchet");
             self.perform_dh_ratchet(&remote_dh_public, identity_secret)
