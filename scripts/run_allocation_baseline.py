@@ -55,7 +55,8 @@ def main():
     metadata['delayed_sequence_exit_code'] = reproduction.returncode
     env = dict(os.environ, CARGO_TARGET_DIR=str(args.time_target))
     # Full matrix once, then five independent A/A repeats of the priority cases.
-    key_filter = r'payload/(P[134]|PE)/(50|65536)$|save/SF/k(0|500|900)_p0$|save/SF/k500_p3$'
+    key_filter = (r'payload/(P[134]|PE)/(50|65536)$|save/SF/k(0|500|900)_p0$|save/SF/k500_p3$'
+                  r'|recv/(D|PE)/k(0|500|900)_p0$|recv/(D|PE)/k500_p3$')
     for run in range(args.repeats + 1):
         label = 'matrix' if run == 0 else f'aa-{run}'
         command = [str(timing), '--bench', '--noplot', '--save-baseline', label]

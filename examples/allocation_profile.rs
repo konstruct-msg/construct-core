@@ -285,6 +285,36 @@ fn main() {
             }
         }
     }
+    // TODO 323: one in-order read after the gap, alone (D) and as the whole receive (PE).
+    // The state changes (chain keys), so the retained delta is recorded, not asserted.
+    let plaintext = b"in order".to_vec();
+    for &(skipped, previous) in CASES {
+        let mut pair = Pair::with_history(skipped, previous);
+        let label = format!("k{skipped}_p{previous}");
+        let metadata =
+            json!({"skipped":skipped,"previous":previous,"held":held(&pair, skipped, previous)});
+        let wire = pair
+            .alice
+            .encrypt_bytes_for(&pair.bob_id, &plaintext)
+            .unwrap();
+        let read = measure(&format!("recv/D/{label}"), &metadata, || {
+            let read = pair.bob.decrypt_bytes_for(&pair.alice_id, &wire).unwrap();
+            assert_eq!(black_box(read), plaintext);
+        });
+        held(&pair, skipped, previous);
+        let id = format!("recv-pe-{label}");
+        let mut event = Some(pair.event(&plaintext, &id));
+        let receive = measure(&format!("recv/PE/{label}"), &metadata, || {
+            let actions = pair.bob.handle_event(event.take().unwrap());
+            validate_actions(&actions, &plaintext, &id);
+            drop(black_box(actions));
+        });
+        held(&pair, skipped, previous);
+        if !verify_only {
+            println!("{read}");
+            println!("{receive}");
+        }
+    }
     eprintln!(
         "Verified PQ fixtures, parse allocation counts, previous-state restore, delayed decrypt, and bidirectional continuation."
     );

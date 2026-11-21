@@ -24,8 +24,9 @@ def main():
         case = benchmark['full_id']
         run = path.parent.name
         times.setdefault(case, {})[run] = estimate
-    if len(times) != 46:
-        raise SystemExit(f'Expected 46 timed cases, found {len(times)}')
+    # Every case is both timed and counted: one list must not grow without the other.
+    if set(times) != set(allocation_runs[0]):
+        raise SystemExit(f'Timed and counted cases differ: {sorted(set(times) ^ set(allocation_runs[0]))}')
     rows = []
     for case, memory in allocation_runs[0].items():
         measurements = times[case]

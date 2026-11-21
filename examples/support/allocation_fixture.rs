@@ -206,6 +206,24 @@ impl Pair {
     }
 }
 
+/// The receiver still holds what the fixture built: K classical and K PQ skipped keys in the
+/// current state and `previous` previous states. A measured read that used or dropped a key, or
+/// replaced the state, changes the series it is in; this refuses it.
+pub fn held(pair: &Pair, skipped: usize, previous: usize) -> String {
+    let health = pair.bob.get_session_health(&pair.alice_id).unwrap();
+    assert_eq!(health.skipped_keys_count, skipped);
+    assert_eq!(health.pq_skipped_keys_count, skipped);
+    let cfe = decode_session(&pair.bob, &pair.alice_id);
+    assert_eq!(cfe.previous.len(), previous);
+    format!(
+        "skipped={} pq_skipped={} previous={} epoch={}",
+        health.skipped_keys_count,
+        health.pq_skipped_keys_count,
+        cfe.previous.len(),
+        health.pq_epoch
+    )
+}
+
 pub fn decode_session(core: &Orchestrator, peer: &str) -> CfeSessionStateV1 {
     cfe::decode_as(
         &core.export_session_cfe(peer).unwrap(),

@@ -126,6 +126,70 @@ fn saving(c: &mut Criterion) {
     group.finish();
 }
 
+/// TODO 323: a message read in order after a gap, while K classical and K PQ skipped keys are held.
+/// No held key is used, so the state keeps K across iterations; what grows with K on this path is
+/// the decrypt snapshot (every table cloned) and the age scan.
+fn receiving(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recv");
+    let plaintext = b"in order".to_vec();
+    for &(skipped, previous) in CASES {
+        let label = format!("k{skipped}_p{previous}");
+        let mut pair = Pair::with_history(skipped, previous);
+        eprintln!("FIXTURE recv/{label}: {}", held(&pair, skipped, previous));
+        // D: the ratchet read alone, no router and no save. One pair throughout: nothing here
+        // grows between messages.
+        group.bench_function(format!("D/{label}"), |b| {
+            b.iter_custom(|iters| {
+                let mut elapsed = Duration::ZERO;
+                let mut remaining = iters;
+                while remaining > 0 {
+                    let n = remaining.min(128);
+                    let wires: Vec<_> = (0..n)
+                        .map(|_| {
+                            pair.alice
+                                .encrypt_bytes_for(&pair.bob_id, &plaintext)
+                                .unwrap()
+                        })
+                        .collect();
+                    let start = Instant::now();
+                    for wire in &wires {
+                        let read = pair.bob.decrypt_bytes_for(&pair.alice_id, black_box(wire));
+                        assert_eq!(black_box(read).unwrap(), plaintext);
+                    }
+                    elapsed += start.elapsed();
+                    held(&pair, skipped, previous);
+                    remaining -= n;
+                }
+                elapsed
+            })
+        });
+        // PE: the whole receive, save of every held state included. A fresh pair per block of
+        // 128, as payload/PE, so the ACK cache stays bounded.
+        group.bench_function(format!("PE/{label}"), |b| {
+            b.iter_custom(|iters| {
+                let mut elapsed = Duration::ZERO;
+                let mut remaining = iters;
+                while remaining > 0 {
+                    let n = remaining.min(128);
+                    let mut live = Pair::with_history(skipped, previous);
+                    let events: Vec<_> = (0..n)
+                        .map(|i| live.event(&plaintext, &format!("r{i}")))
+                        .collect();
+                    let start = Instant::now();
+                    for event in events {
+                        drop(black_box(live.bob.handle_event(black_box(event))));
+                    }
+                    elapsed += start.elapsed();
+                    held(&live, skipped, previous);
+                    remaining -= n;
+                }
+                elapsed
+            })
+        });
+    }
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
@@ -134,5 +198,5 @@ fn config() -> Criterion {
         .without_plots()
 }
 
-criterion_group! { name = benches; config = config(); targets = payload, saving }
+criterion_group! { name = benches; config = config(); targets = payload, saving, receiving }
 criterion_main!(benches);
