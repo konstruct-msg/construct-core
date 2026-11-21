@@ -3593,3 +3593,190 @@ fn test_each_broken_pq_invariant_is_refused_on_load() {
         assert_eq!(reloaded(ser).current_pq_epoch, 0, "{name}: must be refused");
     }
 }
+
+// ── A repeat from a chain the receiver has left ────────────────────────────────────────────
+//
+// A message keeps its sender's ratchet key. Once a later turn has been read, that key is no
+// longer the current one, and the consumed positions of its chain keep no key. Until 0.77.1 a
+// second copy of such a message took the "new ratchet key" branch, stepped from the current root
+// key, failed the AEAD and was answered as unreadable — the same verdict as a sender whose state
+// forked, so neither side could tell a harmless repeat from a lost message (iOS log of
+// 2026-11-21: three messages, each `AEAD decryption failed`). libsignal keeps its last five
+// receiver chains and answers `DuplicatedMessage` (`consume_message_key`).
+
+/// Alice writes three on her first chain, Bob answers, Alice writes on a new chain and Bob reads
+/// it: Bob has left Alice's first chain. Returns the last of the three.
+fn leave_a_chain(
+    alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+    bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
+) -> super::EncryptedRatchetMessage {
+    let first: Vec<_> = (0..3)
+        .map(|i| {
+            alice
+                .encrypt(format!("first chain {i}").as_bytes())
+                .unwrap()
+        })
+        .collect();
+    for m in &first {
+        bob.decrypt(m).unwrap();
+    }
+    let answer = bob.encrypt(b"answer").unwrap();
+    alice.decrypt(&answer).unwrap();
+    let next = alice.encrypt(b"next chain").unwrap();
+    bob.decrypt(&next).unwrap();
+    first[2].clone()
+}
+
+/// Mutations that redden it: no record of left chains; the check after the ratchet step; a
+/// verdict that changes the state.
+#[test]
+fn test_a_repeat_from_a_left_chain_is_a_duplicate() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a1",
+        "bbbbbbbb-0000-4000-8000-0000000003b1",
+    );
+    let old = leave_a_chain(&mut alice, &mut bob);
+    let before = bob.state_fingerprint();
+
+    let verdict = bob.decrypt(&old).unwrap_err();
+    assert!(
+        verdict.starts_with(super::MESSAGE_KEY_CONSUMED),
+        "a second copy from a left chain is a duplicate: {verdict}"
+    );
+    assert_eq!(
+        before,
+        bob.state_fingerprint(),
+        "the verdict changes nothing"
+    );
+
+    let after = alice.encrypt(b"after the repeat").unwrap();
+    assert_eq!(bob.decrypt(&after).unwrap(), b"after the repeat");
+}
+
+/// The same on the PQ-ratchet suite, past its first epoch, where the message key also mixes the
+/// PQ chain key.
+#[test]
+fn test_pqr_a_repeat_from_a_left_chain_is_a_duplicate() {
+    let (mut alice, mut bob) = make_pq_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a2",
+        "bbbbbbbb-0000-4000-8000-0000000003b2",
+    );
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    let old = leave_a_chain(&mut alice, &mut bob);
+
+    let verdict = bob.decrypt(&old).unwrap_err();
+    assert!(
+        verdict.starts_with(super::MESSAGE_KEY_CONSUMED),
+        "a second copy from a left chain is a duplicate: {verdict}"
+    );
+    let after = alice.encrypt(b"after the repeat").unwrap();
+    assert_eq!(bob.decrypt(&after).unwrap(), b"after the repeat");
+}
+
+/// The record is session state: a relaunch between the two copies must not forget it.
+/// Mutations that redden it: the field left out of the CFE copy either way.
+#[test]
+fn test_left_chains_survive_the_cfe_round_trip() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a3",
+        "bbbbbbbb-0000-4000-8000-0000000003b3",
+    );
+    let old = leave_a_chain(&mut alice, &mut bob);
+    let mut bob = cfe_round_trip(&bob);
+
+    let verdict = bob.decrypt(&old).unwrap_err();
+    assert!(
+        verdict.starts_with(super::MESSAGE_KEY_CONSUMED),
+        "after a relaunch the repeat is still a duplicate: {verdict}"
+    );
+}
+
+/// Only a position the chain had passed is a duplicate. A number at or past the point where the
+/// chain was left names a key nobody derived; it stays an ordinary failure.
+/// Mutations that redden it: `<=` for `<`; every message on a left chain called a duplicate.
+#[test]
+fn test_a_position_past_the_left_point_is_not_a_duplicate() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a4",
+        "bbbbbbbb-0000-4000-8000-0000000003b4",
+    );
+    let old = leave_a_chain(&mut alice, &mut bob);
+    let reached = bob.left_receiving_chains.last().unwrap().reached;
+    assert_eq!(
+        old.message_number + 1,
+        reached,
+        "the chain was left just past its last message"
+    );
+    for n in [reached, reached + 4] {
+        let mut beyond = old.clone();
+        beyond.message_number = n;
+        let verdict = bob.decrypt(&beyond).unwrap_err();
+        assert!(
+            !verdict.starts_with(super::MESSAGE_KEY_CONSUMED),
+            "position {n} of a chain left at {reached} is not a duplicate: {verdict}"
+        );
+    }
+}
+
+/// Five left chains are kept, as libsignal's `MAX_RECEIVER_CHAINS`; the sixth turn forgets the
+/// oldest. Mutations that redden it: no bound; a bound of four or six.
+#[test]
+fn test_five_left_chains_are_kept() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a5",
+        "bbbbbbbb-0000-4000-8000-0000000003b5",
+    );
+    // One message per Alice chain; each round trip makes Bob leave one more.
+    let mut olds = Vec::new();
+    for i in 0..7 {
+        let m = alice.encrypt(format!("chain {i}").as_bytes()).unwrap();
+        bob.decrypt(&m).unwrap();
+        olds.push(m);
+        let answer = bob.encrypt(b"answer").unwrap();
+        alice.decrypt(&answer).unwrap();
+    }
+    // Bob is on Alice's seventh chain and has left six.
+    let duplicate = |bob: &mut DoubleRatchetSession<ClassicSuiteProvider>, m| {
+        bob.decrypt(m)
+            .unwrap_err()
+            .starts_with(super::MESSAGE_KEY_CONSUMED)
+    };
+    assert!(
+        !duplicate(&mut bob, &olds[0]),
+        "the sixth left chain is forgotten"
+    );
+    for (i, m) in olds.iter().enumerate().take(6).skip(1) {
+        assert!(duplicate(&mut bob, m), "left chain {i} is kept");
+    }
+    assert!(
+        duplicate(&mut bob, &olds[6]),
+        "the current chain answers as before"
+    );
+}
+
+/// A step that then fails the AEAD remembers nothing: a forged ratchet key must not push a real
+/// chain out of the record, nor record the current one as left.
+/// Mutations that redden it: the record left out of the snapshot or of its restore.
+#[test]
+fn test_a_failed_step_remembers_no_left_chain() {
+    let (mut alice, mut bob) = make_session_pair(
+        "aaaaaaaa-0000-4000-8000-0000000003a6",
+        "bbbbbbbb-0000-4000-8000-0000000003b6",
+    );
+    let old = leave_a_chain(&mut alice, &mut bob);
+    let before = bob.left_receiving_chains.clone();
+    assert_eq!(before.len(), 1);
+
+    let mut forged = alice.encrypt(b"forged key").unwrap();
+    forged.dh_public_key = [0x42; 32];
+    assert!(bob.decrypt(&forged).is_err());
+    assert_eq!(
+        before, bob.left_receiving_chains,
+        "the failed step left no trace"
+    );
+    assert!(
+        bob.decrypt(&old)
+            .unwrap_err()
+            .starts_with(super::MESSAGE_KEY_CONSUMED)
+    );
+}

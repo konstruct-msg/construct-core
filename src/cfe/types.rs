@@ -193,6 +193,15 @@ pub struct CfeSkippedKeyEntryV1 {
     pub timestamp: u64,
 }
 
+/// A receiving chain the ratchet has left: the sender's ratchet key and the position reached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfeLeftChainV1 {
+    #[serde(rename = "dh_pub")]
+    pub dh_pub: ByteBuf,
+    #[serde(rename = "n")]
+    pub reached: u32,
+}
+
 /// Thin CFE wrapper that stores a session as its raw JSON bytes with CRC32 protection.
 /// Used for Phase 4 migration — wraps the existing JSON session format so it gets
 /// integrity checking without requiring a full session state decomposition.
@@ -269,6 +278,12 @@ pub struct CfeSessionStateV1 {
     #[serde(rename = "skipped")]
     #[serde(default)]
     pub skipped: Vec<CfeSkippedKeyEntryV1>,
+
+    /// The receiving chains the ratchet has left, newest last (`LeftReceivingChain`). Absent on
+    /// blobs written before 0.77.1: none remembered, so a repeat from a chain left before the
+    /// upgrade fails as it did then.
+    #[serde(rename = "left", default, skip_serializing_if = "Vec::is_empty")]
+    pub left_chains: Vec<CfeLeftChainV1>,
 
     // `pq_rk1` (the v1 responder's pre-contribution root key) was here; v1 is gone and the
     // named-map codec ignores the key in older blobs.

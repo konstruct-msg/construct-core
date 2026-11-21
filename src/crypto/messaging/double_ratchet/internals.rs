@@ -141,6 +141,20 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.pq_authentication
     }
 
+    /// Record the receiving chain a DH step is about to leave, at the position it reached, and
+    /// forget the oldest past `MAX_LEFT_RECEIVING_CHAINS`.
+    pub(super) fn remember_left_chain(&mut self, remote_dh_public: Vec<u8>) {
+        self.left_receiving_chains.push(LeftReceivingChain {
+            remote_dh_public,
+            reached: self.receiving_chain_length,
+        });
+        let excess = self
+            .left_receiving_chains
+            .len()
+            .saturating_sub(MAX_LEFT_RECEIVING_CHAINS);
+        self.left_receiving_chains.drain(..excess);
+    }
+
     /// Restore session state from a snapshot taken before a failed decrypt attempt.
     pub(super) fn restore_snapshot(&mut self, snapshot: Option<DecryptSnapshot<P>>) {
         if let Some(s) = snapshot {
@@ -155,6 +169,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.previous_sending_length = s.previous_sending_length;
             self.skipped_message_keys = s.skipped_message_keys;
             self.skipped_key_timestamps = s.skipped_key_timestamps;
+            self.left_receiving_chains = s.left_receiving_chains;
             self.pq_turns_since_mix = s.pq_turns_since_mix;
             self.current_pq_epoch = s.current_pq_epoch;
             self.pq_chains = s.pq_chains;
