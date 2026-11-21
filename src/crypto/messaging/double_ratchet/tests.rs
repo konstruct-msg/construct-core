@@ -2455,6 +2455,70 @@ fn consuming_cfe_keeps_skipped_keys_without_copying_their_buffers() {
     assert_eq!(alice.decrypt(&reply).unwrap(), b"continued");
 }
 
+/// The scan the next test relies on sees an unwiped copy, and does not see a wiped one.
+#[test]
+fn freed_secret_scan_sees_a_copy_freed_unwiped() {
+    use crate::crypto::SecretBytes;
+    use crate::freed_secret_scan::freed_blocks_holding;
+    let secret = vec![0xA5; 32];
+    let plain = freed_blocks_holding(std::slice::from_ref(&secret), || {
+        drop(std::hint::black_box(secret.clone()));
+    });
+    assert_eq!(
+        plain, 1,
+        "a plain Vec copy is freed still holding the secret"
+    );
+    let wiped = freed_blocks_holding(std::slice::from_ref(&secret), || {
+        drop(std::hint::black_box(SecretBytes::from_slice(&secret)));
+    });
+    assert_eq!(wiped, 0, "a SecretBytes copy is wiped before it is freed");
+}
+
+/// Every decrypt snapshots the session and drops the snapshot (on success) or the live state it
+/// replaces (on rollback). Until 2026-11-21 the PQ skipped keys were plain `Vec<u8>` in both, so
+/// either drop handed copies of live message keys back to the allocator unwiped.
+#[test]
+fn decrypt_frees_no_pq_skipped_key_unwiped() {
+    use crate::freed_secret_scan::freed_blocks_holding;
+    let (mut alice, mut bob) = make_pq_session_pair("alice", "bob");
+    pq_drive_to_epoch(&mut alice, &mut bob, 1);
+    for _ in 0..4 {
+        let _held = alice.encrypt(b"held").unwrap();
+    }
+    let ahead = alice.encrypt(b"ahead").unwrap();
+    assert_eq!(bob.decrypt(&ahead).unwrap(), b"ahead");
+    let secrets: Vec<Vec<u8>> = bob
+        .pq_skipped_keys
+        .values()
+        .map(|k| k.expose().to_vec())
+        .collect();
+    assert_eq!(secrets.len(), 4, "the gap left PQ skipped keys to look for");
+
+    let next = alice.encrypt(b"next").unwrap();
+    let mut forged = next.clone();
+    forged.ciphertext[0] ^= 1;
+    let on_rollback = freed_blocks_holding(&secrets, || {
+        assert!(bob.decrypt(&forged).is_err());
+    });
+    assert_eq!(
+        on_rollback, 0,
+        "a refused message freed PQ skipped keys unwiped"
+    );
+
+    let on_success = freed_blocks_holding(&secrets, || {
+        assert_eq!(bob.decrypt(&next).unwrap(), b"next");
+    });
+    assert_eq!(
+        on_success, 0,
+        "a read message freed PQ skipped keys unwiped"
+    );
+    assert_eq!(
+        bob.pq_skipped_keys.len(),
+        4,
+        "the keys themselves are still held"
+    );
+}
+
 /// Main persistence test: both sides are serialized mid-exchange (initiator
 /// holds a pending epoch-2 keypair, responder holds the provisional epoch-2
 /// secret + ciphertext, not yet promoted), restored through the full CFE
@@ -2691,7 +2755,9 @@ fn test_pqr2_a_read_message_key_is_gone_from_both_sides() {
             }
         }
         assert!(
-            !s.pq_skipped_keys.values().any(|k| *k == used),
+            !s.pq_skipped_keys
+                .values()
+                .any(|k| k.expose() == used.as_slice()),
             "{side} kept the used key as a skipped one"
         );
     }

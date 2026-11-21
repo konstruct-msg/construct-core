@@ -83,7 +83,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
                             .map(|(&(epoch, index), key)| SerializablePqSkippedKey {
                                 epoch,
                                 index,
-                                key: key.clone(),
+                                key: key.expose().to_vec(),
                                 at: self
                                     .pq_skipped_key_timestamps
                                     .get(&(epoch, index))
@@ -274,7 +274,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         self.pq_chains = pq.chains.iter().map(PqEpochChains::from).collect();
         for s in &pq.skipped {
             self.pq_skipped_keys
-                .insert((s.epoch, s.index), s.key.clone());
+                .insert((s.epoch, s.index), SecretBytes::from_slice(&s.key));
             self.pq_skipped_key_timestamps
                 .insert((s.epoch, s.index), s.at);
         }

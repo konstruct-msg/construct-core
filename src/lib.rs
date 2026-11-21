@@ -62,6 +62,10 @@ pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;
 
+// The lib test binary's allocator: finds secrets freed without being wiped.
+#[cfg(test)]
+pub(crate) mod freed_secret_scan;
+
 // Kani formal verification proofs (only compiled under `cargo kani`)
 #[cfg(kani)]
 mod proofs;

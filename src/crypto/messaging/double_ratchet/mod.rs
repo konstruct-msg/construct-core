@@ -44,9 +44,9 @@
 //! decrypt(msg2) ✅
 //! ```
 
-use crate::crypto::SuiteID;
 use crate::crypto::kyber_prekey_auth::{PqAuthentication, PqHandshake};
 use crate::crypto::provider::CryptoProvider;
+use crate::crypto::{SecretBytes, SuiteID};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zeroize::Zeroize;
@@ -467,7 +467,7 @@ pub struct DoubleRatchetSession<P: CryptoProvider> {
 
     /// PQ chain keys passed over on the way to a later index, by `(epoch, index)` — the
     /// counterpart of `skipped_message_keys`, bounded by the same count and age.
-    pq_skipped_keys: HashMap<(u32, u32), Vec<u8>>,
+    pq_skipped_keys: HashMap<(u32, u32), SecretBytes>,
     pq_skipped_key_timestamps: HashMap<(u32, u32), u64>,
 
     /// Initiator only: exchange in flight (fresh keypair proposing `current_pq_epoch + 1`).
@@ -531,7 +531,7 @@ struct DecryptSnapshot<P: CryptoProvider> {
     pq_turns_since_mix: u32,
     current_pq_epoch: u32,
     pq_chains: Vec<PqEpochChains>,
-    pq_skipped_keys: HashMap<(u32, u32), Vec<u8>>,
+    pq_skipped_keys: HashMap<(u32, u32), SecretBytes>,
     pq_skipped_key_timestamps: HashMap<(u32, u32), u64>,
     pending_pq_exchange: Option<PendingPqExchange>,
     pending_pq_ciphertext: Option<PendingPqCiphertext>,
@@ -623,9 +623,8 @@ impl<P: CryptoProvider> Drop for DoubleRatchetSession<P> {
         for chains in self.pq_chains.iter_mut() {
             chains.zeroize();
         }
-        for key in self.pq_skipped_keys.values_mut() {
-            key.zeroize();
-        }
+        // `pq_skipped_keys` holds `SecretBytes`, which wipes itself: so does every copy of it a
+        // decrypt snapshot makes, which a loop here could not reach.
         for key in self.skipped_message_keys.values_mut() {
             key.zeroize();
         }
