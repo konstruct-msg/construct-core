@@ -82,6 +82,13 @@ namespace construct_core {
     /// before and after the call. Through VEIL a relay could forge it.
     boolean refusal_erases_device(DeviceRefusalKind refusal, boolean over_direct_tls);
 
+    /// The recipient's devices the answers to one message's copies name
+    /// (`recipient_active_devices`), the last that names any winning, sorted; empty when none did.
+    sequence<string> device_set_named(sequence<sequence<string>> answers);
+    /// Whether to ask the key server about that set: it names something, and not the set already
+    /// asked about for this recipient. The set is the address, not a timer.
+    boolean device_set_should_ask(sequence<string> named, sequence<string>? already_asked);
+
     /// What an outgoing message is after its send failed: queued when no answer came or the
     /// status says the path failed (CANCELLED, DEADLINE_EXCEEDED, UNAVAILABLE), failed otherwise.
     MessageAfterSendFailure after_send_failure(SendFailureKind failure);

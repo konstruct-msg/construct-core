@@ -16,6 +16,7 @@
 pub mod call_machine;
 pub mod calls;
 pub mod device_refusal;
+pub mod device_set;
 pub mod fanout_retry;
 pub mod intake;
 pub mod mailbox_gap;
