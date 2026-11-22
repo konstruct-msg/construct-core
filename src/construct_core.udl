@@ -2656,6 +2656,46 @@ dictionary LocalSearchHit {
     i64 timestamp;
 };
 
+/// What one media item is, for the chat gallery and the storage screen (todo 327).
+enum LocalMediaKind {
+    "Photo",
+    "Video",
+    "File",
+    "Voice",
+    "VideoNote",
+    "Animation",
+};
+
+/// One media item of a message, as the client indexes it from the descriptor it decoded.
+dictionary LocalMediaEntry {
+    /// Position in the message (album order), from 0.
+    u32 item;
+    string media_id;
+    LocalMediaKind kind;
+    /// The size the descriptor declares; what is on disk is the client's to measure.
+    i64 byte_size;
+};
+
+/// A chat's media item, read through its message. `order_key`, `message_id` and `item` of the
+/// last one are the next page's cursor.
+dictionary LocalChatMedia {
+    string message_id;
+    u32 item;
+    string media_id;
+    LocalMediaKind kind;
+    i64 byte_size;
+    i64 timestamp;
+    boolean is_sent_by_me;
+    string order_key;
+};
+
+/// Which chat and message hold a media id.
+dictionary LocalMediaOwner {
+    string media_id;
+    string chat_id;
+    string message_id;
+};
+
 interface LocalStore {
     /// Open — creating if absent — the store at `path` under `key`. A key that does not open it
     /// is `WrongKey`, never a fresh empty store.
@@ -2840,6 +2880,32 @@ interface LocalStore {
     /// Messages whose text contains `query` (one phrase, three characters at least), newest first.
     [Throws=LocalStoreError]
     sequence<LocalSearchHit> search(string query, u32 limit);
+
+    /// The media `message_id` holds (todo 327), replacing what was indexed for it; the message is
+    /// marked indexed, with no entries too. False when there is no such message. Called after
+    /// `insert_message` / `set_message_body`, and for each id `unindexed_album_messages` lists.
+    [Throws=LocalStoreError]
+    boolean set_message_media(string message_id, sequence<LocalMediaEntry> entries);
+    /// Up to `limit` albums not indexed yet, oldest first: rows an older build wrote, and any a
+    /// crash caught between the insert and `set_message_media`.
+    [Throws=LocalStoreError]
+    sequence<string> unindexed_album_messages(u32 limit);
+    /// A page of a chat's media of `kinds` (all when empty), newest first. The cursor is the last
+    /// item of the previous page — all three of `before_*` or none — so a cut album continues.
+    [Throws=LocalStoreError]
+    sequence<LocalChatMedia> chat_media(string chat_id, sequence<LocalMediaKind> kinds, string? before_order_key, string? before_message_id, u32? before_item, u32 limit);
+    /// Every media item of a chat in a message older than `before_timestamp` (the messages' unit).
+    [Throws=LocalStoreError]
+    sequence<LocalChatMedia> chat_media_older_than(string chat_id, i64 before_timestamp);
+    /// Which chat and message hold each id; unknown ids are left out, a shared id listed per message.
+    [Throws=LocalStoreError]
+    sequence<LocalMediaOwner> media_owners(sequence<string> media_ids);
+    /// The chat's "save received media to Photos"; off by default. False when there is no such chat.
+    [Throws=LocalStoreError]
+    boolean set_chat_auto_save_media(string id, boolean on);
+    /// Off for a chat that is not there.
+    [Throws=LocalStoreError]
+    boolean chat_auto_save_media(string id);
 
     [Throws=LocalStoreError]
     void upsert_reaction(LocalReaction reaction);

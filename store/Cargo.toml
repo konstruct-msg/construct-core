@@ -1,6 +1,6 @@
 [package]
 name = "construct-store"
-version = "0.16.1"
+version = "0.17.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.100"

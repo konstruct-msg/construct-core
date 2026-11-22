@@ -223,3 +223,75 @@ pub struct SearchHit {
     pub chat_id: String,
     pub timestamp: i64,
 }
+
+/// What one media item of a message is, for the chat gallery and the storage screen (vault todo
+/// 327). The client decides it from the descriptor it already decodes; the store keeps the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Photo,
+    Video,
+    File,
+    Voice,
+    VideoNote,
+    Animation,
+}
+
+impl MediaKind {
+    /// The stored code. Fixed: a store written by one build is read by the next.
+    pub(crate) fn code(self) -> i64 {
+        match self {
+            Self::Photo => 1,
+            Self::Video => 2,
+            Self::File => 3,
+            Self::Voice => 4,
+            Self::VideoNote => 5,
+            Self::Animation => 6,
+        }
+    }
+
+    /// `None` for a code a later build wrote: such a row is skipped, not misread.
+    pub(crate) fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            1 => Self::Photo,
+            2 => Self::Video,
+            3 => Self::File,
+            4 => Self::Voice,
+            5 => Self::VideoNote,
+            6 => Self::Animation,
+            _ => return None,
+        })
+    }
+}
+
+/// One media item of a message, as the client indexes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaEntry {
+    /// Position in the message (album order), from 0.
+    pub item: u32,
+    pub media_id: String,
+    pub kind: MediaKind,
+    /// The size the descriptor declares, in bytes; what is on disk is the client's to measure.
+    pub byte_size: i64,
+}
+
+/// A media item of a chat with what the gallery shows next to it, read through its message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMedia {
+    pub message_id: String,
+    pub item: u32,
+    pub media_id: String,
+    pub kind: MediaKind,
+    pub byte_size: i64,
+    pub timestamp: i64,
+    pub is_sent_by_me: bool,
+    /// The message's transcript order: with `message_id` and `item`, the next page's cursor.
+    pub order_key: String,
+}
+
+/// Which chat, and which message in it, holds a media id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaOwner {
+    pub media_id: String,
+    pub chat_id: String,
+    pub message_id: String,
+}
