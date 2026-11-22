@@ -179,17 +179,27 @@ fn indexing_again_replaces_and_a_missing_message_is_refused() {
     assert!(store.media_owners(&["x".to_string()]).unwrap().is_empty());
 }
 
-/// Albums a build before the index wrote — or a crash caught between insert and index — are
-/// listed until indexed, with no entries too; other kinds never are.
-/// Mutations: drop the `media_indexed` check, or the album-prefix match — each reddens.
+fn content_body() -> Vec<u8> {
+    let mut body = b"CTM1".to_vec();
+    body.push(construct_store::payload::kind::MESSAGE_CONTENT);
+    body.extend_from_slice(&[0x52, 0x00]);
+    body
+}
+
+/// What a build before the index wrote — or a crash caught between insert and index — is listed
+/// until indexed, with no entries too. Both kinds media is stored under are listed: an album iOS
+/// sends, and a message content (everything received, everything Android writes); a plain text
+/// and a profile never are.
+/// Mutations: drop the `media_indexed` check, the album prefix, or the message-content prefix —
+/// each reddens.
 #[test]
-fn an_album_is_listed_until_it_is_indexed() {
+fn a_message_that_may_hold_media_is_listed_until_it_is_indexed() {
     let store = store();
     store
         .insert_message(&message("a1", "c1", "k1", 1, album_body()), None)
         .unwrap();
     store
-        .insert_message(&message("a2", "c1", "k2", 2, album_body()), None)
+        .insert_message(&message("mc", "c1", "k2", 2, content_body()), None)
         .unwrap();
     store
         .insert_message(
@@ -197,16 +207,30 @@ fn an_album_is_listed_until_it_is_indexed() {
             Some("hello"),
         )
         .unwrap();
+    let mut profile = b"CTM1".to_vec();
+    profile.push(construct_store::payload::kind::PROFILE);
+    store
+        .insert_message(&message("p", "c1", "k4", 4, profile), None)
+        .unwrap();
+    store
+        .insert_message(&message("a2", "c1", "k5", 5, album_body()), None)
+        .unwrap();
 
-    assert_eq!(store.unindexed_album_messages(10).unwrap(), ["a1", "a2"]);
-    assert_eq!(store.unindexed_album_messages(1).unwrap(), ["a1"]);
+    assert_eq!(
+        store.unindexed_media_messages(10).unwrap(),
+        ["a1", "mc", "a2"]
+    );
+    assert_eq!(store.unindexed_media_messages(1).unwrap(), ["a1"]);
 
     store.set_message_media("a1", &[]).unwrap();
-    assert_eq!(store.unindexed_album_messages(10).unwrap(), ["a2"]);
+    assert_eq!(store.unindexed_media_messages(10).unwrap(), ["mc", "a2"]);
+    store
+        .set_message_media("mc", &[entry(0, "v", MediaKind::Voice, 1)])
+        .unwrap();
     store
         .set_message_media("a2", &[entry(0, "m", MediaKind::Photo, 1)])
         .unwrap();
-    assert!(store.unindexed_album_messages(10).unwrap().is_empty());
+    assert!(store.unindexed_media_messages(10).unwrap().is_empty());
 }
 
 /// A media id maps to the chat and message holding it; one two messages share is listed twice;

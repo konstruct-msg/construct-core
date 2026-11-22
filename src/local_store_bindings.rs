@@ -657,8 +657,8 @@ impl LocalStore {
         let entries: Vec<store::MediaEntry> = entries.into_iter().map(Into::into).collect();
         self.with(|s| s.set_message_media(&message_id, &entries))
     }
-    pub fn unindexed_album_messages(&self, limit: u32) -> Result<Vec<String>> {
-        self.with(|s| s.unindexed_album_messages(limit))
+    pub fn unindexed_media_messages(&self, limit: u32) -> Result<Vec<String>> {
+        self.with(|s| s.unindexed_media_messages(limit))
     }
     pub fn chat_media(
         &self,

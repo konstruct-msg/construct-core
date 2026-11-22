@@ -1122,7 +1122,7 @@ impl Store {
     /// The media `message_id` holds, replacing what was indexed for it, and the message marked
     /// indexed — with no entries too, so it is not asked for again. False when there is no such
     /// message. The client calls this after `insert_message` / `set_message_body`, and for the
-    /// ids `unindexed_album_messages` returns.
+    /// ids `unindexed_media_messages` returns.
     pub fn set_message_media(&self, message_id: &str, entries: &[MediaEntry]) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1151,23 +1151,31 @@ impl Store {
         Ok(true)
     }
 
-    /// Up to `limit` albums (CTM1 kind `MEDIA_ALBUM`) not yet indexed, oldest first: the rows a
+    /// Up to `limit` messages that may hold media and are not indexed yet, oldest first: the rows a
     /// build before the index wrote, and any a crash caught between the insert and the index.
-    pub fn unindexed_album_messages(&self, limit: u32) -> Result<Vec<String>> {
-        let album_prefix: Vec<u8> = payload::MAGIC
-            .iter()
-            .copied()
-            .chain([payload::kind::MEDIA_ALBUM])
-            .collect();
+    /// Media is stored under two CTM1 kinds — `MEDIA_ALBUM` (an album iOS sends) and
+    /// `MESSAGE_CONTENT` (whatever arrives, and all Android writes: an album, a voice note, or a
+    /// text) — and only the client reads what is inside, so both are listed; a text comes back
+    /// once and is indexed with no entries.
+    pub fn unindexed_media_messages(&self, limit: u32) -> Result<Vec<String>> {
+        let prefix =
+            |kind: u8| -> Vec<u8> { payload::MAGIC.iter().copied().chain([kind]).collect() };
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT m.id FROM messages m
-             WHERE substr(m.body, 1, 5) = ?1
+             WHERE substr(m.body, 1, 5) IN (?1, ?2)
                AND NOT EXISTS (SELECT 1 FROM media_indexed i WHERE i.message_id = m.id)
-             ORDER BY m.rowid LIMIT ?2",
+             ORDER BY m.rowid LIMIT ?3",
         )?;
         let ids = stmt
-            .query_map(params![album_prefix, limit], |row| row.get(0))?
+            .query_map(
+                params![
+                    prefix(payload::kind::MEDIA_ALBUM),
+                    prefix(payload::kind::MESSAGE_CONTENT),
+                    limit
+                ],
+                |row| row.get(0),
+            )?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
