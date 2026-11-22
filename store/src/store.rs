@@ -8,10 +8,12 @@ use crate::KEY_LEN;
 use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
-    CallRecord, Chat, Contact, DeliveryStatus, IdentityKeyPin, IssuedInvite, KvEntry, Message,
-    OwnProfile, PeerDevice, PendingChunk, PendingResend, Reaction, SearchHit, delivery,
+    CallRecord, Chat, ChatMedia, Contact, DeliveryStatus, IdentityKeyPin, IssuedInvite, KvEntry,
+    MediaEntry, MediaKind, MediaOwner, Message, OwnProfile, PeerDevice, PendingChunk,
+    PendingResend, Reaction, SearchHit, delivery,
 };
 use crate::observer::{Change, StoreObserver, Table};
+use crate::payload;
 
 /// Whether a write added a row or found it there already. Deliveries repeat — a stream replay, a
 /// history import over live mail — and the caller decides what a repeat means.
@@ -1115,6 +1117,163 @@ impl Store {
         Ok(rows)
     }
 
+    // MARK: - Media index (vault todo 327)
+
+    /// The media `message_id` holds, replacing what was indexed for it, and the message marked
+    /// indexed — with no entries too, so it is not asked for again. False when there is no such
+    /// message. The client calls this after `insert_message` / `set_message_body`, and for the
+    /// ids `unindexed_album_messages` returns.
+    pub fn set_message_media(&self, message_id: &str, entries: &[MediaEntry]) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let exists = tx
+            .query_row("SELECT 1 FROM messages WHERE id = ?1", [message_id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM media WHERE message_id = ?1", [message_id])?;
+        for e in entries {
+            tx.execute(
+                "INSERT OR REPLACE INTO media (message_id, item, media_id, kind, byte_size)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![message_id, e.item, e.media_id, e.kind.code(), e.byte_size],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO media_indexed (message_id) VALUES (?1)",
+            [message_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Up to `limit` albums (CTM1 kind `MEDIA_ALBUM`) not yet indexed, oldest first: the rows a
+    /// build before the index wrote, and any a crash caught between the insert and the index.
+    pub fn unindexed_album_messages(&self, limit: u32) -> Result<Vec<String>> {
+        let album_prefix: Vec<u8> = payload::MAGIC
+            .iter()
+            .copied()
+            .chain([payload::kind::MEDIA_ALBUM])
+            .collect();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id FROM messages m
+             WHERE substr(m.body, 1, 5) = ?1
+               AND NOT EXISTS (SELECT 1 FROM media_indexed i WHERE i.message_id = m.id)
+             ORDER BY m.rowid LIMIT ?2",
+        )?;
+        let ids = stmt
+            .query_map(params![album_prefix, limit], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// A page of a chat's media of `kinds` (all kinds when empty), newest first. `before` is the
+    /// last item of the previous page — `(order_key, message_id, item)` — so an album cut by
+    /// `limit` continues where it stopped.
+    pub fn chat_media(
+        &self,
+        chat_id: &str,
+        kinds: &[MediaKind],
+        before: Option<(&str, &str, u32)>,
+        limit: u32,
+    ) -> Result<Vec<ChatMedia>> {
+        let kind_filter = if kinds.is_empty() {
+            String::new()
+        } else {
+            let codes: Vec<String> = kinds.iter().map(|k| k.code().to_string()).collect();
+            format!("AND d.kind IN ({})", codes.join(","))
+        };
+        let (key, id, item) = match before {
+            Some((k, i, n)) => (Some(k), Some(i), Some(n)),
+            None => (None, None, None),
+        };
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT m.id, d.item, d.media_id, d.kind, d.byte_size, m.timestamp, m.is_sent_by_me,
+                    m.order_key
+             FROM messages m JOIN media d ON d.message_id = m.id
+             WHERE m.chat_id = ?1 {kind_filter}
+               AND (?2 IS NULL OR (m.order_key, m.id, d.item) < (?2, ?3, ?4))
+             ORDER BY m.order_key DESC, m.id DESC, d.item DESC LIMIT ?5"
+        ))?;
+        let rows = stmt
+            .query_map(params![chat_id, key, id, item, limit], chat_media_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    /// Every media item of a chat in a message older than `before_timestamp` (the messages'
+    /// own unit): what "remove this chat's media older than …" removes from the device.
+    pub fn chat_media_older_than(
+        &self,
+        chat_id: &str,
+        before_timestamp: i64,
+    ) -> Result<Vec<ChatMedia>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, d.item, d.media_id, d.kind, d.byte_size, m.timestamp, m.is_sent_by_me,
+                    m.order_key
+             FROM messages m JOIN media d ON d.message_id = m.id
+             WHERE m.chat_id = ?1 AND m.timestamp < ?2
+             ORDER BY m.order_key, m.id, d.item",
+        )?;
+        let rows = stmt
+            .query_map(params![chat_id, before_timestamp], chat_media_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    /// Which chat and message hold each of `media_ids` — how the client turns the files it
+    /// measured on disk into space per chat. Ids nobody holds are left out; an id two messages
+    /// share (a forward) is listed for each.
+    pub fn media_owners(&self, media_ids: &[String]) -> Result<Vec<MediaOwner>> {
+        let conn = self.lock();
+        let mut owners = Vec::new();
+        for chunk in media_ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT d.media_id, m.chat_id, m.id
+                 FROM media d JOIN messages m ON m.id = d.message_id
+                 WHERE d.media_id IN ({marks})
+                 ORDER BY d.media_id, m.chat_id, m.id"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok(MediaOwner {
+                        media_id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        message_id: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            owners.extend(rows);
+        }
+        Ok(owners)
+    }
+
+    /// The chat's "save received media to Photos". False when there is no such chat.
+    pub fn set_chat_auto_save_media(&self, id: &str, on: bool) -> Result<bool> {
+        self.update_chat(id, "auto_save_media = ?1", "", &[&on])
+    }
+
+    /// Off for a chat that is not there.
+    pub fn chat_auto_save_media(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT auto_save_media FROM chats WHERE id = ?1",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     // MARK: - Reactions
 
     /// One reaction per person per message; a new one replaces theirs.
@@ -1873,6 +2032,23 @@ const MESSAGE_COLUMNS: &str = "id, chat_id, from_user_id, to_user_id, is_sent_by
     order_key, body, content_type, delivery_status, retry_count, suite_id, is_edited, edited_at,
     reply_to_message_id, reply_to_content, transcript_text, transcript_language,
     transcript_generated_at";
+
+/// A `chat_media` row; `None` for a kind code a later build wrote, which is skipped.
+fn chat_media_row(row: &Row<'_>) -> rusqlite::Result<Option<ChatMedia>> {
+    let Some(kind) = MediaKind::from_code(row.get(3)?) else {
+        return Ok(None);
+    };
+    Ok(Some(ChatMedia {
+        message_id: row.get(0)?,
+        item: row.get(1)?,
+        media_id: row.get(2)?,
+        kind,
+        byte_size: row.get(4)?,
+        timestamp: row.get(5)?,
+        is_sent_by_me: row.get(6)?,
+        order_key: row.get(7)?,
+    }))
+}
 
 fn message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {

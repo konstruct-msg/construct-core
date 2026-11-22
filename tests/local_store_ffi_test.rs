@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use construct_core::{
     HistoryError, HistoryMessageExport, HistoryMessageImport, LocalArchiveOutcome, LocalCall,
-    LocalChat, LocalContact, LocalInsert, LocalIssuedInvite, LocalMessage, LocalMessageInsert,
-    LocalOwnProfile, LocalPeerDevice, LocalPendingChunk, LocalPendingResend, LocalStore,
-    LocalStoreChange, LocalStoreError, LocalStoreObserver, LocalStoreTable, history_export_chat,
-    history_export_message, history_import_chat, history_import_message,
+    LocalChat, LocalContact, LocalInsert, LocalIssuedInvite, LocalMediaEntry, LocalMediaKind,
+    LocalMessage, LocalMessageInsert, LocalOwnProfile, LocalPeerDevice, LocalPendingChunk,
+    LocalPendingResend, LocalStore, LocalStoreChange, LocalStoreError, LocalStoreObserver,
+    LocalStoreTable, history_export_chat, history_export_message, history_import_chat,
+    history_import_message,
 };
 
 const KEY: [u8; 32] = [3; 32];
@@ -618,4 +619,92 @@ fn a_failed_wipe_can_be_retried_until_the_files_are_gone() {
     store.wipe().unwrap();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     assert!(matches!(store.wipe(), Err(LocalStoreError::Closed)));
+}
+
+/// The media index crosses (todo 327): kinds both ways, the cursor whole or not at all, the chat's
+/// auto-save switch. Mutation: accept a partial cursor (order key and id without the item) — the
+/// first page is no longer what a partial cursor reads.
+#[test]
+fn the_media_index_crosses_and_a_partial_cursor_reads_the_first_page() {
+    let store = LocalStore::in_memory(KEY.to_vec()).unwrap();
+    store.upsert_contact(contact("peer")).unwrap();
+    store
+        .upsert_chat(LocalChat {
+            id: "c1".into(),
+            peer_id: "peer".into(),
+            last_message_text: None,
+            last_message_time: None,
+            is_pinned: false,
+            unread_count: 0,
+        })
+        .unwrap();
+    store.insert_message(message("m1", "k1"), None).unwrap();
+    let entry = |item: u32, id: &str, kind: LocalMediaKind| LocalMediaEntry {
+        item,
+        media_id: id.into(),
+        kind,
+        byte_size: 100,
+    };
+    assert!(
+        store
+            .set_message_media(
+                "m1".into(),
+                vec![
+                    entry(0, "p", LocalMediaKind::Photo),
+                    entry(1, "v", LocalMediaKind::VideoNote),
+                ],
+            )
+            .unwrap()
+    );
+
+    let page = store
+        .chat_media("c1".into(), vec![], None, None, None, 10)
+        .unwrap();
+    let ids: Vec<&str> = page.iter().map(|m| m.media_id.as_str()).collect();
+    assert_eq!(ids, ["v", "p"]);
+    assert!(matches!(page[0].kind, LocalMediaKind::VideoNote));
+
+    let after_first = store
+        .chat_media(
+            "c1".into(),
+            vec![],
+            Some("k1".into()),
+            Some("m1".into()),
+            Some(1),
+            10,
+        )
+        .unwrap();
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first[0].media_id, "p");
+    let partial = store
+        .chat_media(
+            "c1".into(),
+            vec![],
+            Some("k1".into()),
+            Some("m1".into()),
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(partial.len(), 2, "a partial cursor is the first page");
+
+    let photos = store
+        .chat_media(
+            "c1".into(),
+            vec![LocalMediaKind::Photo],
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(photos.len(), 1);
+    assert_eq!(
+        store.media_owners(vec!["v".into()]).unwrap()[0].chat_id,
+        "c1"
+    );
+
+    assert!(!store.chat_auto_save_media("c1".into()).unwrap());
+    assert!(store.set_chat_auto_save_media("c1".into(), true).unwrap());
+    assert!(store.chat_auto_save_media("c1".into()).unwrap());
 }

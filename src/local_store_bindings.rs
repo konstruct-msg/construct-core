@@ -202,6 +202,101 @@ mirror!(LocalSearchHit <=> store::SearchHit {
     message_id: String, chat_id: String, timestamp: i64,
 });
 
+pub enum LocalMediaKind {
+    Photo,
+    Video,
+    File,
+    Voice,
+    VideoNote,
+    Animation,
+}
+
+impl From<store::MediaKind> for LocalMediaKind {
+    fn from(v: store::MediaKind) -> Self {
+        match v {
+            store::MediaKind::Photo => Self::Photo,
+            store::MediaKind::Video => Self::Video,
+            store::MediaKind::File => Self::File,
+            store::MediaKind::Voice => Self::Voice,
+            store::MediaKind::VideoNote => Self::VideoNote,
+            store::MediaKind::Animation => Self::Animation,
+        }
+    }
+}
+
+impl From<LocalMediaKind> for store::MediaKind {
+    fn from(v: LocalMediaKind) -> Self {
+        match v {
+            LocalMediaKind::Photo => Self::Photo,
+            LocalMediaKind::Video => Self::Video,
+            LocalMediaKind::File => Self::File,
+            LocalMediaKind::Voice => Self::Voice,
+            LocalMediaKind::VideoNote => Self::VideoNote,
+            LocalMediaKind::Animation => Self::Animation,
+        }
+    }
+}
+
+pub struct LocalMediaEntry {
+    pub item: u32,
+    pub media_id: String,
+    pub kind: LocalMediaKind,
+    pub byte_size: i64,
+}
+
+impl From<LocalMediaEntry> for store::MediaEntry {
+    fn from(v: LocalMediaEntry) -> Self {
+        Self {
+            item: v.item,
+            media_id: v.media_id,
+            kind: v.kind.into(),
+            byte_size: v.byte_size,
+        }
+    }
+}
+
+pub struct LocalChatMedia {
+    pub message_id: String,
+    pub item: u32,
+    pub media_id: String,
+    pub kind: LocalMediaKind,
+    pub byte_size: i64,
+    pub timestamp: i64,
+    pub is_sent_by_me: bool,
+    pub order_key: String,
+}
+
+impl From<store::ChatMedia> for LocalChatMedia {
+    fn from(v: store::ChatMedia) -> Self {
+        Self {
+            message_id: v.message_id,
+            item: v.item,
+            media_id: v.media_id,
+            kind: v.kind.into(),
+            byte_size: v.byte_size,
+            timestamp: v.timestamp,
+            is_sent_by_me: v.is_sent_by_me,
+            order_key: v.order_key,
+        }
+    }
+}
+
+pub struct LocalMediaOwner {
+    pub media_id: String,
+    pub chat_id: String,
+    pub message_id: String,
+}
+
+impl From<store::MediaOwner> for LocalMediaOwner {
+    fn from(v: store::MediaOwner) -> Self {
+        Self {
+            media_id: v.media_id,
+            chat_id: v.chat_id,
+            message_id: v.message_id,
+        }
+    }
+}
+
 /// The store, closable: `wipe` takes it out, and every call after is `Closed` — except another
 /// `wipe` while files of the first one are still on disk, which removes them.
 pub struct LocalStore {
@@ -552,6 +647,59 @@ impl LocalStore {
     }
     pub fn search(&self, query: String, limit: u32) -> Result<Vec<LocalSearchHit>> {
         Ok(all(self.with(|s| s.search(&query, limit))?))
+    }
+
+    pub fn set_message_media(
+        &self,
+        message_id: String,
+        entries: Vec<LocalMediaEntry>,
+    ) -> Result<bool> {
+        let entries: Vec<store::MediaEntry> = entries.into_iter().map(Into::into).collect();
+        self.with(|s| s.set_message_media(&message_id, &entries))
+    }
+    pub fn unindexed_album_messages(&self, limit: u32) -> Result<Vec<String>> {
+        self.with(|s| s.unindexed_album_messages(limit))
+    }
+    pub fn chat_media(
+        &self,
+        chat_id: String,
+        kinds: Vec<LocalMediaKind>,
+        before_order_key: Option<String>,
+        before_message_id: Option<String>,
+        before_item: Option<u32>,
+        limit: u32,
+    ) -> Result<Vec<LocalChatMedia>> {
+        let kinds: Vec<store::MediaKind> = kinds.into_iter().map(Into::into).collect();
+        // All three or none: a partial cursor is no cursor, the first page.
+        let before = match (
+            before_order_key.as_deref(),
+            before_message_id.as_deref(),
+            before_item,
+        ) {
+            (Some(key), Some(id), Some(item)) => Some((key, id, item)),
+            _ => None,
+        };
+        Ok(all(
+            self.with(|s| s.chat_media(&chat_id, &kinds, before, limit))?
+        ))
+    }
+    pub fn chat_media_older_than(
+        &self,
+        chat_id: String,
+        before_timestamp: i64,
+    ) -> Result<Vec<LocalChatMedia>> {
+        Ok(all(self.with(|s| {
+            s.chat_media_older_than(&chat_id, before_timestamp)
+        })?))
+    }
+    pub fn media_owners(&self, media_ids: Vec<String>) -> Result<Vec<LocalMediaOwner>> {
+        Ok(all(self.with(|s| s.media_owners(&media_ids))?))
+    }
+    pub fn set_chat_auto_save_media(&self, id: String, on: bool) -> Result<bool> {
+        self.with(|s| s.set_chat_auto_save_media(&id, on))
+    }
+    pub fn chat_auto_save_media(&self, id: String) -> Result<bool> {
+        self.with(|s| s.chat_auto_save_media(&id))
     }
 
     pub fn upsert_reaction(&self, reaction: LocalReaction) -> Result<()> {

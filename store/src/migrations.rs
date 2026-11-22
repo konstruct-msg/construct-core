@@ -270,6 +270,27 @@ pub(crate) const STEPS: &[&str] = &[
         value BLOB NOT NULL
     );
     "#,
+    // 7 — which media each message holds, for the chat gallery and the storage screen, and the
+    // chat's own "save media to Photos" (vault todo 327, decisions/chat-media-gallery-storage-backup).
+    // Fed by the client, like `message_search`: an album is bytes the store does not parse. Order,
+    // time and chat are read from `messages` by join, never copied here.
+    r#"
+    CREATE TABLE media (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        item       INTEGER NOT NULL,
+        media_id   TEXT NOT NULL,
+        kind       INTEGER NOT NULL,
+        byte_size  INTEGER NOT NULL,
+        PRIMARY KEY (message_id, item)
+    );
+    CREATE INDEX media_by_media_id ON media(media_id);
+    -- A message the client has indexed, its entries possibly none: what tells "nothing to index"
+    -- from "not indexed yet" after a crash between the insert and the index.
+    CREATE TABLE media_indexed (
+        message_id TEXT PRIMARY KEY NOT NULL REFERENCES messages(id) ON DELETE CASCADE
+    );
+    ALTER TABLE chats ADD COLUMN auto_save_media INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;
