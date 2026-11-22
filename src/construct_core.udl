@@ -2883,13 +2883,14 @@ interface LocalStore {
 
     /// The media `message_id` holds (todo 327), replacing what was indexed for it; the message is
     /// marked indexed, with no entries too. False when there is no such message. Called after
-    /// `insert_message` / `set_message_body`, and for each id `unindexed_album_messages` lists.
+    /// `insert_message` / `set_message_body`, and for each id `unindexed_media_messages` lists.
     [Throws=LocalStoreError]
     boolean set_message_media(string message_id, sequence<LocalMediaEntry> entries);
-    /// Up to `limit` albums not indexed yet, oldest first: rows an older build wrote, and any a
-    /// crash caught between the insert and `set_message_media`.
+    /// Up to `limit` messages not indexed yet whose body may hold media (CTM1 album or message
+    /// content — a text among them too), oldest first: rows an older build wrote, and any a crash
+    /// caught between the insert and `set_message_media`.
     [Throws=LocalStoreError]
-    sequence<string> unindexed_album_messages(u32 limit);
+    sequence<string> unindexed_media_messages(u32 limit);
     /// A page of a chat's media of `kinds` (all when empty), newest first. The cursor is the last
     /// item of the previous page — all three of `before_*` or none — so a cut album continues.
     [Throws=LocalStoreError]
