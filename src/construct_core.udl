@@ -2419,6 +2419,7 @@ enum LocalStoreTable {
     "PeerDevices",
     "OwnProfile",
     "IssuedInvites",
+    "Notes",
 };
 
 enum LocalInsert {
@@ -2689,6 +2690,28 @@ dictionary LocalChatMedia {
     string order_key;
 };
 
+/// Something kept for oneself, on this device only (todo 279). Times are milliseconds since the epoch.
+dictionary LocalNote {
+    string id;
+    /// A message body (CTM1): text, or what a saved message held.
+    bytes body;
+    i64 created_at;
+    i64? edited_at;
+    boolean is_pinned;
+    /// Whose message it was saved from, as they were called then, and when it was sent.
+    string? source_name;
+    i64? source_at;
+};
+
+/// A file a note holds.
+dictionary LocalNoteMedia {
+    string note_id;
+    u32 item;
+    string media_id;
+    LocalMediaKind kind;
+    i64 byte_size;
+};
+
 /// Which chat and message hold a media id.
 dictionary LocalMediaOwner {
     string media_id;
@@ -2907,6 +2930,32 @@ interface LocalStore {
     /// Off for a chat that is not there.
     [Throws=LocalStoreError]
     boolean chat_auto_save_media(string id);
+
+    /// A new note, what it says (null for nothing to find) and the files it holds. `AlreadyPresent`
+    /// changes nothing.
+    [Throws=LocalStoreError]
+    LocalInsert insert_note(LocalNote note, string? search_text, sequence<LocalMediaEntry> media);
+    /// What a note says and holds now; its creation, pin and source stay. The media ids no note
+    /// holds any more — the copies the client may delete — or null when there is no such note.
+    [Throws=LocalStoreError]
+    sequence<string>? edit_note(string id, bytes body, string? search_text, sequence<LocalMediaEntry> media, i64 edited_at);
+    /// False when there is no such note.
+    [Throws=LocalStoreError]
+    boolean set_note_pinned(string id, boolean pinned);
+    /// In one transaction; the media ids no note holds any more.
+    [Throws=LocalStoreError]
+    sequence<string> delete_notes(sequence<string> ids);
+    [Throws=LocalStoreError]
+    LocalNote? note(string id);
+    /// A page: pinned first, each part newest first. `after` is the last note of the previous page.
+    [Throws=LocalStoreError]
+    sequence<LocalNote> notes(LocalNote? after, u32 limit);
+    /// In the list's order; fewer than three characters find nothing.
+    [Throws=LocalStoreError]
+    sequence<LocalNote> search_notes(string query, u32 limit);
+    /// Every file notes hold: what a cache limit leaves alone, and the space notes take.
+    [Throws=LocalStoreError]
+    sequence<LocalNoteMedia> notes_media();
 
     [Throws=LocalStoreError]
     void upsert_reaction(LocalReaction reaction);

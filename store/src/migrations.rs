@@ -291,6 +291,38 @@ pub(crate) const STEPS: &[&str] = &[
     );
     ALTER TABLE chats ADD COLUMN auto_save_media INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 8 — notes: what a person keeps for themselves, on this device only (vault todo 279,
+    // decisions/notes-stay-on-the-device). Not messages: no chat, no peer, no delivery, no server
+    // order. `body` is a message body (CTM1), so a client renders a note with what renders a
+    // message; `source_*` is who a saved message was from and when, copied, so it stays when the
+    // chat goes. `note_media` names the files a note holds: the client keeps those whatever its
+    // cache limit says, since the server forgets them in days.
+    r#"
+    CREATE TABLE notes (
+        id          TEXT PRIMARY KEY NOT NULL,
+        body        BLOB NOT NULL,
+        created_at  INTEGER NOT NULL,            -- ms since the epoch
+        edited_at   INTEGER,
+        is_pinned   INTEGER NOT NULL DEFAULT 0,
+        source_name TEXT,
+        source_at   INTEGER
+    );
+    CREATE INDEX notes_in_order ON notes(is_pinned, created_at, id);
+    CREATE TABLE note_media (
+        note_id   TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        item      INTEGER NOT NULL,
+        media_id  TEXT NOT NULL,
+        kind      INTEGER NOT NULL,
+        byte_size INTEGER NOT NULL,
+        PRIMARY KEY (note_id, item)
+    );
+    CREATE INDEX note_media_by_media_id ON note_media(media_id);
+    CREATE VIRTUAL TABLE note_search USING fts5(text, tokenize = 'trigram');
+    INSERT INTO note_search (note_search, rank) VALUES ('secure-delete', 1);
+    CREATE TRIGGER notes_leave_search AFTER DELETE ON notes BEGIN
+        DELETE FROM note_search WHERE rowid = old.rowid;
+    END;
+    "#,
 ];
 
 pub(crate) const VERSION: i64 = STEPS.len() as i64;

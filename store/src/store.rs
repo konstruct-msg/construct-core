@@ -9,8 +9,8 @@ use crate::error::{Result, StoreError};
 use crate::migrations;
 use crate::model::{
     CallRecord, Chat, ChatMedia, Contact, DeliveryStatus, IdentityKeyPin, IssuedInvite, KvEntry,
-    MediaEntry, MediaKind, MediaOwner, Message, OwnProfile, PeerDevice, PendingChunk,
-    PendingResend, Reaction, SearchHit, delivery,
+    MediaEntry, MediaKind, MediaOwner, Message, Note, NoteMedia, OwnProfile, PeerDevice,
+    PendingChunk, PendingResend, Reaction, SearchHit, delivery,
 };
 use crate::observer::{Change, StoreObserver, Table};
 use crate::payload;
@@ -1097,7 +1097,6 @@ impl Store {
     /// never parsed as FTS syntax — a user's quote or `OR` is text, not an operator. Fewer than
     /// three characters find nothing (trigram index).
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>> {
-        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT m.id, m.chat_id, m.timestamp FROM message_search s
@@ -1106,7 +1105,7 @@ impl Store {
              ORDER BY m.timestamp DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![phrase, limit], |row| {
+            .query_map(params![phrase(query), limit], |row| {
                 Ok(SearchHit {
                     message_id: row.get(0)?,
                     chat_id: row.get(1)?,
@@ -1280,6 +1279,166 @@ impl Store {
             )
             .optional()?
             .unwrap_or(false))
+    }
+
+    // MARK: - Notes (vault todo 279)
+
+    /// A new note with what it says (`search_text`, `None` for nothing to find) and the files it
+    /// holds. `AlreadyPresent` changes nothing: a move that runs again adds nothing twice.
+    pub fn insert_note(
+        &self,
+        n: &Note,
+        search_text: Option<&str>,
+        media: &[MediaEntry],
+    ) -> Result<Insert> {
+        {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let added = tx.execute(
+                "INSERT INTO notes (id, body, created_at, edited_at, is_pinned, source_name,
+                                    source_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
+                params![
+                    n.id,
+                    n.body,
+                    n.created_at,
+                    n.edited_at,
+                    n.is_pinned,
+                    n.source_name,
+                    n.source_at
+                ],
+            )?;
+            if added == 0 {
+                return Ok(Insert::AlreadyPresent);
+            }
+            write_note_parts(&tx, &n.id, search_text, media)?;
+            tx.commit()?;
+        }
+        self.notify(Table::Notes, vec![n.id.clone()]);
+        Ok(Insert::Inserted)
+    }
+
+    /// What a note says and holds now. Returns the media ids no note holds any more — the files
+    /// the client may delete — or `None` when there is no such note. Its time of creation, its
+    /// pin and its source stay.
+    pub fn edit_note(
+        &self,
+        id: &str,
+        body: &[u8],
+        search_text: Option<&str>,
+        media: &[MediaEntry],
+        edited_at: i64,
+    ) -> Result<Option<Vec<String>>> {
+        let released = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let held = note_media_ids(&tx, id)?;
+            let changed = tx.execute(
+                "UPDATE notes SET body = ?2, edited_at = ?3 WHERE id = ?1",
+                params![id, body, edited_at],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            write_note_parts(&tx, id, search_text, media)?;
+            let released = held_by_no_note(&tx, held)?;
+            tx.commit()?;
+            released
+        };
+        self.notify(Table::Notes, vec![id.to_string()]);
+        Ok(Some(released))
+    }
+
+    /// False when there is no such note.
+    pub fn set_note_pinned(&self, id: &str, pinned: bool) -> Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE notes SET is_pinned = ?2 WHERE id = ?1",
+            params![id, pinned],
+        )? > 0;
+        if changed {
+            self.notify(Table::Notes, vec![id.to_string()]);
+        }
+        Ok(changed)
+    }
+
+    /// Deletes notes in one transaction. Returns the media ids no note holds any more.
+    pub fn delete_notes(&self, ids: &[String]) -> Result<Vec<String>> {
+        let (deleted, released) = {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            let mut held = Vec::new();
+            let mut deleted = Vec::new();
+            for id in ids {
+                let media = note_media_ids(&tx, id)?;
+                if tx.execute("DELETE FROM notes WHERE id = ?1", [id])? > 0 {
+                    held.extend(media);
+                    deleted.push(id.clone());
+                }
+            }
+            let released = held_by_no_note(&tx, held)?;
+            tx.commit()?;
+            (deleted, released)
+        };
+        self.notify(Table::Notes, deleted);
+        Ok(released)
+    }
+
+    pub fn note(&self, id: &str) -> Result<Option<Note>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!("SELECT {NOTE_COLUMNS} FROM notes n WHERE n.id = ?1"),
+                [id],
+                note_row,
+            )
+            .optional()?)
+    }
+
+    /// A page of notes: pinned first, each part newest first. `before` is the last note of the
+    /// previous page — `(is_pinned, created_at, id)`.
+    pub fn notes(&self, before: Option<(bool, i64, &str)>, limit: u32) -> Result<Vec<Note>> {
+        let (pinned, at, id) = match before {
+            Some((p, t, i)) => (Some(p), Some(t), Some(i)),
+            None => (None, None, None),
+        };
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NOTE_COLUMNS} FROM notes n
+             WHERE ?1 IS NULL OR (n.is_pinned, n.created_at, n.id) < (?1, ?2, ?3)
+             ORDER BY n.is_pinned DESC, n.created_at DESC, n.id DESC LIMIT ?4"
+        ))?;
+        let rows = stmt
+            .query_map(params![pinned, at, id, limit], note_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Notes whose text contains `query`, in the list's order; matched as `search` matches
+    /// messages, so fewer than three characters find nothing.
+    pub fn search_notes(&self, query: &str, limit: u32) -> Result<Vec<Note>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NOTE_COLUMNS} FROM note_search s JOIN notes n ON n.rowid = s.rowid
+             WHERE note_search MATCH ?1
+             ORDER BY n.is_pinned DESC, n.created_at DESC, n.id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![phrase(query), limit], note_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every file notes hold: what a cache limit must leave alone, and the space notes take.
+    pub fn notes_media(&self) -> Result<Vec<NoteMedia>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT note_id, item, media_id, kind, byte_size FROM note_media
+             ORDER BY note_id, item",
+        )?;
+        let rows = stmt
+            .query_map([], note_media_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     // MARK: - Reactions
@@ -2041,6 +2200,93 @@ const MESSAGE_COLUMNS: &str = "id, chat_id, from_user_id, to_user_id, is_sent_by
     reply_to_message_id, reply_to_content, transcript_text, transcript_language,
     transcript_generated_at";
 
+/// `query` as one FTS phrase, never parsed as FTS syntax.
+fn phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+const NOTE_COLUMNS: &str =
+    "n.id, n.body, n.created_at, n.edited_at, n.is_pinned, n.source_name, n.source_at";
+
+fn note_row(row: &Row<'_>) -> rusqlite::Result<Note> {
+    Ok(Note {
+        id: row.get(0)?,
+        body: row.get(1)?,
+        created_at: row.get(2)?,
+        edited_at: row.get(3)?,
+        is_pinned: row.get(4)?,
+        source_name: row.get(5)?,
+        source_at: row.get(6)?,
+    })
+}
+
+/// `None` for a kind code a later build wrote, which is skipped.
+fn note_media_row(row: &Row<'_>) -> rusqlite::Result<Option<NoteMedia>> {
+    let Some(kind) = MediaKind::from_code(row.get(3)?) else {
+        return Ok(None);
+    };
+    Ok(Some(NoteMedia {
+        note_id: row.get(0)?,
+        item: row.get(1)?,
+        media_id: row.get(2)?,
+        kind,
+        byte_size: row.get(4)?,
+    }))
+}
+
+/// What a note says and holds, replacing what was written for it.
+fn write_note_parts(
+    tx: &Connection,
+    id: &str,
+    search_text: Option<&str>,
+    media: &[MediaEntry],
+) -> Result<()> {
+    let rowid: i64 = tx.query_row("SELECT rowid FROM notes WHERE id = ?1", [id], |r| r.get(0))?;
+    tx.execute("DELETE FROM note_search WHERE rowid = ?1", [rowid])?;
+    if let Some(text) = search_text.filter(|t| !t.is_empty()) {
+        tx.execute(
+            "INSERT INTO note_search (rowid, text) VALUES (?1, ?2)",
+            params![rowid, text],
+        )?;
+    }
+    tx.execute("DELETE FROM note_media WHERE note_id = ?1", [id])?;
+    for e in media {
+        tx.execute(
+            "INSERT OR REPLACE INTO note_media (note_id, item, media_id, kind, byte_size)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, e.item, e.media_id, e.kind.code(), e.byte_size],
+        )?;
+    }
+    Ok(())
+}
+
+fn note_media_ids(tx: &Connection, id: &str) -> Result<Vec<String>> {
+    ids_where(
+        tx,
+        "SELECT DISTINCT media_id FROM note_media WHERE note_id = ?1",
+        [id],
+    )
+}
+
+/// Those of `media_ids` no note holds, each once.
+fn held_by_no_note(tx: &Connection, media_ids: Vec<String>) -> Result<Vec<String>> {
+    let mut released = Vec::new();
+    for media_id in media_ids {
+        let held = tx
+            .query_row(
+                "SELECT 1 FROM note_media WHERE media_id = ?1 LIMIT 1",
+                [&media_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !held && !released.contains(&media_id) {
+            released.push(media_id);
+        }
+    }
+    Ok(released)
+}
+
 /// A `chat_media` row; `None` for a kind code a later build wrote, which is skipped.
 fn chat_media_row(row: &Row<'_>) -> rusqlite::Result<Option<ChatMedia>> {
     let Some(kind) = MediaKind::from_code(row.get(3)?) else {
@@ -2196,6 +2442,29 @@ mod residue_tests {
             !holds(&on_disk(&path), TERM),
             "the deleted text is still in the index"
         );
+    }
+
+    /// Mutation: `note_search` without its `secure-delete` — the words stay in the index.
+    #[test]
+    fn a_deleted_note_leaves_nothing_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = open_plain(&path);
+        let note = Note {
+            id: "n1".into(),
+            body: BODY.to_vec(),
+            created_at: 1,
+            ..Default::default()
+        };
+        let said = String::from_utf8(TERM.to_vec()).unwrap();
+        store.insert_note(&note, Some(&said), &[]).unwrap();
+        assert!(holds(&on_disk(&path), BODY), "the probe sees a live body");
+        assert!(holds(&on_disk(&path), TERM), "the probe sees a live term");
+
+        store.delete_notes(&["n1".into()]).unwrap();
+
+        assert!(!holds(&on_disk(&path), BODY), "the deleted note's body");
+        assert!(!holds(&on_disk(&path), TERM), "the deleted note's words");
     }
 
     /// Mutation: as above — an edit frees the old body exactly as a delete does.

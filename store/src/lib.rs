@@ -27,8 +27,8 @@ mod store;
 pub use error::StoreError;
 pub use model::{
     CallRecord, Chat, ChatMedia, Contact, DeliveryStatus, IdentityKeyPin, IssuedInvite, KvEntry,
-    MediaEntry, MediaKind, MediaOwner, Message, OwnProfile, PeerDevice, PendingChunk,
-    PendingResend, Reaction, SearchHit, delivery,
+    MediaEntry, MediaKind, MediaOwner, Message, Note, NoteMedia, OwnProfile, PeerDevice,
+    PendingChunk, PendingResend, Reaction, SearchHit, delivery,
 };
 pub use observer::{Change, StoreObserver, Table};
 pub use store::{Insert, Store};

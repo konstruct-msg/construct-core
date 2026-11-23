@@ -13,6 +13,8 @@ pub enum Table {
     OwnProfile,
     /// Invites this device minted; the ids are their `jti`.
     IssuedInvites,
+    /// Notes kept for oneself.
+    Notes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

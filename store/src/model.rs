@@ -295,3 +295,29 @@ pub struct MediaOwner {
     pub chat_id: String,
     pub message_id: String,
 }
+
+/// Something kept for oneself, on this device only (vault todo 279).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Note {
+    pub id: String,
+    /// A message body (CTM1): text, or what a saved message held.
+    pub body: Vec<u8>,
+    /// Milliseconds since the epoch, as `edited_at` and `source_at`.
+    pub created_at: i64,
+    pub edited_at: Option<i64>,
+    pub is_pinned: bool,
+    /// Whose message it was saved from, as they were called then.
+    pub source_name: Option<String>,
+    /// When that message was sent.
+    pub source_at: Option<i64>,
+}
+
+/// A file a note holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteMedia {
+    pub note_id: String,
+    pub item: u32,
+    pub media_id: String,
+    pub kind: MediaKind,
+    pub byte_size: i64,
+}
