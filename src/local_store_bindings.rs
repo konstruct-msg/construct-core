@@ -46,6 +46,7 @@ pub enum LocalStoreTable {
     PeerDevices,
     OwnProfile,
     IssuedInvites,
+    Notes,
 }
 
 impl From<store::Table> for LocalStoreTable {
@@ -59,6 +60,7 @@ impl From<store::Table> for LocalStoreTable {
             store::Table::PeerDevices => Self::PeerDevices,
             store::Table::OwnProfile => Self::OwnProfile,
             store::Table::IssuedInvites => Self::IssuedInvites,
+            store::Table::Notes => Self::Notes,
         }
     }
 }
@@ -277,6 +279,64 @@ impl From<store::ChatMedia> for LocalChatMedia {
             timestamp: v.timestamp,
             is_sent_by_me: v.is_sent_by_me,
             order_key: v.order_key,
+        }
+    }
+}
+
+pub struct LocalNote {
+    pub id: String,
+    pub body: Vec<u8>,
+    pub created_at: i64,
+    pub edited_at: Option<i64>,
+    pub is_pinned: bool,
+    pub source_name: Option<String>,
+    pub source_at: Option<i64>,
+}
+
+impl From<store::Note> for LocalNote {
+    fn from(v: store::Note) -> Self {
+        Self {
+            id: v.id,
+            body: v.body,
+            created_at: v.created_at,
+            edited_at: v.edited_at,
+            is_pinned: v.is_pinned,
+            source_name: v.source_name,
+            source_at: v.source_at,
+        }
+    }
+}
+
+impl From<LocalNote> for store::Note {
+    fn from(v: LocalNote) -> Self {
+        Self {
+            id: v.id,
+            body: v.body,
+            created_at: v.created_at,
+            edited_at: v.edited_at,
+            is_pinned: v.is_pinned,
+            source_name: v.source_name,
+            source_at: v.source_at,
+        }
+    }
+}
+
+pub struct LocalNoteMedia {
+    pub note_id: String,
+    pub item: u32,
+    pub media_id: String,
+    pub kind: LocalMediaKind,
+    pub byte_size: i64,
+}
+
+impl From<store::NoteMedia> for LocalNoteMedia {
+    fn from(v: store::NoteMedia) -> Self {
+        Self {
+            note_id: v.note_id,
+            item: v.item,
+            media_id: v.media_id,
+            kind: v.kind.into(),
+            byte_size: v.byte_size,
         }
     }
 }
@@ -700,6 +760,50 @@ impl LocalStore {
     }
     pub fn chat_auto_save_media(&self, id: String) -> Result<bool> {
         self.with(|s| s.chat_auto_save_media(&id))
+    }
+
+    pub fn insert_note(
+        &self,
+        note: LocalNote,
+        search_text: Option<String>,
+        media: Vec<LocalMediaEntry>,
+    ) -> Result<LocalInsert> {
+        let media: Vec<store::MediaEntry> = media.into_iter().map(Into::into).collect();
+        Ok(self
+            .with(|s| s.insert_note(&note.into(), search_text.as_deref(), &media))?
+            .into())
+    }
+    pub fn edit_note(
+        &self,
+        id: String,
+        body: Vec<u8>,
+        search_text: Option<String>,
+        media: Vec<LocalMediaEntry>,
+        edited_at: i64,
+    ) -> Result<Option<Vec<String>>> {
+        let media: Vec<store::MediaEntry> = media.into_iter().map(Into::into).collect();
+        self.with(|s| s.edit_note(&id, &body, search_text.as_deref(), &media, edited_at))
+    }
+    pub fn set_note_pinned(&self, id: String, pinned: bool) -> Result<bool> {
+        self.with(|s| s.set_note_pinned(&id, pinned))
+    }
+    pub fn delete_notes(&self, ids: Vec<String>) -> Result<Vec<String>> {
+        self.with(|s| s.delete_notes(&ids))
+    }
+    pub fn note(&self, id: String) -> Result<Option<LocalNote>> {
+        Ok(self.with(|s| s.note(&id))?.map(Into::into))
+    }
+    pub fn notes(&self, after: Option<LocalNote>, limit: u32) -> Result<Vec<LocalNote>> {
+        let before = after
+            .as_ref()
+            .map(|n| (n.is_pinned, n.created_at, n.id.as_str()));
+        Ok(all(self.with(|s| s.notes(before, limit))?))
+    }
+    pub fn search_notes(&self, query: String, limit: u32) -> Result<Vec<LocalNote>> {
+        Ok(all(self.with(|s| s.search_notes(&query, limit))?))
+    }
+    pub fn notes_media(&self) -> Result<Vec<LocalNoteMedia>> {
+        Ok(all(self.with(|s| s.notes_media())?))
     }
 
     pub fn upsert_reaction(&self, reaction: LocalReaction) -> Result<()> {
