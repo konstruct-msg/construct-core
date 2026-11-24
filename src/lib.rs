@@ -106,10 +106,10 @@ pub use rules_bindings::*;
 #[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 include!(concat!(env!("OUT_DIR"), "/construct_core.uniffi.rs"));
 
-// Re-export construct-veil's raw C FFI symbols so the cdylib link keeps them
-// alive. Without this `pub use`, `#[no_mangle] pub extern "C" fn veil_start`
-// lives in the construct-veil rlib but has no reachable caller from the
-// construct-core cdylib — linker GC drops it. iOS uses staticlib (.a) which
-// preserves all .o files regardless, so iOS doesn't need this hint.
-#[cfg(feature = "android")]
+// construct-veil's C ABI (`veil_start`, `veil_front_ferry_fd`, …) ships inside this library.
+// Without a path from here rustc leaves the construct-veil rlib out of the staticlib, and the
+// cdylib's linker drops it. On Apple that was made up for outside: the app's build script
+// merged construct-veil's own staticlib into this one, two archives with a copy of std and the
+// shared crates each, and neither could be link-time optimised (todo 341).
+#[cfg(any(feature = "ios", feature = "mac", feature = "android"))]
 pub use construct_veil::ffi::*;

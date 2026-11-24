@@ -157,7 +157,12 @@ swift = true
 
 [profile.release]
 opt-level = "z"     # optimize for binary size (vs speed)
-lto = "thin"        # thin LTO: cross-crate dead-code strip without fat objects
+# thin LTO: cross-crate dead-code strip without fat objects. `cargo build` does NOT apply it here:
+# the library is rlib + staticlib + cdylib, LTO cannot produce an rlib, and cargo drops the flag
+# without a word. Until 2026-11-24 every shipped library was built that way. A release library is
+# built with one crate type, `cargo rustc --lib --crate-type staticlib|cdylib --release …`; the
+# Android CI job fails if rustc was not given the flag (todo 341).
+lto = "thin"
 codegen-units = 1   # single unit = better optimization (slower compile)
 strip = "debuginfo" # strip DWARF debug info only; keep symbol table for C FFI exports
 panic = "abort"     # no unwinding machinery (~10-15% smaller)
