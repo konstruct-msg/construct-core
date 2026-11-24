@@ -55,3 +55,48 @@ fn a_method_is_told_from_a_longer_name() {
     assert!(!names_method("    void force_close();", "close"));
     assert!(!names_method("    boolean closed;", "close"));
 }
+
+/// UniFFI writes a parameter's name into the C header as it is. A C keyword there
+/// (`boolean signed`, 0.83.0 before it was sent) builds here and fails every Swift build.
+#[test]
+fn no_parameter_takes_a_c_keyword() {
+    const KEYWORDS: [&str; 16] = [
+        "auto", "char", "default", "double", "enum", "extern", "float", "int", "long", "register",
+        "short", "signed", "static", "struct", "unsigned", "volatile",
+    ];
+    let udl = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/construct_core.udl"
+    ))
+    .expect("read the UDL");
+    let hits: Vec<_> = udl
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| parameters(line).any(|name| KEYWORDS.contains(&name)))
+        .map(|(i, line)| (i + 1, line.trim().to_string()))
+        .collect();
+    assert!(hits.is_empty(), "rename these parameters: {hits:?}");
+}
+
+/// The last word of each comma-separated part after the first `(`.
+fn parameters(line: &str) -> impl Iterator<Item = &str> {
+    let code = line.split("//").next().unwrap_or("");
+    let list = code.split_once('(').map_or("", |(_, rest)| rest);
+    list.trim_end()
+        .trim_end_matches(';')
+        .trim_end_matches(')')
+        .split(',')
+        .filter_map(|part| part.split_whitespace().last())
+}
+
+#[test]
+fn a_parameter_is_read_by_its_name() {
+    let names = |line: &'static str| parameters(line).collect::<Vec<_>>();
+    assert_eq!(
+        names("    T f(string? anchor, sequence<u8> offered, boolean signed);"),
+        ["anchor", "offered", "signed"]
+    );
+    assert_eq!(names("    void f();"), Vec::<&str>::new());
+    assert_eq!(names("    u32 signed;"), Vec::<&str>::new());
+    assert_eq!(names("/// f(int signed)"), Vec::<&str>::new());
+}

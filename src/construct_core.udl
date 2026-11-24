@@ -639,6 +639,144 @@ interface DeviceJoinWait {
     void on_sign_in_failed(SendFailureKind failure, i64 now_ms);
 };
 
+// ── Transport route (construct-rules `transport_route`) ──────────────────────────────────────
+
+/// The person's choice: never through a front, when the direct path fails, or only through one.
+[Remote]
+enum RouteMode { "Off", "Auto", "On" };
+
+/// Which path a call or a stream went on.
+[Remote]
+enum RouteVia { "Direct", "Veil" };
+
+/// Which channel a call went on: signed in (also the stream's connection), or sealed (no identity,
+/// a connection of its own).
+[Remote]
+enum RouteLane { "Auth", "Sealed" };
+
+[Remote]
+enum RouteStreamFailure {
+    "OpenTimeout",
+    "MidSessionTimeout",
+    "WriteFailed",
+    "Closed",
+    "TransportUnknown",
+    "MidSessionClosed",
+    "MidSessionUnknown",
+};
+
+[Remote]
+enum RouteRpcFailure {
+    "TransientCancellation",
+    "AuthRejected",
+    "ApplicationError",
+    /// The edge answered with an HTTP status and no gRPC status: a service behind it restarts.
+    "ServerNotReady",
+    "TlsFingerprintBlocked",
+    "TlsCertExpired",
+    "WebTunnelBlocked",
+    /// Ours, not the front's.
+    "StaleLocalProxy",
+    "StreamTimeout",
+    "TransportUnknown",
+};
+
+/// Soft failures in a row through VEIL, per lane.
+[Remote]
+dictionary RouteSoftFails {
+    u32 auth;
+    u32 sealed;
+};
+
+[Enum]
+interface RouteState {
+    Offline();
+    Direct(u32 fails);
+    VeilProbing();
+    VeilActive(string relay, u16 port, i64 since_ms, RouteSoftFails soft_fails, u32 front_fails);
+    VeilCooldown(i64 until_ms);
+};
+
+[Enum]
+interface RouteEvent {
+    RpcSucceeded(RouteVia via, RouteLane lane);
+    /// `foreground`: a call the person waits on.
+    RpcFailed(RouteRpcFailure failure, RouteVia via, boolean foreground, RouteLane lane);
+    StreamOpened(RouteVia via);
+    StreamFailed(RouteStreamFailure failure, RouteVia via);
+    NetworkPathChanged(boolean reachable);
+    /// The new mode is the `mode` argument.
+    VeilModeChanged();
+    VeilConfigChanged();
+    BackgroundWake();
+    ProxyStarted(string relay, u16 port, boolean restarted);
+    ProxyStartFailed();
+    /// A new connection to this front came up: handshake and pin.
+    FrontDialed(string relay);
+    /// A new connection to this front did not come up. One per dial, whatever it tried inside; a
+    /// dial the client stopped itself is not one.
+    FrontDialFailed(string relay);
+    CooldownElapsed();
+    ManualReset();
+};
+
+[Enum]
+interface RouteEffect {
+    InvalidateGrpcClient();
+    /// Point gRPC at this local port, or away from the tunnel.
+    SetVeilPort(u16? port);
+    /// Start the proxy and answer with `ProxyStarted` or `ProxyStartFailed`.
+    RequestProxyStart();
+    RequestProxyStop();
+    /// The rotation that follows is this front's fault: count it before the next start.
+    DemoteRelay(string relay);
+    /// Post `CooldownElapsed` at this time.
+    ScheduleCooldownEnd(i64 at_ms);
+};
+
+[Remote]
+dictionary RouteConfig {
+    u32 direct_fail_threshold;
+    u32 mid_session_death_weight;
+    boolean allow_direct_to_veil_escalation;
+    i64 veil_cooldown_ms;
+    u32 veil_soft_fail_threshold;
+    u32 front_dial_fail_threshold;
+};
+
+dictionary RouteOutcome {
+    RouteState state;
+    sequence<RouteEffect> effects;
+};
+
+// ── VEIL fronts (construct-rules `veil_fronts`) ──────────────────────────────────────────────
+
+/// The pin kept for a front this device learned. `disputed`: a dial to it met another key, and
+/// none since met this one; kept for the life of the process. A disputed front is dialled last, is
+/// not a usable one, and is not deleted.
+dictionary FrontHeldPin {
+    string spki;
+    boolean disputed;
+};
+
+/// What an offered pin means for a front.
+[Remote]
+enum FrontPinVerdict {
+    /// The pin held. A dispute stays until a dial meets it.
+    "Same",
+    /// Not known here: pin it.
+    "Learn",
+    /// Known and disputed, offered under a signed new key: pin the new one.
+    "Repin",
+    "Malformed",
+    /// A public anchor has this address under another key.
+    "DiffersFromAnchor",
+    /// Known here under another key, which no dial has disputed.
+    "DiffersFromHeld",
+    /// New coordinates with no live signature.
+    "Unsigned",
+};
+
 /// What an outgoing message is after its send failed.
 enum MessageAfterSendFailure {
     /// Waits for a path; the same ciphertext is sent again.
@@ -1101,6 +1239,18 @@ dictionary HybridSignatureKeyPair {
 };
 
 namespace construct_core {
+    /// Which path the next call takes: one rule for every client. `route_step` is pure — the
+    /// client keeps the state, applies the effects in order, and posts what it sees.
+    RouteConfig route_default_config();
+    /// Where a fresh process starts.
+    RouteState route_initial(RouteMode mode, boolean reachable);
+    RouteOutcome route_step(RouteState state, RouteEvent event, RouteMode mode, RouteConfig config, i64 now_ms);
+
+    /// What a pin offered for a front means. `anchor`: the pin a public anchor (the signed
+    /// manifest, the binary) has for the address. `vouched`: the offered coordinates carry the
+    /// relay-config key's signature and have not expired.
+    FrontPinVerdict judge_front_pin(string? anchor, FrontHeldPin? held, string offered, boolean vouched);
+
     [Throws=CryptoError]
     ClassicCryptoCore create_crypto_core();
 
