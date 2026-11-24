@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use crate::device_link_qr;
 use crate::rule_state::{
     self, call_machine, calls, device_join, device_refusal, device_set, fanout_retry, intake,
-    mailbox_gap, names, read_sync, send_failure, stream_cursor,
+    mailbox_gap, names, read_sync, send_failure, stream_cursor, transport_route, veil_fronts,
 };
 use crate::uniffi_bindings::CryptoError;
 
@@ -1817,6 +1817,250 @@ impl DeviceJoinWait {
     }
 }
 
+// ── Transport route ───────────────────────────────────────────────────────────
+
+// The rule's plain enums and records cross as they are. UniFFI 0.30 takes no remote enum with
+// fields, so those three are mirrored.
+pub use crate::rule_state::transport_route::{
+    Config as RouteConfig, Lane as RouteLane, Mode as RouteMode, RpcFailure as RouteRpcFailure,
+    SoftFails as RouteSoftFails, StreamFailure as RouteStreamFailure, Via as RouteVia,
+};
+pub use crate::rule_state::veil_fronts::PinVerdict as FrontPinVerdict;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteState {
+    Offline,
+    Direct {
+        fails: u32,
+    },
+    VeilProbing,
+    VeilActive {
+        relay: String,
+        port: u16,
+        since_ms: i64,
+        soft_fails: RouteSoftFails,
+        front_fails: u32,
+    },
+    VeilCooldown {
+        until_ms: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteEvent {
+    RpcSucceeded {
+        via: RouteVia,
+        lane: RouteLane,
+    },
+    RpcFailed {
+        failure: RouteRpcFailure,
+        via: RouteVia,
+        foreground: bool,
+        lane: RouteLane,
+    },
+    StreamOpened {
+        via: RouteVia,
+    },
+    StreamFailed {
+        failure: RouteStreamFailure,
+        via: RouteVia,
+    },
+    NetworkPathChanged {
+        reachable: bool,
+    },
+    VeilModeChanged,
+    VeilConfigChanged,
+    BackgroundWake,
+    ProxyStarted {
+        relay: String,
+        port: u16,
+        restarted: bool,
+    },
+    ProxyStartFailed,
+    FrontDialed {
+        relay: String,
+    },
+    FrontDialFailed {
+        relay: String,
+    },
+    CooldownElapsed,
+    ManualReset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteEffect {
+    InvalidateGrpcClient,
+    SetVeilPort { port: Option<u16> },
+    RequestProxyStart,
+    RequestProxyStop,
+    DemoteRelay { relay: String },
+    ScheduleCooldownEnd { at_ms: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteOutcome {
+    pub state: RouteState,
+    pub effects: Vec<RouteEffect>,
+}
+
+impl From<transport_route::State> for RouteState {
+    fn from(state: transport_route::State) -> Self {
+        use transport_route::State as S;
+        match state {
+            S::Offline => Self::Offline,
+            S::Direct { fails } => Self::Direct { fails },
+            S::VeilProbing => Self::VeilProbing,
+            S::VeilActive {
+                relay,
+                port,
+                since_ms,
+                soft_fails,
+                front_fails,
+            } => Self::VeilActive {
+                relay,
+                port,
+                since_ms,
+                soft_fails,
+                front_fails,
+            },
+            S::VeilCooldown { until_ms } => Self::VeilCooldown { until_ms },
+        }
+    }
+}
+
+impl From<RouteState> for transport_route::State {
+    fn from(state: RouteState) -> Self {
+        use RouteState as S;
+        match state {
+            S::Offline => Self::Offline,
+            S::Direct { fails } => Self::Direct { fails },
+            S::VeilProbing => Self::VeilProbing,
+            S::VeilActive {
+                relay,
+                port,
+                since_ms,
+                soft_fails,
+                front_fails,
+            } => Self::VeilActive {
+                relay,
+                port,
+                since_ms,
+                soft_fails,
+                front_fails,
+            },
+            S::VeilCooldown { until_ms } => Self::VeilCooldown { until_ms },
+        }
+    }
+}
+
+impl From<RouteEvent> for transport_route::Event {
+    fn from(event: RouteEvent) -> Self {
+        use RouteEvent as E;
+        match event {
+            E::RpcSucceeded { via, lane } => Self::RpcSucceeded { via, lane },
+            E::RpcFailed {
+                failure,
+                via,
+                foreground,
+                lane,
+            } => Self::RpcFailed {
+                failure,
+                via,
+                foreground,
+                lane,
+            },
+            E::StreamOpened { via } => Self::StreamOpened { via },
+            E::StreamFailed { failure, via } => Self::StreamFailed { failure, via },
+            E::NetworkPathChanged { reachable } => Self::NetworkPathChanged { reachable },
+            E::VeilModeChanged => Self::VeilModeChanged,
+            E::VeilConfigChanged => Self::VeilConfigChanged,
+            E::BackgroundWake => Self::BackgroundWake,
+            E::ProxyStarted {
+                relay,
+                port,
+                restarted,
+            } => Self::ProxyStarted {
+                relay,
+                port,
+                restarted,
+            },
+            E::ProxyStartFailed => Self::ProxyStartFailed,
+            E::FrontDialed { relay } => Self::FrontDialed { relay },
+            E::FrontDialFailed { relay } => Self::FrontDialFailed { relay },
+            E::CooldownElapsed => Self::CooldownElapsed,
+            E::ManualReset => Self::ManualReset,
+        }
+    }
+}
+
+impl From<transport_route::Effect> for RouteEffect {
+    fn from(effect: transport_route::Effect) -> Self {
+        use transport_route::Effect as E;
+        match effect {
+            E::InvalidateGrpcClient => Self::InvalidateGrpcClient,
+            E::SetVeilPort { port } => Self::SetVeilPort { port },
+            E::RequestProxyStart => Self::RequestProxyStart,
+            E::RequestProxyStop => Self::RequestProxyStop,
+            E::DemoteRelay { relay } => Self::DemoteRelay { relay },
+            E::ScheduleCooldownEnd { at_ms } => Self::ScheduleCooldownEnd { at_ms },
+        }
+    }
+}
+
+pub fn route_default_config() -> RouteConfig {
+    RouteConfig::default()
+}
+
+pub fn route_initial(mode: RouteMode, reachable: bool) -> RouteState {
+    transport_route::initial(mode, reachable).into()
+}
+
+pub fn route_step(
+    state: RouteState,
+    event: RouteEvent,
+    mode: RouteMode,
+    config: RouteConfig,
+    now_ms: i64,
+) -> RouteOutcome {
+    let out = transport_route::reduce(&state.into(), &event.into(), mode, config, now_ms);
+    RouteOutcome {
+        state: out.state.into(),
+        effects: out.effects.into_iter().map(RouteEffect::from).collect(),
+    }
+}
+
+// ── VEIL fronts ───────────────────────────────────────────────────────────────
+
+/// The pin kept for a front this device learned (`construct_rules::veil_fronts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontHeldPin {
+    pub spki: String,
+    pub disputed: bool,
+}
+
+impl FrontHeldPin {
+    fn rule(&self) -> veil_fronts::HeldPin<'_> {
+        veil_fronts::HeldPin {
+            spki: &self.spki,
+            disputed: self.disputed,
+        }
+    }
+}
+
+pub fn judge_front_pin(
+    anchor: Option<String>,
+    held: Option<FrontHeldPin>,
+    offered: String,
+    vouched: bool,
+) -> FrontPinVerdict {
+    veil_fronts::judge_pin(
+        anchor.as_deref(),
+        held.as_ref().map(FrontHeldPin::rule),
+        &offered,
+        vouched,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2628,6 +2872,157 @@ mod tests {
                 e2ee: true,
                 stream: false
             }
+        );
+    }
+
+    /// Every case crosses to the same case with the same fields: the two print alike, and a state
+    /// goes there and back. Mutation: swap two arms or two fields of a conversion.
+    #[test]
+    fn every_route_case_crosses_as_itself() {
+        let r = || "front:443".to_string();
+        let states = [
+            RouteState::Offline,
+            RouteState::Direct { fails: 1 },
+            RouteState::VeilProbing,
+            RouteState::VeilActive {
+                relay: r(),
+                port: 7,
+                since_ms: 8,
+                soft_fails: RouteSoftFails { auth: 1, sealed: 2 },
+                front_fails: 3,
+            },
+            RouteState::VeilCooldown { until_ms: 9 },
+        ];
+        for state in states {
+            let there = transport_route::State::from(state.clone());
+            assert_eq!(format!("{there:?}"), format!("{state:?}"));
+            assert_eq!(RouteState::from(there), state);
+        }
+        let (via, lane) = (RouteVia::Veil, RouteLane::Sealed);
+        let events = [
+            RouteEvent::RpcSucceeded { via, lane },
+            RouteEvent::RpcFailed {
+                failure: RouteRpcFailure::ServerNotReady,
+                via,
+                foreground: true,
+                lane,
+            },
+            RouteEvent::StreamOpened { via },
+            RouteEvent::StreamFailed {
+                failure: RouteStreamFailure::WriteFailed,
+                via,
+            },
+            RouteEvent::NetworkPathChanged { reachable: true },
+            RouteEvent::VeilModeChanged,
+            RouteEvent::VeilConfigChanged,
+            RouteEvent::BackgroundWake,
+            RouteEvent::ProxyStarted {
+                relay: r(),
+                port: 7,
+                restarted: true,
+            },
+            RouteEvent::ProxyStartFailed,
+            RouteEvent::FrontDialed { relay: r() },
+            RouteEvent::FrontDialFailed { relay: r() },
+            RouteEvent::CooldownElapsed,
+            RouteEvent::ManualReset,
+        ];
+        for event in events {
+            let there = transport_route::Event::from(event.clone());
+            assert_eq!(format!("{there:?}"), format!("{event:?}"));
+        }
+        use transport_route::Effect as E;
+        let effects = [
+            E::InvalidateGrpcClient,
+            E::SetVeilPort { port: Some(7) },
+            E::RequestProxyStart,
+            E::RequestProxyStop,
+            E::DemoteRelay { relay: r() },
+            E::ScheduleCooldownEnd { at_ms: 9 },
+        ];
+        for effect in effects {
+            let here = RouteEffect::from(effect.clone());
+            assert_eq!(format!("{here:?}"), format!("{effect:?}"));
+        }
+    }
+
+    /// The route and the pin rule answer across the bridge: an event moves the state given, under
+    /// the mode, config and time given, and every argument reaches the rule.
+    #[test]
+    fn the_route_crosses_the_bridge() {
+        let front = "front:443".to_string();
+        let up = route_step(
+            route_initial(RouteMode::On, true),
+            RouteEvent::ProxyStarted {
+                relay: front.clone(),
+                port: 7,
+                restarted: false,
+            },
+            RouteMode::On,
+            route_default_config(),
+            42,
+        );
+        assert_eq!(
+            up.state,
+            RouteState::VeilActive {
+                relay: front.clone(),
+                port: 7,
+                since_ms: 42,
+                soft_fails: RouteSoftFails::default(),
+                front_fails: 0,
+            }
+        );
+        let failed = RouteEvent::FrontDialFailed { relay: front };
+        let once = RouteConfig {
+            front_dial_fail_threshold: 1,
+            ..route_default_config()
+        };
+        let left = route_step(up.state, failed, RouteMode::On, once, 43);
+        assert_eq!(left.state, RouteState::VeilProbing);
+        assert_eq!(
+            left.effects[0],
+            RouteEffect::DemoteRelay {
+                relay: "front:443".into()
+            }
+        );
+        assert_eq!(left.effects.len(), 5);
+        let cooled = |mode| {
+            route_step(
+                RouteState::VeilCooldown { until_ms: 1 },
+                RouteEvent::CooldownElapsed,
+                mode,
+                route_default_config(),
+                2,
+            )
+            .state
+        };
+        assert_eq!(cooled(RouteMode::On), RouteState::VeilProbing);
+        assert_eq!(cooled(RouteMode::Auto), RouteState::Direct { fails: 0 });
+        assert_eq!(route_initial(RouteMode::On, false), RouteState::Offline);
+        assert_eq!(
+            route_initial(RouteMode::Auto, true),
+            RouteState::Direct { fails: 0 }
+        );
+    }
+
+    #[test]
+    fn a_front_pin_crosses_the_bridge() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let held = |disputed| {
+            Some(FrontHeldPin {
+                spki: a.clone(),
+                disputed,
+            })
+        };
+        use FrontPinVerdict as V;
+        let judge = |anchor, held, signed| judge_front_pin(anchor, held, b.clone(), signed);
+        assert_eq!(judge(None, held(true), true), V::Repin);
+        assert_eq!(judge_front_pin(None, held(true), a.clone(), true), V::Same);
+        assert_eq!(judge(None, held(true), false), V::Unsigned);
+        assert_eq!(judge(None, held(false), true), V::DiffersFromHeld);
+        assert_eq!(
+            judge(Some(a.clone()), held(true), true),
+            V::DiffersFromAnchor
         );
     }
 }

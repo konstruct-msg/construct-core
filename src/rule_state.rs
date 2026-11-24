@@ -11,7 +11,7 @@
 
 pub use construct_rules::{
     call_machine, calls, device_join, device_refusal, device_set, fanout_retry, intake,
-    mailbox_gap, names, read_sync, send_failure, stream_cursor,
+    mailbox_gap, names, read_sync, send_failure, stream_cursor, transport_route, veil_fronts,
 };
 
 use crate::cfe::{self, CfeError, CfeMessageType};
