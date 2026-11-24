@@ -288,15 +288,26 @@ jobs:
       # Build all three ABIs in one cargo-ndk invocation. `-o jniLibs/` lays the
       # output out exactly as Android Studio expects under
       # app/src/main/jniLibs/<abi>/libconstruct_core.so.
+      # `rustc --crate-type cdylib`, not `build`: with the manifest's three crate types cargo
+      # silently drops the profile's LTO. The count below is the check that it did not — one
+      # `-C lto` per ABI. `touch` because a cached target may be fresh, and a fresh unit prints
+      # no command to look at.
       - name: Build .so for arm64-v8a, armeabi-v7a, x86_64
         working-directory: construct-core
         run: |
+          touch src/lib.rs
           cargo ndk \
             -t arm64-v8a \
             -t armeabi-v7a \
             -t x86_64 \
             -o ../android-out/jniLibs \
-            build --release --features android
+            rustc --lib --crate-type cdylib --release --features android -v \
+            > ../android-build.log 2>&1 || { tail -n 60 ../android-build.log; exit 1; }
+          lto=$(grep -e '--crate-name construct_core ' ../android-build.log | grep -c -e '-C lto=thin' || true)
+          if [ "$lto" != "3" ]; then
+            echo "::error::$lto of 3 ABIs were linked with LTO"
+            exit 1
+          fi
 
       # The README written a few steps below tells integrators to identify a
       # build by running exactly this command. Run it here, against the .so we
