@@ -15,6 +15,7 @@
 
 pub mod call_machine;
 pub mod calls;
+pub mod device_join;
 pub mod device_refusal;
 pub mod device_set;
 pub mod fanout_retry;
