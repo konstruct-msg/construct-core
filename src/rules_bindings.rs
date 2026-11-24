@@ -4,9 +4,10 @@
 
 use std::sync::Mutex;
 
+use crate::device_link_qr;
 use crate::rule_state::{
-    self, call_machine, calls, device_refusal, device_set, fanout_retry, intake, mailbox_gap,
-    names, read_sync, send_failure, stream_cursor,
+    self, call_machine, calls, device_join, device_refusal, device_set, fanout_retry, intake,
+    mailbox_gap, names, read_sync, send_failure, stream_cursor,
 };
 use crate::uniffi_bindings::CryptoError;
 
@@ -155,12 +156,17 @@ pub enum MessageAfterSendFailure {
     Failed,
 }
 
+impl From<SendFailureKind> for send_failure::SendError {
+    fn from(failure: SendFailureKind) -> Self {
+        match failure {
+            SendFailureKind::NoAnswer => Self::NoAnswer,
+            SendFailureKind::Status { code } => Self::Status(code),
+        }
+    }
+}
+
 pub fn after_send_failure(failure: SendFailureKind) -> MessageAfterSendFailure {
-    let failure = match failure {
-        SendFailureKind::NoAnswer => send_failure::SendError::NoAnswer,
-        SendFailureKind::Status { code } => send_failure::SendError::Status(code),
-    };
-    match send_failure::after(failure) {
+    match send_failure::after(failure.into()) {
         send_failure::AfterSend::Queued => MessageAfterSendFailure::Queued,
         send_failure::AfterSend::Failed => MessageAfterSendFailure::Failed,
     }
@@ -1644,9 +1650,279 @@ impl CallMachine {
     }
 }
 
+// ── Linking a device ──────────────────────────────────────────────────────────
+
+pub fn device_sign_in_message(device_id: String, timestamp: i64) -> Vec<u8> {
+    crate::device_id::sign_in_message(&device_id, timestamp)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTokenClaims {
+    pub user_id: Option<String>,
+    pub issued_at: Option<i64>,
+}
+
+pub fn session_token_claims(token: String) -> Option<SessionTokenClaims> {
+    let claims = crate::session_token::claims(&token)?;
+    Some(SessionTokenClaims {
+        user_id: claims.user_id,
+        issued_at: claims.issued_at,
+    })
+}
+
+pub fn device_link_start_cursor(access_token: String) -> Option<String> {
+    crate::session_token::start_cursor(&access_token)
+}
+
+/// No `Debug`, as `device_link_qr::LinkQr`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DeviceLinkQr {
+    Offer {
+        token: String,
+        fingerprint: Option<Vec<u8>>,
+        secret: Option<Vec<u8>>,
+    },
+    JoinRequest {
+        device_id: String,
+        identity_public: Vec<u8>,
+        fingerprint: Option<Vec<u8>>,
+        name: String,
+        platform: String,
+    },
+}
+
+fn key32(bytes: &[u8]) -> Result<&[u8; 32], CryptoError> {
+    bytes.try_into().map_err(|_| CryptoError::InvalidKeyData)
+}
+
+pub fn device_link_offer_qr(
+    token: String,
+    fingerprint: Option<Vec<u8>>,
+    secret: Vec<u8>,
+) -> Result<String, CryptoError> {
+    let fingerprint = fingerprint.as_deref().map(key32).transpose()?;
+    Ok(device_link_qr::offer(&token, fingerprint, key32(&secret)?))
+}
+
+pub fn device_join_request_qr(
+    identity_public: Vec<u8>,
+    hybrid_public: Vec<u8>,
+    name: String,
+    platform: String,
+) -> Result<String, CryptoError> {
+    let identity_public = key32(&identity_public)?;
+    Ok(device_link_qr::join_request(
+        identity_public,
+        &hybrid_public,
+        &name,
+        &platform,
+    ))
+}
+
+pub fn read_device_link_qr(text: String) -> Option<DeviceLinkQr> {
+    Some(match device_link_qr::read(&text)? {
+        device_link_qr::LinkQr::Offer {
+            token,
+            fingerprint,
+            secret,
+        } => DeviceLinkQr::Offer {
+            token,
+            fingerprint: fingerprint.map(Into::into),
+            secret: secret.map(Into::into),
+        },
+        device_link_qr::LinkQr::JoinRequest {
+            device_id,
+            identity_public,
+            fingerprint,
+            name,
+            platform,
+        } => DeviceLinkQr::JoinRequest {
+            device_id,
+            identity_public: identity_public.into(),
+            fingerprint: fingerprint.map(Into::into),
+            name,
+            platform,
+        },
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceJoinEnd {
+    Rejected,
+    Expired,
+    SignInRefused,
+    LetInUnreachable,
+}
+
+impl From<device_join::End> for DeviceJoinEnd {
+    fn from(end: device_join::End) -> Self {
+        match end {
+            device_join::End::Rejected => Self::Rejected,
+            device_join::End::Expired => Self::Expired,
+            device_join::End::SignInRefused => Self::SignInRefused,
+            device_join::End::LetInUnreachable => Self::LetInUnreachable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceJoinStep {
+    Wait { ms: i64 },
+    Ask,
+    SignIn,
+    Ended { end: DeviceJoinEnd },
+}
+
+impl From<device_join::Step> for DeviceJoinStep {
+    fn from(step: device_join::Step) -> Self {
+        match step {
+            device_join::Step::Wait(ms) => Self::Wait { ms },
+            device_join::Step::Ask => Self::Ask,
+            device_join::Step::SignIn => Self::SignIn,
+            device_join::Step::Ended(end) => Self::Ended { end: end.into() },
+        }
+    }
+}
+
+/// The new device's wait in Flow B (`construct_rules::device_join`).
+pub struct DeviceJoinWait {
+    join: Mutex<device_join::Join>,
+}
+
+impl DeviceJoinWait {
+    pub fn new(now_ms: i64) -> Self {
+        Self {
+            join: Mutex::new(device_join::Join::new(now_ms)),
+        }
+    }
+
+    fn join(&self) -> std::sync::MutexGuard<'_, device_join::Join> {
+        self.join.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn next(&self, now_ms: i64) -> DeviceJoinStep {
+        self.join().next(now_ms).into()
+    }
+
+    pub fn on_status(&self, status: i32, now_ms: i64) {
+        self.join().on_status(status, now_ms);
+    }
+
+    pub fn on_status_failed(&self, now_ms: i64) {
+        self.join().on_status_failed(now_ms);
+    }
+
+    pub fn on_sign_in_failed(&self, failure: SendFailureKind, now_ms: i64) {
+        self.join().on_sign_in_failed(failure.into(), now_ms);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The link exports carry every field through. Mutations that redden it: swap two fields or
+    /// two arms of a conversion; accept a short key.
+    #[test]
+    fn linking_crosses_the_bridge() {
+        let (identity, print, secret) = (vec![5u8; 32], vec![6u8; 32], vec![7u8; 32]);
+        let offer = device_link_offer_qr(s("t"), Some(print.clone()), secret.clone()).unwrap();
+        assert!(
+            read_device_link_qr(offer)
+                == Some(DeviceLinkQr::Offer {
+                    token: s("t"),
+                    fingerprint: Some(print.clone()),
+                    secret: Some(secret.clone()),
+                })
+        );
+        let hybrid = vec![8u8; 64];
+        let request =
+            device_join_request_qr(identity.clone(), hybrid.clone(), s("n"), s("p")).unwrap();
+        assert!(
+            read_device_link_qr(request)
+                == Some(DeviceLinkQr::JoinRequest {
+                    device_id: crate::device_id::derive_device_id(&identity),
+                    identity_public: identity.clone(),
+                    fingerprint: Some(
+                        crate::history::discovery::qr_fingerprint(&identity, &hybrid).into()
+                    ),
+                    name: s("n"),
+                    platform: s("p"),
+                })
+        );
+        assert!(read_device_link_qr(s("konstruct://add?invite=x")).is_none());
+        for short in [31, 33] {
+            let short = vec![1u8; short];
+            assert!(device_link_offer_qr(s("t"), None, short.clone()).is_err());
+            assert!(device_link_offer_qr(s("t"), Some(short.clone()), secret.clone()).is_err());
+            assert!(device_join_request_qr(short, hybrid.clone(), s("n"), s("p")).is_err());
+        }
+        assert_eq!(device_sign_in_message(s("id"), 12), b"id12".to_vec());
+
+        // nonce (32) ‖ claims ‖ signature (64), as `session_token` reads it.
+        let payload = [&[1u8; 32][..], br#"{"sub":"u","iat":3}"#, &[2u8; 64]].concat();
+        let token = format!(
+            "v4.public.{}",
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+        );
+        assert_eq!(
+            session_token_claims(token.clone()),
+            Some(SessionTokenClaims {
+                user_id: Some(s("u")),
+                issued_at: Some(3)
+            })
+        );
+        assert_eq!(device_link_start_cursor(token), Some(s("3000-0")));
+        assert_eq!(session_token_claims(s("t")), None);
+        assert_eq!(device_link_start_cursor(s("t")), None);
+    }
+
+    /// Every step and end crosses. Mutations that redden it: swap two arms; a report dropped.
+    #[test]
+    fn a_join_crosses_the_bridge() {
+        use DeviceJoinEnd as E;
+        use DeviceJoinStep as S;
+        let due = 3_000;
+        let wait = || DeviceJoinWait::new(0);
+
+        let join = wait();
+        assert_eq!(join.next(1_000), S::Wait { ms: 2_000 });
+        assert_eq!(join.next(due), S::Ask);
+        join.on_status_failed(due);
+        assert_eq!(join.next(due), S::Wait { ms: 3_000 });
+        let due = 2 * due;
+        assert_eq!(join.next(due), S::Ask);
+        join.on_status(1, due);
+        assert_eq!(join.next(due), S::SignIn);
+        join.on_sign_in_failed(SendFailureKind::NoAnswer, due);
+        assert_eq!(join.next(due), S::Wait { ms: 3_000 });
+        join.on_sign_in_failed(SendFailureKind::Status { code: 16 }, due);
+        assert_eq!(
+            join.next(due),
+            S::Ended {
+                end: E::SignInRefused
+            }
+        );
+
+        let join = wait();
+        join.on_status(2, due);
+        assert_eq!(join.next(due), S::Ended { end: E::Rejected });
+
+        let join = wait();
+        join.on_status(3, due);
+        join.on_sign_in_failed(SendFailureKind::Status { code: 16 }, due);
+        assert_eq!(join.next(due), S::Ended { end: E::Expired });
+
+        let join = wait();
+        join.on_status(1, due);
+        join.on_sign_in_failed(SendFailureKind::NoAnswer, due + 600_000);
+        assert_eq!(
+            join.next(due),
+            S::Ended {
+                end: E::LetInUnreachable
+            }
+        );
+    }
 
     fn s(v: &str) -> String {
         v.to_owned()

@@ -44,6 +44,12 @@ pub fn derive_device_id_bytes(identity_public_key: &[u8]) -> [u8; 16] {
     hash[0..16].try_into().expect("16 of 32 bytes")
 }
 
+/// What a device signs to sign in (`AuthenticateDevice`): its id and the Unix time in seconds, as
+/// decimal text, one after the other. The server takes a time within five minutes of its own.
+pub fn sign_in_message(device_id: &str, timestamp: i64) -> Vec<u8> {
+    format!("{device_id}{timestamp}").into_bytes()
+}
+
 /// Format device ID for federated identifier
 ///
 /// # Arguments
@@ -93,6 +99,15 @@ pub fn parse_federated_id(federated_id: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// construct-server `authenticate_device_core` verifies exactly these bytes.
+    #[test]
+    fn the_sign_in_message_is_the_id_and_the_time() {
+        assert_eq!(
+            sign_in_message("00ff", 1_700_000_000),
+            b"00ff1700000000".to_vec()
+        );
+    }
 
     #[test]
     fn the_hex_id_is_the_raw_bytes_encoded() {

@@ -82,6 +82,26 @@ namespace construct_core {
     /// before and after the call. Through VEIL a relay could forge it.
     boolean refusal_erases_device(DeviceRefusalKind refusal, boolean over_direct_tls);
 
+    /// What a device signs to sign in (`AuthenticateDevice`), for `sign_with_device_key`: its id and
+    /// the Unix time in seconds it sends with it.
+    bytes device_sign_in_message(string device_id, i64 timestamp);
+    /// The claims a client reads in its own access token (PASETO v4.public, signature not checked);
+    /// null when it is not one.
+    SessionTokenClaims? session_token_claims(string token);
+    /// Where a newly linked device's stream starts: the moment its token was issued; null when the
+    /// token does not say.
+    string? device_link_start_cursor(string access_token);
+    /// The Flow A code. `fingerprint`: `history_qr_fingerprint` of this device, null before it holds
+    /// a hybrid key; `secret`: `new_device_link_secret`. InvalidKeyData unless each is 32 bytes.
+    [Throws=CryptoError]
+    string device_link_offer_qr(string token, bytes? fingerprint, bytes secret);
+    /// The Flow B code of the device that holds these keys: its id and fingerprint follow from them.
+    /// InvalidKeyData unless `identity_public` is 32 bytes.
+    [Throws=CryptoError]
+    string device_join_request_qr(bytes identity_public, bytes hybrid_public, string name, string platform);
+    /// The link code in a scanned or opened text; null when it is not one.
+    DeviceLinkQr? read_device_link_qr(string text);
+
     /// The recipient's devices the answers to one message's copies name
     /// (`recipient_active_devices`), the last that names any winning, sorted; empty when none did.
     sequence<string> device_set_named(sequence<sequence<string>> answers);
@@ -557,6 +577,66 @@ interface SendFailureKind {
     NoAnswer();
     /// The server, or a relay on its behalf, answered with this gRPC status code.
     Status(u32 code);
+};
+
+/// What a client reads in its own access token; each null when the token does not carry it.
+dictionary SessionTokenClaims {
+    string? user_id;
+    /// Unix seconds.
+    i64? issued_at;
+};
+
+/// A device-link QR code. A fingerprint or secret of any other shape than 32 bytes reads as null.
+[Enum]
+interface DeviceLinkQr {
+    /// Flow A, shown by a device of the account. `secret` null: an older code — the device links,
+    /// unvouched.
+    Offer(string token, bytes? fingerprint, bytes? secret);
+    /// Flow B, shown by the new device; `device_id` is the one of `identity_public`.
+    /// `fingerprint` null: it is let in, unvouched.
+    JoinRequest(string device_id, bytes identity_public, bytes? fingerprint, string name, string platform);
+};
+
+/// What a device waiting to be let in does now.
+[Enum]
+interface DeviceJoinStep {
+    /// Nothing for this long; then ask `next` again.
+    Wait(i64 ms);
+    /// `CheckJoinRequestStatus`; then `on_status` or `on_status_failed`.
+    Ask();
+    /// `AuthenticateDevice` under the key it asked to join with; then `on_sign_in_failed`, or the
+    /// device is in and this object is done with.
+    SignIn();
+    Ended(DeviceJoinEnd end);
+};
+
+/// How the wait ended without the device signed in.
+enum DeviceJoinEnd {
+    /// A device of the account turned the request down.
+    "Rejected",
+    /// Nobody let this device in before the request ran out: show a new code.
+    "Expired",
+    /// Let in, then refused in a way that would repeat: a clock out by minutes, a wrong key.
+    "SignInRefused",
+    /// Let in, and the server could not be reached to sign in. The account lists the device.
+    "LetInUnreachable",
+};
+
+/// The new device's wait in Flow B, one rule for every client (construct-rules `device_join`;
+/// decisions/a-joining-device-signs-in-with-its-own-key.md): when to ask, when to sign in, how it
+/// ends. The platform makes the two calls and shows the end. Not kept: a restarted client shows a
+/// new code.
+interface DeviceJoinWait {
+    /// The request was submitted and its code is on the screen.
+    constructor(i64 now_ms);
+    /// What to do now. Asked again after every step.
+    DeviceJoinStep next(i64 now_ms);
+    /// The server's answer: the number of `CheckJoinRequestStatusResponse.Status`.
+    void on_status(i32 status, i64 now_ms);
+    /// The server gave no answer about the request.
+    void on_status_failed(i64 now_ms);
+    /// The sign-in gave no tokens.
+    void on_sign_in_failed(SendFailureKind failure, i64 now_ms);
 };
 
 /// What an outgoing message is after its send failed.
