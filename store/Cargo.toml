@@ -15,8 +15,9 @@ default = []
 vendored-openssl = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
-# 0.32 is the rusqlite on libsqlite3-sys 0.30 — the version already in this workspace's lock
-# (via sqlx-sqlite). `links = "sqlite3"` allows one libsqlite3-sys per resolve.
+# `links = "sqlite3"` allows one libsqlite3-sys per resolve. 0.32 (libsqlite3-sys 0.30) was held by
+# construct-veil's sqlx until veil 4.0.0; nothing else holds it now. RUSTSEC-2026-0459: a newer
+# libsqlite3-sys alone does not help, its bundled SQLCipher has an affected SQLite (todo 308).
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 thiserror = "2"
 zeroize = "1.0"
