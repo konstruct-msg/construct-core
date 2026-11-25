@@ -87,16 +87,15 @@ ignore = [
     "RUSTSEC-2026-0330",
     "RUSTSEC-2026-0331",
 
-    # RUSTSEC-2023-0071: rsa 0.9.10 — Marvin timing sidechannel (MEDIUM, no fixed
-    # upgrade available). NOT COMPILED into our library: it arrives only via
-    # sqlx-mysql, an optional sqlx driver. construct-veil enables sqlx with the
-    # `sqlite` driver only (features = ["runtime-tokio","sqlite","macros",...]);
-    # the mysql driver is never selected.
-    # Verified: `cargo tree -i sqlx-mysql --features ios --target all` → no path.
-    # REMOVE THIS IGNORE when: sqlx no longer pins sqlx-mysql in the lock for a
-    # sqlite-only consumer (sqlx feature-resolution fix), or rsa ships a constant
-    # -time fix.
-    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
+    # RUSTSEC-2023-0071, COMPILED (2026-11-14, todo 311): rsa 0.10.0-rc.18 via
+    # blind-rsa-signatures (AUTH v4 tokens, construct-veil-protocol `token`). The advisory
+    # lists ">= 0.10.0" as patched, and a pre-release sorts below it. rc.18 already carries
+    # the fix (read in its source): crypto-bigint constant-time arithmetic, RSA blinding of
+    # the private-key operation and a check of its result (`rsa_decrypt_and_check`). And no
+    # veil binary runs a private-key operation: relay and client only verify, blind and
+    # finalize (public key); `EpochKey::blind_sign` runs on the issuer.
+    # REMOVE THIS IGNORE when blind-rsa-signatures builds against rsa >= 0.10.0 and the pin
+    # in construct-veil-protocol/Cargo.toml goes.
     "RUSTSEC-2023-0071",
 ]
 
