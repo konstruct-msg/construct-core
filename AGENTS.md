@@ -118,6 +118,33 @@ the same change, or is removed.
   `set_local_user_id` is the one seam). It never learns `ServerUserId` — the client translates
   account → devices and hands over the set.
 
+### Code shape
+
+From the architecture lint of 2026-11-26 (vault `todo/epic-core-architecture-lint-2026-11-26.md`,
+tasks 348–366). Reviewed by hand until task 366 makes the lint a gate that only new findings fail.
+
+- **Layers point down:** `cfe`, `wire_payload` → `crypto` → `history` → `orchestration` →
+  bindings. A lower module never names a higher one. A trait a lower layer declares is
+  implemented where the implementing type lives (`impl DeviceKeys for Orchestrator` belongs in
+  `orchestration`, 362); types every layer uses (`SecretBytes`, the TLV codec) sit in a leaf.
+  The wire layout is declared by `wire_payload` and read by the ratchet, not the other way.
+- **Protocol constants are `const` in one leaf module** — not global state, not the module that
+  first needed them. A value both peers must agree on is not configuration (`Config::global()`
+  only ever held its default, 361).
+- **No module cycles.** Something two modules both need goes into a leaf both import. One type
+  split over files by `impl` blocks is fine.
+- **An owner does the operation; it does not hand out its insides.** The orchestrator asks
+  `SessionLifecycleManager`, `KeyManager`, `EnvelopeBook` to seal, open or reopen; it does not take
+  a key, book or record out and decide itself (349, 352, 363). Bindings call the orchestrator
+  API, never `key_manager`. A crate below the core gives its state by method, not field (364).
+- **Bindings and the store are split by area;** a new FFI function or `Store` query goes into its
+  area's module (364, 365).
+- **Size is a signal, not a rule.** Split along the sections a file already has, after ownership
+  has moved out of it; never to satisfy a counter.
+- **Measure with `deslop-please -F mac,post-quantum`.** Without the feature the bindings, store and
+  rules are not checked (26 findings instead of 34). A PR that moves ownership quotes the
+  before/after field-leak counts.
+
 ### Session lifecycle
 
 - **A session renews by sending.** A message carrying the handshake header (ML-KEM ciphertext)
