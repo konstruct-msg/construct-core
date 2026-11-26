@@ -767,6 +767,24 @@ impl Orchestrator {
     pub fn init_session_with_bundle(
         &mut self,
         contact_id: &str,
+        public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
+        kyber: KyberBundleKeys,
+        allow_stale: bool,
+    ) -> Result<String, OpenRefusal> {
+        Self::init_initiator_session(
+            &mut self.lifecycle,
+            &mut self.open_without_one_time_prekey,
+            contact_id,
+            public_bundle,
+            kyber,
+            allow_stale,
+        )
+    }
+
+    fn init_initiator_session(
+        lifecycle: &mut SessionLifecycleManager,
+        open_without_one_time_prekey: &mut HashSet<String>,
+        contact_id: &str,
         mut public_bundle: crate::crypto::handshake::x3dh::X3DHPublicKeyBundle,
         mut kyber: KyberBundleKeys,
         allow_stale: bool,
@@ -775,7 +793,7 @@ impl Orchestrator {
 
         // The peer said it does not hold the one-time prekey it would be given: open on its signed
         // prekeys alone, which it can always reproduce. Whatever the bundle carries is not used.
-        if self.opens_without_one_time_prekey(contact_id) {
+        if open_without_one_time_prekey.contains(contact_id) {
             public_bundle.one_time_prekey_public = None;
             public_bundle.one_time_prekey_id = None;
             kyber.one_time_prekey_id = None;
@@ -788,7 +806,7 @@ impl Orchestrator {
         // Before anything is spent on it: a bundle that goes back behind what this device has
         // admitted from the peer is a replay, whoever asked for the open (TODO 176).
         let spk_epoch = public_bundle.spk_rotation_epoch;
-        if let Some(regressed) = self.lifecycle.spk_epoch_regression(contact_id, spk_epoch) {
+        if let Some(regressed) = lifecycle.spk_epoch_regression(contact_id, spk_epoch) {
             return Err(regressed.to_string().into());
         }
 
@@ -837,8 +855,8 @@ impl Orchestrator {
                 ),
             };
             let ctx = PqxdhContext {
-                now: self.lifecycle.now_secs(),
-                pinned_hybrid_identity: self.lifecycle.pinned_hybrid_identity(contact_id),
+                now: lifecycle.now_secs(),
+                pinned_hybrid_identity: lifecycle.pinned_hybrid_identity(contact_id),
             };
             let choice = plan_pqxdh(&offer, &ctx).map_err(|reason| {
                 tracing::error!(
@@ -873,8 +891,7 @@ impl Orchestrator {
 
             let enc = crate::crypto::pq_x3dh::mlkem1024_encapsulate(&choice.kyber_public)
                 .map_err(|e| format!("PQXDH_ENCAPSULATION_FAILED: {e}"))?;
-            let kem_identity = self
-                .lifecycle
+            let kem_identity = lifecycle
                 .client
                 .key_manager()
                 .kem_identity_public()
@@ -885,7 +902,7 @@ impl Orchestrator {
                 kem_ciphertext: &enc.ciphertext,
                 initiator_kem_identity: &kem_identity,
             };
-            self.lifecycle
+            lifecycle
                 .client
                 .init_session_with_pq(
                     contact_id,
@@ -903,7 +920,7 @@ impl Orchestrator {
                 key: crate::crypto::sealed_sender::first_flight::FirstFlightKey::from_kem_secret(
                     enc.shared_secret.expose(),
                 ),
-                handshake_at: self.lifecycle.now_secs(),
+                handshake_at: lifecycle.now_secs(),
             };
             let header = PrekeyHeader {
                 one_time_prekey_id,
@@ -919,12 +936,12 @@ impl Orchestrator {
         };
 
         // The header carries the OTPK id now; the client's own copy would only go stale.
-        let _ = self.lifecycle.client.take_pending_otpk_id(contact_id);
+        let _ = lifecycle.client.take_pending_otpk_id(contact_id);
         // X3DH above verified the bundle's SPK signature: only now is its hybrid key worth pinning.
         if let Some(fingerprint) = hybrid_pin {
-            self.lifecycle.pin_hybrid_identity(contact_id, fingerprint);
+            lifecycle.pin_hybrid_identity(contact_id, fingerprint);
         }
-        if let Some(session) = self.lifecycle.client.get_session_mut(contact_id) {
+        if let Some(session) = lifecycle.client.get_session_mut(contact_id) {
             let ratchet = session.messaging_session_mut();
             if hybrid_pin.is_some() {
                 ratchet.mark_pqxdh_v2(
@@ -936,21 +953,20 @@ impl Orchestrator {
         }
         // The key every first flight of this session is sealed with, until the peer answers.
         if let Some(filed) = first_flight
-            && let Some(session_id) = self
-                .lifecycle
+            && let Some(session_id) = lifecycle
                 .client
                 .get_session(contact_id)
                 .map(|s| s.session_id().to_string())
         {
-            self.lifecycle.client.envelopes_mut().set_first_flight(
+            lifecycle.client.envelopes_mut().set_first_flight(
                 &session_id,
                 filed.ciphertext_hash,
                 filed.key,
                 filed.handshake_at,
             );
         }
-        self.lifecycle.note_spk_epoch(contact_id, spk_epoch);
-        self.open_without_one_time_prekey.remove(contact_id);
+        lifecycle.note_spk_epoch(contact_id, spk_epoch);
+        open_without_one_time_prekey.remove(contact_id);
         tracing::info!(
             target: "crypto::orchestrator",
             contact_id = %contact_id,
@@ -996,21 +1012,17 @@ impl Orchestrator {
         kyber: KyberBundleKeys,
         allow_stale: bool,
     ) -> Result<String, OpenRefusal> {
-        let held = self.lifecycle.client.take_session(contact_id);
-        let opened = self.init_session_with_bundle(contact_id, public_bundle, kyber, allow_stale);
-        match (&opened, held) {
-            (Err(e), Some(session)) => {
-                tracing::warn!(
-                    target: "crypto::orchestrator",
-                    contact_id = %contact_id,
-                    error = %e,
-                    "reopen refused — keeping the session already held"
-                );
-                self.lifecycle.client.put_back_session(contact_id, session);
-            }
-            (Ok(_), Some(session)) => self.lifecycle.retire(contact_id, session),
-            (_, None) => {}
-        }
+        let open_without_one_time_prekey = &mut self.open_without_one_time_prekey;
+        let opened = self.lifecycle.reopen_with(contact_id, |lifecycle| {
+            Self::init_initiator_session(
+                lifecycle,
+                open_without_one_time_prekey,
+                contact_id,
+                public_bundle,
+                kyber,
+                allow_stale,
+            )
+        });
         if opened.is_err() {
             self.reopen_refused(contact_id);
         }
@@ -4700,7 +4712,7 @@ mod pqxdh_v2_tests {
     /// The case the upgrade meets while the peer is still on an old build: its bundle has no
     /// Kyber-1024 key. The working session must survive the refusal.
     ///
-    /// Mutation: drop `put_back_session` from `reopen_session_with_bundle` — this reddens.
+    /// Mutation: drop `put_back_session` from `SessionLifecycleManager::reopen_with`.
     #[test]
     fn a_refused_reopen_keeps_the_session_held() {
         let (mut zed, mut bob) = (device("zed"), device("bob"));

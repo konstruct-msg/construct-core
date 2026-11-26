@@ -450,6 +450,31 @@ impl SessionLifecycleManager {
         self.client.put_back_session(contact_id, session);
     }
 
+    /// Set the current state aside while `open` installs its replacement. A successful open
+    /// keeps the old state as previous; an error puts it back as current.
+    pub(super) fn reopen_with<T, E: std::fmt::Display>(
+        &mut self,
+        contact_id: &str,
+        open: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let held = self.client.take_session(contact_id);
+        let opened = open(self);
+        match (&opened, held) {
+            (Err(e), Some(session)) => {
+                tracing::warn!(
+                    target: "crypto::orchestrator",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "reopen refused — keeping the session already held"
+                );
+                self.client.put_back_session(contact_id, session);
+            }
+            (Ok(_), Some(session)) => self.retire(contact_id, session),
+            (_, None) => {}
+        }
+        opened
+    }
+
     /// Keep `session` — taken out of the client, no longer current — as the newest previous state.
     pub(crate) fn retire(&mut self, contact_id: &str, session: HeldSession) {
         let retired_at = self.clock.now_secs();
