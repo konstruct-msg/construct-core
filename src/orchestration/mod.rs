@@ -28,6 +28,7 @@ pub mod pq_prekey_plan;
 pub mod receiving_init_plan;
 pub mod reorder_stats;
 pub mod send_plan;
+mod session_bundle;
 pub mod session_lifecycle;
 pub mod session_machine;
 pub mod stale_spk_plan;
