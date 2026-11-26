@@ -703,14 +703,33 @@ impl<P: CryptoProvider> KeyManager<P> {
         key_id: u32,
         ciphertext: &[u8],
     ) -> Result<crate::crypto::SecretBytes> {
-        let prekey = if key_id == 0 {
-            self.kyber_prekeys.current_spk()
+        let secret = if key_id == 0 {
+            Self::decapsulate_held_kyber_prekey(self.kyber_prekeys.current_spk(), ciphertext)
         } else {
-            self.kyber_prekeys.find(key_id)
-        }
-        .ok_or_else(|| Self::crypto_err(format!("Kyber prekey {key_id} not held")))?;
-        crate::crypto::pq_x3dh::mlkem1024_decapsulate(prekey.seed(), ciphertext)
-            .map_err(Self::crypto_err)
+            self.decapsulate_named_kyber_prekey(key_id, ciphertext)
+        };
+        secret
+            .map_err(Self::crypto_err)?
+            .ok_or_else(|| Self::crypto_err(format!("Kyber prekey {key_id} not held")))
+    }
+
+    /// Decapsulate with the exact key named by a handshake. No fallback to the current SPK.
+    /// `None` means the key is not held; `Err` means decapsulation could not be performed.
+    pub(crate) fn decapsulate_named_kyber_prekey(
+        &self,
+        key_id: u32,
+        ciphertext: &[u8],
+    ) -> std::result::Result<Option<crate::crypto::SecretBytes>, String> {
+        Self::decapsulate_held_kyber_prekey(self.kyber_prekeys.find(key_id), ciphertext)
+    }
+
+    fn decapsulate_held_kyber_prekey(
+        prekey: Option<&crate::crypto::kyber_prekeys::KyberPrekey>,
+        ciphertext: &[u8],
+    ) -> std::result::Result<Option<crate::crypto::SecretBytes>, String> {
+        prekey
+            .map(|prekey| crate::crypto::pq_x3dh::mlkem1024_decapsulate(prekey.seed(), ciphertext))
+            .transpose()
     }
 
     /// Replace the Kyber prekeys from a snapshot (`KyberPrivateKeys` CFE).

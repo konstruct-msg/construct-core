@@ -1631,19 +1631,7 @@ impl Orchestrator {
     ///   peer has no session yet, so no tag of ours can find it;
     /// - there is no current state, or its pair is not in the book (made before the envelope).
     pub fn seal_envelope(&self, contact_id: &str, wire_payload: &[u8]) -> Option<Vec<u8>> {
-        let session = self.lifecycle.client.get_session(contact_id)?;
-        if session.messaging_session().prekey_header().is_some() {
-            return None;
-        }
-        self.lifecycle
-            .client
-            .envelopes()
-            .seal(
-                session.session_id(),
-                crate::crypto::sealed_sender::envelope::EnvelopeKind::Ratchet,
-                wire_payload,
-            )
-            .ok()
+        self.lifecycle.seal_envelope(contact_id, wire_payload)
     }
 
     /// Seal a first flight to `contact_id` — `wire_payload` written on a session whose peer has not
@@ -1662,39 +1650,8 @@ impl Orchestrator {
         wire_payload: &[u8],
         certificate: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
-        use crate::crypto::sealed_sender::first_flight;
-        if crate::device_id::derive_device_id(recipient_identity) != contact_id {
-            return Err(format!(
-                "FIRST_FLIGHT_WRONG_KEY: the identity key given does not derive to {}",
-                crate::crypto::messaging::double_ratchet::id_prefix(contact_id)
-            ));
-        }
-        let Some(handshake) = first_flight::handshake_of_wire(wire_payload) else {
-            return Ok(None);
-        };
-        let session = self
-            .lifecycle
-            .client
-            .get_session(contact_id)
-            .ok_or_else(|| format!("FIRST_FLIGHT_NO_SESSION: {}", contact_id))?;
-        let filed = self
-            .lifecycle
-            .client
-            .envelopes()
-            .first_flight_of_session(session.session_id())
-            .ok_or_else(|| {
-                "FIRST_FLIGHT_NO_KEY: the session has no first-flight key — answered, or made by \
-                 a core older than 0.27"
-                    .to_string()
-            })?;
-        if handshake.ciphertext_hash() != filed.ciphertext_hash {
-            return Err(
-                "FIRST_FLIGHT_OTHER_HANDSHAKE: the payload was written on another state".into(),
-            );
-        }
-        first_flight::seal(&filed.key, recipient_identity, wire_payload, certificate)
-            .map(Some)
-            .map_err(|e| e.to_string())
+        self.lifecycle
+            .seal_first_flight(contact_id, recipient_identity, wire_payload, certificate)
     }
 
     /// Open a first flight sealed to this device: the handshake's key from the book when an
@@ -1705,36 +1662,7 @@ impl Orchestrator {
         &self,
         sealed: &[u8],
     ) -> Result<crate::crypto::sealed_sender::first_flight::OpenedFirstFlight, String> {
-        use crate::crypto::sealed_sender::first_flight::{self, FirstFlightKey};
-        let handshake = first_flight::handshake_of_box(sealed).map_err(|e| e.to_string())?;
-        let km = self.lifecycle.client.key_manager();
-        let key = match self
-            .lifecycle
-            .client
-            .envelopes()
-            .first_flight_by_handshake(&handshake.ciphertext_hash())
-        {
-            Some(key) => key.clone(),
-            None => {
-                let prekey = km
-                    .kyber_prekeys()
-                    .find(handshake.kyber_prekey_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "FIRST_FLIGHT_KEY_UNAVAILABLE: Kyber prekey {} is not held",
-                            handshake.kyber_prekey_id
-                        )
-                    })?;
-                let shared = crate::crypto::pq_x3dh::mlkem1024_decapsulate(
-                    prekey.seed(),
-                    handshake.kem_ciphertext,
-                )?;
-                FirstFlightKey::from_kem_secret(shared.expose())
-            }
-        };
-        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
-        first_flight::open(&key, <_ as AsRef<[u8]>>::as_ref(secret), sealed)
-            .map_err(|e| e.to_string())
+        self.lifecycle.open_first_flight(sealed)
     }
 
     /// Find who wrote `envelope` by its tag and open it. `None` when no pair this device holds
@@ -1745,7 +1673,7 @@ impl Orchestrator {
         &self,
         envelope: &[u8],
     ) -> Option<crate::crypto::sealed_sender::book::OpenedEnvelope> {
-        self.lifecycle.client.envelopes().open(envelope)
+        self.lifecycle.open_envelope(envelope)
     }
 
     /// Open a sealed delivery (`SealedInner`) and return who wrote it and what it carries.
