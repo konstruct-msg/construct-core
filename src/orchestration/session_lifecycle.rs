@@ -299,6 +299,103 @@ impl SessionLifecycleManager {
         Ok(DecryptResult { plaintext, actions })
     }
 
+    // ── Sealed envelopes ──────────────────────────────────────────────────────
+
+    pub(super) fn seal_envelope(&self, contact_id: &str, wire_payload: &[u8]) -> Option<Vec<u8>> {
+        let session = self.client.get_session(contact_id)?;
+        if session.messaging_session().prekey_header().is_some() {
+            return None;
+        }
+        self.client
+            .envelopes()
+            .seal(
+                session.session_id(),
+                crate::crypto::sealed_sender::envelope::EnvelopeKind::Ratchet,
+                wire_payload,
+            )
+            .ok()
+    }
+
+    pub(super) fn open_envelope(
+        &self,
+        envelope: &[u8],
+    ) -> Option<crate::crypto::sealed_sender::book::OpenedEnvelope> {
+        self.client.envelopes().open(envelope)
+    }
+
+    pub(super) fn seal_first_flight(
+        &self,
+        contact_id: &str,
+        recipient_identity: &[u8],
+        wire_payload: &[u8],
+        certificate: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        use crate::crypto::sealed_sender::first_flight;
+        if crate::device_id::derive_device_id(recipient_identity) != contact_id {
+            return Err(format!(
+                "FIRST_FLIGHT_WRONG_KEY: the identity key given does not derive to {}",
+                crate::crypto::messaging::double_ratchet::id_prefix(contact_id)
+            ));
+        }
+        let Some(handshake) = first_flight::handshake_of_wire(wire_payload) else {
+            return Ok(None);
+        };
+        let session = self
+            .client
+            .get_session(contact_id)
+            .ok_or_else(|| format!("FIRST_FLIGHT_NO_SESSION: {}", contact_id))?;
+        let filed = self
+            .client
+            .envelopes()
+            .first_flight_of_session(session.session_id())
+            .ok_or_else(|| {
+                "FIRST_FLIGHT_NO_KEY: the session has no first-flight key — answered, or made by \
+                 a core older than 0.27"
+                    .to_string()
+            })?;
+        if handshake.ciphertext_hash() != filed.ciphertext_hash {
+            return Err(
+                "FIRST_FLIGHT_OTHER_HANDSHAKE: the payload was written on another state".into(),
+            );
+        }
+        first_flight::seal(&filed.key, recipient_identity, wire_payload, certificate)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn open_first_flight(
+        &self,
+        sealed: &[u8],
+    ) -> Result<crate::crypto::sealed_sender::first_flight::OpenedFirstFlight, String> {
+        use crate::crypto::sealed_sender::first_flight::{self, FirstFlightKey};
+        let handshake = first_flight::handshake_of_box(sealed).map_err(|e| e.to_string())?;
+        let km = self.client.key_manager();
+        let key = match self
+            .client
+            .envelopes()
+            .first_flight_by_handshake(&handshake.ciphertext_hash())
+        {
+            Some(key) => key.clone(),
+            None => {
+                let shared = km
+                    .decapsulate_named_kyber_prekey(
+                        handshake.kyber_prekey_id,
+                        handshake.kem_ciphertext,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "FIRST_FLIGHT_KEY_UNAVAILABLE: Kyber prekey {} is not held",
+                            handshake.kyber_prekey_id
+                        )
+                    })?;
+                FirstFlightKey::from_kem_secret(shared.expose())
+            }
+        };
+        let secret = km.identity_secret_key().map_err(|e| e.to_string())?;
+        first_flight::open(&key, <_ as AsRef<[u8]>>::as_ref(secret), sealed)
+            .map_err(|e| e.to_string())
+    }
+
     // ── Previous states ───────────────────────────────────────────────────────
 
     /// Decrypt `msg` on any state held with `contact_id`: the current one, then each previous
