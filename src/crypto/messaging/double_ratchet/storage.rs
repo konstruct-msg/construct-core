@@ -351,7 +351,7 @@ fn validate_pq_ratchet_state(pq: &SerializablePqRatchetState) -> Result<(), Stri
             pq.current_epoch
         ));
     }
-    if pq.skipped.len() > crate::config::Config::global().max_skipped_messages as usize {
+    if pq.skipped.len() > crate::limits::MAX_SKIPPED_MESSAGES as usize {
         return Err(format!(
             "{} skipped PQ keys exceed the skipped-key bound",
             pq.skipped.len()

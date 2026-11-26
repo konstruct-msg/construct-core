@@ -54,6 +54,7 @@ pub mod error;
 pub mod history;
 pub mod intake;
 pub mod knst;
+mod limits;
 pub mod media;
 pub mod orchestration;
 pub mod pow;

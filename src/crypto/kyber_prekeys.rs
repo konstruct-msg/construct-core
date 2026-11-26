@@ -29,8 +29,8 @@ use std::collections::BTreeMap;
 
 use crate::cfe::{CfeKyberPrekeyV1, CfeKyberPrekeysV1, CfeRetiredKyberSpkV1};
 use crate::crypto::SecretBytes;
-use crate::crypto::keys::SPK_RETENTION_AFTER_ROTATION_SECS;
 use crate::crypto::pq_x3dh::MLKEM_SEED_SIZE;
+use crate::limits::SPK_RETENTION_AFTER_ROTATION_SECS;
 
 /// First id of the one-time range (signed prekeys count up from 1).
 pub const KYBER_OTPK_ID_START: u32 = 1_000_000;

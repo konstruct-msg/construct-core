@@ -1,11 +1,12 @@
-//! Централизованная конфигурация для Construct Messenger Core
+//! Compatibility configuration API for Rust callers.
 //!
-//! Все константы и настройки приложения должны быть определены здесь,
-//! чтобы избежать хардкода по всему проекту.
+//! Protocol code uses the fixed limits directly. `Config` exposes those same values through
+//! the existing Rust API; it does not configure the engine.
 
+use crate::limits;
 use std::sync::OnceLock;
 
-/// Глобальная конфигурация приложения (синглтон)
+/// Initialization state of the compatibility API.
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
 /// Основная структура конфигурации
@@ -56,19 +57,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Криптография
-            chacha_nonce_length: 12,
-
-            // Double Ratchet
-            max_skipped_messages: 1000,
-            max_message_jump: 2000,
-            max_skipped_message_age_seconds: 7 * 24 * 60 * 60, // 7 days
-            pq_ratchet_interval: 16,
-            pq_ratchet_max_age_seconds: 7 * 24 * 60 * 60,
-
-            // Временные параметры
-            prekey_cleanup_period_secs: crate::crypto::keys::SPK_RETENTION_AFTER_ROTATION_SECS
-                as i64,
+            chacha_nonce_length: limits::CHACHA_NONCE_LENGTH,
+            max_skipped_messages: limits::MAX_SKIPPED_MESSAGES,
+            max_message_jump: limits::MAX_MESSAGE_JUMP,
+            max_skipped_message_age_seconds: limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS,
+            pq_ratchet_interval: limits::PQ_RATCHET_INTERVAL,
+            pq_ratchet_max_age_seconds: limits::PQ_RATCHET_MAX_AGE_SECONDS,
+            prekey_cleanup_period_secs: limits::SPK_RETENTION_AFTER_ROTATION_SECS as i64,
         }
     }
 }
