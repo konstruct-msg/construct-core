@@ -1,9 +1,9 @@
 use super::*;
-use crate::config::Config;
 use crate::crypto::SuiteID;
 use crate::crypto::handshake::InitiatorState;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
+use crate::limits;
 use std::collections::HashMap;
 use zeroize::Zeroize;
 
@@ -315,8 +315,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         let message_number = self.sending_chain_length;
         self.sending_chain_length = next_number;
 
-        // Generate nonce - use configured nonce length for ChaCha20Poly1305
-        let nonce = P::generate_nonce(Config::global().chacha_nonce_length)
+        let nonce = P::generate_nonce(limits::CHACHA_NONCE_LENGTH)
             .map_err(|e| format!("Nonce generation failed: {}", e))?;
 
         // Convert dh_ratchet_public to [u8; 32] first
@@ -537,7 +536,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         if self.receiving_chain_length.is_multiple_of(100)
             && !(self.skipped_message_keys.is_empty() && self.pq_skipped_keys.is_empty())
         {
-            self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
+            self.cleanup_old_skipped_keys(limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS);
         }
 
         debug!(
@@ -640,7 +639,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         // 2. CPU DoS guards: reject a message whose numbers would make the chain-advance loops
         // below do more than `max_message_jump` HKDF steps before the skipped-key memory limit
         // stops them. Without this an attacker sends msg_num = 1_000_000 for O(N) work.
-        let max_jump = Config::global().max_message_jump;
+        let max_jump = limits::MAX_MESSAGE_JUMP;
         if needs_ratchet {
             // After the step the receiving chain restarts at 0: the jump is the number itself.
             if encrypted.message_number > max_jump {

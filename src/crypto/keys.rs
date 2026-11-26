@@ -11,32 +11,9 @@ use std::marker::PhantomData;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-/// How long a rotated-out signed prekey — classic or Kyber — is kept for first messages still in
-/// flight to it: the server's queue TTL (7 days) plus as much again. One constant for both, so the
-/// two cannot drift apart. Counted from rotation, not creation: a key rotated out on day 30 of its
-/// life still has its full window.
-pub const SPK_RETENTION_AFTER_ROTATION_SECS: u64 = 14 * 24 * 3600;
-
-/// How long the server keeps an undelivered message: construct-server `MESSAGE_TTL_DAYS` (7, the
-/// default and the production value, checked 2026-10-01). Changing it there means re-checking the
-/// inequality below.
-pub const QUEUE_TTL_SECS: u64 = 7 * 24 * 3600;
-
-/// The oldest unanswered handshake an initiator still writes first flights on. Past it the session
-/// is retired and the next send opens a new one from a fresh bundle
-/// (construct-docs `decisions/first-flight-sealed-whole.md`).
-///
-/// Since construct-core 0.27 a first flight is sealed under its handshake's ML-KEM secret, so a
-/// recipient that no longer holds the prekey cannot tell who wrote it and cannot answer. The prekey
-/// a handshake used is held at least `SPK_RETENTION_AFTER_ROTATION_SECS` from the moment its bundle
-/// was served; a first flight written at the handshake's age `a` may wait `QUEUE_TTL_SECS` in the
-/// queue. Every first flight opens while `a + queue ≤ retention`.
-pub const MAX_UNANSWERED_HANDSHAKE_AGE_SECS: u64 = 7 * 24 * 3600;
-
-const _: () = assert!(
-    MAX_UNANSWERED_HANDSHAKE_AGE_SECS + QUEUE_TTL_SECS <= SPK_RETENTION_AFTER_ROTATION_SECS,
-    "a first flight could outlive the prekey it was sealed to"
-);
+pub use crate::limits::{
+    MAX_UNANSWERED_HANDSHAKE_AGE_SECS, QUEUE_TTL_SECS, SPK_RETENTION_AFTER_ROTATION_SECS,
+};
 
 /// HKDF info of the KEM identity seed (`KeyManager::kem_identity_seed`).
 const KEM_IDENTITY_SEED_INFO: &[u8] = b"Construct-KEM-identity-v1";
@@ -354,8 +331,7 @@ impl<P: CryptoProvider> KeyManager<P> {
 
         self.current_signed_prekey = Some(prekey_store);
 
-        // Очищаем старые prekeys (используя конфигурируемый период)
-        self.cleanup_old_prekeys(crate::config::Config::global().prekey_cleanup_period_secs);
+        self.cleanup_old_prekeys(SPK_RETENTION_AFTER_ROTATION_SECS as i64);
 
         Ok(())
     }
@@ -783,7 +759,7 @@ impl<P: CryptoProvider> KeyManager<P> {
         created_at: i64,
         retired_at: Option<i64>,
     ) -> Result<()> {
-        let max_age = crate::config::Config::global().prekey_cleanup_period_secs;
+        let max_age = SPK_RETENTION_AFTER_ROTATION_SECS as i64;
         let now = crate::utils::time::current_timestamp();
         let retired_at = retired_at.unwrap_or(now);
         if now - retired_at >= max_age {
@@ -999,7 +975,7 @@ mod tests {
         fn one_retention_for_both_signed_prekeys() {
             assert_eq!(SPK_RETENTION_AFTER_ROTATION_SECS, 14 * 24 * 3600);
             assert_eq!(
-                crate::config::Config::global().prekey_cleanup_period_secs as u64,
+                crate::config::Config::default().prekey_cleanup_period_secs as u64,
                 SPK_RETENTION_AFTER_ROTATION_SECS,
                 "classic SPK retention and the Kyber store's must be the same constant"
             );

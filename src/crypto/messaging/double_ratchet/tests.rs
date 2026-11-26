@@ -8,6 +8,7 @@ use crate::crypto::keys::build_prologue;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
+use crate::limits;
 
 // ── Shared test helper ────────────────────────────────────────────────────
 //
@@ -326,7 +327,6 @@ fn test_decrypt_rollback_on_failure() {
 fn test_max_message_jump_dos_guard() {
     // Verify that a message with a forward jump exceeding max_message_jump is
     // rejected immediately — before any HKDF work is done — preventing CPU DoS.
-    use crate::config::Config;
     use crate::crypto::handshake::x3dh::{X3DHProtocol, X3DHPublicKeyBundle};
     use crate::crypto::keys::build_prologue;
 
@@ -390,7 +390,7 @@ fn test_max_message_jump_dos_guard() {
     let legit = alice.encrypt(b"legitimate").unwrap();
 
     // Craft a message with msg_num strictly beyond receiving_chain_length + max_jump.
-    let max_jump = Config::global().max_message_jump;
+    let max_jump = limits::MAX_MESSAGE_JUMP;
     let mut malicious = legit.clone();
     // Use max_jump * 2 to ensure we're well beyond the guard threshold
     // regardless of Bob's current receiving_chain_length.
@@ -1514,7 +1514,7 @@ fn fill_skipped_store(
     alice: &mut DoubleRatchetSession<ClassicSuiteProvider>,
     bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
 ) -> Vec<EncryptedRatchetMessage> {
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let sent: Vec<_> = (0..=limit)
         .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
         .collect();
@@ -1536,7 +1536,7 @@ fn test_gap_wider_than_the_skipped_store_is_read_and_keeps_its_newest_keys() {
         "aaaaaaaa-0000-4000-8000-000000000011",
         "bbbbbbbb-0000-4000-8000-000000000012",
     );
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let sent: Vec<_> = (0..=limit + 1)
         .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
         .collect();
@@ -1568,7 +1568,7 @@ fn test_full_skipped_store_drops_its_oldest_key_for_a_new_gap() {
         "aaaaaaaa-0000-4000-8000-000000000013",
         "bbbbbbbb-0000-4000-8000-000000000014",
     );
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let sent = fill_skipped_store(&mut alice, &mut bob);
     let skipped = alice.encrypt(b"skipped").unwrap();
     let arriving = alice.encrypt(b"arriving").unwrap();
@@ -1593,7 +1593,7 @@ fn test_message_that_does_not_decrypt_evicts_no_skipped_key() {
         "aaaaaaaa-0000-4000-8000-000000000015",
         "bbbbbbbb-0000-4000-8000-000000000016",
     );
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let sent = fill_skipped_store(&mut alice, &mut bob);
     let _skipped = alice.encrypt(b"skipped").unwrap();
     let mut forged = alice.encrypt(b"forged").unwrap();
@@ -1617,7 +1617,7 @@ fn test_full_pq_skipped_store_drops_its_oldest_key_and_stays_loadable() {
         "bbbbbbbb-0000-4000-8000-000000000018",
     );
     pq_drive_to_epoch(&mut alice, &mut bob, 1);
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let epoch = alice.current_pq_epoch;
     let sent: Vec<_> = (0..=limit + 1)
         .map(|i| alice.encrypt(format!("msg-{i}").as_bytes()).unwrap())
@@ -1673,7 +1673,7 @@ fn test_previous_chain_gap_wider_than_the_store_is_read_across_the_dh_step() {
         "aaaaaaaa-0000-4000-8000-000000000019",
         "bbbbbbbb-0000-4000-8000-00000000001a",
     );
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let first = alice.encrypt(b"first").unwrap();
     assert_eq!(bob.decrypt(&first).unwrap(), b"first");
     let (lost, turned) = turn_alice_after_unread(&mut alice, &mut bob, limit + 1);
@@ -1701,7 +1701,7 @@ fn test_full_skipped_store_drops_its_oldest_key_for_a_previous_chain_gap() {
         "aaaaaaaa-0000-4000-8000-00000000001b",
         "bbbbbbbb-0000-4000-8000-00000000001c",
     );
-    let limit = crate::config::Config::global().max_skipped_messages as usize;
+    let limit = limits::MAX_SKIPPED_MESSAGES as usize;
     let sent = fill_skipped_store(&mut alice, &mut bob);
     let (lost, turned) = turn_alice_after_unread(&mut alice, &mut bob, 1);
 
@@ -1885,7 +1885,7 @@ fn pq_drive_to_epoch(
     bob: &mut DoubleRatchetSession<ClassicSuiteProvider>,
     epoch: u32,
 ) -> u32 {
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     let budget = (interval + 4) * epoch;
     for round in 1..=budget {
         pq_round(alice, bob, &format!("drive round {round}"));
@@ -2069,7 +2069,7 @@ fn test_pq_ratchet_reordered_delivery_across_epoch_boundary() {
         "aaaaaaaa-0000-4000-8000-0000000000b7",
         "bbbbbbbb-0000-4000-8000-0000000000b8",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
 
     // Drive until Alice has an exchange in flight (EK pending).
     for round in 1..=(interval + 2) {
@@ -2123,7 +2123,7 @@ fn test_pq_ratchet_lost_ek_carrier_healed_by_resend() {
         "aaaaaaaa-0000-4000-8000-0000000000b9",
         "bbbbbbbb-0000-4000-8000-0000000000c0",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     for round in 1..=(interval + 2) {
         pq_round(&mut alice, &mut bob, &format!("warmup {round}"));
         if alice.pending_pq_exchange.is_some() {
@@ -2159,7 +2159,7 @@ fn test_pq_ratchet_lost_ct_carrier_healed_by_resend() {
         "aaaaaaaa-0000-4000-8000-0000000000c1",
         "bbbbbbbb-0000-4000-8000-0000000000c2",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     for round in 1..=(interval + 2) {
         pq_round(&mut alice, &mut bob, &format!("warmup {round}"));
         if alice.pending_pq_exchange.is_some() {
@@ -2194,7 +2194,7 @@ fn test_pq_ratchet_duplicate_ek_is_idempotent() {
         "aaaaaaaa-0000-4000-8000-0000000000c3",
         "bbbbbbbb-0000-4000-8000-0000000000c4",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     for round in 1..=(interval + 2) {
         pq_round(&mut alice, &mut bob, &format!("warmup {round}"));
         if alice.pending_pq_exchange.is_some() {
@@ -2236,7 +2236,7 @@ fn test_pq_ratchet_stale_ct_for_abandoned_keypair_ignored() {
         "aaaaaaaa-0000-4000-8000-0000000000c5",
         "bbbbbbbb-0000-4000-8000-0000000000c6",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     for round in 1..=(interval + 2) {
         pq_round(&mut alice, &mut bob, &format!("warmup {round}"));
         if alice.pending_pq_exchange.is_some() {
@@ -2251,7 +2251,7 @@ fn test_pq_ratchet_stale_ct_for_abandoned_keypair_ignored() {
 
     // Alice's exchange times out and is abandoned; the next cadence firing
     // re-proposes the same epoch id with a fresh keypair.
-    let max_age = crate::config::Config::global().max_skipped_message_age_seconds as u64;
+    let max_age = limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS as u64;
     alice.pq_pending_since = super::unix_now().saturating_sub(max_age + 3600);
     alice.pq_turns_since_mix = interval - 1;
     let old_public = alice
@@ -2346,7 +2346,7 @@ fn test_pq_ratchet_responder_never_initiates() {
         "aaaaaaaa-0000-4000-8000-0000000000c9",
         "bbbbbbbb-0000-4000-8000-0000000000d0",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
     for round in 1..=(interval * 2) {
         pq_round(&mut alice, &mut bob, &format!("round {round}"));
         assert!(
@@ -2363,7 +2363,7 @@ fn test_pq_ratchet_cadence_fires_after_default_interval() {
         "aaaaaaaa-0000-4000-8000-0000000000d1",
         "bbbbbbbb-0000-4000-8000-0000000000d2",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
 
     alice.pq_turns_since_mix = interval - 2;
     alice.maybe_advance_pq_ratchet().unwrap();
@@ -2529,7 +2529,7 @@ fn test_pq_ratchet_state_survives_cfe_round_trip_mid_exchange() {
         "aaaaaaaa-0000-4000-8000-0000000000e3",
         "bbbbbbbb-0000-4000-8000-0000000000e4",
     );
-    let interval = crate::config::Config::global().pq_ratchet_interval;
+    let interval = limits::PQ_RATCHET_INTERVAL;
 
     // Reach epoch 1, then drive until the epoch-2 exchange is in flight.
     pq_drive_to_epoch(&mut alice, &mut bob, 1);
@@ -2925,7 +2925,7 @@ fn test_pqr1_a_one_way_conversation_rekeys_once_the_epoch_is_old() {
         bob.decrypt(&m).unwrap();
     }
 
-    let max_age = crate::config::Config::global().pq_ratchet_max_age_seconds;
+    let max_age = limits::PQ_RATCHET_MAX_AGE_SECONDS;
     alice.pq_epoch_since = super::unix_now().saturating_sub(max_age + 1);
     let m = alice.encrypt(b"old epoch").unwrap();
     assert!(
@@ -2976,7 +2976,7 @@ fn test_pqr1_a_responder_only_conversation_rekeys_through_the_initiators_receipt
         "aaaaaaaa-0000-4000-8000-0000000001b7",
         "bbbbbbbb-0000-4000-8000-0000000001b8",
     );
-    let max_age = crate::config::Config::global().pq_ratchet_max_age_seconds;
+    let max_age = limits::PQ_RATCHET_MAX_AGE_SECONDS;
     alice.pq_epoch_since = super::unix_now().saturating_sub(max_age + 1);
 
     // Bob writes; Alice only acknowledges. Three rounds: proposal, ciphertext, promotion.
@@ -3339,7 +3339,7 @@ fn turned_message() -> (Dr, Dr, EncryptedRatchetMessage) {
 /// Mutation: `>` → `==` or `>=` on the after-DH-step guard — this reddens.
 #[test]
 fn test_jump_guard_after_a_dh_step_refuses_past_the_limit_only() {
-    let max_jump = crate::config::Config::global().max_message_jump;
+    let max_jump = limits::MAX_MESSAGE_JUMP;
     let (_alice, mut bob, turned) = turned_message();
 
     let mut over = turned.clone();
@@ -3361,7 +3361,7 @@ fn test_jump_guard_after_a_dh_step_refuses_past_the_limit_only() {
 /// Mutation: `>` → `==` or `>=` on the PN guard — this reddens.
 #[test]
 fn test_jump_guard_on_the_previous_chain_refuses_past_the_limit_only() {
-    let max_jump = crate::config::Config::global().max_message_jump;
+    let max_jump = limits::MAX_MESSAGE_JUMP;
     let (_alice, mut bob, turned) = turned_message();
     let at = bob.receiving_chain_length;
 
@@ -3387,7 +3387,7 @@ fn test_jump_guard_on_the_previous_chain_refuses_past_the_limit_only() {
 /// Mutation: `>` → `>=` on the same-chain guard — the edge is refused and this reddens.
 #[test]
 fn test_jump_guard_on_the_current_chain_refuses_past_the_limit_only() {
-    let max_jump = crate::config::Config::global().max_message_jump;
+    let max_jump = limits::MAX_MESSAGE_JUMP;
     let (mut alice, mut bob) = make_session_pair(
         "aaaaaaaa-0000-4000-8000-000000000033",
         "bbbbbbbb-0000-4000-8000-000000000034",
@@ -3410,7 +3410,7 @@ fn test_jump_guard_on_the_current_chain_refuses_past_the_limit_only() {
 /// Mutation: `>` → `==` or `>=` on the PQ guard — this reddens.
 #[test]
 fn test_pq_jump_guard_refuses_past_the_limit_only() {
-    let max_jump = crate::config::Config::global().max_message_jump;
+    let max_jump = limits::MAX_MESSAGE_JUMP;
     let (mut alice, mut bob) = make_pq_session_pair(
         "aaaaaaaa-0000-4000-8000-000000000035",
         "bbbbbbbb-0000-4000-8000-000000000036",
@@ -3446,7 +3446,7 @@ fn test_pq_skipped_key_past_the_age_bound_is_dropped() {
     bob.decrypt(&read).unwrap();
     assert_eq!(bob.pq_skipped_keys.len(), 2);
 
-    let max_age = crate::config::Config::global().max_skipped_message_age_seconds;
+    let max_age = limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS;
     let now = crate::utils::time::now();
     let mut slots: Vec<_> = bob.pq_skipped_keys.keys().copied().collect();
     slots.sort();
@@ -3480,7 +3480,7 @@ fn test_decrypt_ages_out_skipped_keys_on_the_hundredth_position() {
     bob.decrypt(&read).unwrap();
     assert_eq!(bob.skipped_message_keys.len(), 1);
     let slot = bob.skipped_message_keys.keys().next().unwrap().clone();
-    let max_age = crate::config::Config::global().max_skipped_message_age_seconds;
+    let max_age = limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS;
     bob.skipped_key_timestamps.insert(
         slot.clone(),
         crate::utils::time::now() - max_age as u64 - 10,
@@ -3617,7 +3617,7 @@ fn test_each_broken_pq_invariant_is_refused_on_load() {
                 .send = None;
         }),
         ("one skipped key more than the bound", |pq| {
-            let limit = crate::config::Config::global().max_skipped_messages;
+            let limit = limits::MAX_SKIPPED_MESSAGES;
             pq.skipped = (0..=limit)
                 .map(|i| super::storage::SerializablePqSkippedKey {
                     epoch: pq.current_epoch,

@@ -1,13 +1,13 @@
 use super::*;
-use crate::config::Config;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
+use crate::limits;
 use zeroize::Zeroize;
 
 impl<P: CryptoProvider> DoubleRatchetSession<P> {
     /// How many skipped keys a state keeps, classical and PQ each.
     pub(super) fn max_skipped() -> u32 {
-        Config::global().max_skipped_messages
+        limits::MAX_SKIPPED_MESSAGES
     }
 
     /// Make room for `incoming` classical skipped keys by dropping the oldest stored ones (by
@@ -67,7 +67,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
 
     /// Cleanup старых skipped message keys с дефолтным периодом (7 дней)
     pub fn cleanup_old_skipped_keys_default(&mut self) {
-        self.cleanup_old_skipped_keys(Config::global().max_skipped_message_age_seconds);
+        self.cleanup_old_skipped_keys(limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS);
     }
 
     /// Return a read-only health snapshot of this session. Does not mutate state.
@@ -380,8 +380,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         }
         self.abandon_unanswered_pq_exchange();
         self.pq_turns_since_mix = self.pq_turns_since_mix.saturating_add(1);
-        if self.pq_turns_since_mix < Config::global().pq_ratchet_interval && !self.pq_epoch_is_old()
-        {
+        if self.pq_turns_since_mix < limits::PQ_RATCHET_INTERVAL && !self.pq_epoch_is_old() {
             return Ok(());
         }
         self.start_pq_exchange()
@@ -404,15 +403,14 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
     }
 
     pub(super) fn pq_epoch_is_old(&self) -> bool {
-        unix_now().saturating_sub(self.pq_epoch_since)
-            >= Config::global().pq_ratchet_max_age_seconds
+        unix_now().saturating_sub(self.pq_epoch_since) >= limits::PQ_RATCHET_MAX_AGE_SECONDS
     }
 
     /// Abandon an exchange nobody answered — bandwidth hygiene only. Safe because nothing was
     /// activated: the peer's provisional state (if any) is superseded by the next proposal's fresh
     /// keypair, disambiguated by `ek_hash`.
     fn abandon_unanswered_pq_exchange(&mut self) {
-        let max_age = Config::global().max_skipped_message_age_seconds.max(0) as u64;
+        let max_age = limits::MAX_SKIPPED_MESSAGE_AGE_SECONDS as u64;
         if self.pq_pending_since != 0
             && unix_now().saturating_sub(self.pq_pending_since) > max_age
             && let Some(mut ex) = self.pending_pq_exchange.take()
@@ -703,8 +701,8 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             return Ok(Some(key.into_vec()));
         }
         let current = self.current_pq_epoch;
-        let max_jump = Config::global().max_message_jump;
-        let max_skipped = Config::global().max_skipped_messages as usize;
+        let max_jump = limits::MAX_MESSAGE_JUMP;
+        let max_skipped = limits::MAX_SKIPPED_MESSAGES as usize;
         let chain = match self.pq_chains.iter_mut().find(|c| c.epoch == epoch) {
             Some(c) => &mut c.recv,
             None => match self.pending_pq_ciphertext.as_mut() {

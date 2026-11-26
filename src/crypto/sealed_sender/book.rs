@@ -21,7 +21,7 @@ use crate::error::CryptoError;
 
 /// How long a retired pair still names its writer: the server's queue window — after it nothing
 /// written on the pair can still arrive.
-pub const RETIRED_RETENTION_SECS: u64 = crate::crypto::keys::QUEUE_TTL_SECS;
+pub const RETIRED_RETENTION_SECS: u64 = crate::limits::QUEUE_TTL_SECS;
 
 /// One session's pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
