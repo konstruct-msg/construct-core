@@ -4,6 +4,8 @@
 //! Платформенный слой исполняет каждое действие и при необходимости передаёт
 //! результат обратно через `IncomingEvent`.
 
+use super::session_bundle::SessionBundle;
+
 /// Which durable slot a `SaveToSecureStore` payload belongs in.
 ///
 /// The core names *what* the bytes are; the platform names *where* they go. Until 2026-08-26 the
@@ -312,7 +314,7 @@ pub enum IncomingEvent {
         contact_id: String,
         /// Boxed: a parsed bundle is ~400 bytes and every other event is half that or less, so
         /// unboxed it set the size of each event moved through `handle_event`.
-        bundle: Box<Result<crate::orchestration::orchestrator::SessionBundle, String>>,
+        bundle: Box<Result<SessionBundle, String>>,
     },
     /// The answer to `Action::OpenSession` when no bundle could be fetched (network, no such
     /// device on the server). Ends `Opening` now rather than at its TTL; the held session stays.
