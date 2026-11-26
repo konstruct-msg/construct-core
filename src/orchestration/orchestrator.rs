@@ -159,15 +159,6 @@ pub enum PeekVerdict {
     Unreadable,
 }
 
-/// The KEM half of a first message, as the wire carried it.
-#[derive(Clone, Copy)]
-struct ResponderKem<'a> {
-    pqxdh_v2: bool,
-    kyber_prekey_id: u32,
-    kem_ciphertext: &'a [u8],
-    kem_identity: Option<&'a [u8]>,
-}
-
 pub struct Orchestrator {
     lifecycle: SessionLifecycleManager,
     router: MessageRouter,
@@ -1023,7 +1014,15 @@ impl Orchestrator {
                 allow_stale,
             )
         });
-        if opened.is_err() {
+        if let Err(e) = &opened {
+            if self.lifecycle.has_active_session(contact_id) {
+                tracing::warn!(
+                    target: "crypto::orchestrator",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "reopen refused — keeping the session already held"
+                );
+            }
             self.reopen_refused(contact_id);
         }
         opened
@@ -1189,18 +1188,9 @@ impl Orchestrator {
                 continue;
             }
 
-            let held = self.lifecycle.client.take_session(device);
-            match self.init_receiving_with_identity(device, &identity, &first) {
-                Ok(plaintext) => {
-                    if let Some(session) = held {
-                        self.lifecycle.retire(device, session);
-                    }
-                    return self.receiving_opened(device, carrier, plaintext);
-                }
+            match self.reopen_responder_session(device, &identity, &first) {
+                Ok(plaintext) => return self.receiving_opened(device, carrier, plaintext),
                 Err(e) => {
-                    if let Some(session) = held {
-                        self.lifecycle.client.put_back_session(device, session);
-                    }
                     if e.starts_with("OTPK id=") || e.starts_with("PQXDH_KEY_UNAVAILABLE") {
                         prekey_missing.insert(carrier.message_id.clone());
                     }
@@ -1313,7 +1303,7 @@ impl Orchestrator {
     /// holds — a one-time key already burned, a signed prekey past its 14 days — means the
     /// session cannot be derived at all (`PQXDH_KEY_UNAVAILABLE`).
     fn responder_kem(
-        &self,
+        lifecycle: &SessionLifecycleManager,
         ratchet_suite_id: u16,
         pqxdh_v2: bool,
         kyber_prekey_id: u32,
@@ -1331,7 +1321,7 @@ impl Orchestrator {
                 "PQXDH_REQUIRED: first message on suite {ratchet_suite_id}; the PQ-ratchet suite is mandatory"
             ));
         }
-        let key_manager = self.lifecycle.client.key_manager();
+        let key_manager = lifecycle.client.key_manager();
         let prekey = key_manager
             .kyber_prekeys()
             .find(kyber_prekey_id)
@@ -1346,20 +1336,24 @@ impl Orchestrator {
     /// After a responder init built on Kyber prekey `kyber_prekey_id`: label the session, and burn
     /// the key if it was one-time. The burn marks the prekeys dirty
     /// (`take_kyber_prekeys_to_persist`).
-    fn after_responder_init(&mut self, contact_id: &str, kyber_prekey_id: u32) {
+    fn after_responder_init(
+        lifecycle: &mut SessionLifecycleManager,
+        kyber_prekeys_dirty: &mut bool,
+        contact_id: &str,
+        kyber_prekey_id: u32,
+    ) {
         if kyber_prekey_id >= crate::crypto::kyber_prekeys::KYBER_OTPK_ID_START
-            && self
-                .lifecycle
+            && lifecycle
                 .client
                 .key_manager_mut()
                 .kyber_prekeys_mut()
                 .remove_otpk(kyber_prekey_id)
                 .is_some()
         {
-            self.kyber_prekeys_dirty = true;
+            *kyber_prekeys_dirty = true;
         }
         if kyber_prekey_id != 0
-            && let Some(session) = self.lifecycle.client.get_session_mut(contact_id)
+            && let Some(session) = lifecycle.client.get_session_mut(contact_id)
         {
             session
                 .messaging_session_mut()
@@ -1404,8 +1398,41 @@ impl Orchestrator {
         remote_identity: &[u8],
         first_message: &IncomingFirstMessage,
     ) -> Result<Vec<u8>, String> {
+        Self::init_responder_session(
+            &mut self.lifecycle,
+            &mut self.kyber_prekeys_dirty,
+            contact_id,
+            remote_identity,
+            first_message,
+        )
+    }
+
+    fn reopen_responder_session(
+        &mut self,
+        contact_id: &str,
+        remote_identity: &[u8],
+        first_message: &IncomingFirstMessage,
+    ) -> Result<Vec<u8>, String> {
+        let kyber_prekeys_dirty = &mut self.kyber_prekeys_dirty;
+        self.lifecycle.reopen_with(contact_id, |lifecycle| {
+            Self::init_responder_session(
+                lifecycle,
+                kyber_prekeys_dirty,
+                contact_id,
+                remote_identity,
+                first_message,
+            )
+        })
+    }
+
+    fn init_responder_session(
+        lifecycle: &mut SessionLifecycleManager,
+        kyber_prekeys_dirty: &mut bool,
+        contact_id: &str,
+        remote_identity: &[u8],
+        first_message: &IncomingFirstMessage,
+    ) -> Result<Vec<u8>, String> {
         use crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage;
-        use crate::crypto::provider::CryptoProvider;
 
         let sealed_box = &first_message.content;
         if sealed_box.len() < 12 {
@@ -1445,62 +1472,37 @@ impl Orchestrator {
             first_message.ephemeral_public_key.clone(),
         );
 
-        let plaintext = self.complete_responder_init(
-            contact_id,
-            &remote_identity,
-            &remote_ephemeral,
-            &encrypted_first_message,
-            first_message.one_time_prekey_id,
-            ResponderKem {
-                pqxdh_v2: first_message.pqxdh_v2,
-                kyber_prekey_id: first_message.kyber_prekey_id,
-                kem_ciphertext: &first_message.kem_ciphertext,
-                kem_identity: first_message.kem_identity.as_deref(),
-            },
+        let kyber_prekey_id = first_message.kyber_prekey_id;
+        let kem_ciphertext = &first_message.kem_ciphertext;
+        let (kyber_public, shared) = Self::responder_kem(
+            lifecycle,
+            encrypted_first_message.suite_id,
+            first_message.pqxdh_v2,
+            kyber_prekey_id,
+            kem_ciphertext,
         )?;
-        Ok(plaintext)
-    }
-
-    /// The step both responder entry points end in: the KEM part (`responder_kem`), the X3DH +
-    /// Double Ratchet responder init with it, then `after_responder_init`.
-    fn complete_responder_init(
-        &mut self,
-        contact_id: &str,
-        remote_identity: &<ClassicSuiteProvider as CryptoProvider>::KemPublicKey,
-        remote_ephemeral: &<ClassicSuiteProvider as CryptoProvider>::KemPublicKey,
-        message: &crate::crypto::messaging::double_ratchet::EncryptedRatchetMessage,
-        one_time_prekey_id: u32,
-        kem: ResponderKem<'_>,
-    ) -> Result<Vec<u8>, String> {
-        let (kyber_public, shared) = self.responder_kem(
-            message.suite_id,
-            kem.pqxdh_v2,
-            kem.kyber_prekey_id,
-            kem.kem_ciphertext,
-        )?;
-        let (kem_identity, answer) = self.admit_kem_identity(contact_id, kem.kem_identity)?;
+        let (kem_identity, answer) =
+            Self::admit_kem_identity(lifecycle, contact_id, first_message.kem_identity.as_deref())?;
         let pq = Some(crate::crypto::handshake::PqxdhInput {
             shared_secret: shared.expose(),
             kyber_public: &kyber_public,
-            kem_ciphertext: kem.kem_ciphertext,
+            kem_ciphertext,
             initiator_kem_identity: kem_identity,
         });
 
-        let (_session_id, plaintext) = self
-            .lifecycle
+        let (_session_id, plaintext) = lifecycle
             .client
             .init_receiving_session_with_ephemeral(
                 contact_id,
-                remote_identity,
-                remote_ephemeral,
-                message,
-                one_time_prekey_id,
+                &remote_identity,
+                &remote_ephemeral,
+                &encrypted_first_message,
+                first_message.one_time_prekey_id,
                 pq.as_ref(),
             )
             .map_err(|e| e.to_string())?;
         {
-            let answered = self
-                .lifecycle
+            let answered = lifecycle
                 .client
                 .get_session_mut(contact_id)
                 .ok_or_else(|| "responder init left no session".to_string())
@@ -1511,29 +1513,28 @@ impl Orchestrator {
                     )
                 });
             if let Err(e) = answered {
-                self.lifecycle.client.remove_session(contact_id);
+                lifecycle.client.remove_session(contact_id);
                 return Err(format!("KEM_IDENTITY_ANSWER_FAILED: {e}"));
             }
             // The first message decrypted under a root key bound to this key: only now is it
             // worth pinning — as the initiator pins a hybrid key only after X3DH verified it.
-            self.lifecycle.pin_kem_identity(
+            lifecycle.pin_kem_identity(
                 contact_id,
                 crate::orchestration::pq_prekey_plan::kem_identity_fingerprint(kem_identity),
             );
-            self.after_responder_init(contact_id, kem.kyber_prekey_id);
+            Self::after_responder_init(lifecycle, kyber_prekeys_dirty, contact_id, kyber_prekey_id);
             // The later first flights of this handshake name a one-time prekey just burned: they
             // open with this, until the initiator proves itself.
-            if let Some(session_id) = self
-                .lifecycle
+            if let Some(session_id) = lifecycle
                 .client
                 .get_session(contact_id)
                 .map(|s| s.session_id().to_string())
             {
                 use crate::crypto::sealed_sender::first_flight::{FirstFlightKey, ciphertext_hash};
-                let now = self.lifecycle.now_secs();
-                self.lifecycle.client.envelopes_mut().set_first_flight(
+                let now = lifecycle.now_secs();
+                lifecycle.client.envelopes_mut().set_first_flight(
                     &session_id,
-                    ciphertext_hash(kem.kem_ciphertext),
+                    ciphertext_hash(kem_ciphertext),
                     FirstFlightKey::from_kem_secret(shared.expose()),
                     now,
                 );
@@ -1546,7 +1547,7 @@ impl Orchestrator {
     /// and the answer to it (`IdentityProof`). Mandatory — a first flight that names no key is
     /// refused, as one without an ML-KEM ciphertext is (decisions/responder-authenticates-initiator-by-kem.md).
     fn admit_kem_identity<'a>(
-        &self,
+        lifecycle: &SessionLifecycleManager,
         contact_id: &str,
         kem_identity: Option<&'a [u8]>,
     ) -> Result<(&'a [u8], crate::crypto::pq_x3dh::MLKEMEncapsulation), String> {
@@ -1557,7 +1558,7 @@ impl Orchestrator {
             )
         })?;
         let fingerprint = crate::orchestration::pq_prekey_plan::kem_identity_fingerprint(key);
-        if let Some(pinned) = self.lifecycle.pinned_kem_identity(contact_id)
+        if let Some(pinned) = lifecycle.pinned_kem_identity(contact_id)
             && *pinned != fingerprint
         {
             tracing::error!(
@@ -1592,21 +1593,8 @@ impl Orchestrator {
             .to_vec();
         let first = IncomingFirstMessage::from_wire_payload(wire_payload)?;
         let device = certificate.device_id.clone();
-        let held = self.lifecycle.client.take_session(&device);
-        match self.init_receiving_with_identity(&device, &identity, &first) {
-            Ok(plaintext) => {
-                if let Some(session) = held {
-                    self.lifecycle.retire(&device, session);
-                }
-                Ok((device, plaintext))
-            }
-            Err(e) => {
-                if let Some(session) = held {
-                    self.lifecycle.client.put_back_session(&device, session);
-                }
-                Err(e)
-            }
-        }
+        let plaintext = self.reopen_responder_session(&device, &identity, &first)?;
+        Ok((device, plaintext))
     }
 
     pub fn remove_session_by_contact(&mut self, contact_id: &str) -> bool {
@@ -5602,7 +5590,7 @@ mod pqxdh_v2_tests {
     /// after the first has burned the one-time Kyber prekey it names, and the key is dropped on
     /// both sides once the first flights are over.
     ///
-    /// Mutation: skip `set_first_flight` in `complete_responder_init` — the second open reddens.
+    /// Mutation: skip `set_first_flight` in `init_responder_session` — the second open reddens.
     #[test]
     fn first_flights_are_sealed_whole_and_the_later_ones_open_after_the_prekey_burns() {
         use crate::crypto::sealed_sender::first_flight::{ciphertext_hash, handshake_of_wire};
@@ -6863,8 +6851,8 @@ mod pqxdh_v2_tests {
     /// the first then decrypts on its skipped key. On the stand (2026-09-27) the second got an
     /// END_SESSION.
     ///
-    /// Mutation: archive the held session in `open_receiving` instead of retiring it — the
-    /// message on the old state, delivered after, reddens this.
+    /// Mutation: drop the held session instead of retiring it in `reopen_with` — the message
+    /// on the old state, delivered after, reddens this.
     #[test]
     fn a_new_state_opens_from_any_of_its_messages_and_the_old_one_still_reads() {
         let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
@@ -6907,7 +6895,7 @@ mod pqxdh_v2_tests {
     /// with that sibling is kept as a previous one, not dropped — what it still has in flight
     /// decrypts.
     ///
-    /// Mutation: drop the `retire` in `receiving_from_certificate` — the late message reddens.
+    /// Mutation: drop the `retire` in `reopen_with` — the late message reddens.
     #[test]
     fn a_siblings_new_state_opened_outside_the_queue_keeps_the_old_one() {
         let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
@@ -6931,6 +6919,33 @@ mod pqxdh_v2_tests {
             .unwrap();
         assert_eq!(plaintext, b"n0");
         assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 1);
+        assert_eq!(bob.decrypt_bytes_for(&alice_id, &late).unwrap(), b"late");
+    }
+
+    #[test]
+    fn a_refused_sibling_reopen_keeps_the_session_current() {
+        let ((mut alice, alice_id), (mut bob, bob_id)) = named_pair();
+        let server = trusting_server(&mut bob);
+        let cert = certificate(&server, &alice);
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice
+            .init_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let first = alice.encrypt_bytes_for(&bob_id, b"first").unwrap();
+        bob.receiving_from_certificate(&cert, &first).unwrap();
+        let held = bob.lifecycle.active_session_id(&alice_id).unwrap();
+        let late = alice.encrypt_bytes_for(&bob_id, b"late").unwrap();
+
+        let (x3dh, kyber) = bundle_of(&mut bob, false);
+        alice
+            .reopen_session_with_bundle(&bob_id, x3dh, kyber, false)
+            .unwrap();
+        let mut reinit = alice.encrypt_bytes_for(&bob_id, b"again").unwrap();
+        reinit[crate::wire_payload::HEADER_SIZE + 10] ^= 0x01;
+        bob.receiving_from_certificate(&cert, &reinit).unwrap_err();
+
+        assert_eq!(bob.lifecycle.active_session_id(&alice_id), Some(held));
+        assert_eq!(bob.lifecycle.previous_state_count(&alice_id), 0);
         assert_eq!(bob.decrypt_bytes_for(&alice_id, &late).unwrap(), b"late");
     }
 
