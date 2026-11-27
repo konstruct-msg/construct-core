@@ -334,7 +334,7 @@ impl SessionLifecycleManager {
         if crate::device_id::derive_device_id(recipient_identity) != contact_id {
             return Err(format!(
                 "FIRST_FLIGHT_WRONG_KEY: the identity key given does not derive to {}",
-                crate::crypto::messaging::double_ratchet::id_prefix(contact_id)
+                crate::utils::diagnostics::id_prefix(contact_id)
             ));
         }
         let Some(handshake) = first_flight::handshake_of_wire(wire_payload) else {
@@ -488,7 +488,7 @@ impl SessionLifecycleManager {
         tracing::info!(
             target: "crypto::lifecycle",
             contact_id = %contact_id,
-            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(promoted.session.session_id()),
+            session_id = %crate::utils::diagnostics::id_prefix(promoted.session.session_id()),
             "a previous state decrypted — promoted to current"
         );
         self.install_current(contact_id, promoted.session);
@@ -896,7 +896,7 @@ impl SessionLifecycleManager {
         if !self.client.envelopes().has_session(ratchet.session_id()) {
             return Err(format!(
                 "{SESSION_PREDATES_ENVELOPE}: session {} has no envelope keys",
-                crate::crypto::messaging::double_ratchet::id_prefix(ratchet.session_id())
+                crate::utils::diagnostics::id_prefix(ratchet.session_id())
             ));
         }
         // A session still in its first flights needs their key — the initiator to seal them, the
@@ -914,7 +914,7 @@ impl SessionLifecycleManager {
             return Err(format!(
                 "{SESSION_PREDATES_ENVELOPE}: session {} is in its first flights and has no \
                  first-flight key",
-                crate::crypto::messaging::double_ratchet::id_prefix(ratchet.session_id())
+                crate::utils::diagnostics::id_prefix(ratchet.session_id())
             ));
         }
         match retired {

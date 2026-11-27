@@ -430,7 +430,7 @@ where
         info!(
             target: "crypto::client",
             contact_id = %contact_id,
-            session_id = %crate::crypto::messaging::double_ratchet::id_prefix(&session_id),
+            session_id = %crate::utils::diagnostics::id_prefix(&session_id),
             "Session initialized successfully"
         );
 
@@ -524,7 +524,7 @@ where
         let verifying_key = P::signature_public_key_from_bytes(bundle_data.verifying_key.clone());
 
         // Собираем данные для верификации с prologue (как при создании)
-        let prologue = crate::crypto::keys::build_prologue(bundle_data.suite_id);
+        let prologue = crate::crypto::handshake::signing::build_prologue(bundle_data.suite_id);
         let mut message_to_verify =
             Vec::with_capacity(prologue.len() + bundle_data.signed_prekey_public.len());
         message_to_verify.extend_from_slice(&prologue);
@@ -704,7 +704,7 @@ where
                     info!(
                         target: "crypto::client",
                         contact_id = %contact_id,
-                        session_id = %crate::crypto::messaging::double_ratchet::id_prefix(&session_id),
+                        session_id = %crate::utils::diagnostics::id_prefix(&session_id),
                         plaintext_len = %plaintext.len(),
                         "Receiving session initialized and first message decrypted"
                     );

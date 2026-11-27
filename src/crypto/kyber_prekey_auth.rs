@@ -12,7 +12,7 @@
 //! receiving side checked a Kyber signature at all; a substituted key got the ML-KEM secret of
 //! every session opened to that device while every indicator said "PQ".
 
-use crate::crypto::keys::KeyManager;
+use crate::crypto::handshake::signing;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 
@@ -50,10 +50,7 @@ pub fn kyber_prekey_sign_message_v2(created_at: u64, kyber_public: &[u8]) -> Vec
     let mut payload = Vec::with_capacity(8 + kyber_public.len());
     payload.extend_from_slice(&created_at.to_be_bytes());
     payload.extend_from_slice(kyber_public);
-    KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(
-        KYBER_PREKEY_SIGN_SUITE_V2,
-        &payload,
-    )
+    signing::build_x3dh_sign_message(KYBER_PREKEY_SIGN_SUITE_V2, &payload)
 }
 
 /// Check a v2 Kyber prekey's Ed25519 signature against the bundle's `verifying_key`.
@@ -235,11 +232,8 @@ mod tests {
         );
 
         // A v1 (0x10) signature over the same key is not a v2 one.
-        let v1 = ClassicSuiteProvider::sign(
-            &sk,
-            &KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x10, &pk),
-        )
-        .unwrap();
+        let v1 =
+            ClassicSuiteProvider::sign(&sk, &signing::build_x3dh_sign_message(0x10, &pk)).unwrap();
         assert_eq!(
             check_kyber_prekey_signature_v2(&vk, &pk, 1000, Some(&v1)),
             KyberPrekeySignature::Invalid

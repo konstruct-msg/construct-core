@@ -3,6 +3,7 @@
 
 use crate::crypto::CryptoProvider;
 use crate::crypto::SuiteID;
+use crate::crypto::handshake::signing;
 use crate::utils::error::{ConstructError, Result};
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
@@ -11,23 +12,13 @@ use std::marker::PhantomData;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+pub use crate::crypto::handshake::signing::build_prologue;
 pub use crate::limits::{
     MAX_UNANSWERED_HANDSHAKE_AGE_SECS, QUEUE_TTL_SECS, SPK_RETENTION_AFTER_ROTATION_SECS,
 };
 
 /// HKDF info of the KEM identity seed (`KeyManager::kem_identity_seed`).
 const KEM_IDENTITY_SEED_INFO: &[u8] = b"Construct-KEM-identity-v1";
-
-/// Build prologue for X3DH signature (как в Noise Protocol)
-/// Prologue включает протокол и suite ID для предотвращения key substitution attacks
-pub fn build_prologue(suite_id: SuiteID) -> Vec<u8> {
-    let protocol_name = b"KonstruktX3DH-v1";
-    let suite_id_bytes = suite_id.as_u16().to_be_bytes();
-    let mut prologue = Vec::with_capacity(protocol_name.len() + suite_id_bytes.len());
-    prologue.extend_from_slice(protocol_name);
-    prologue.extend_from_slice(&suite_id_bytes);
-    prologue
-}
 
 /// Пара ключей X25519
 #[derive(Clone, Zeroize)]
@@ -430,7 +421,7 @@ impl<P: CryptoProvider> KeyManager<P> {
 
     /// Domain separation for X3DH pre-key signatures (both classic Ed25519 and hybrid).
     /// Must stay byte-identical to Swift `x3dhPrologue` and server.
-    pub const X3DH_SIGN_PROLOGUE: &'static [u8] = b"KonstruktX3DH-v1";
+    pub const X3DH_SIGN_PROLOGUE: &'static [u8] = signing::X3DH_SIGN_PROLOGUE;
 
     /// Domain separation for binding the hybrid identity key to the classic device Ed25519 identity.
     /// Must stay byte-identical to Swift `bindPrologue` / server `HYBRID_ID_BIND_PROLOGUE`.
@@ -441,12 +432,7 @@ impl<P: CryptoProvider> KeyManager<P> {
     ///
     /// Format: PROLOGUE || [0x00, suite_id] || public_key_bytes
     pub fn build_x3dh_sign_message(suite_id: u8, public_key: &[u8]) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(Self::X3DH_SIGN_PROLOGUE.len() + 2 + public_key.len());
-        msg.extend_from_slice(Self::X3DH_SIGN_PROLOGUE);
-        msg.push(0x00);
-        msg.push(suite_id);
-        msg.extend_from_slice(public_key);
-        msg
+        signing::build_x3dh_sign_message(suite_id, public_key)
     }
 
     /// Build the message for the cross-signature that binds a freshly generated

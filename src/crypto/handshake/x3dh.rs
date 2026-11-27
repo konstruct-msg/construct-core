@@ -59,9 +59,9 @@
 //! Поэтому: DH(a, B) = DH(b, A)
 //! ```
 
+use super::signing::build_prologue;
 use crate::crypto::SuiteID;
 use crate::crypto::handshake::{InitiatorState, KeyAgreement};
-use crate::crypto::keys::build_prologue;
 use crate::crypto::log_fingerprint::{public_prefix, secret_fingerprint};
 use crate::crypto::provider::CryptoProvider;
 use serde::{Deserialize, Serialize};

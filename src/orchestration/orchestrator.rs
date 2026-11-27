@@ -2116,9 +2116,7 @@ impl Orchestrator {
     /// Build the canonical X3DH prekey signature message (used for both
     /// classic Ed25519 and hybrid ML-DSA signatures).
     pub fn build_x3dh_sign_message(suite_id: u8, public_key: &[u8]) -> Vec<u8> {
-        crate::crypto::keys::KeyManager::<crate::crypto::suites::classic::ClassicSuiteProvider>::build_x3dh_sign_message(
-            suite_id, public_key,
-        )
+        crate::crypto::handshake::signing::build_x3dh_sign_message(suite_id, public_key)
     }
 
     /// Build the bind message for hybrid identity cross-signature.
@@ -7420,9 +7418,9 @@ mod pqxdh_v2_tests {
         assert_eq!(GC_SWEEP_INTERVAL_MS, 600_000);
     }
 
-    /// `build_x3dh_sign_message` is the key manager's, not a copy. Mutation: return a constant.
+    /// Both public paths produce the same canonical message. Mutation: return a constant.
     #[test]
-    fn the_x3dh_sign_message_is_the_key_managers() {
+    fn the_x3dh_sign_message_preserves_the_key_manager_api() {
         assert_eq!(
             Orchestrator::build_x3dh_sign_message(0x01, &[7; 32]),
             KeyManager::<ClassicSuiteProvider>::build_x3dh_sign_message(0x01, &[7; 32])

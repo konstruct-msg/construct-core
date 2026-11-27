@@ -4,6 +4,7 @@ use crate::crypto::handshake::InitiatorState;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use crate::limits;
+use crate::utils::diagnostics::id_prefix;
 use std::collections::HashMap;
 use zeroize::Zeroize;
 
@@ -46,9 +47,9 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
 
         tracing::debug!(
             target: "crypto::double_ratchet",
-            contact_id = %super::id_prefix(&contact_id),
+            contact_id = %id_prefix(&contact_id),
             root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
-            session_id = %super::id_prefix(&shared_session_id),
+            session_id = %id_prefix(&shared_session_id),
             "INITIATOR session_id derived"
         );
 
@@ -159,7 +160,7 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         tracing::debug!(
             target: "crypto::double_ratchet",
             root_key_fp = %crate::crypto::log_fingerprint::secret_fingerprint("root_key", root_key),
-            session_id = %super::id_prefix(&shared_session_id),
+            session_id = %id_prefix(&shared_session_id),
             "RESPONDER session_id derived"
         );
 
@@ -365,9 +366,9 @@ impl<P: CryptoProvider> SecureMessaging<P> for DoubleRatchetSession<P> {
         // on every message (TODO 198).
         tracing::debug!(
             target: "crypto::double_ratchet",
-            local_user_id = %super::id_prefix(&self.local_user_id),
-            contact_id = %super::id_prefix(&self.contact_id),
-            session_id = %super::id_prefix(&self.session_id),
+            local_user_id = %id_prefix(&self.local_user_id),
+            contact_id = %id_prefix(&self.contact_id),
+            session_id = %id_prefix(&self.session_id),
             msg_num = %message_number,
             dh_pub_prefix = %crate::crypto::log_fingerprint::public_prefix(&dh_public_key),
             ad_len = %associated_data.len(),
