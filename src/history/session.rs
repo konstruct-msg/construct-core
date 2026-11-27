@@ -598,63 +598,6 @@ impl Receiver {
     }
 }
 
-// ── The orchestrator's keys ───────────────────────────────────────────────────
-
-impl DeviceKeys for crate::orchestration::Orchestrator {
-    fn identity_public(&self) -> Result<[u8; 32], HistoryFailure> {
-        self.get_registration_bundle_fields()
-            .map_err(|_| HistoryFailure::LocalKeysUnavailable)?
-            .identity_public
-            .try_into()
-            .map_err(|_| HistoryFailure::LocalKeysUnavailable)
-    }
-
-    fn hybrid_public(&self) -> Result<Vec<u8>, HistoryFailure> {
-        self.hybrid_signature_public_key()
-            .ok_or(HistoryFailure::LocalKeysUnavailable)
-    }
-
-    fn current_kyber_key_id(&self) -> Result<u32, HistoryFailure> {
-        self.current_kyber_spk_upload()
-            .ok()
-            .flatten()
-            .map(|spk| spk.key_id)
-            .ok_or(HistoryFailure::LocalKeysUnavailable)
-    }
-
-    fn sign_hybrid(&self, message: &[u8]) -> Result<Vec<u8>, HistoryFailure> {
-        crate::orchestration::Orchestrator::sign_hybrid(self, message)
-            .map_err(|_| HistoryFailure::LocalKeysUnavailable)
-    }
-
-    fn kyber_decapsulate(
-        &self,
-        key_id: u32,
-        kem_ct: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, HistoryFailure> {
-        let ss = self
-            .kyber_prekey_decapsulate(key_id, kem_ct)
-            .map_err(|_| HistoryFailure::KemKeyIdMismatch)?;
-        Ok(Zeroizing::new(ss.as_ref().to_vec()))
-    }
-
-    fn file_channel_key(
-        &self,
-        sender_eph: &[u8; 32],
-        kem_key_id: u32,
-        kem_ct: &[u8],
-        snapshot_id: &[u8; 16],
-    ) -> Result<Zeroizing<[u8; 32]>, HistoryFailure> {
-        let key = self
-            .history_file_channel_key(sender_eph, kem_key_id, kem_ct, snapshot_id)
-            .map_err(|_| HistoryFailure::KemKeyIdMismatch)?;
-        let key = Zeroizing::new(key);
-        Ok(Zeroizing::new(
-            key[..].try_into().map_err(|_| HistoryFailure::Malformed)?,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
