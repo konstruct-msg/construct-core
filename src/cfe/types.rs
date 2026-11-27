@@ -1,4 +1,4 @@
-use crate::crypto::SecretBytes;
+use crate::utils::secret_bytes::SecretBytes;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
