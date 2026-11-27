@@ -1,6 +1,7 @@
 use super::*;
 use crate::crypto::SuiteID;
 use crate::crypto::provider::CryptoProvider;
+use crate::utils::diagnostics::id_prefix;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zeroize::Zeroize;
@@ -675,16 +676,6 @@ impl Drop for SerializableSession {
             entry.key_bytes.zeroize();
         }
     }
-}
-
-/// First 8 characters of an identifier, for diagnostics that must not carry the whole value.
-/// Indexed by `char_indices` rather than by byte, so a non-ASCII id cannot panic the error path.
-///
-/// Shared across the module rather than re-written per call site: a second truncation helper is a
-/// second answer to "how much of an identifier may a log carry", and the two would drift.
-pub(crate) fn id_prefix(id: &str) -> &str {
-    let end = id.char_indices().nth(8).map_or(id.len(), |(i, _)| i);
-    &id[..end]
 }
 
 impl SerializableSession {

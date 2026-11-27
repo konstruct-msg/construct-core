@@ -2,6 +2,7 @@ use super::*;
 use crate::crypto::messaging::SecureMessaging;
 use crate::crypto::provider::CryptoProvider;
 use crate::limits;
+use crate::utils::diagnostics::id_prefix;
 use zeroize::Zeroize;
 
 impl<P: CryptoProvider> DoubleRatchetSession<P> {
@@ -245,7 +246,7 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
             self.pq_authentication = PqAuthentication::ReceivedProven;
             tracing::info!(
                 target: "crypto::double_ratchet",
-                session_id = %super::id_prefix(&self.session_id),
+                session_id = %id_prefix(&self.session_id),
                 "initiator proved its KEM identity key"
             );
         }
@@ -862,7 +863,6 @@ impl<P: CryptoProvider> DoubleRatchetSession<P> {
         message_key: &P::AeadKey,
         encrypted: &EncryptedRatchetMessage,
     ) -> Result<Vec<u8>, String> {
-        use super::storage::id_prefix;
         use tracing::debug;
 
         let ad_version = encrypted.ad_version;

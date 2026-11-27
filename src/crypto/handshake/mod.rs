@@ -204,6 +204,7 @@ pub trait KeyAgreement<P: CryptoProvider> {
 }
 
 // Re-exports
+pub(crate) mod signing;
 pub mod x3dh;
 
 // Backward compatibility

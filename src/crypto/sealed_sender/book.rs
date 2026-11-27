@@ -182,7 +182,7 @@ impl EnvelopeBook {
             .ok_or_else(|| {
                 CryptoError::InvalidInputError(format!(
                     "no envelope keys for session {}",
-                    crate::crypto::messaging::double_ratchet::id_prefix(session_id)
+                    crate::utils::diagnostics::id_prefix(session_id)
                 ))
             })?;
         let mut body = Vec::with_capacity(1 + payload.len());
