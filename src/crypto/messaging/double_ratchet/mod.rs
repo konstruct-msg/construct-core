@@ -57,6 +57,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+pub use crate::wire_payload::ratchet::{AD_VERSION_HEADER, AD_VERSION_LEGACY, PqRatchetWireField};
 pub use storage::{SerializableSession, SkippedKeyEntry};
 
 /// Prefix of the error for a message whose position on the **current** receiving chain has no
@@ -89,38 +90,11 @@ pub(crate) struct LeftReceivingChain {
     pub(crate) reached: u32,
 }
 
-/// AD (Associated Data) version byte — the first byte of the AD, so a format mismatch surfaces
-/// as an AEAD failure rather than a silent format bug. The wire names the version a message was
-/// sealed with (`wire_payload::AD_V4_FLAG`); the AD itself is never on the wire.
+/// What a sender writes until it has read a v4 message from its peer. Both versions are read,
+/// but after the first v4 message the ratchet writes v4 and refuses older v3 messages
+/// (`peer_ad_version`, persisted). Only the wire version markers live in `wire_payload`.
 ///
-///   v4 — the AD covers the whole header: after the v3 fields, `previous_chain_length` (BE32),
-///        `suite_id` (BE16), the PQ-ratchet field (tag ‖ epoch ‖ len ‖ bytes) and the identity
-///        proof ciphertext (len ‖ bytes). Until 2026-10-20 those four were outside the AD and
-///        the wire has no outer MAC, so a relay could swap the PQ field — encapsulate to the
-///        initiator's public EK itself, hand the initiator an epoch the responder never gets —
-///        or move PN so the receiver kept no keys for the old chain (TODO 192).
-///
-/// Rollout. A receiver reads both versions; a sender writes `AD_SEND_DEFAULT` until it has read
-/// a v4 message from the peer, and v4 from then on (`peer_ad_version`, persisted). Once a peer
-/// has sent v4 it never sends v3 again, so a v3 message after a v4 one is refused: the version
-/// of a session's peer only moves up. The default flips to 4 once every client ships a core
-/// that reads v4; until then a v4 message to an old core is an unknown suite there.
-///
-/// History:
-///   v1 — original format (before the AD identity bug fix)
-///   v2 — after AD bug fix: local_user_id/contact_id agree in *kind* on both sides
-///   v3 — after session_id derivation v2: HKDF info includes sorted user IDs
-///
-/// The version byte says nothing about which identifier space those two fields hold, and it did
-/// not change when that space did. What belongs in them is one meaning with one owner: the
-/// platform seam (`SessionAddressing` on iOS) puts a **crypto device id** there, and has since
-/// 2026-08-26. v2's line here named account UUIDs until then, which was true when written and
-/// silently stopped being true — the same way the AEAD failure hint in `internals.rs` did.
-pub const AD_VERSION_LEGACY: u8 = 3;
-/// The AD that covers the whole header. See `AD_VERSION_LEGACY`.
-pub const AD_VERSION_HEADER: u8 = 4;
-/// What a sender writes to a peer it has not yet read a v4 message from. Phase 1 (this): 3.
-/// Phase 2, when every client reads v4: 4. Phase 3: v3 is no longer read.
+/// Phase 1 (this): 3. Phase 2, when every client reads v4: 4. Phase 3: v3 is no longer read.
 pub(super) const AD_SEND_DEFAULT: u8 = AD_VERSION_LEGACY;
 
 fn legacy_ad_version() -> u8 {
@@ -281,22 +255,6 @@ impl Zeroize for PendingPqCiphertext {
     fn zeroize(&mut self) {
         self.chains.zeroize();
     }
-}
-
-/// Wire-level representation of the optional sparse PQ-ratchet field carried on
-/// a PQ-ratchet message, alongside the always-present `pq_message_epoch` tag.
-/// Serialized/parsed by `wire_payload.rs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PqRatchetWireField {
-    /// Initiator's fresh ML-KEM-768 public key (1184 bytes) proposing epoch `epoch`.
-    PublicKey { epoch: u32, key: Vec<u8> },
-    /// Responder's ML-KEM-768 ciphertext (1088 bytes) completing epoch `epoch`.
-    /// `ek_hash` identifies which encapsulation key it was built against.
-    Ciphertext {
-        epoch: u32,
-        ek_hash: [u8; 8],
-        ct: Vec<u8>,
-    },
 }
 
 /// How many epochs' chains are kept: the current one and the one before it, whose receive chain
