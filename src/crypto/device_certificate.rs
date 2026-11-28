@@ -53,6 +53,7 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use super::device_fingerprint::qr_fingerprint;
 use crate::crypto::provider::CryptoProvider;
 use crate::crypto::suites::classic::ClassicSuiteProvider;
 use crate::crypto::suites::hybrid::{
@@ -234,10 +235,7 @@ fn link_proof_mac(secret: &[u8], identity_public: &[u8], hybrid_public: &[u8]) -
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes any key length");
     mac.update(LINK_PROOF_PROLOGUE);
     mac.update(&[0x00]);
-    mac.update(&crate::history::discovery::qr_fingerprint(
-        identity_public,
-        hybrid_public,
-    ));
+    mac.update(&qr_fingerprint(identity_public, hybrid_public));
     mac
 }
 
@@ -261,8 +259,7 @@ fn check_keys(keys: &DeviceKeys<'_>) -> Result<[u8; DEVICE_ID_LEN], CertError> {
 fn check_evidence(keys: &DeviceKeys<'_>, evidence: &LinkEvidence<'_>) -> Result<(), CertError> {
     match evidence {
         LinkEvidence::QrFingerprint(fingerprint) => {
-            let ours =
-                crate::history::discovery::qr_fingerprint(keys.identity_public, keys.hybrid_public);
+            let ours = qr_fingerprint(keys.identity_public, keys.hybrid_public);
             // Public values: no need for a constant-time compare.
             if fingerprint[..] == ours[..] {
                 Ok(())
@@ -469,7 +466,7 @@ mod tests {
         }
 
         fn fingerprint(&self) -> [u8; 32] {
-            crate::history::discovery::qr_fingerprint(&self.identity, &self.hybrid_public)
+            qr_fingerprint(&self.identity, &self.hybrid_public)
         }
 
         fn vouch(&self, subject: &TestDevice) -> Vec<u8> {
@@ -621,7 +618,7 @@ mod tests {
             hybrid_public: &other.hybrid_public,
             ..new.keys()
         };
-        let fp = crate::history::discovery::qr_fingerprint(&new.identity, &other.hybrid_public);
+        let fp = qr_fingerprint(&new.identity, &other.hybrid_public);
         let refused = issue(
             &old.identity,
             &old.hybrid_public,

@@ -3,10 +3,10 @@
 //! A sealed delivery carries its writer in one of three fields, and which one is set is the
 //! choice of route. Until 2026-10-11 that choice was the platform's. The iOS app read the fields
 //! with its generated code and called the core per field, and Android would have had to make the
-//! same choice again. It is read here, by field number, with the wire reader the history
-//! protocol uses (`history::wire`), so the crate holds no second copy of the schema.
+//! same choice again. It is read here, by field number, with the shared protobuf field reader,
+//! without generating another copy of the schema.
 
-use crate::history::wire::{self, Value};
+use crate::protobuf_wire::{self as wire, Value};
 
 /// `SealedInner.sender_cert_ciphertext`.
 const SENDER_CERT_CIPHERTEXT: u32 = 3;

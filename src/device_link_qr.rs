@@ -15,8 +15,8 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 
+use crate::crypto::device_fingerprint::qr_fingerprint;
 use crate::device_id::derive_device_id;
-use crate::history::discovery::qr_fingerprint;
 
 const OFFER: &str = "konstruct://link?";
 const JOIN_REQUEST: &str = "konstruct://link-to-me?";

@@ -124,6 +124,7 @@ pub mod device_copy_tag;
 
 /// Devices of one account vouch for each other: certificate, link evidence, verdicts
 pub mod device_certificate;
+pub(crate) mod device_fingerprint;
 
 /// Server keys rooted offline: delegations from a pinned hybrid root, labelled server signatures
 pub mod server_trust;

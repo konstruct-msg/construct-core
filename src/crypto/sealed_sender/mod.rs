@@ -423,7 +423,7 @@ pub enum CertificateVerdict {
 /// copy of the schema. A known field with the wrong wire type is a parse failure, not a guess;
 /// unknown fields are skipped, as proto3 requires.
 pub fn decode_sender_certificate(bytes: &[u8]) -> Result<SenderCertificate, String> {
-    use crate::history::wire::{self, Value};
+    use crate::protobuf_wire::{self as wire, Value};
 
     let mut cert = SenderCertificate {
         user_id: String::new(),
@@ -1066,15 +1066,15 @@ mod decode_certificate_tests {
 
     fn varint_field(number: u32, value: u64) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::history::wire::write_varint(u64::from(number) << 3, &mut out);
-        crate::history::wire::write_varint(value, &mut out);
+        crate::protobuf_wire::write_varint(u64::from(number) << 3, &mut out);
+        crate::protobuf_wire::write_varint(value, &mut out);
         out
     }
 
     fn bytes_field(number: u32, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::history::wire::write_varint(u64::from(number) << 3 | 2, &mut out);
-        crate::history::wire::write_varint(bytes.len() as u64, &mut out);
+        crate::protobuf_wire::write_varint(u64::from(number) << 3 | 2, &mut out);
+        crate::protobuf_wire::write_varint(bytes.len() as u64, &mut out);
         out.extend_from_slice(bytes);
         out
     }
