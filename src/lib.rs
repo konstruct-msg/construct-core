@@ -62,6 +62,7 @@ mod protobuf_wire;
 pub mod rule_state;
 pub mod session_token;
 pub mod share_draft;
+mod suite_id;
 pub mod traffic_protection;
 pub mod utils;
 pub mod wire_payload;

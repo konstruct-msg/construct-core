@@ -22,6 +22,9 @@
 //!
 //! The server stores and forwards the payload opaquely without inspecting its contents.
 
+use crate::suite_id::SuiteID;
+use ratchet::{AD_VERSION_HEADER, AD_VERSION_LEGACY, PqRatchetWireField};
+
 const MSG_NUM_SIZE: usize = 4;
 const DH_KEY_SIZE: usize = 32;
 const OTPK_ID_SIZE: usize = 4;
@@ -44,12 +47,11 @@ pub const KEM_IDENTITY_FLAG: u16 = 0x0200;
 /// Set on a responder's messages until the initiator proves itself: the ML-KEM-1024 answer to the
 /// initiator's identity key follows.
 pub const IDENTITY_PROOF_FLAG: u16 = 0x0400;
-/// Every bit the wire uses above the ratchet suite; stripped by `unpack`.
-/// The sealed box was authenticated with AD v4 (`double_ratchet::AD_VERSION_HEADER`): the
-/// associated data covers the whole header, not only the ratchet key and the message number.
-/// A receiver rebuilds the AD the flag names; an older core sees an unknown suite and refuses,
-/// which is the honest outcome — it could not have checked what v4 checks (TODO 192).
+/// The sealed box was authenticated with AD v4. The receiver rebuilds that version of the
+/// associated data; an older core sees an unknown suite and refuses (TODO 192).
 pub const AD_V4_FLAG: u16 = 0x0800;
+
+/// Every bit the wire uses above the ratchet suite; stripped by `unpack`.
 const WIRE_FLAGS: u16 = PQXDH_V2_FLAG | KEM_IDENTITY_FLAG | IDENTITY_PROOF_FLAG | AD_V4_FLAG;
 /// Size of the KEM identity key and of the answer to it (ML-KEM-1024).
 const KEM_IDENTITY_OBJECT_SIZE: usize = 1568;
@@ -67,6 +69,33 @@ pub const HEADER_SIZE: usize = MSG_NUM_SIZE
 /// first-flight box (`crypto::sealed_sender::first_flight`), which lifts the ciphertext out.
 pub(crate) const KYBER_PREKEY_ID_OFFSET: usize = MSG_NUM_SIZE + DH_KEY_SIZE + OTPK_ID_SIZE;
 pub(crate) const KEM_LEN_OFFSET: usize = KYBER_PREKEY_ID_OFFSET + KYBER_OTPK_ID_SIZE;
+
+/// Wire declarations shared with the ratchet. The existing public paths are re-exported there.
+pub(crate) mod ratchet {
+    use serde::{Deserialize, Serialize};
+
+    /// Legacy associated data, version 3 (session ID derived with the sorted device IDs).
+    /// The version is the first byte of the associated data, which is never sent directly.
+    pub const AD_VERSION_LEGACY: u8 = 3;
+    /// Associated data version 4: v3 plus the previous chain length (BE32), suite ID (BE16),
+    /// sparse PQ-ratchet field and identity-proof ciphertext. These header fields were not
+    /// authenticated in v3 (TODO 192).
+    pub const AD_VERSION_HEADER: u8 = 4;
+
+    /// The optional sparse PQ-ratchet field carried alongside the `pq_message_epoch` tag.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PqRatchetWireField {
+        /// Initiator's fresh ML-KEM-768 public key (1184 bytes) proposing epoch `epoch`.
+        PublicKey { epoch: u32, key: Vec<u8> },
+        /// Responder's ML-KEM-768 ciphertext (1088 bytes) completing epoch `epoch`.
+        /// `ek_hash` identifies which encapsulation key it was built against.
+        Ciphertext {
+            epoch: u32,
+            ek_hash: [u8; 8],
+            ct: Vec<u8>,
+        },
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DecodedWirePayload {
@@ -98,7 +127,7 @@ pub struct DecodedWirePayload {
     pub pq_key_index: u32,
     /// Sparse PQ ratchet field (EK proposal or CT completion) for PQ-ratchet sessions.
     /// Only parsed/produced for `SuiteID::PQ_RATCHET`; additive after kem block.
-    pub pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+    pub pq_ratchet_field: Option<PqRatchetWireField>,
     /// The AD version the sealed box was authenticated with: 4 when the wire carried
     /// `AD_V4_FLAG`, else the legacy 3.
     pub ad_version: u8,
@@ -143,10 +172,10 @@ pub fn pack(
     sealed_box: &[u8],
     pq_message_epoch: u32,
     pq_key_index: u32,
-    pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+    pq_ratchet_field: Option<PqRatchetWireField>,
 ) -> Result<Vec<u8>, WirePayloadError> {
     pack_message(
-        crate::crypto::messaging::double_ratchet::AD_VERSION_LEGACY,
+        AD_VERSION_LEGACY,
         dh_public_key,
         message_number,
         one_time_prekey_id,
@@ -180,10 +209,8 @@ pub fn pack_message(
     sealed_box: &[u8],
     pq_message_epoch: u32,
     pq_key_index: u32,
-    pq_ratchet_field: Option<crate::crypto::messaging::double_ratchet::PqRatchetWireField>,
+    pq_ratchet_field: Option<PqRatchetWireField>,
 ) -> Result<Vec<u8>, WirePayloadError> {
-    use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
-
     if dh_public_key.len() != DH_KEY_SIZE {
         return Err(WirePayloadError::InvalidDhPublicKey(dh_public_key.len()));
     }
@@ -205,7 +232,7 @@ pub fn pack_message(
     // The flags are the wire's business: derived from what is present, never taken from the caller.
     let suite_id = suite_id & !WIRE_FLAGS;
     let mut wire_suite_id = suite_id;
-    if ad_version >= crate::crypto::messaging::double_ratchet::AD_VERSION_HEADER {
+    if ad_version >= AD_VERSION_HEADER {
         wire_suite_id |= AD_V4_FLAG;
     }
     if kem_len > 0 {
@@ -319,9 +346,9 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
     let has_kem_identity = wire_suite_id & KEM_IDENTITY_FLAG != 0;
     let has_identity_proof = wire_suite_id & IDENTITY_PROOF_FLAG != 0;
     let ad_version = if wire_suite_id & AD_V4_FLAG != 0 {
-        crate::crypto::messaging::double_ratchet::AD_VERSION_HEADER
+        AD_VERSION_HEADER
     } else {
-        crate::crypto::messaging::double_ratchet::AD_VERSION_LEGACY
+        AD_VERSION_LEGACY
     };
     let suite_id = wire_suite_id & !WIRE_FLAGS;
     if pqxdh_v2 && kem_len == 0 {
@@ -370,15 +397,13 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
     // [4B pq_message_epoch][LEB128 pq_key_index][1B type][type-specific payload].
     // See pack()'s doc. Suite 3, which had no index, is refused outright rather than read as a
     // message whose section is shorter by the index.
-    if suite_id == crate::crypto::SuiteID::RETIRED_PQ_RATCHET_V1 {
+    if suite_id == SuiteID::RETIRED_PQ_RATCHET_V1 {
         return Err(WirePayloadError::RetiredSuite(suite_id));
     }
     let mut pq_message_epoch = 0u32;
     let mut pq_key_index = 0u32;
     let mut pq_ratchet_field = None;
     if suite_id == PQ_RATCHET_SUITE {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
-
         if data.len() < cursor + 4 {
             return Err(WirePayloadError::TooShort(data.len()));
         }
@@ -461,7 +486,7 @@ pub fn unpack(data: &[u8]) -> Result<DecodedWirePayload, WirePayloadError> {
 }
 
 /// The PQ-ratchet suite, as the wire carries it.
-const PQ_RATCHET_SUITE: u16 = crate::crypto::SuiteID::PQ_RATCHET.as_u16();
+const PQ_RATCHET_SUITE: u16 = SuiteID::PQ_RATCHET.as_u16();
 
 /// Unsigned LEB128: seven bits per byte, low first, high bit = more follows.
 fn write_leb128(out: &mut Vec<u8>, mut value: u32) {
@@ -609,7 +634,6 @@ mod tests {
     /// a key outside a handshake or an object of the wrong size is refused both ways.
     #[test]
     fn the_kem_identity_and_its_answer_round_trip() {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0xAA; 32];
         let sealed = make_sealed_box(0xBB);
         let (kem, ikk, answer) = (vec![0x44; 1568], vec![0x55; 1568], vec![0x66; 1568]);
@@ -816,7 +840,6 @@ mod tests {
 
     #[test]
     fn round_trip_pq_ratchet_public_key_field() {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x55);
         let ek = vec![0x66; 1184];
@@ -855,7 +878,6 @@ mod tests {
 
     #[test]
     fn round_trip_pq_ratchet_ciphertext_field() {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0x11; 32];
         let sealed = make_sealed_box(0x77);
         let ct = vec![0x88; 1088];
@@ -922,7 +944,6 @@ mod tests {
     /// (a slice past the end panics).
     #[test]
     fn a_payload_cut_before_its_sealed_box_is_too_short_at_every_byte() {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0xAA; 32];
         let sealed = make_sealed_box(0xBB);
         let first_flight = pack(
@@ -980,7 +1001,6 @@ mod tests {
     /// Mutation: compare a length with `>=` or `==` the limit.
     #[test]
     fn a_length_the_wire_writes_as_u16_fits_up_to_its_max() {
-        use crate::crypto::messaging::double_ratchet::PqRatchetWireField;
         let dh_key = vec![0xAA; 32];
         let sealed = make_sealed_box(0xBB);
         let at = vec![1u8; u16::MAX as usize];
@@ -1143,34 +1163,19 @@ mod tests {
     /// it back and strips it from the suite; `pack` (the fixtures' shorthand) is legacy.
     #[test]
     fn the_wire_names_the_ad_version() {
-        use crate::crypto::messaging::double_ratchet::{AD_VERSION_HEADER, AD_VERSION_LEGACY};
         let dh_key = [7u8; 32];
         let sealed = vec![9u8; 40];
         let v4 = pack_message(
-            AD_VERSION_HEADER,
-            &dh_key,
-            3,
-            0,
-            0,
-            2,
-            1,
-            None,
-            None,
-            None,
-            &sealed,
-            0,
-            0,
-            None,
+            4, &dh_key, 3, 0, 0, 2, 1, None, None, None, &sealed, 0, 0, None,
         )
         .unwrap();
         let wire_suite = u16::from_le_bytes(v4[HEADER_SIZE - 2..HEADER_SIZE].try_into().unwrap());
         assert_eq!(
-            wire_suite,
-            1 | AD_V4_FLAG,
+            wire_suite, 0x0801,
             "an older core sees suite 0x0801 and refuses"
         );
         let d = unpack(&v4).unwrap();
-        assert_eq!(d.ad_version, AD_VERSION_HEADER);
+        assert_eq!(d.ad_version, 4);
         assert_eq!(d.suite_id, 1, "stripped");
         assert_eq!(d.previous_chain_length, 2);
 
@@ -1178,7 +1183,7 @@ mod tests {
             &dh_key, 3, 0, 0, 2, 1, None, None, None, &sealed, 0, 0, None,
         )
         .unwrap();
-        assert_eq!(unpack(&v3).unwrap().ad_version, AD_VERSION_LEGACY);
+        assert_eq!(unpack(&v3).unwrap().ad_version, 3);
         assert_ne!(v3, v4);
     }
 }
