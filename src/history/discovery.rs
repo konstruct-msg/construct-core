@@ -1,6 +1,7 @@
 //! The two values two devices must compute alike before any byte of history moves: the name the
 //! new device is advertised under on the local network, and the fingerprint the link QR pins.
 
+pub use crate::crypto::device_fingerprint::qr_fingerprint;
 use sha2::{Digest, Sha256};
 
 /// `hex(SHA256("cth1:" ‖ dashed account UUID ‖ 32-hex device id)[0..16])`. The preimage is frozen
@@ -22,16 +23,6 @@ pub fn discovery_instance_name(tag: &str) -> String {
         .chain_update(tag.as_bytes())
         .finalize();
     hex::encode(&digest[..16])
-}
-
-/// What a Flow A link QR carries for the offering device: `SHA256(identity_pub ‖ hybrid_pub)`,
-/// 32 bytes — a 1984-byte hybrid key does not fit a scannable code.
-pub fn qr_fingerprint(identity_public: &[u8], hybrid_public: &[u8]) -> [u8; 32] {
-    Sha256::new()
-        .chain_update(identity_public)
-        .chain_update(hybrid_public)
-        .finalize()
-        .into()
 }
 
 #[cfg(test)]

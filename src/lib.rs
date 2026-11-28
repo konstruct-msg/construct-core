@@ -58,6 +58,7 @@ mod limits;
 pub mod media;
 pub mod orchestration;
 pub mod pow;
+mod protobuf_wire;
 pub mod rule_state;
 pub mod session_token;
 pub mod share_draft;

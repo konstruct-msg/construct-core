@@ -7,96 +7,12 @@
 //! be a second copy of the schema in this crate; this reads fields by number.
 
 use super::HistoryFailure;
+use crate::protobuf_wire::Malformed;
+pub(crate) use crate::protobuf_wire::{Value, fields, read_varint, tag, write_varint};
 
-/// One field as it appears on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Value<'a> {
-    Varint(u64),
-    Fixed64,
-    Bytes(&'a [u8]),
-    Fixed32,
-}
-
-/// A varint at `buf[*pos..]`, advancing `pos`. `None` when the buffer ends first; an error for a
-/// varint longer than ten bytes.
-pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Result<Option<u64>, HistoryFailure> {
-    let mut value = 0u64;
-    for i in 0..10 {
-        let Some(&byte) = buf.get(*pos + i) else {
-            return Ok(None);
-        };
-        if i == 9 && byte > 1 {
-            return Err(HistoryFailure::Malformed);
-        }
-        value |= u64::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            *pos += i + 1;
-            return Ok(Some(value));
-        }
-    }
-    Err(HistoryFailure::Malformed)
-}
-
-/// The fields of a complete message, in wire order.
-pub(crate) fn fields(buf: &[u8]) -> Fields<'_> {
-    Fields { buf, pos: 0 }
-}
-
-pub(crate) struct Fields<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Iterator for Fields<'a> {
-    type Item = Result<(u32, Value<'a>), HistoryFailure>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.buf.len() {
-            return None;
-        }
-        Some(self.field())
-    }
-}
-
-impl<'a> Fields<'a> {
-    fn field(&mut self) -> Result<(u32, Value<'a>), HistoryFailure> {
-        let key = read_varint(self.buf, &mut self.pos)?.ok_or(HistoryFailure::Malformed)?;
-        let number = u32::try_from(key >> 3).map_err(|_| HistoryFailure::Malformed)?;
-        if number == 0 {
-            return Err(HistoryFailure::Malformed);
-        }
-        let value = match key & 7 {
-            0 => Value::Varint(
-                read_varint(self.buf, &mut self.pos)?.ok_or(HistoryFailure::Malformed)?,
-            ),
-            1 => {
-                self.skip(8)?;
-                Value::Fixed64
-            }
-            2 => {
-                let len = read_varint(self.buf, &mut self.pos)?.ok_or(HistoryFailure::Malformed)?;
-                let len = usize::try_from(len).map_err(|_| HistoryFailure::Malformed)?;
-                let start = self.pos;
-                self.skip(len)?;
-                Value::Bytes(&self.buf[start..self.pos])
-            }
-            5 => {
-                self.skip(4)?;
-                Value::Fixed32
-            }
-            // Groups (3, 4) are proto2 and absent from every schema here; 6 and 7 do not exist.
-            _ => return Err(HistoryFailure::Malformed),
-        };
-        Ok((number, value))
-    }
-
-    fn skip(&mut self, n: usize) -> Result<(), HistoryFailure> {
-        let end = self.pos.checked_add(n).ok_or(HistoryFailure::Malformed)?;
-        if end > self.buf.len() {
-            return Err(HistoryFailure::Malformed);
-        }
-        self.pos = end;
-        Ok(())
+impl From<Malformed> for HistoryFailure {
+    fn from(_: Malformed) -> Self {
+        Self::Malformed
     }
 }
 
@@ -173,19 +89,6 @@ pub(crate) fn message_body(buf: &[u8]) -> Result<Body, HistoryFailure> {
     })
 }
 
-/// A key byte: field number and wire type. Every tag this module writes is one byte.
-pub(crate) const fn tag(number: u8, wire_type: u8) -> u8 {
-    (number << 3) | wire_type
-}
-
-pub(crate) fn write_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,10 +117,7 @@ mod tests {
     #[test]
     fn hostile_varints_and_lengths_are_malformed_not_panics() {
         // Eleven continuation bytes.
-        assert_eq!(
-            read_varint(&[0xff; 11], &mut 0),
-            Err(HistoryFailure::Malformed)
-        );
+        assert_eq!(read_varint(&[0xff; 11], &mut 0), Err(Malformed));
         // A length-delimited field claiming more than the buffer holds.
         assert_eq!(
             well_formed(&[tag(2, 2), 0x05, 1, 2]),
@@ -261,7 +161,7 @@ mod tests {
         assert_eq!(read_varint(&zero, &mut 0), Ok(Some(0)));
         let mut two = vec![0xff; 9];
         two.push(0x02);
-        assert_eq!(read_varint(&two, &mut 0), Err(HistoryFailure::Malformed));
+        assert_eq!(read_varint(&two, &mut 0), Err(Malformed));
     }
 
     /// Fixed-width fields are stepped over by their width and the next field still reads.
